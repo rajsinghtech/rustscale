@@ -70,10 +70,14 @@ grep -q 'SHA256SUMS' scripts/install.sh
 grep -q 'SHA256SUMS' scripts/install.ps1
 grep -q 'packaging/systemd/rustscaled.service' .github/workflows/release.yml
 grep -q 'tools/packaging/test-first-run.sh' .github/workflows/ci.yml
+grep -q 'tools/packaging/test-linux-replacement.sh' .github/workflows/ci.yml
 grep -q 'tools/interop-tun\*\.sh' .github/workflows/ci.yml
+test -x tools/packaging/test-linux-replacement.sh
 test -s docs/release-first-run.md
 grep -q 'Protected real-control smoke gate' docs/release-first-run.md
-grep -q 'Remaining systemd and artifact gaps' docs/release-first-run.md
+grep -q 'Installed Linux replacement journey' docs/release-first-run.md
+grep -q 'RUSTSCALE_REQUIRE_LINUX_REPLACEMENT' .github/workflows/ci.yml
+grep -q 'TESTCONTROL_GO_CLIENT_DIR' tools/testcontrol/build.sh
 
 # The privileged TUN job must establish local kernel prerequisites before it
 # mints any external credential, then run one exact serial fail-closed test.

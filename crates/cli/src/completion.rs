@@ -18,6 +18,7 @@ enum FlagValue {
 #[derive(Clone, Copy, Debug)]
 struct FlagSpec {
     name: &'static str,
+    aliases: &'static [&'static str],
     value: FlagValue,
 }
 
@@ -29,7 +30,23 @@ struct CommandSpec {
 }
 
 const fn flag(name: &'static str, value: FlagValue) -> FlagSpec {
-    FlagSpec { name, value }
+    FlagSpec {
+        name,
+        aliases: &[],
+        value,
+    }
+}
+
+const fn flag_with_aliases(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    value: FlagValue,
+) -> FlagSpec {
+    FlagSpec {
+        name,
+        aliases,
+        value,
+    }
 }
 
 const fn command(
@@ -94,10 +111,18 @@ const DEBUG_SUBCOMMANDS: &[CommandSpec] = &[
 ];
 const LOCK_SUBCOMMANDS: &[CommandSpec] = &[
     command("status", &[], NONE),
-    command("init", &[], NONE),
-    command("add", &[], NONE),
-    command("remove", &[], NONE),
+    command(
+        "init",
+        &[
+            flag("--confirm", FlagValue::Bool),
+            flag("--resume", FlagValue::Bool),
+            flag("--gen-disablements", FlagValue::Value),
+        ],
+        NONE,
+    ),
+    command("sign", &[], NONE),
     command("disable", &[], NONE),
+    command("local-disable", &[], NONE),
 ];
 const DRIVE_SUBCOMMANDS: &[CommandSpec] = &[
     command("status", &[], NONE),
@@ -107,6 +132,12 @@ const DRIVE_SUBCOMMANDS: &[CommandSpec] = &[
 ];
 const DNS_SUBCOMMANDS: &[CommandSpec] =
     &[command("status", &[], NONE), command("query", &[], NONE)];
+const EXIT_NODE_SUBCOMMANDS: &[CommandSpec] = &[
+    command("list", &[], NONE),
+    command("select", &[], NONE),
+    command("clear", &[], NONE),
+    command("suggest", &[], NONE),
+];
 const COMPLETION_SUBCOMMANDS: &[CommandSpec] = &[
     command("bash", &[], NONE),
     command("zsh", &[], NONE),
@@ -126,6 +157,7 @@ const COMMANDS: &[CommandSpec] = &[
             flag("--accept-routes", FlagValue::Bool),
             flag("--accept-dns", FlagValue::Bool),
             flag("--advertise-tags", FlagValue::Value),
+            flag("--operator", FlagValue::Value),
             flag("--reset", FlagValue::Bool),
             flag("--force-reauth", FlagValue::Bool),
             flag("--timeout", FlagValue::Value),
@@ -155,6 +187,7 @@ const COMMANDS: &[CommandSpec] = &[
             flag("--exit-node", FlagValue::Value),
             flag("--route-all", FlagValue::Bool),
             flag("--advertise-tags", FlagValue::Value),
+            flag("--operator", FlagValue::Value),
             flag("--reset", FlagValue::Bool),
         ],
         NONE,
@@ -207,28 +240,20 @@ const COMMANDS: &[CommandSpec] = &[
             flag("--tsmp", FlagValue::Bool),
             flag("--icmp", FlagValue::Bool),
             flag("--peerapi", FlagValue::Bool),
-            flag("--size", FlagValue::Value),
-            flag("-s", FlagValue::Value),
-            flag("--count", FlagValue::Value),
-            flag("--c", FlagValue::Value),
-            flag("-c", FlagValue::Value),
+            flag_with_aliases("--size", &["-s"], FlagValue::Value),
+            flag_with_aliases("--count", &["--c", "-c"], FlagValue::Value),
             flag("--timeout", FlagValue::Value),
-            flag("--until-direct", FlagValue::Bool),
-            flag("-d", FlagValue::Bool),
+            flag_with_aliases("--until-direct", &["-d"], FlagValue::Bool),
         ],
         NONE,
     ),
     command(
         "speedtest",
         &[
-            flag("--host", FlagValue::Value),
-            flag("-host", FlagValue::Value),
-            flag("--time", FlagValue::Value),
-            flag("-t", FlagValue::Value),
-            flag("--server", FlagValue::Bool),
-            flag("-s", FlagValue::Bool),
-            flag("--reverse", FlagValue::Bool),
-            flag("-r", FlagValue::Bool),
+            flag_with_aliases("--host", &["-host"], FlagValue::Value),
+            flag_with_aliases("--time", &["-t"], FlagValue::Value),
+            flag_with_aliases("--server", &["-s"], FlagValue::Bool),
+            flag_with_aliases("--reverse", &["-r"], FlagValue::Bool),
         ],
         NONE,
     ),
@@ -250,15 +275,34 @@ const COMMANDS: &[CommandSpec] = &[
         "exit-node",
         &[
             flag("--list", FlagValue::Bool),
+            flag("--select", FlagValue::Value),
+            flag("--clear", FlagValue::Bool),
             flag("--suggest", FlagValue::Bool),
         ],
-        NONE,
+        EXIT_NODE_SUBCOMMANDS,
     ),
     command("dns", &[], DNS_SUBCOMMANDS),
     command("nc", &[], NONE),
     command("id-token", &[], NONE),
-    command("update", &[], NONE),
-    command("wait", &[flag("--timeout", FlagValue::Value)], NONE),
+    command(
+        "update",
+        &[
+            flag("--yes", FlagValue::Bool),
+            flag("--dry-run", FlagValue::Bool),
+            flag("--track", FlagValue::Value),
+            flag("--version", FlagValue::Value),
+        ],
+        NONE,
+    ),
+    command(
+        "wait",
+        &[flag_with_aliases(
+            "--timeout",
+            &["-timeout"],
+            FlagValue::Value,
+        )],
+        NONE,
+    ),
     command("lock", &[], LOCK_SUBCOMMANDS),
     command("drive", &[], DRIVE_SUBCOMMANDS),
     command("completion", &[], COMPLETION_SUBCOMMANDS),
@@ -335,6 +379,48 @@ pub fn run_script(args: &[String]) -> Result<(), CliError> {
     };
     print!("{script}");
     Ok(())
+}
+
+/// Return the command model used by shell completion as normalized JSON.
+///
+/// This is consumed by the compatibility-contract generator through the
+/// hidden, side-effect-free `__compat-contract` command. Keeping extraction on
+/// the built binary makes the checked manifest follow the same command tree
+/// that users' shells see.
+pub fn contract_json() -> serde_json::Value {
+    fn value_json(value: FlagValue) -> serde_json::Value {
+        match value {
+            FlagValue::Bool => serde_json::json!({"kind": "bool"}),
+            FlagValue::Value => serde_json::json!({"kind": "value"}),
+            FlagValue::OneOf(values) => {
+                serde_json::json!({"kind": "one_of", "values": values})
+            }
+        }
+    }
+
+    fn flag_json(spec: &FlagSpec) -> serde_json::Value {
+        serde_json::json!({
+            "name": spec.name,
+            "aliases": spec.aliases,
+            "value": value_json(spec.value),
+        })
+    }
+
+    fn command_json(spec: &CommandSpec) -> serde_json::Value {
+        serde_json::json!({
+            "name": spec.name,
+            "aliases": [],
+            "flags": spec.flags.iter().map(flag_json).collect::<Vec<_>>(),
+            "subcommands": spec.subcommands.iter().map(command_json).collect::<Vec<_>>(),
+        })
+    }
+
+    serde_json::json!({
+        "name": "rustscale",
+        "aliases": [],
+        "flags": GLOBAL_FLAGS.iter().map(flag_json).collect::<Vec<_>>(),
+        "commands": COMMANDS.iter().map(command_json).collect::<Vec<_>>(),
+    })
 }
 
 /// Return newline-safe static candidates for the hidden shell protocol.
@@ -451,7 +537,7 @@ fn complete_names_and_flags(
         for name in flags
             .iter()
             .chain(GLOBAL_FLAGS)
-            .map(|flag| flag.name)
+            .flat_map(|flag| std::iter::once(flag.name).chain(flag.aliases.iter().copied()))
             .filter(|name| name.starts_with(current))
         {
             if !candidates.iter().any(|candidate| candidate == name) {
@@ -473,7 +559,7 @@ fn flag_value(flags: &[FlagSpec], token: &str) -> Option<FlagValue> {
     let name = token.split_once('=').map_or(token, |(name, _)| name);
     flags
         .iter()
-        .find(|flag| flag.name == name)
+        .find(|flag| flag.name == name || flag.aliases.contains(&name))
         .map(|flag| flag.value)
 }
 
@@ -606,5 +692,38 @@ mod tests {
             assert!(script.contains("rustscale __complete --"));
             assert!(!script.contains("rustscale status"));
         }
+    }
+
+    #[test]
+    fn aliases_complete_and_are_exported_by_the_contract() {
+        assert!(complete(&words(&["ping", "-"]))
+            .iter()
+            .any(|candidate| candidate == "-c"));
+        assert_eq!(
+            flag_value(
+                COMMANDS
+                    .iter()
+                    .find(|command| command.name == "wait")
+                    .unwrap()
+                    .flags,
+                "-timeout",
+            ),
+            Some(FlagValue::Value)
+        );
+
+        let contract = contract_json();
+        let commands = contract["commands"].as_array().unwrap();
+        let speedtest = commands
+            .iter()
+            .find(|command| command["name"] == "speedtest")
+            .unwrap();
+        assert!(speedtest["flags"].as_array().unwrap().iter().any(|flag| {
+            flag["name"] == "--host"
+                && flag["aliases"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|alias| alias == "-host")
+        }));
     }
 }

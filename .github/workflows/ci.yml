@@ -73,6 +73,9 @@ jobs:
         if: ${{ matrix.os == 'windows-latest' }}
         shell: pwsh
         run: tools/packaging/test-install.ps1
+      - name: Compatibility contract drift
+        if: ${{ matrix.os == 'ubuntu-22.04' }}
+        run: tools/compat/check.sh
       - name: Dirty-tree guard (tracked files)
         if: ${{ matrix.os == 'ubuntu-22.04' }}
         run: git diff --no-ext-diff --name-only --exit-code || (echo "Build/test modified tracked files above."; exit 1)
@@ -166,6 +169,26 @@ jobs:
       - name: Run interop tests
         run: cargo test -p rustscale-interop-testcontrol --locked -- --nocapture --test-threads=1
 
+  linux-replacement:
+    name: Installed Linux replacement journey
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: linux-replacement
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26'
+      - name: Run bounded installed replacement journey
+        env:
+          RUSTSCALE_REQUIRE_LINUX_REPLACEMENT: '1'
+          RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT: '900'
+        run: tools/packaging/test-linux-replacement.sh
+
   ignore-guard:
     name: #[ignore] count guard (L6)
     runs-on: ubuntu-latest
@@ -178,7 +201,7 @@ jobs:
   alls-green:
     name: All green
     if: always()
-    needs: [check, cross, msrv, testcontrol, ignore-guard]
+    needs: [check, cross, msrv, testcontrol, linux-replacement, ignore-guard]
     runs-on: ubuntu-latest
     steps:
       - name: Decide if change is okay to merge

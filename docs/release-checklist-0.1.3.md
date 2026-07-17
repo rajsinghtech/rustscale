@@ -17,13 +17,17 @@ required GitHub Actions workflow.
   tools/packaging/check-release.sh
   tools/packaging/test-install.sh
   tools/packaging/test-first-run.sh
+  tools/packaging/test-linux-replacement.sh
   tools/packaging/test-container.sh
   cargo package --workspace --no-verify --locked
   go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
   ```
 
-- Require a clean Linux installed-first-run acceptance run and Linux glibc
-  compatibility execution from the exact release commit.
+- Require clean Linux installed-first-run and **Installed Linux replacement
+  journey** runs plus Linux glibc compatibility execution from the exact
+  release commit. The replacement job must report both its systemd journey and
+  pinned-Go kernel-TUN packet roundtrip as `PASS`; a prerequisite `SKIP` is not
+  acceptable in required CI.
 - Require the trusted-repository `interop-tun` job from the exact release
   commit. Its credential-free preflight must complete before OIDC minting, and
   its focused privileged test must prove Linux TUN kernel state plus a packet
@@ -65,8 +69,7 @@ GHCR multi-architecture manifest and verify `rustscale`, `rustscaled`,
 `tailscale`, and `tailscaled` command names.
 
 Publishing individual workspace crates to crates.io remains a separate
-operation.
-
-The current TUN gate is source-level. Installed systemd service behavior in a
-private network namespace and TUN startup from the exact published archive or
-container remain explicit release gaps; see `docs/release-first-run.md`.
+operation. The installed replacement gate assembles its candidate archive from
+the exact checkout; execution of the separately uploaded GNU artifact and the
+published container remains the responsibility of the release workflow and
+post-publication checks described above.

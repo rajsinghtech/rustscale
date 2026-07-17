@@ -23,9 +23,9 @@ pub async fn run(args: Vec<String>, socket: &Path) -> Result<(), CliError> {
         mask.Prefs.AdvertiseExitNode = true;
         mask.AdvertiseExitNodeSet = true;
     }
-    if let Some(e) = parse_str_flag(&args, "exit-node") {
-        mask.Prefs.ExitNodeIP = e;
-        mask.ExitNodeIPSet = true;
+    if let Some(selector) = parse_str_flag(&args, "exit-node") {
+        let status = lc.status_bounded().await?;
+        super::exit_node::apply_exit_node_arg(&mut mask, &status, &selector, false)?;
     }
     if parse_bool_flag(&args, "shields-up").unwrap_or(false) {
         mask.Prefs.ShieldsUp = true;

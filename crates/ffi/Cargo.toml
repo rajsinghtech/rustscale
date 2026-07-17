@@ -37,9 +37,9 @@ enum_glob_use = "allow"
 doc_markdown = "allow"
 
 [dependencies]
-rustscale-tsnet = { path = "../tsnet", version = "0.1.3" }
-rustscale-netstack = { path = "../netstack", version = "0.1.3" }
-rustscale-health = { path = "../health", version = "0.1.3" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.4" }
+rustscale-netstack = { path = "../netstack", version = "0.1.4" }
+rustscale-health = { path = "../health", version = "0.1.4" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

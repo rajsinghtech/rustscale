@@ -1,8 +1,8 @@
 //! Scoped Tailnet Lock runtime: durable authority state, bounded control sync,
 //! LocalAPI operations, and fail-closed peer authorization.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rand_core::RngCore as _;
@@ -21,6 +21,9 @@ use sha2::{Digest as _, Sha256};
 const MAX_SYNC_AUMS: usize = 2000;
 const MAX_INIT_NODES: usize = 4096;
 const MAX_DISABLEMENT_SECRET: usize = 1024;
+const LOCAL_DISABLE_DENYLIST_VERSION: u32 = 1;
+const MAX_LOCAL_DISABLED_STATES: usize = 256;
+const MAX_LOCAL_DISABLE_DENYLIST_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TailnetLockError {
@@ -44,6 +47,8 @@ pub(crate) enum TailnetLockError {
     Sync(String),
     #[error("Tailnet Lock initialization outcome is ambiguous; disablement secrets remain in the durable receipt; check lock status or resume the same transaction")]
     InitAmbiguous,
+    #[error("Tailnet Lock was locally disabled, but retired authority cleanup is incomplete; retry the same local-disable operation")]
+    LocalDisableCommitted,
     #[error("Tailnet Lock persistence failed")]
     Persistence(#[source] std::io::Error),
 }
@@ -76,10 +81,22 @@ pub(crate) struct TailnetLockParams {
 struct Inner {
     authority: Option<Authority>,
     storage: Option<Arc<FsChonk>>,
+    /// Authority state IDs explicitly disabled for this profile/control
+    /// namespace. The complete bounded set is atomically persisted before a
+    /// local-disable operation can withdraw the active authority.
+    disallowed_state_ids: BTreeSet<AuthorityStateId>,
+    /// A verified disallowed authority selected by the latest authenticated
+    /// control bootstrap. This is the explicit local-disable escape hatch:
+    /// peer signatures are not enforced only while `ready` proves that the
+    /// current advertised head still belongs to this state ID.
+    locally_disabled_state: Option<AuthorityStateId>,
+    locally_disabled_head: Option<rustscale_tka::AumHash>,
+    local_disable_cleanup_pending: bool,
     /// Control has advertised enabled state. This is set before attempting
     /// bootstrap/sync so failed or partial state can never open the peer set.
     required: bool,
-    /// The authority reached the control head during the latest operation.
+    /// The authority reached the control head during the latest operation, or
+    /// an authenticated bootstrap proved that authority is locally disabled.
     ready: bool,
     filtered: Vec<FilteredPeer>,
     self_node: Option<Node>,
@@ -91,6 +108,7 @@ pub(crate) struct TailnetLock {
     path: Option<PathBuf>,
     operation: tokio::sync::Mutex<()>,
     init_flight: tokio::sync::Mutex<Option<InitFlightState>>,
+    local_disable_flight: tokio::sync::Mutex<Option<LocalDisableFlightState>>,
     peer_authority: Mutex<Option<Arc<crate::map_update::PeerAuthorityRuntime>>>,
     inner: Mutex<Inner>,
 }
@@ -110,8 +128,34 @@ struct InitFlightState {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// A LocalAPI local-disable waiter. The retained task, rather than the socket
+/// handler, owns the durable denylist commit and traffic-withdrawal barrier.
+pub(crate) struct LocalDisableFlight {
+    result: tokio::sync::watch::Receiver<Option<SharedLocalDisableResult>>,
+}
+
+type SharedLocalDisableResult = Arc<Result<(), TailnetLockError>>;
+
+struct LocalDisableFlightState {
+    result: tokio::sync::watch::Receiver<Option<SharedLocalDisableResult>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 impl InitFlight {
     pub(crate) async fn wait(mut self) -> SharedInitResult {
+        loop {
+            if let Some(result) = self.result.borrow().clone() {
+                return result;
+            }
+            if self.result.changed().await.is_err() {
+                return Arc::new(Err(TailnetLockError::StateUnavailable));
+            }
+        }
+    }
+}
+
+impl LocalDisableFlight {
+    pub(crate) async fn wait(mut self) -> SharedLocalDisableResult {
         loop {
             if let Some(result) = self.result.borrow().clone() {
                 return result;
@@ -147,6 +191,45 @@ impl Operation<'_> {
     ) -> Result<(), TailnetLockError> {
         self.lock.apply_control_info_inner(info, initial).await
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityStateId {
+    id1: u64,
+    id2: u64,
+}
+
+impl AuthorityStateId {
+    fn from_authority(authority: &Authority) -> Self {
+        let (id1, id2) = authority.state_ids();
+        Self { id1, id2 }
+    }
+
+    fn display(self) -> String {
+        format!("{}:{}", self.id1, self.id2)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalDisableDenylist {
+    version: u32,
+    state_ids: Vec<AuthorityStateId>,
+}
+
+impl Default for LocalDisableDenylist {
+    fn default() -> Self {
+        Self {
+            version: LOCAL_DISABLE_DENYLIST_VERSION,
+            state_ids: Vec::new(),
+        }
+    }
+}
+
+enum PersistGenesisOutcome {
+    Installed(Box<Authority>, Arc<FsChonk>),
+    LocallyDisabled(AuthorityStateId),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -225,29 +308,204 @@ impl AumSigner for NlSigner<'_> {
     }
 }
 
+fn local_disable_denylist_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("tailnet-lock-local-disable.json")
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool, std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_local_disable_denylist(
+    denylist: LocalDisableDenylist,
+) -> Result<BTreeSet<AuthorityStateId>, TailnetLockError> {
+    if denylist.version != LOCAL_DISABLE_DENYLIST_VERSION {
+        return Err(TailnetLockError::InvalidRequest(
+            "durable local-disable denylist version is unsupported".into(),
+        ));
+    }
+    if denylist.state_ids.len() > MAX_LOCAL_DISABLED_STATES {
+        return Err(TailnetLockError::InvalidRequest(
+            "durable local-disable denylist exceeds its state bound".into(),
+        ));
+    }
+    let state_count = denylist.state_ids.len();
+    let states = denylist.state_ids.into_iter().collect::<BTreeSet<_>>();
+    if states.len() != state_count {
+        return Err(TailnetLockError::InvalidRequest(
+            "durable local-disable denylist contains duplicate state IDs".into(),
+        ));
+    }
+    Ok(states)
+}
+
+fn load_local_disable_denylist(
+    state_dir: Option<&Path>,
+) -> Result<BTreeSet<AuthorityStateId>, TailnetLockError> {
+    let Some(state_dir) = state_dir else {
+        return Ok(BTreeSet::new());
+    };
+    let path = local_disable_denylist_path(state_dir);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
+        Err(error) => return Err(TailnetLockError::Persistence(error)),
+    };
+    if metadata.len() > MAX_LOCAL_DISABLE_DENYLIST_BYTES {
+        return Err(TailnetLockError::InvalidRequest(
+            "durable local-disable denylist exceeds its byte bound".into(),
+        ));
+    }
+    let bytes = rustscale_atomicfile::read_private(&path).map_err(TailnetLockError::Persistence)?;
+    if bytes.len() as u64 > MAX_LOCAL_DISABLE_DENYLIST_BYTES {
+        return Err(TailnetLockError::InvalidRequest(
+            "durable local-disable denylist exceeds its byte bound".into(),
+        ));
+    }
+    let denylist = serde_json::from_slice::<LocalDisableDenylist>(&bytes).map_err(|_| {
+        TailnetLockError::InvalidRequest("durable local-disable denylist is malformed".into())
+    })?;
+    validate_local_disable_denylist(denylist)
+}
+
+fn save_local_disable_denylist(
+    state_dir: Option<&Path>,
+    states: &BTreeSet<AuthorityStateId>,
+) -> Result<(), TailnetLockError> {
+    let state_dir = state_dir.ok_or(TailnetLockError::NoStateDirectory)?;
+    if states.len() > MAX_LOCAL_DISABLED_STATES {
+        return Err(TailnetLockError::InvalidRequest(
+            "local-disable denylist is full".into(),
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(&LocalDisableDenylist {
+        version: LOCAL_DISABLE_DENYLIST_VERSION,
+        state_ids: states.iter().copied().collect(),
+    })
+    .map_err(|error| TailnetLockError::Persistence(std::io::Error::other(error)))?;
+    if bytes.len() as u64 > MAX_LOCAL_DISABLE_DENYLIST_BYTES {
+        return Err(TailnetLockError::InvalidRequest(
+            "local-disable denylist exceeds its byte bound".into(),
+        ));
+    }
+    rustscale_atomicfile::write_private(&local_disable_denylist_path(state_dir), &bytes)
+        .map_err(TailnetLockError::Persistence)
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+fn cleanup_authority_tombstone(path: &Path) -> Result<(), std::io::Error> {
+    let tombstone = path.with_extension("deleting");
+    if !path_entry_exists(&tombstone)? {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(&tombstone)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Tailnet Lock deletion tombstone is not a real directory",
+        ));
+    }
+    std::fs::remove_dir_all(&tombstone)?;
+    sync_parent(&tombstone)
+}
+
+/// Retire one authority directory with a crash-recoverable rename. A
+/// previously renamed tombstone is removed first. Unexpected file types are
+/// never followed or deleted.
+fn retire_authority_path(path: &Path) -> Result<(), std::io::Error> {
+    cleanup_authority_tombstone(path)?;
+    let tombstone = path.with_extension("deleting");
+    if !path_entry_exists(path)? {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Tailnet Lock authority path is not a real directory",
+        ));
+    }
+    std::fs::rename(path, &tombstone)?;
+    sync_parent(path)?;
+    std::fs::remove_dir_all(&tombstone)?;
+    sync_parent(&tombstone)
+}
+
 impl TailnetLock {
     pub(crate) fn open(params: TailnetLockParams) -> Result<Arc<Self>, TailnetLockError> {
+        let disallowed_state_ids = load_local_disable_denylist(params.state_dir.as_deref())?;
         let path = params.state_dir.as_ref().map(|dir| {
             dir.join("tailnet-lock")
                 .join(hex::encode(params.signing_key.public().raw32()))
         });
-        if let Some(existing) = path.as_ref().filter(|path| path.exists()) {
-            rustscale_atomicfile::ensure_private_dir(existing)
+        let mut local_disable_cleanup_pending = false;
+        if let Some(path) = path.as_ref() {
+            if let Err(error) = cleanup_authority_tombstone(path) {
+                local_disable_cleanup_pending = true;
+                log::warn!(
+                    "tsnet: retained Tailnet Lock local-disable cleanup requires retry: {error}"
+                );
+            }
+        }
+
+        let authority_path_exists = match path.as_ref() {
+            Some(path) => path_entry_exists(path).map_err(TailnetLockError::Persistence)?,
+            None => false,
+        };
+        if authority_path_exists {
+            rustscale_atomicfile::ensure_private_dir(path.as_ref().expect("authority path exists"))
                 .map_err(TailnetLockError::Persistence)?;
         }
-        let (authority, storage) = match path.as_ref().filter(|path| path.is_dir()) {
-            Some(path) => {
-                let storage = Arc::new(
-                    FsChonk::open(path)
-                        .map_err(rustscale_tka::AuthorityError::from)
-                        .map_err(TailnetLockError::Authority)?,
-                );
-                let authority = Authority::open(storage.as_ref())?;
-                (Some(authority), Some(storage))
-            }
-            None => (None, None),
+        let (mut authority, mut storage) = if authority_path_exists {
+            let path = path.as_ref().expect("authority path exists");
+            let storage = Arc::new(
+                FsChonk::open(path)
+                    .map_err(rustscale_tka::AuthorityError::from)
+                    .map_err(TailnetLockError::Authority)?,
+            );
+            let authority = Authority::open(storage.as_ref())?;
+            (Some(authority), Some(storage))
+        } else {
+            (None, None)
         };
+        let mut locally_disabled_state = None;
+        if let Some(state_id) = authority
+            .as_ref()
+            .map(AuthorityStateId::from_authority)
+            .filter(|state_id| disallowed_state_ids.contains(state_id))
+        {
+            // The denylist commit is authoritative even if a crash left the
+            // old Chonk directory in place. Never reinstall that authority.
+            authority = None;
+            storage = None;
+            locally_disabled_state = Some(state_id);
+            if let Some(path) = path.as_ref() {
+                if let Err(error) = retire_authority_path(path) {
+                    local_disable_cleanup_pending = true;
+                    log::warn!("tsnet: locally disabled authority cleanup requires retry: {error}");
+                }
+            }
+        }
         let enabled = authority.is_some();
+        let state_unknown = !disallowed_state_ids.is_empty() || locally_disabled_state.is_some();
         let current_node_key = Mutex::new(params.node_key.clone());
         Ok(Arc::new(Self {
             current_node_key,
@@ -255,11 +513,16 @@ impl TailnetLock {
             path,
             operation: tokio::sync::Mutex::new(()),
             init_flight: tokio::sync::Mutex::new(None),
+            local_disable_flight: tokio::sync::Mutex::new(None),
             peer_authority: Mutex::new(None),
             inner: Mutex::new(Inner {
                 authority,
                 storage,
-                required: enabled,
+                disallowed_state_ids,
+                locally_disabled_state,
+                locally_disabled_head: None,
+                local_disable_cleanup_pending,
+                required: enabled || state_unknown,
                 ready: enabled,
                 filtered: Vec::new(),
                 self_node: None,
@@ -367,10 +630,22 @@ impl TailnetLock {
                 let Ok(wanted) = info.Head.parse::<rustscale_tka::AumHash>() else {
                     return true;
                 };
-                inner.authority.as_ref().map(Authority::head) != Some(wanted)
+                if inner.locally_disabled_state.is_some() {
+                    inner.locally_disabled_head != Some(wanted)
+                } else {
+                    inner.authority.as_ref().map(Authority::head) != Some(wanted)
+                }
             }
-            Some(_) => inner.required || inner.authority.is_some(),
-            None if initial => inner.required || inner.authority.is_some(),
+            Some(_) => {
+                inner.required
+                    || inner.authority.is_some()
+                    || inner.locally_disabled_state.is_some()
+            }
+            None if initial => {
+                inner.required
+                    || inner.authority.is_some()
+                    || inner.locally_disabled_state.is_some()
+            }
             None => false,
         }
     }
@@ -380,6 +655,9 @@ impl TailnetLock {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.locally_disabled_state.is_some() {
+            return inner.ready;
+        }
         if inner.required || inner.authority.is_some() {
             inner.ready && inner.authority.is_some()
         } else {
@@ -438,7 +716,11 @@ impl TailnetLock {
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if inner.authority.as_ref().map(Authority::head) == Some(wanted) {
+                let authority_matches =
+                    inner.authority.as_ref().map(Authority::head) == Some(wanted);
+                let local_disable_matches = inner.locally_disabled_state.is_some()
+                    && inner.locally_disabled_head == Some(wanted);
+                if authority_matches || local_disable_matches {
                     inner.ready = true;
                     return Ok(());
                 }
@@ -447,7 +729,17 @@ impl TailnetLock {
             let control = self.control();
             let session = TkaClient::new(&control).connect().await?;
             if self.authority_snapshot().is_none() {
-                self.bootstrap_from_control(&session).await?;
+                if let Some(state_id) = self.bootstrap_from_control(&session).await? {
+                    let mut inner = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    inner.required = true;
+                    inner.ready = true;
+                    inner.locally_disabled_state = Some(state_id);
+                    inner.locally_disabled_head = Some(wanted);
+                    return Ok(());
+                }
             }
             self.sync_with_control(&session).await?;
             let mut inner = self
@@ -461,6 +753,8 @@ impl TailnetLock {
                 ));
             }
             inner.ready = true;
+            inner.locally_disabled_state = None;
+            inner.locally_disabled_head = None;
             return Ok(());
         }
 
@@ -481,6 +775,8 @@ impl TailnetLock {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.required = false;
         inner.ready = true;
+        inner.locally_disabled_state = None;
+        inner.locally_disabled_head = None;
         inner.filtered.clear();
         Ok(())
     }
@@ -493,7 +789,13 @@ impl TailnetLock {
         Some((inner.authority.clone()?, inner.storage.clone()?))
     }
 
-    async fn bootstrap_from_control(&self, session: &TkaSession) -> Result<(), TailnetLockError> {
+    /// Return `Some(state_id)` when the authenticated, fully verified genesis
+    /// belongs to an explicitly denylisted authority. That is the only path
+    /// which activates local-disable mode for an enabled control map.
+    async fn bootstrap_from_control(
+        &self,
+        session: &TkaSession,
+    ) -> Result<Option<AuthorityStateId>, TailnetLockError> {
         let request = TKABootstrapRequest {
             Version: self.params.capability_version,
             NodeKey: self.node_public(),
@@ -508,14 +810,20 @@ impl TailnetLock {
         let genesis = Aum::decode(&response.GenesisAUM).map_err(|_| {
             TailnetLockError::Sync("control returned malformed genesis state".into())
         })?;
-        let (authority, storage) = self.persist_genesis(&genesis)?;
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.authority = Some(authority);
-        inner.storage = Some(storage);
-        Ok(())
+        match self.persist_genesis(&genesis)? {
+            PersistGenesisOutcome::Installed(authority, storage) => {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.authority = Some(*authority);
+                inner.storage = Some(storage);
+                inner.locally_disabled_state = None;
+                inner.locally_disabled_head = None;
+                Ok(None)
+            }
+            PersistGenesisOutcome::LocallyDisabled(state_id) => Ok(Some(state_id)),
+        }
     }
 
     fn receipt_path(&self) -> Result<PathBuf, TailnetLockError> {
@@ -551,38 +859,83 @@ impl TailnetLock {
             .map_err(TailnetLockError::Persistence)
     }
 
-    fn persist_genesis(
-        &self,
-        genesis: &Aum,
-    ) -> Result<(Authority, Arc<FsChonk>), TailnetLockError> {
+    fn persist_genesis(&self, genesis: &Aum) -> Result<PersistGenesisOutcome, TailnetLockError> {
         let path = self
             .path
             .as_ref()
             .ok_or(TailnetLockError::NoStateDirectory)?;
         let parent = path.parent().ok_or(TailnetLockError::NoStateDirectory)?;
         rustscale_atomicfile::ensure_private_dir(parent).map_err(TailnetLockError::Persistence)?;
+        cleanup_authority_tombstone(path).map_err(TailnetLockError::Persistence)?;
+
         let pending = path.with_extension("pending");
-        if pending.exists() {
+        if path_entry_exists(&pending).map_err(TailnetLockError::Persistence)? {
+            let metadata =
+                std::fs::symlink_metadata(&pending).map_err(TailnetLockError::Persistence)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(TailnetLockError::Persistence(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Tailnet Lock pending path is not a real directory",
+                )));
+            }
             std::fs::remove_dir_all(&pending).map_err(TailnetLockError::Persistence)?;
-        }
-        if path.exists() {
-            return Err(TailnetLockError::AlreadyEnabled);
+            sync_parent(&pending).map_err(TailnetLockError::Persistence)?;
         }
         rustscale_atomicfile::ensure_private_dir(&pending)
             .map_err(TailnetLockError::Persistence)?;
         let pending_storage = FsChonk::open(&pending)
             .map_err(rustscale_tka::AuthorityError::from)
             .map_err(TailnetLockError::Authority)?;
-        Authority::bootstrap(&pending_storage, genesis.clone())?;
+        let pending_authority = Authority::bootstrap(&pending_storage, genesis.clone())?;
+        let state_id = AuthorityStateId::from_authority(&pending_authority);
+        let disallowed = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .disallowed_state_ids
+            .contains(&state_id);
+        drop(pending_authority);
         drop(pending_storage);
+        if disallowed {
+            std::fs::remove_dir_all(&pending).map_err(TailnetLockError::Persistence)?;
+            sync_parent(&pending).map_err(TailnetLockError::Persistence)?;
+            return Ok(PersistGenesisOutcome::LocallyDisabled(state_id));
+        }
+
+        if path_entry_exists(path).map_err(TailnetLockError::Persistence)? {
+            let existing_storage = FsChonk::open(path)
+                .map_err(rustscale_tka::AuthorityError::from)
+                .map_err(TailnetLockError::Authority)?;
+            let existing = Authority::open(&existing_storage)?;
+            let existing_state = AuthorityStateId::from_authority(&existing);
+            let existing_is_disallowed = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .disallowed_state_ids
+                .contains(&existing_state);
+            drop(existing);
+            drop(existing_storage);
+            if existing_is_disallowed {
+                retire_authority_path(path).map_err(TailnetLockError::Persistence)?;
+            } else {
+                let _ = std::fs::remove_dir_all(&pending);
+                return Err(TailnetLockError::AlreadyEnabled);
+            }
+        }
+
         std::fs::rename(&pending, path).map_err(TailnetLockError::Persistence)?;
+        sync_parent(path).map_err(TailnetLockError::Persistence)?;
         let storage = Arc::new(
             FsChonk::open(path)
                 .map_err(rustscale_tka::AuthorityError::from)
                 .map_err(TailnetLockError::Authority)?,
         );
         let authority = Authority::open(storage.as_ref())?;
-        Ok((authority, storage))
+        Ok(PersistGenesisOutcome::Installed(
+            Box::new(authority),
+            storage,
+        ))
     }
 
     async fn sync_with_control(&self, session: &TkaSession) -> Result<(), TailnetLockError> {
@@ -678,6 +1031,9 @@ impl TailnetLock {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.authority = None;
         inner.storage = None;
+        inner.locally_disabled_state = None;
+        inner.locally_disabled_head = None;
+        inner.local_disable_cleanup_pending = false;
         Ok(())
     }
 
@@ -686,21 +1042,13 @@ impl TailnetLock {
             .path
             .as_ref()
             .ok_or(TailnetLockError::NoStateDirectory)?;
-        if !path.exists() {
-            return Ok(());
-        }
-        let tombstone = path.with_extension("deleting");
-        if tombstone.exists() {
-            std::fs::remove_dir_all(&tombstone).map_err(TailnetLockError::Persistence)?;
-        }
-        std::fs::rename(path, &tombstone).map_err(TailnetLockError::Persistence)?;
-        std::fs::remove_dir_all(tombstone).map_err(TailnetLockError::Persistence)?;
+        retire_authority_path(path).map_err(TailnetLockError::Persistence)?;
         if let Some(parent) = path.parent() {
             let empty = std::fs::read_dir(parent)
                 .map(|mut entries| entries.next().is_none())
                 .unwrap_or(false);
-            if empty {
-                let _ = std::fs::remove_dir(parent);
+            if empty && std::fs::remove_dir(parent).is_ok() {
+                let _ = sync_parent(parent);
             }
         }
         Ok(())
@@ -771,6 +1119,51 @@ impl TailnetLock {
         self.init_flight.lock().await.is_some()
     }
 
+    /// Admit or join the one lifecycle-retained local-disable transaction.
+    /// Once the denylist write commits, socket EOF, handler cancellation, and
+    /// shutdown retries cannot abandon traffic withdrawal or local teardown.
+    pub(crate) async fn start_force_local_disable(
+        self: &Arc<Self>,
+    ) -> Result<LocalDisableFlight, TailnetLockError> {
+        let mut retained = self.local_disable_flight.lock().await;
+        if let Some(flight) = retained.as_mut() {
+            if !flight.task.is_finished() {
+                return Ok(LocalDisableFlight {
+                    result: flight.result.clone(),
+                });
+            }
+            let _ = (&mut flight.task).await;
+            *retained = None;
+        }
+
+        let (result_tx, result) = tokio::sync::watch::channel(None);
+        let lock = self.clone();
+        let task = tokio::spawn(async move {
+            let result = Arc::new(lock.force_local_disable().await);
+            result_tx.send_replace(Some(result));
+        });
+        *retained = Some(LocalDisableFlightState {
+            result: result.clone(),
+            task,
+        });
+        Ok(LocalDisableFlight { result })
+    }
+
+    /// Observe completion before the peer-authority runtime can be torn down.
+    /// Cancellation leaves the same handle retained for a shutdown retry.
+    pub(crate) async fn join_local_disable_flight(&self) {
+        let mut retained = self.local_disable_flight.lock().await;
+        if let Some(flight) = retained.as_mut() {
+            let _ = (&mut flight.task).await;
+            *retained = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn local_disable_flight_retained(&self) -> bool {
+        self.local_disable_flight.lock().await.is_some()
+    }
+
     /// Persist the complete disablement receipt before contacting control,
     /// then perform both irreversible phases on one authenticated session.
     /// The receipt intentionally survives success until an operator retrieves
@@ -790,6 +1183,17 @@ impl TailnetLock {
         } else {
             if self.authority_snapshot().is_some() {
                 return Err(TailnetLockError::AlreadyEnabled);
+            }
+            if self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .required
+            {
+                return Err(TailnetLockError::InvalidRequest(
+                    "Tailnet Lock control state is enabled or unconfirmed; local-disable must not be replaced by initialization"
+                        .into(),
+                ));
             }
             if self.load_init_receipt()?.is_some() {
                 return Err(TailnetLockError::InvalidRequest(
@@ -897,13 +1301,24 @@ impl TailnetLock {
                 .await
             {
                 if bootstrap.GenesisAUM == receipt.genesis_aum {
-                    let (authority, storage) = self.persist_genesis(&genesis)?;
+                    let (authority, storage) = match self.persist_genesis(&genesis)? {
+                        PersistGenesisOutcome::Installed(authority, storage) => {
+                            (*authority, storage)
+                        }
+                        PersistGenesisOutcome::LocallyDisabled(_) => {
+                            return Err(TailnetLockError::InvalidRequest(
+                                "initialization authority state is locally denylisted".into(),
+                            ));
+                        }
+                    };
                     let mut inner = self
                         .inner
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     inner.authority = Some(authority);
                     inner.storage = Some(storage);
+                    inner.locally_disabled_state = None;
+                    inner.locally_disabled_head = None;
                     inner.required = true;
                     inner.ready = false;
                     drop(inner);
@@ -957,13 +1372,22 @@ impl TailnetLock {
         receipt.phase = InitReceiptPhase::ControlCommitted;
         self.save_init_receipt(&receipt)?;
 
-        let (authority, storage) = self.persist_genesis(&genesis)?;
+        let (authority, storage) = match self.persist_genesis(&genesis)? {
+            PersistGenesisOutcome::Installed(authority, storage) => (*authority, storage),
+            PersistGenesisOutcome::LocallyDisabled(_) => {
+                return Err(TailnetLockError::InvalidRequest(
+                    "initialization authority state is locally denylisted".into(),
+                ));
+            }
+        };
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.authority = Some(authority);
         inner.storage = Some(storage);
+        inner.locally_disabled_state = None;
+        inner.locally_disabled_head = None;
         inner.required = true;
         inner.ready = false;
         drop(inner);
@@ -1072,6 +1496,96 @@ impl TailnetLock {
         Ok(())
     }
 
+    /// Disable Tailnet Lock enforcement for this profile/control namespace.
+    ///
+    /// This follows pinned Tailscale v1.100.0
+    /// `ipn/ipnlocal.NetworkLockForceLocalDisable` and
+    /// `persist.DisallowedTKAStateIDs`, adapted to RustScale's already-scoped
+    /// owner-only state directory.
+    ///
+    /// This is an explicit recovery escape hatch, not a tailnet-wide change.
+    /// The verified authority state ID is atomically denylisted before the
+    /// active peer generation is withdrawn. A fresh authenticated bootstrap
+    /// must prove that control still advertises that exact state ID before an
+    /// unfiltered peer generation can be published again.
+    async fn force_local_disable(&self) -> Result<(), TailnetLockError> {
+        let _operation = self.operation().await;
+
+        let already_disabled = {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.locally_disabled_state
+        };
+        if already_disabled.is_some() {
+            let cleanup = self.remove_durable_state();
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.local_disable_cleanup_pending = cleanup.is_err();
+            return cleanup.map_err(|_| TailnetLockError::LocalDisableCommitted);
+        }
+
+        // Resolve every fallible precondition before the durable commit. In
+        // particular, never write a denylist that no attached runtime can
+        // enforce in this process.
+        let peer_authority = self.peer_authority()?;
+        let (state_id, mut denylist) = {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let authority = inner
+                .authority
+                .as_ref()
+                .ok_or(TailnetLockError::NotEnabled)?;
+            (
+                AuthorityStateId::from_authority(authority),
+                inner.disallowed_state_ids.clone(),
+            )
+        };
+        denylist.insert(state_id);
+        save_local_disable_denylist(self.params.state_dir.as_deref(), &denylist)?;
+
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.disallowed_state_ids = denylist;
+            inner.required = true;
+            inner.ready = false;
+        }
+
+        // This await is retained independently of the LocalAPI socket. It
+        // drains every packet/publication reader before authority state is
+        // removed, so no traffic can straddle the local-disable boundary.
+        peer_authority.withdraw().await;
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.authority = None;
+            inner.storage = None;
+            inner.locally_disabled_state = Some(state_id);
+            inner.locally_disabled_head = None;
+            inner.required = true;
+            inner.ready = false;
+            inner.filtered.clear();
+        }
+
+        let cleanup = self.remove_durable_state();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.local_disable_cleanup_pending = cleanup.is_err();
+        cleanup.map_err(|_| TailnetLockError::LocalDisableCommitted)
+    }
+
     /// Filter an entire reconstructed peer set. This runs after deltas and
     /// patches are applied, so a key/signature split across partial updates is
     /// rejected rather than accidentally paired with stale state.
@@ -1083,6 +1597,24 @@ impl TailnetLock {
         let enforcement = inner.required || inner.authority.is_some();
         if !enforcement {
             inner.filtered.clear();
+            return;
+        }
+        if inner.locally_disabled_state.is_some() && inner.ready {
+            let mut filtered = Vec::new();
+            peers.retain(|peer| {
+                if peer.UnsignedPeerAPIOnly {
+                    // Local disable relaxes TKA signature enforcement, not the
+                    // control-provided PeerAPI-only confinement. RustScale
+                    // cannot yet carry that confinement through every data-
+                    // plane consumer, so keep dropping these peers rather than
+                    // promoting them to ordinary network access.
+                    filtered.push(filtered_peer(peer, "unsigned PeerAPI-only unsupported"));
+                    false
+                } else {
+                    true
+                }
+            });
+            inner.filtered = filtered;
             return;
         }
         let authority = inner.authority.clone();
@@ -1207,8 +1739,17 @@ impl TailnetLock {
                     })
                 })
         });
+        let local_disable_pending = inner.authority.is_none()
+            && inner.locally_disabled_state.is_none()
+            && !inner.disallowed_state_ids.is_empty()
+            && inner.required;
         serde_json::json!({
             "Enabled": enabled,
+            "LocalDisabled": inner.locally_disabled_state.is_some(),
+            "LocalDisablePending": local_disable_pending,
+            "LocalDisableStateID": inner.locally_disabled_state.map(AuthorityStateId::display),
+            "LocalDisableCleanupPending": inner.local_disable_cleanup_pending,
+            "DisallowedStateIDs": inner.disallowed_state_ids.iter().copied().map(AuthorityStateId::display).collect::<Vec<_>>(),
             "StateConsistent": !inner.required || inner.ready,
             "Head": inner.authority.as_ref().map(|authority| authority.head().to_string()),
             "PublicKey": public.cli_string(),
@@ -1250,6 +1791,185 @@ mod tests {
             extra_root_certs: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn local_disable_denylist_rejects_duplicates_and_excess() {
+        let duplicate = LocalDisableDenylist {
+            version: LOCAL_DISABLE_DENYLIST_VERSION,
+            state_ids: vec![
+                AuthorityStateId { id1: 1, id2: 2 },
+                AuthorityStateId { id1: 1, id2: 2 },
+            ],
+        };
+        assert!(validate_local_disable_denylist(duplicate).is_err());
+        let excessive = LocalDisableDenylist {
+            version: LOCAL_DISABLE_DENYLIST_VERSION,
+            state_ids: (0..=MAX_LOCAL_DISABLED_STATES)
+                .map(|id| AuthorityStateId {
+                    id1: id as u64,
+                    id2: 0,
+                })
+                .collect(),
+        };
+        assert!(validate_local_disable_denylist(excessive).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_local_disable_denylist_fails_closed_on_open() {
+        let state = tempfile::tempdir().unwrap();
+        rustscale_atomicfile::write_private(
+            &local_disable_denylist_path(state.path()),
+            br#"{"version":1,"state_ids":[{"id1":"bad","id2":2}]}"#,
+        )
+        .unwrap();
+        let error = TailnetLock::open(TailnetLockParams {
+            control_url: "http://127.0.0.1:1".into(),
+            machine_key: MachinePrivate::generate(),
+            server_pub_key: MachinePrivate::generate().public(),
+            node_key: NodePrivate::generate(),
+            signing_key: NLPrivate::generate(),
+            capability_version: 141,
+            protocol_version: 141,
+            state_dir: Some(state.path().into()),
+            extra_root_certs: None,
+        })
+        .err()
+        .expect("malformed denylist must reject startup");
+        assert!(matches!(error, TailnetLockError::InvalidRequest(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denylist_matches_exact_state_id_but_does_not_disable_a_new_authority() {
+        let state = tempfile::tempdir().unwrap();
+        let denied = AuthorityStateId { id1: 10, id2: 20 };
+        save_local_disable_denylist(
+            Some(state.path()),
+            &std::iter::once(denied).collect::<BTreeSet<_>>(),
+        )
+        .unwrap();
+        let signing_key = NLPrivate::generate();
+        let lock = TailnetLock::open(TailnetLockParams {
+            control_url: "http://127.0.0.1:1".into(),
+            machine_key: MachinePrivate::generate(),
+            server_pub_key: MachinePrivate::generate().public(),
+            node_key: NodePrivate::generate(),
+            signing_key: signing_key.clone(),
+            capability_version: 141,
+            protocol_version: 141,
+            state_dir: Some(state.path().into()),
+            extra_root_certs: None,
+        })
+        .unwrap();
+        assert_eq!(lock.status_json()["LocalDisablePending"], true);
+        let make_genesis = |state_id: AuthorityStateId| {
+            let storage = MemChonk::new();
+            Authority::create(
+                &storage,
+                State {
+                    last_aum_hash: None,
+                    disablement_values: vec![rustscale_tka::disablement_kdf(b"exact-state")],
+                    keys: vec![Key {
+                        kind: rustscale_tka::KeyKind::Key25519,
+                        votes: 1,
+                        public: signing_key.public().raw32().to_vec(),
+                        meta: None,
+                    }],
+                    state_id1: state_id.id1,
+                    state_id2: state_id.id2,
+                },
+                &NlSigner(&signing_key),
+            )
+            .unwrap()
+            .1
+        };
+
+        assert!(matches!(
+            lock.persist_genesis(&make_genesis(denied)).unwrap(),
+            PersistGenesisOutcome::LocallyDisabled(state_id) if state_id == denied
+        ));
+        let replacement = AuthorityStateId { id1: 10, id2: 21 };
+        match lock.persist_genesis(&make_genesis(replacement)).unwrap() {
+            PersistGenesisOutcome::Installed(authority, _) => {
+                assert_eq!(authority.state_ids(), (replacement.id1, replacement.id2));
+            }
+            PersistGenesisOutcome::LocallyDisabled(_) => {
+                panic!("a distinct authority state ID inherited local-disable")
+            }
+        }
+    }
+
+    #[test]
+    fn local_disable_never_promotes_unsigned_peerapi_only_to_network_access() {
+        let lock = unlocked_runtime();
+        let state_id = AuthorityStateId { id1: 5, id2: 6 };
+        {
+            let mut inner = lock.inner.lock().unwrap();
+            inner.disallowed_state_ids.insert(state_id);
+            inner.locally_disabled_state = Some(state_id);
+            inner.locally_disabled_head = Some(rustscale_tka::AumHash([2; 32]));
+            inner.required = true;
+            inner.ready = true;
+        }
+        let ordinary = Node {
+            ID: 1,
+            StableID: "ordinary".into(),
+            Key: NodePrivate::generate().public(),
+            ..Default::default()
+        };
+        let restricted = Node {
+            ID: 2,
+            StableID: "peerapi-only".into(),
+            Key: NodePrivate::generate().public(),
+            UnsignedPeerAPIOnly: true,
+            ..Default::default()
+        };
+        let mut peers = vec![ordinary.clone(), restricted];
+        lock.filter_peers(&mut peers);
+        assert_eq!(peers, vec![ordinary]);
+        assert_eq!(
+            lock.status_json()["FilteredPeers"][0]["Reason"],
+            "unsigned PeerAPI-only unsupported"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_head_withdraws_a_ready_local_disable_generation() {
+        let lock = unlocked_runtime();
+        let state_id = AuthorityStateId { id1: 7, id2: 9 };
+        {
+            let mut inner = lock.inner.lock().unwrap();
+            inner.disallowed_state_ids.insert(state_id);
+            inner.locally_disabled_state = Some(state_id);
+            inner.locally_disabled_head = Some(rustscale_tka::AumHash([3; 32]));
+            inner.required = true;
+            inner.ready = true;
+        }
+        let mut peers = vec![Node {
+            ID: 1,
+            Key: NodePrivate::generate().public(),
+            ..Default::default()
+        }];
+        lock.filter_peers(&mut peers);
+        assert_eq!(peers.len(), 1);
+
+        let malformed = TKAInfo {
+            Head: "not-an-aum-hash".into(),
+            Disabled: false,
+        };
+        assert!(lock
+            .operation()
+            .await
+            .control_change_requires_revocation(Some(&malformed), false));
+        assert!(lock
+            .apply_control_info(Some(&malformed), false)
+            .await
+            .is_err());
+        assert!(!lock.authorization_ready());
+        lock.filter_peers(&mut peers);
+        assert!(peers.is_empty());
     }
 
     #[tokio::test]

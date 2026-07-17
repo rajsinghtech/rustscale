@@ -40,9 +40,8 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         update.Prefs.AdvertiseExitNode = true;
         update.AdvertiseExitNodeSet = true;
     }
-    if let Some(e) = parse_str_flag(&args, "exit-node") {
-        update.Prefs.ExitNodeIP = e;
-        update.ExitNodeIPSet = true;
+    if let Some(selector) = parse_str_flag(&args, "exit-node") {
+        super::exit_node::apply_exit_node_arg(&mut update, &status, &selector, false)?;
     }
     if parse_bool_flag(&args, "shields-up").unwrap_or(false) {
         update.Prefs.ShieldsUp = true;

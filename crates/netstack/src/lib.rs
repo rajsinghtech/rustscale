@@ -225,6 +225,7 @@ pub struct UdpPacket {
 pub struct UdpListener {
     recv_rx: mpsc::Receiver<UdpPacket>,
     send_tx: mpsc::Sender<OutboundUdpPacket>,
+    notify: Arc<Notify>,
     local_addr: SocketAddr,
     cmd_tx: mpsc::Sender<Command>,
     key: (IpAddr, u16),
@@ -248,7 +249,11 @@ impl UdpListener {
                 dst,
             })
             .await
-            .map_err(|_| NetstackError::ShuttingDown)
+            .map_err(|_| NetstackError::ShuttingDown)?;
+        // The bounded send remains the backpressure and cancellation point;
+        // only a packet that was successfully queued may wake the poll loop.
+        self.notify.notify_one();
+        Ok(())
     }
 
     /// The local address the listener is bound to.
@@ -620,6 +625,7 @@ impl Netstack {
         Ok(UdpListener {
             recv_rx: parts.recv_rx,
             send_tx: parts.send_tx,
+            notify: Arc::clone(&self.notify),
             local_addr: parts.local_addr,
             cmd_tx: self.cmd_tx.clone(),
             key: parts.key,

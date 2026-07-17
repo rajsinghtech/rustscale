@@ -54,7 +54,7 @@ PANEL_CONTRACTS = {
 
 CONTAINER_COMMAND = (
     "docker run --rm --privileged --device /dev/net/tun -e TS_USERSPACE=0 "
-    "-e TS_AUTHKEY=tskey-... ghcr.io/rajsinghtech/rustscale:v0.1.3"
+    "-e TS_AUTHKEY=tskey-... ghcr.io/rajsinghtech/rustscale:v0.1.4"
 )
 USERSPACE_COMMAND = (
     "tools/bench/gcp/run-matrix.sh --repeat 3 --topology same-zone "

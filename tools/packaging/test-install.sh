@@ -154,6 +154,64 @@ INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_UNAME_S=Linux \
 grep -q 'official tailscale' "$prefix/bin/tailscale"
 test "$(readlink "$prefix/bin/tailscaled")" = /opt/tailscale/tailscaled
 
+# Explicit compatibility mode must fail before installing anything when either
+# alias would replace an official command. Exercise each destination so the
+# validation cannot accidentally stop after checking only the CLI alias.
+prefix="$TMP/prefix-compat-cli-collision"
+mkdir -p "$prefix/bin"
+printf 'official tailscale\n' > "$prefix/bin/tailscale"
+if INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
+    sh "$ROOT/scripts/install.sh" --version "$VERSION" \
+        --tailscale-compatible >"$TMP/compat-cli-collision.out" 2>&1; then
+    echo "compatibility install unexpectedly replaced the official CLI" >&2
+    exit 1
+fi
+grep -q 'refusing to replace existing compatibility command' "$TMP/compat-cli-collision.out"
+grep -q 'official tailscale' "$prefix/bin/tailscale"
+test ! -e "$prefix/bin/rustscale"
+test ! -e "$prefix/bin/rustscaled"
+test ! -e "$prefix/bin/.rustscale-install-receipt-v1"
+
+prefix="$TMP/prefix-compat-daemon-collision"
+mkdir -p "$prefix/bin"
+ln -s rustscale "$prefix/bin/tailscale"
+ln -s /opt/tailscale/tailscaled "$prefix/bin/tailscaled"
+if INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
+    sh "$ROOT/scripts/install.sh" --version "$VERSION" \
+        --tailscale-compatible >"$TMP/compat-daemon-collision.out" 2>&1; then
+    echo "compatibility install unexpectedly replaced the official daemon alias" >&2
+    exit 1
+fi
+grep -q 'refusing to replace existing compatibility command' "$TMP/compat-daemon-collision.out"
+test "$(readlink "$prefix/bin/tailscale")" = rustscale
+test "$(readlink "$prefix/bin/tailscaled")" = /opt/tailscale/tailscaled
+test ! -e "$prefix/bin/rustscale"
+test ! -e "$prefix/bin/rustscaled"
+test ! -e "$prefix/bin/.rustscale-install-receipt-v1"
+
+# Pre-existing installer-owned links are idempotent and remain relative. The
+# installer never redirects compatibility mode into official state/socket
+# paths; those remain the RustScale paths encoded by the shipped unit.
+prefix="$TMP/prefix-compat-owned"
+mkdir -p "$prefix/bin"
+ln -s rustscale "$prefix/bin/tailscale"
+ln -s rustscaled "$prefix/bin/tailscaled"
+INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
+    sh "$ROOT/scripts/install.sh" --version "$VERSION" \
+        --tailscale-compatible >/dev/null
+test "$(readlink "$prefix/bin/tailscale")" = rustscale
+test "$(readlink "$prefix/bin/tailscaled")" = rustscaled
+grep -Fq '/var/lib/rustscale' "$ROOT/packaging/systemd/rustscaled.service"
+grep -Fq '/var/run/rustscaled.sock' "$ROOT/packaging/systemd/rustscaled.service"
+if grep -Eq '/var/(lib|run)/tailscale|/var/run/tailscaled[.]sock' \
+    "$ROOT/packaging/systemd/rustscaled.service"; then
+    echo "rustscaled service unexpectedly uses official Tailscale state" >&2
+    exit 1
+fi
+
 # Exercise wget separately with a deterministic file:// implementation.
 mkdir -p "$TMP/fakebin"
 cat > "$TMP/fakebin/wget" <<'EOF'

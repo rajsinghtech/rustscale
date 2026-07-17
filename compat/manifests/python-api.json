@@ -1,0 +1,1328 @@
+{
+  "$schema": "../schema/manifest-v1.schema.json",
+  "api_version": 1,
+  "comparisons": [
+    {
+      "classification": "shimmed",
+      "denominator_id": "class:Connection",
+      "id": "python:class:Connection",
+      "local_ids": [
+        "class:Connection"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "class:Listener",
+      "id": "python:class:Listener",
+      "local_ids": [
+        "class:Listener"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "class:RustscaleError",
+      "id": "python:class:RustscaleError",
+      "local_ids": [
+        "class:RustscaleError"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "class:Server",
+      "id": "python:class:Server",
+      "local_ids": [
+        "class:Server"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "constant:RS_ERR_BUSY",
+      "id": "python:constant:RS_ERR_BUSY",
+      "local_ids": [
+        "constant:RS_ERR_BUSY"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "constant:RS_ERR_INVAL",
+      "id": "python:constant:RS_ERR_INVAL",
+      "local_ids": [
+        "constant:RS_ERR_INVAL"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "constant:RS_ERR_NOENT",
+      "id": "python:constant:RS_ERR_NOENT",
+      "local_ids": [
+        "constant:RS_ERR_NOENT"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "constant:RS_ERR_TIMEOUT",
+      "id": "python:constant:RS_ERR_TIMEOUT",
+      "local_ids": [
+        "constant:RS_ERR_TIMEOUT"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "constant:RS_ERR_UNKNOWN",
+      "id": "python:constant:RS_ERR_UNKNOWN",
+      "local_ids": [
+        "constant:RS_ERR_UNKNOWN"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "constant:RS_OK",
+      "id": "python:constant:RS_OK",
+      "local_ids": [
+        "constant:RS_OK"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Connection.__enter__",
+      "id": "python:method:Connection.__enter__",
+      "local_ids": [
+        "method:Connection.__enter__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Connection.__exit__",
+      "id": "python:method:Connection.__exit__",
+      "local_ids": [
+        "method:Connection.__exit__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Connection.__init__",
+      "id": "python:method:Connection.__init__",
+      "local_ids": [
+        "method:Connection.__init__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Connection.close",
+      "id": "python:method:Connection.close",
+      "local_ids": [
+        "method:Connection.close"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_conn_close"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Connection.read",
+      "id": "python:method:Connection.read",
+      "local_ids": [
+        "method:Connection.read"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_conn_read"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Connection.recv",
+      "id": "python:method:Connection.recv",
+      "local_ids": [
+        "method:Connection.recv"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Connection.send",
+      "id": "python:method:Connection.send",
+      "local_ids": [
+        "method:Connection.send"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Connection.write",
+      "id": "python:method:Connection.write",
+      "local_ids": [
+        "method:Connection.write"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_conn_write"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Listener.__enter__",
+      "id": "python:method:Listener.__enter__",
+      "local_ids": [
+        "method:Listener.__enter__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Listener.__exit__",
+      "id": "python:method:Listener.__exit__",
+      "local_ids": [
+        "method:Listener.__exit__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Listener.__init__",
+      "id": "python:method:Listener.__init__",
+      "local_ids": [
+        "method:Listener.__init__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Listener.accept",
+      "id": "python:method:Listener.accept",
+      "local_ids": [
+        "method:Listener.accept"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_accept"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Listener.close",
+      "id": "python:method:Listener.close",
+      "local_ids": [
+        "method:Listener.close"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_listener_close"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:RustscaleError.__init__",
+      "id": "python:method:RustscaleError.__init__",
+      "local_ids": [
+        "method:RustscaleError.__init__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.__enter__",
+      "id": "python:method:Server.__enter__",
+      "local_ids": [
+        "method:Server.__enter__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.__exit__",
+      "id": "python:method:Server.__exit__",
+      "local_ids": [
+        "method:Server.__exit__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.__init__",
+      "id": "python:method:Server.__init__",
+      "local_ids": [
+        "method:Server.__init__"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_new",
+        "ts_set_authkey",
+        "ts_set_control_url",
+        "ts_set_ephemeral",
+        "ts_set_hostname",
+        "ts_set_state_dir"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.close",
+      "id": "python:method:Server.close",
+      "local_ids": [
+        "method:Server.close"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_close"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.dial",
+      "id": "python:method:Server.dial",
+      "local_ids": [
+        "method:Server.dial"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_dial"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.handle",
+      "id": "python:method:Server.handle",
+      "local_ids": [
+        "method:Server.handle"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "Python API support surface"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.listen",
+      "id": "python:method:Server.listen",
+      "local_ids": [
+        "method:Server.listen"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_listen"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.status",
+      "id": "python:method:Server.status",
+      "local_ids": [
+        "method:Server.status"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_status_json"
+      ],
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.up",
+      "id": "python:method:Server.up",
+      "local_ids": [
+        "method:Server.up"
+      ],
+      "note": "explicit Python export backed by the checked C ABI",
+      "target": [
+        "ts_up"
+      ],
+      "upstream_ids": []
+    }
+  ],
+  "contract_version": 1,
+  "denominator": {
+    "count": 33,
+    "ids": [
+      "class:Connection",
+      "class:Listener",
+      "class:RustscaleError",
+      "class:Server",
+      "constant:RS_ERR_BUSY",
+      "constant:RS_ERR_INVAL",
+      "constant:RS_ERR_NOENT",
+      "constant:RS_ERR_TIMEOUT",
+      "constant:RS_ERR_UNKNOWN",
+      "constant:RS_OK",
+      "method:Connection.__enter__",
+      "method:Connection.__exit__",
+      "method:Connection.__init__",
+      "method:Connection.close",
+      "method:Connection.read",
+      "method:Connection.recv",
+      "method:Connection.send",
+      "method:Connection.write",
+      "method:Listener.__enter__",
+      "method:Listener.__exit__",
+      "method:Listener.__init__",
+      "method:Listener.accept",
+      "method:Listener.close",
+      "method:RustscaleError.__init__",
+      "method:Server.__enter__",
+      "method:Server.__exit__",
+      "method:Server.__init__",
+      "method:Server.close",
+      "method:Server.dial",
+      "method:Server.handle",
+      "method:Server.listen",
+      "method:Server.status",
+      "method:Server.up"
+    ],
+    "sha256": "546b6365c6abe592a2205b2171b1a9b2b5483deb1161cd3dcb76a14f2b77b9dd",
+    "source": "local-python-api"
+  },
+  "generator_version": 1,
+  "guards": {
+    "c_backing": {
+      "count": 17,
+      "ids": [
+        "ts_accept",
+        "ts_close",
+        "ts_conn_close",
+        "ts_conn_read",
+        "ts_conn_write",
+        "ts_dial",
+        "ts_errmsg",
+        "ts_listen",
+        "ts_listener_close",
+        "ts_new",
+        "ts_set_authkey",
+        "ts_set_control_url",
+        "ts_set_ephemeral",
+        "ts_set_hostname",
+        "ts_set_state_dir",
+        "ts_status_json",
+        "ts_up"
+      ],
+      "sha256": "17f6f265a3d842d3608f400acbdacbbbb4c0521cf1c1c47ddb1d36096d0d06ba"
+    },
+    "local": {
+      "count": 33,
+      "ids": [
+        "class:Connection",
+        "class:Listener",
+        "class:RustscaleError",
+        "class:Server",
+        "constant:RS_ERR_BUSY",
+        "constant:RS_ERR_INVAL",
+        "constant:RS_ERR_NOENT",
+        "constant:RS_ERR_TIMEOUT",
+        "constant:RS_ERR_UNKNOWN",
+        "constant:RS_OK",
+        "method:Connection.__enter__",
+        "method:Connection.__exit__",
+        "method:Connection.__init__",
+        "method:Connection.close",
+        "method:Connection.read",
+        "method:Connection.recv",
+        "method:Connection.send",
+        "method:Connection.write",
+        "method:Listener.__enter__",
+        "method:Listener.__exit__",
+        "method:Listener.__init__",
+        "method:Listener.accept",
+        "method:Listener.close",
+        "method:RustscaleError.__init__",
+        "method:Server.__enter__",
+        "method:Server.__exit__",
+        "method:Server.__init__",
+        "method:Server.close",
+        "method:Server.dial",
+        "method:Server.handle",
+        "method:Server.listen",
+        "method:Server.status",
+        "method:Server.up"
+      ],
+      "sha256": "546b6365c6abe592a2205b2171b1a9b2b5483deb1161cd3dcb76a14f2b77b9dd"
+    },
+    "local_shape": {
+      "count": 33,
+      "ids": [
+        "class:Connection@4507db2eced107404dd0fc52642eda572bc072eeeb6e658ac3eefb5e9637cec7",
+        "class:Listener@97f735fdac2a0a255121c0faf33c5b363e8471fd85e15a44cc8d096c7b5067fd",
+        "class:RustscaleError@2af39b48dc81be440caacba49f00c3a531eb5c5a095838e4a992324276bc1872",
+        "class:Server@ce96ddd782c9850bea13a666b6be075cb911d179e6c631f2f24d22028a3b34cb",
+        "constant:RS_ERR_BUSY@a651fc1b9e7de2e6e7e807d096e141c87c162ef26bc7593386a9799ad1508118",
+        "constant:RS_ERR_INVAL@a29a8cb7137a495d2a20c51ea6b461befa4a5d0400dd725d9f5e30f901d66021",
+        "constant:RS_ERR_NOENT@ba0395e8c9864034ea120f961a28fd37711aea8057617bc2d7e4585ddd04a34e",
+        "constant:RS_ERR_TIMEOUT@53155b31fa8494f9817f6bd6b6a91ee975695a7b27eda5447143c3a8ce213c5d",
+        "constant:RS_ERR_UNKNOWN@ac65fc5f966452e7c2dbef9c02fb72e6be23cc3ee99470cfe8a78b7416fe9a67",
+        "constant:RS_OK@528a3901b4daaac3b716953582829d5ad98fa9480895a501bbd6780a79756255",
+        "method:Connection.__enter__@9ad532c0873b546b7361dbb3ddca6b5ee86e8bb800a8b5f38f1e8be51f3ab496",
+        "method:Connection.__exit__@558f83d7d0869234bdafd8a1c79be21e9f6b0d8a462f84459347364df1389236",
+        "method:Connection.__init__@be1508788ed000314e458453ad7ed70f8abdea8b09584fe333fcb8e447b1a2b6",
+        "method:Connection.close@f8cb93ef841a05c82fdb5c4a91d1e45d4117acd751a8114b0cd131d89c9c18e3",
+        "method:Connection.read@b930524c0d020d8d2556a45e2e158de6bdbf284321ff36584d0cad479fb4edd6",
+        "method:Connection.recv@0e460cdc3f8bea778175c9a1b273676b012bdf33b85d03996fc7ff4741173a63",
+        "method:Connection.send@508a53c376a754635279cf775064e35c34d1fe62906dad09030432afd1f7b635",
+        "method:Connection.write@0972f6f620e45b8d4c62af089c60080fc280d8475819843d0d8feda7a268e83e",
+        "method:Listener.__enter__@497d77f70143ada7eb0863e6a5460177c981319a87e8af9d51750a96207f085a",
+        "method:Listener.__exit__@f9bf4c5295c002a96d79ee7cd75c25e67b7c41563b312403e69c9c9c2490bb81",
+        "method:Listener.__init__@e8db450b1685db68ede776a75a640dae255563ad9fc4891d10c0f3c1177d77ce",
+        "method:Listener.accept@697974bccfa2ab4bdea6cc643f6f1ffd0ff4cf0c38728a9bd393451a97eca833",
+        "method:Listener.close@1e1f03ccbf3650f76312385d302a827959ee620305de39222a1aa1eddb575998",
+        "method:RustscaleError.__init__@ba3edf4027d060e1f58716c8495808c161fc3c350eb4c203adfa450272ae26e8",
+        "method:Server.__enter__@688784e5f1de35101ce34c7f96db1bf50ee21523202f30a567469862c5a3b15f",
+        "method:Server.__exit__@74953a8240025fdb7a607ede72507c62cc06e3343209f672b47841eaaa8da81e",
+        "method:Server.__init__@790c750c2fa93ba3a9bf492e89c9d1e5664caaf9e68d71f34d621298ad964907",
+        "method:Server.close@e9c39eebfe3def57c7d3e63fd854574d506332cb96d64915845a6c7fcf0cfa08",
+        "method:Server.dial@1e75141552a9e3b7fefd80850ff4202c8533232dfa0a23aed29145873f465bfd",
+        "method:Server.handle@751a55db3e0114566f723cceca93ed8cf372aec74fd94f8855912e6a0d3adb30",
+        "method:Server.listen@8a4d1970f694a7cbf5ed911c386ade999255eb9624d42f54fdd5010e79076cac",
+        "method:Server.status@8d6e90a8fc8ddbfa3af2864f21d91f70ae0f29f23b1f78efb087af3c289a41d1",
+        "method:Server.up@7b49bf3ea197fe6ab1693b58efce52eeb0eb2d371fe8e0620227859ce7d482e7"
+      ],
+      "sha256": "6098a33f649889515f7971520a1f9cce392072ad6218d42e70f14200ac07118b"
+    }
+  },
+  "inventory": {
+    "backing_symbols": [
+      "ts_accept",
+      "ts_close",
+      "ts_conn_close",
+      "ts_conn_read",
+      "ts_conn_write",
+      "ts_dial",
+      "ts_errmsg",
+      "ts_listen",
+      "ts_listener_close",
+      "ts_new",
+      "ts_set_authkey",
+      "ts_set_control_url",
+      "ts_set_ephemeral",
+      "ts_set_hostname",
+      "ts_set_state_dir",
+      "ts_status_json",
+      "ts_up"
+    ],
+    "c_symbols_resolved": true,
+    "local": [
+      {
+        "id": "class:Connection",
+        "kind": "class",
+        "name": "Connection",
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "id": "class:Listener",
+        "kind": "class",
+        "name": "Listener",
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "id": "class:RustscaleError",
+        "kind": "class",
+        "name": "RustscaleError",
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "id": "class:Server",
+        "kind": "class",
+        "name": "Server",
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "id": "constant:RS_ERR_BUSY",
+        "kind": "constant",
+        "name": "RS_ERR_BUSY",
+        "source": "bindings/python/rustscale.py",
+        "value": -16
+      },
+      {
+        "id": "constant:RS_ERR_INVAL",
+        "kind": "constant",
+        "name": "RS_ERR_INVAL",
+        "source": "bindings/python/rustscale.py",
+        "value": -22
+      },
+      {
+        "id": "constant:RS_ERR_NOENT",
+        "kind": "constant",
+        "name": "RS_ERR_NOENT",
+        "source": "bindings/python/rustscale.py",
+        "value": -2
+      },
+      {
+        "id": "constant:RS_ERR_TIMEOUT",
+        "kind": "constant",
+        "name": "RS_ERR_TIMEOUT",
+        "source": "bindings/python/rustscale.py",
+        "value": -110
+      },
+      {
+        "id": "constant:RS_ERR_UNKNOWN",
+        "kind": "constant",
+        "name": "RS_ERR_UNKNOWN",
+        "source": "bindings/python/rustscale.py",
+        "value": -1
+      },
+      {
+        "id": "constant:RS_OK",
+        "kind": "constant",
+        "name": "RS_OK",
+        "source": "bindings/python/rustscale.py",
+        "value": 0
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Connection.__enter__",
+        "kind": "method",
+        "name": "__enter__",
+        "owner": "Connection",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Connection.__exit__",
+        "kind": "method",
+        "name": "__exit__",
+        "owner": "Connection",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "var_positional",
+              "name": "exc"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Connection.__init__",
+        "kind": "method",
+        "name": "__init__",
+        "owner": "Connection",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": "int",
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "handle"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_conn_close"
+        ],
+        "id": "method:Connection.close",
+        "kind": "method",
+        "name": "close",
+        "owner": "Connection",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            }
+          ],
+          "returns": "None"
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_conn_read"
+        ],
+        "id": "method:Connection.read",
+        "kind": "method",
+        "name": "read",
+        "owner": "Connection",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": "int",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "n"
+            }
+          ],
+          "returns": "bytes"
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Connection.recv",
+        "kind": "method",
+        "name": "recv",
+        "owner": "Connection",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": null,
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "n"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Connection.send",
+        "kind": "method",
+        "name": "send",
+        "owner": "Connection",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "data"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_conn_write"
+        ],
+        "id": "method:Connection.write",
+        "kind": "method",
+        "name": "write",
+        "owner": "Connection",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": "bytes",
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "data"
+            }
+          ],
+          "returns": "int"
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Listener.__enter__",
+        "kind": "method",
+        "name": "__enter__",
+        "owner": "Listener",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Listener.__exit__",
+        "kind": "method",
+        "name": "__exit__",
+        "owner": "Listener",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "var_positional",
+              "name": "exc"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Listener.__init__",
+        "kind": "method",
+        "name": "__init__",
+        "owner": "Listener",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": "int",
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "handle"
+            },
+            {
+              "annotation": "int",
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "server_handle"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_accept"
+        ],
+        "id": "method:Listener.accept",
+        "kind": "method",
+        "name": "accept",
+        "owner": "Listener",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": "float | None",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "timeout"
+            }
+          ],
+          "returns": "\"Connection\""
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_listener_close"
+        ],
+        "id": "method:Listener.close",
+        "kind": "method",
+        "name": "close",
+        "owner": "Listener",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            }
+          ],
+          "returns": "None"
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:RustscaleError.__init__",
+        "kind": "method",
+        "name": "__init__",
+        "owner": "RustscaleError",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": "int",
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "code"
+            },
+            {
+              "annotation": "str",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "message"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Server.__enter__",
+        "kind": "method",
+        "name": "__enter__",
+        "owner": "Server",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Server.__exit__",
+        "kind": "method",
+        "name": "__exit__",
+        "owner": "Server",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "var_positional",
+              "name": "exc"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_new",
+          "ts_set_authkey",
+          "ts_set_control_url",
+          "ts_set_ephemeral",
+          "ts_set_hostname",
+          "ts_set_state_dir"
+        ],
+        "id": "method:Server.__init__",
+        "kind": "method",
+        "name": "__init__",
+        "owner": "Server",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": "str",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "hostname"
+            },
+            {
+              "annotation": "str | None",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "auth_key"
+            },
+            {
+              "annotation": "str | None",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "control_url"
+            },
+            {
+              "annotation": "str | None",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "state_dir"
+            },
+            {
+              "annotation": "bool",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "ephemeral"
+            }
+          ],
+          "returns": null
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_close"
+        ],
+        "id": "method:Server.close",
+        "kind": "method",
+        "name": "close",
+        "owner": "Server",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            }
+          ],
+          "returns": "None"
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_dial"
+        ],
+        "id": "method:Server.dial",
+        "kind": "method",
+        "name": "dial",
+        "owner": "Server",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": "str",
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "addr"
+            },
+            {
+              "annotation": "str",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "proto"
+            }
+          ],
+          "returns": "\"Connection\""
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [],
+        "id": "method:Server.handle",
+        "kind": "method",
+        "name": "handle",
+        "owner": "Server",
+        "property": true,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            }
+          ],
+          "returns": "int"
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_listen"
+        ],
+        "id": "method:Server.listen",
+        "kind": "method",
+        "name": "listen",
+        "owner": "Server",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            },
+            {
+              "annotation": "str",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "proto"
+            },
+            {
+              "annotation": "str",
+              "has_default": true,
+              "kind": "positional_or_keyword",
+              "name": "addr"
+            }
+          ],
+          "returns": "\"Listener\""
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_status_json"
+        ],
+        "id": "method:Server.status",
+        "kind": "method",
+        "name": "status",
+        "owner": "Server",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            }
+          ],
+          "returns": "dict"
+        },
+        "source": "bindings/python/rustscale.py"
+      },
+      {
+        "backing_symbols": [
+          "ts_up"
+        ],
+        "id": "method:Server.up",
+        "kind": "method",
+        "name": "up",
+        "owner": "Server",
+        "property": false,
+        "signature": {
+          "async": false,
+          "parameters": [
+            {
+              "annotation": null,
+              "has_default": false,
+              "kind": "positional_or_keyword",
+              "name": "self"
+            }
+          ],
+          "returns": "None"
+        },
+        "source": "bindings/python/rustscale.py"
+      }
+    ]
+  },
+  "kind": "python-exports",
+  "schema_version": 1,
+  "scope": "explicit __all__ exports, public class methods, and C backing symbols",
+  "upstream": {
+    "go_mod_sum": "h1:DQ9YBy85DpNlSyeU2XRIWzbAu3RsGp/frv+Khg57meE=",
+    "module": "tailscale.com",
+    "repository": "https://github.com/tailscale/tailscale",
+    "revision": "c811bb19bf3b0c89061ac7b7a073f6cd23b504d0",
+    "sum": "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=",
+    "version": "v1.100.0"
+  }
+}

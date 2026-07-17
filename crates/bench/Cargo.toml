@@ -10,9 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-tsnet = { path = "../tsnet", version = "0.1.3" }
-rustscale-magicsock = { path = "../magicsock", version = "0.1.3" }
-rustscale-netstack = { path = "../netstack", version = "0.1.3" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.4" }
+rustscale-magicsock = { path = "../magicsock", version = "0.1.4" }
+rustscale-netstack = { path = "../netstack", version = "0.1.4" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

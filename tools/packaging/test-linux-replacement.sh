@@ -1,0 +1,762 @@
+#!/usr/bin/env bash
+# Installed Linux replacement journey. Builds a release archive, installs it
+# through scripts/install.sh with explicit Tailscale-compatible aliases, starts
+# the shipped systemd unit, enrolls against pinned Go testcontrol, and proves a
+# kernel-TUN packet roundtrip to a pinned Go tailscaled peer.
+
+set -euo pipefail
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+LABEL='[linux-replacement]'
+REQUIRE=${RUSTSCALE_REQUIRE_LINUX_REPLACEMENT:-0}
+
+skip() {
+  local reason=$1
+  if [[ "$REQUIRE" == 1 ]]; then
+    echo "$LABEL ERROR: required journey unavailable: $reason" >&2
+    exit 1
+  fi
+  echo "$LABEL SKIP: $reason" >&2
+  exit 0
+}
+
+case "$REQUIRE" in
+  0|1) ;;
+  *) echo "$LABEL ERROR: RUSTSCALE_REQUIRE_LINUX_REPLACEMENT must be 0 or 1" >&2; exit 2 ;;
+esac
+
+if [[ $# -ne 0 ]]; then
+  echo "usage: tools/packaging/test-linux-replacement.sh" >&2
+  exit 2
+fi
+
+os=$(uname -s)
+[[ "$os" == Linux ]] || skip "requires Linux; found $os"
+
+# Keep teardown inside the child: GNU timeout sends TERM first, allowing the
+# EXIT trap to stop systemd and remove kernel state, and escalates only if that
+# bounded cleanup itself hangs.
+if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
+  command -v timeout >/dev/null 2>&1 || skip "GNU timeout is required for bounded teardown"
+  deadline=${RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT:-900}
+  case "$deadline" in
+    ''|*[!0-9]*) echo "$LABEL ERROR: timeout must be a positive integer" >&2; exit 2 ;;
+  esac
+  (( deadline > 0 )) || { echo "$LABEL ERROR: timeout must be positive" >&2; exit 2; }
+  echo "$LABEL bounded journey deadline: ${deadline}s" >&2
+  exec timeout --signal=TERM --kill-after=60s "${deadline}s" \
+    env RUSTSCALE_LINUX_REPLACEMENT_INNER=1 \
+      RUSTSCALE_REQUIRE_LINUX_REPLACEMENT="$REQUIRE" \
+      RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT="$deadline" \
+      bash "$ROOT/tools/packaging/test-linux-replacement.sh"
+fi
+
+for command_name in awk cargo curl find getconf go grep id install ip mktemp \
+  python3 readlink sed sha256sum sudo systemctl tar tee tr wc; do
+  command -v "$command_name" >/dev/null 2>&1 \
+    || skip "required command '$command_name' is not available"
+done
+
+if ! sudo -n true 2>/dev/null; then
+  skip "passwordless sudo is unavailable"
+fi
+systemd_state=$(systemctl is-system-running 2>/dev/null || true)
+case "$systemd_state" in
+  running|degraded) ;;
+  *) skip "systemd manager is not running (state=${systemd_state:-unknown})" ;;
+esac
+[[ -c /dev/net/tun ]] || skip "/dev/net/tun is not a character device"
+if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+  skip "the installed service journey requires the GNU/Linux release artifact"
+fi
+if ! id nobody >/dev/null 2>&1; then
+  skip "the unrelated LocalAPI identity 'nobody' is unavailable"
+fi
+
+case "$(uname -m)" in
+  x86_64|amd64)
+    MACHINE=x86_64
+    ARCHIVE=rustscale-x86_64-unknown-linux-gnu.tar.gz
+    ;;
+  aarch64|arm64)
+    MACHINE=aarch64
+    ARCHIVE=rustscale-aarch64-unknown-linux-gnu.tar.gz
+    ;;
+  *) skip "unsupported Linux architecture $(uname -m)" ;;
+esac
+
+# This journey intentionally owns the standard RustScale installation and TUN
+# names. Refuse an occupied host before creating any fixture or root-owned file.
+for command_name in rustscale rustscaled tailscale tailscaled; do
+  if command -v "$command_name" >/dev/null 2>&1; then
+    skip "command '$command_name' already exists at $(command -v "$command_name")"
+  fi
+done
+if systemctl cat rustscaled.service >/dev/null 2>&1; then
+  skip "rustscaled.service already exists"
+fi
+for path in \
+  /usr/local/bin/rustscale \
+  /usr/local/bin/rustscaled \
+  /usr/local/bin/tailscale \
+  /usr/local/bin/tailscaled \
+  /usr/local/bin/.rustscale-install-receipt-v1 \
+  /usr/local/lib/librustscale.so \
+  /usr/local/lib/librustscale.a \
+  /usr/local/include/rustscale.h \
+  /etc/systemd/system/rustscaled.service \
+  /etc/systemd/system/rustscaled.service.d \
+  /etc/default/rustscaled \
+  /etc/default/rustscaled-install-journey \
+  /etc/rustscale-install-journey.json \
+  /var/lib/rustscale \
+  /var/cache/rustscale \
+  /run/rustscale \
+  /var/run/rustscaled.sock \
+  /var/lib/tailscale \
+  /run/tailscale \
+  /var/run/tailscaled.sock \
+  /sys/class/net/tun0; do
+  if [[ -e "$path" || -L "$path" ]]; then
+    skip "safety path already exists: $path"
+  fi
+done
+if ip -4 -details rule show | grep -q 'proto 201' \
+    || ip -6 -details rule show | grep -q 'proto 201'; then
+  skip "an existing protocol-201 policy rule makes cleanup attribution ambiguous"
+fi
+
+if ! tun_preflight=$("$ROOT/tools/interop-tun-preflight.sh" 2>&1); then
+  tun_preflight=${tun_preflight//$'\n'/'; '}
+  skip "Linux TUN preflight failed: $tun_preflight"
+fi
+echo "$tun_preflight" >&2
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/rustscale-linux-replacement.XXXXXX")
+CONTROL_PID=
+GO_PID=
+ECHO_PID=
+INSTALL_STARTED=0
+OFFICIAL_SENTINELS=0
+RULE_BASE=
+JOURNEY_FINISHED=0
+CONFIG_PATH=/etc/rustscale-install-journey.json
+DROPIN_DIR=/etc/systemd/system/rustscaled.service.d
+JOURNEY_ENV=/etc/default/rustscaled-install-journey
+PREFIX=/usr/local
+DEFAULT_SOCKET=/var/run/rustscaled.sock
+TUN_NAME=tun0
+
+stop_pid() {
+  local pid=$1 label=$2
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in {1..30}; do
+      kill -0 "$pid" 2>/dev/null || break
+      if [[ -r "/proc/$pid/stat" ]] \
+          && [[ "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" == Z ]]; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "$LABEL cleanup: killing stuck $label process $pid" >&2
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+uninstall_release() {
+  timeout --signal=TERM --kill-after=10s 30s \
+    env INSTALL_SERVICE=1 PREFIX="$PREFIX" RUSTSCALE_UNAME_S=Linux \
+      RUSTSCALE_UNAME_M="$MACHINE" RUSTSCALE_LIBC=gnu \
+      sh "$ROOT/scripts/install.sh" --uninstall
+}
+
+# Last-resort host restoration for an interrupted or wedged service stop. The
+# preflight rejects every one of these names/selectors before the journey, so
+# this removes only state attributable to this isolated run. Successful journey
+# assertions happen before this function can be used.
+emergency_kernel_cleanup() {
+  local family preference table ifindex
+  sudo -n systemctl kill --kill-whom=all --signal=KILL rustscaled.service \
+    >/dev/null 2>&1 || true
+  if [[ -z "$RULE_BASE" && -r "/sys/class/net/$TUN_NAME/ifindex" ]]; then
+    ifindex=$(<"/sys/class/net/$TUN_NAME/ifindex")
+    if [[ "$ifindex" =~ ^[1-9][0-9]*$ ]]; then
+      RULE_BASE=$((5000 + (ifindex % 200) * 100))
+    fi
+  fi
+  if [[ -n "$RULE_BASE" ]]; then
+    for family in -4 -6; do
+      for preference in $((RULE_BASE + 70)) $((RULE_BASE + 50)) \
+        $((RULE_BASE + 30)) $((RULE_BASE + 10)); do
+        case "$preference" in
+          $((RULE_BASE + 70)))
+            sudo -n ip "$family" rule del pref "$preference" protocol 201 table 52 \
+              >/dev/null 2>&1 || true
+            ;;
+          $((RULE_BASE + 50)))
+            sudo -n ip "$family" rule del pref "$preference" \
+              fwmark 0x80000/0xff0000 protocol 201 type unreachable \
+              >/dev/null 2>&1 || true
+            ;;
+          *)
+            table=main
+            [[ "$preference" == $((RULE_BASE + 30)) ]] && table=default
+            sudo -n ip "$family" rule del pref "$preference" \
+              fwmark 0x80000/0xff0000 protocol 201 table "$table" \
+              >/dev/null 2>&1 || true
+            ;;
+        esac
+      done
+    done
+    sudo -n rm -f "/run/rustscale/rule-owners/$RULE_BASE"
+  fi
+  sudo -n ip link delete dev "$TUN_NAME" >/dev/null 2>&1 || true
+  sudo -n rm -f "$DEFAULT_SOCKET"
+}
+
+assert_kernel_clean() {
+  local socket_must_be_absent=${1:-yes}
+  local leaked=0 family rules preference routes
+  if [[ -e "/sys/class/net/$TUN_NAME" ]]; then
+    echo "$LABEL cleanup leak: interface $TUN_NAME still exists" >&2
+    leaked=1
+  fi
+  if [[ "$socket_must_be_absent" == yes ]] \
+      && [[ -e "$DEFAULT_SOCKET" || -L "$DEFAULT_SOCKET" ]]; then
+    echo "$LABEL cleanup leak: LocalAPI path $DEFAULT_SOCKET still exists" >&2
+    leaked=1
+  fi
+  if [[ -n "$RULE_BASE" ]]; then
+    for family in -4 -6; do
+      rules=$(ip "$family" -details rule show 2>/dev/null || true)
+      for preference in $((RULE_BASE + 10)) $((RULE_BASE + 30)) \
+        $((RULE_BASE + 50)) $((RULE_BASE + 70)); do
+        if printf '%s\n' "$rules" \
+          | grep -E "^[[:space:]]*${preference}:.*proto 201([[:space:]]|$)" >/dev/null; then
+          echo "$LABEL cleanup leak: IPv${family#-} rule $preference remains" >&2
+          leaked=1
+        fi
+      done
+    done
+    if [[ -e "/run/rustscale/rule-owners/$RULE_BASE" \
+        || -L "/run/rustscale/rule-owners/$RULE_BASE" ]]; then
+      echo "$LABEL cleanup leak: policy-rule owner record $RULE_BASE remains" >&2
+      leaked=1
+    fi
+  fi
+  routes=$(ip -4 route show table 52 2>/dev/null || true)
+  if printf '%s\n' "$routes" | grep -F "dev $TUN_NAME" >/dev/null; then
+    echo "$LABEL cleanup leak: table 52 still routes through $TUN_NAME" >&2
+    leaked=1
+  fi
+  [[ "$leaked" == 0 ]]
+}
+
+verify_official_sentinels() {
+  [[ "$OFFICIAL_SENTINELS" == 1 ]] || return 0
+  local expected='official-tailscale-state-must-not-change'
+  [[ "$(sudo -n cat /var/lib/tailscale/.rustscale-install-journey 2>/dev/null || true)" == "$expected" ]] \
+    || { echo "$LABEL official state sentinel changed" >&2; return 1; }
+  [[ "$(sudo -n cat /run/tailscale/.rustscale-install-journey 2>/dev/null || true)" == "$expected" ]] \
+    || { echo "$LABEL official runtime sentinel changed" >&2; return 1; }
+  [[ "$(sudo -n find /var/lib/tailscale -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d ' ')" == 1 ]] \
+    || { echo "$LABEL official state directory gained unexpected entries" >&2; return 1; }
+  [[ "$(sudo -n find /run/tailscale -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d ' ')" == 1 ]] \
+    || { echo "$LABEL official runtime directory gained unexpected entries" >&2; return 1; }
+}
+
+cleanup() {
+  local status=$? cleanup_failed=0
+  trap - EXIT INT TERM
+  set +e
+
+  if [[ "$status" != 0 && "$INSTALL_STARTED" == 1 ]] \
+      && command -v journalctl >/dev/null 2>&1; then
+    echo "$LABEL last rustscaled journal entries:" >&2
+    sudo -n journalctl -u rustscaled.service -n 80 --no-pager >&2 || true
+  fi
+
+  if [[ "$INSTALL_STARTED" == 1 ]]; then
+    # Root owns systemd's client and service processes, so put the deadline
+    # inside sudo. This leaves time for the remaining EXIT cleanup before the
+    # outer timeout's 60-second KILL escalation.
+    if ! sudo -n timeout --signal=TERM --kill-after=5s 20s \
+        systemctl disable --now rustscaled.service >/dev/null 2>&1; then
+      cleanup_failed=1
+      emergency_kernel_cleanup
+    fi
+    timeout --signal=TERM --kill-after=5s 15s \
+      env INSTALL_SERVICE=1 PREFIX="$PREFIX" RUSTSCALE_UNAME_S=Linux \
+        RUSTSCALE_UNAME_M="$MACHINE" RUSTSCALE_LIBC=gnu \
+        sh "$ROOT/scripts/install.sh" --uninstall >/dev/null 2>&1 \
+      || cleanup_failed=1
+    # Failure fallback. Safety preflight proved these names were free before
+    # this journey set INSTALL_STARTED.
+    sudo -n rm -f /etc/systemd/system/rustscaled.service /etc/default/rustscaled \
+      "$DROPIN_DIR/10-rustscale-install-journey.conf" "$JOURNEY_ENV"
+    sudo -n rmdir "$DROPIN_DIR" >/dev/null 2>&1 || true
+    sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+    for alias in tailscale tailscaled; do
+      target=rustscale
+      [[ "$alias" == tailscaled ]] && target=rustscaled
+      if [[ -L "$PREFIX/bin/$alias" ]] \
+          && [[ "$(readlink "$PREFIX/bin/$alias")" == "$target" ]]; then
+        sudo -n rm -f "$PREFIX/bin/$alias"
+      fi
+    done
+    sudo -n rm -f \
+      "$PREFIX/bin/rustscale" "$PREFIX/bin/rustscaled" \
+      "$PREFIX/bin/.rustscale-install-receipt-v1" \
+      "$PREFIX/lib/librustscale.so" "$PREFIX/lib/librustscale.a" \
+      "$PREFIX/include/rustscale.h"
+  fi
+
+  stop_pid "$GO_PID" 'Go tailscaled'
+  stop_pid "$ECHO_PID" 'echo backend'
+  stop_pid "$CONTROL_PID" testcontrol
+
+  if ! assert_kernel_clean; then
+    cleanup_failed=1
+    [[ "$INSTALL_STARTED" == 1 ]] && emergency_kernel_cleanup
+    assert_kernel_clean || cleanup_failed=1
+  fi
+  if [[ "$INSTALL_STARTED" == 1 ]]; then
+    sudo -n rm -f "$CONFIG_PATH" "$JOURNEY_ENV" \
+      "$DROPIN_DIR/10-rustscale-install-journey.conf"
+    sudo -n rmdir "$DROPIN_DIR" >/dev/null 2>&1 || true
+    sudo -n rm -rf /var/lib/rustscale /var/cache/rustscale /run/rustscale
+  fi
+
+  if ! verify_official_sentinels; then
+    cleanup_failed=1
+  fi
+  if [[ "$OFFICIAL_SENTINELS" == 1 ]]; then
+    sudo -n rm -f /var/lib/tailscale/.rustscale-install-journey \
+      /run/tailscale/.rustscale-install-journey
+    sudo -n rmdir /var/lib/tailscale /run/tailscale 2>/dev/null || cleanup_failed=1
+  fi
+
+  rm -rf "$TMP"
+  if [[ "$cleanup_failed" != 0 ]]; then
+    echo "$LABEL ERROR: bounded cleanup did not restore the isolated host" >&2
+    [[ "$status" != 0 ]] || status=1
+  elif [[ "$JOURNEY_FINISHED" == 1 ]]; then
+    echo "$LABEL cleanup: service, processes, fixture state, and sentinels removed" >&2
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+backend_state() {
+  python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState", ""))'
+}
+
+status_ip() {
+  python3 -c 'import json,sys; values=json.load(sys.stdin).get("TailscaleIPs") or []; print(next((value for value in values if "." in value), ""))'
+}
+
+wait_backend() {
+  local expected=$1 attempts=${2:-240} output state
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if output=$(/usr/local/bin/tailscale status --json 2>/dev/null); then
+      state=$(printf '%s' "$output" | backend_state 2>/dev/null || true)
+      if [[ "$state" == "$expected" ]]; then
+        printf '%s' "$output"
+        return 0
+      fi
+    fi
+    systemctl is-active --quiet rustscaled.service || break
+    sleep 0.25
+  done
+  echo "$LABEL ERROR: timed out waiting for LocalAPI BackendState=$expected" >&2
+  systemctl status rustscaled.service --no-pager >&2 || true
+  return 1
+}
+
+node_count() {
+  curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])'
+}
+
+wait_node_count() {
+  local wanted=$1 count=
+  for _ in {1..120}; do
+    count=$(node_count 2>/dev/null || true)
+    if [[ "$count" =~ ^[0-9]+$ ]] && (( count >= wanted )); then
+      echo "$count"
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "$LABEL ERROR: testcontrol did not reach $wanted nodes (last=${count:-unavailable})" >&2
+  return 1
+}
+
+write_config() {
+  local include_key=$1 output=$2
+  python3 - "$CONTROL_URL" "$OPERATOR" "$include_key" >"$output" <<'PY'
+import json
+import sys
+value = {
+    "Version": "alpha0",
+    "ServerURL": sys.argv[1],
+    "Hostname": "rustscale-installed-journey",
+    "OperatorUser": sys.argv[2],
+}
+if sys.argv[3] == "yes":
+    value["AuthKey"] = "tskey-testcontrol"
+json.dump(value, sys.stdout, separators=(",", ":"))
+sys.stdout.write("\n")
+PY
+}
+
+# Build every artifact before touching system state.
+echo "$LABEL building real release binaries and libraries" >&2
+cargo build --release --locked \
+  -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
+
+TESTCONTROL_BIN="$TMP/testcontrol"
+GO_CLIENT_DIR="$TMP/go-client"
+TESTCONTROL_OUTPUT="$TESTCONTROL_BIN" TESTCONTROL_GO_CLIENT_DIR="$GO_CLIENT_DIR" \
+  "$ROOT/tools/testcontrol/build.sh"
+GO_CLI="$GO_CLIENT_DIR/tailscale"
+GO_DAEMON="$GO_CLIENT_DIR/tailscaled"
+GO_VERSION=$($GO_CLI version | sed -n '1p')
+[[ "$GO_VERSION" == 1.100.0* ]] \
+  || { echo "$LABEL ERROR: unexpected pinned Go client version: $GO_VERSION" >&2; exit 1; }
+
+VERSION=$(awk '
+  /^\[workspace.package\]/ { workspace = 1; next }
+  workspace && /^version = / { gsub(/[" ]/, "", $3); print $3; exit }
+' "$ROOT/Cargo.toml")
+[[ -n "$VERSION" ]] || { echo "$LABEL ERROR: workspace version not found" >&2; exit 1; }
+RELEASE_DIR="$TMP/releases/download/v$VERSION"
+STAGE="$TMP/stage"
+mkdir -p "$RELEASE_DIR" "$STAGE"
+install -m 755 "$ROOT/target/release/rustscale" "$STAGE/rustscale"
+install -m 755 "$ROOT/target/release/rustscaled" "$STAGE/rustscaled"
+install -m 755 "$ROOT/target/release/librustscale.so" "$STAGE/librustscale.so"
+install -m 644 "$ROOT/target/release/librustscale.a" "$STAGE/librustscale.a"
+install -m 644 "$ROOT/include/rustscale.h" "$STAGE/rustscale.h"
+install -m 644 "$ROOT/packaging/systemd/rustscaled.service" "$STAGE/rustscaled.service"
+install -m 644 "$ROOT/packaging/systemd/rustscaled.default" "$STAGE/rustscaled.default"
+install -m 644 "$ROOT/LICENSE" "$STAGE/LICENSE"
+tar --format=ustar -czf "$RELEASE_DIR/$ARCHIVE" -C "$STAGE" .
+printf '%s  %s\n' "$(sha256sum "$RELEASE_DIR/$ARCHIVE" | awk '{print $1}')" "$ARCHIVE" \
+  >"$RELEASE_DIR/SHA256SUMS"
+
+# Start the standalone pinned-Go control plane and retain all logs for a failed
+# run without writing generated binaries into the checkout.
+"$TESTCONTROL_BIN" >"$TMP/testcontrol.url" 2>"$TMP/testcontrol.log" &
+CONTROL_PID=$!
+CONTROL_URL=
+for _ in {1..200}; do
+  if [[ -s "$TMP/testcontrol.url" ]]; then
+    IFS= read -r CONTROL_URL <"$TMP/testcontrol.url" || true
+    [[ -n "$CONTROL_URL" ]] && break
+  fi
+  kill -0 "$CONTROL_PID" 2>/dev/null \
+    || { cat "$TMP/testcontrol.log" >&2; echo "$LABEL ERROR: testcontrol exited" >&2; exit 1; }
+  sleep 0.05
+done
+[[ "$CONTROL_URL" =~ ^http://127[.]0[.]0[.]1:[1-9][0-9]*$ ]] \
+  || { echo "$LABEL ERROR: invalid testcontrol URL '$CONTROL_URL'" >&2; exit 1; }
+curl --max-time 2 -fsS "$CONTROL_URL/testapi/health" >/dev/null
+
+# Place canaries in the official Tailscale state locations. Compatibility
+# aliases must remain command-name shims only; RustScale uses its own unit,
+# state directory, and LocalAPI socket.
+printf '%s\n' 'official-tailscale-state-must-not-change' >"$TMP/official-sentinel"
+sudo -n install -d -m 700 /var/lib/tailscale /run/tailscale
+sudo -n install -m 600 "$TMP/official-sentinel" \
+  /var/lib/tailscale/.rustscale-install-journey
+sudo -n install -m 600 "$TMP/official-sentinel" \
+  /run/tailscale/.rustscale-install-journey
+OFFICIAL_SENTINELS=1
+
+OPERATOR=$(id -un)
+INSTALL_STARTED=1
+
+# Keep the first installed startup local and log-upload-free without modifying
+# either checked-in systemd artifact. The test-only drop-in resets the base
+# EnvironmentFile list, supplies a no-key local config, and leaves ExecStart
+# unchanged. The public uninstaller handles the public files; trap cleanup owns
+# only this drop-in and its environment file.
+write_config no "$TMP/config-without-key.json"
+sudo -n install -m 600 "$TMP/config-without-key.json" "$CONFIG_PATH"
+printf 'FLAGS="--config %s --no-logs-no-support"\n' "$CONFIG_PATH" \
+  >"$TMP/rustscaled-install-journey.env"
+cat >"$TMP/rustscaled-install-journey.conf" <<EOF
+[Service]
+EnvironmentFile=
+EnvironmentFile=$JOURNEY_ENV
+EOF
+sudo -n install -m 644 "$TMP/rustscaled-install-journey.env" "$JOURNEY_ENV"
+sudo -n install -d -m 755 "$DROPIN_DIR"
+sudo -n install -m 644 "$TMP/rustscaled-install-journey.conf" \
+  "$DROPIN_DIR/10-rustscale-install-journey.conf"
+
+echo "$LABEL installing archive with explicit aliases and shipped systemd service" >&2
+INSTALL_SERVICE=1 PREFIX="$PREFIX" RUSTSCALE_RELEASE_BASE="file://$TMP/releases" \
+  RUSTSCALE_HTTP_CLIENT=curl RUSTSCALE_UNAME_S=Linux \
+  RUSTSCALE_UNAME_M="$MACHINE" RUSTSCALE_LIBC=gnu \
+  sh "$ROOT/scripts/install.sh" --version "$VERSION" --tailscale-compatible \
+  | tee "$TMP/install.log"
+
+[[ "$(readlink /usr/local/bin/tailscale)" == rustscale ]]
+[[ "$(readlink /usr/local/bin/tailscaled)" == rustscaled ]]
+[[ "$(sha256sum /usr/local/bin/rustscale | awk '{print $1}')" \
+   == "$(sha256sum "$STAGE/rustscale" | awk '{print $1}')" ]]
+[[ "$(sha256sum /usr/local/bin/rustscaled | awk '{print $1}')" \
+   == "$(sha256sum "$STAGE/rustscaled" | awk '{print $1}')" ]]
+[[ "$(sha256sum /usr/local/lib/librustscale.so | awk '{print $1}')" \
+   == "$(sha256sum "$STAGE/librustscale.so" | awk '{print $1}')" ]]
+[[ "$(sha256sum /usr/local/lib/librustscale.a | awk '{print $1}')" \
+   == "$(sha256sum "$STAGE/librustscale.a" | awk '{print $1}')" ]]
+[[ "$(sha256sum /usr/local/include/rustscale.h | awk '{print $1}')" \
+   == "$(sha256sum "$STAGE/rustscale.h" | awk '{print $1}')" ]]
+[[ "$(sha256sum /etc/default/rustscaled | awk '{print $1}')" \
+   == "$(sha256sum "$STAGE/rustscaled.default" | awk '{print $1}')" ]]
+systemctl is-enabled --quiet rustscaled.service
+systemctl is-active --quiet rustscaled.service
+initial_status=$(wait_backend NeedsLogin)
+[[ -S "$DEFAULT_SOCKET" ]]
+[[ "$(printf '%s' "$initial_status" | backend_state)" == NeedsLogin ]]
+verify_official_sentinels
+
+# Point the exact shipped service at local testcontrol and enroll with its
+# documented test key. The key is removed before persistence is tested.
+write_config yes "$TMP/config-with-key.json"
+sudo -n install -m 600 "$TMP/config-with-key.json" "$CONFIG_PATH"
+sudo -n systemctl restart rustscaled.service
+running_status=$(wait_backend Running 320)
+RUST_IP=$(printf '%s' "$running_status" | status_ip)
+[[ "$RUST_IP" == 100.* ]] \
+  || { echo "$LABEL ERROR: enrolled Rust node has invalid IP '$RUST_IP'" >&2; exit 1; }
+[[ "$(wait_node_count 1)" -ge 1 ]]
+curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
+  | python3 -c 'import json,sys; wanted=sys.argv[1]; data=json.load(sys.stdin); raise SystemExit(0 if any((node.get("ip") or "").split("/", 1)[0] == wanted for node in data["nodes"]) else 1)' \
+      "$RUST_IP"
+[[ -S "$DEFAULT_SOCKET" ]]
+
+# Exercise kernel peer credentials through the default LocalAPI socket.
+sudo -n -u nobody -- /usr/local/bin/tailscale status --json >/dev/null
+if nobody_logout=$(sudo -n -u nobody -- /usr/local/bin/tailscale logout 2>&1); then
+  echo "$LABEL ERROR: unrelated LocalAPI identity performed logout" >&2
+  exit 1
+fi
+printf '%s\n' "$nobody_logout" >"$TMP/nobody-logout.out"
+grep -q 'access denied' "$TMP/nobody-logout.out"
+
+# Prove the installed service owns a live Linux TUN and its interface-derived
+# protocol-201 policy chain.
+[[ -d "/sys/class/net/$TUN_NAME" ]]
+ifindex=$(<"/sys/class/net/$TUN_NAME/ifindex")
+flags=$(<"/sys/class/net/$TUN_NAME/flags")
+mtu=$(<"/sys/class/net/$TUN_NAME/mtu")
+[[ "$ifindex" =~ ^[1-9][0-9]*$ ]]
+(( (16#${flags#0x} & 1) != 0 ))
+[[ "$mtu" == 1280 ]]
+RULE_BASE=$((5000 + (ifindex % 200) * 100))
+rules=$(ip -4 -details rule show)
+for expectation in \
+  "$((RULE_BASE + 10)):lookup main" \
+  "$((RULE_BASE + 30)):lookup default" \
+  "$((RULE_BASE + 50)):unreachable" \
+  "$((RULE_BASE + 70)):lookup 52"; do
+  preference=${expectation%%:*}
+  target=${expectation#*:}
+  rule=$(printf '%s\n' "$rules" \
+    | grep -E "^[[:space:]]*${preference}:.*proto 201([[:space:]]|$)" || true)
+  [[ -n "$rule" && "$rule" == *"$target"* ]] \
+    || { echo "$LABEL ERROR: missing policy rule $preference ($target)" >&2; exit 1; }
+done
+ip -4 route show table 52 \
+  | grep -E "^100[.]64[.]0[.]0/10 .*dev $TUN_NAME([[:space:]]|$)" >/dev/null
+
+# Start a real userspace-networking Go peer from the same pinned module as the
+# control server, expose a TCP echo service, and connect with an OS socket. The
+# packet must cross Linux TCP, tun0, RustScale WireGuard/magicsock, and Go's
+# netstack before returning.
+cat >"$TMP/echo.py" <<'PY'
+import socket
+import sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(8)
+with open(sys.argv[1], "w", encoding="ascii") as handle:
+    handle.write(str(s.getsockname()[1]) + "\n")
+while True:
+    connection, _ = s.accept()
+    with connection:
+        while True:
+            data = connection.recv(4096)
+            if not data:
+                break
+            connection.sendall(data)
+PY
+python3 "$TMP/echo.py" "$TMP/echo.port" >"$TMP/echo.log" 2>&1 &
+ECHO_PID=$!
+for _ in {1..100}; do
+  [[ -s "$TMP/echo.port" ]] && break
+  kill -0 "$ECHO_PID" 2>/dev/null || { cat "$TMP/echo.log" >&2; exit 1; }
+  sleep 0.05
+done
+BACKEND_PORT=$(<"$TMP/echo.port")
+[[ "$BACKEND_PORT" =~ ^[1-9][0-9]*$ ]]
+
+GO_STATE="$TMP/go-state"
+GO_SOCKET="$TMP/go-tailscaled.sock"
+mkdir -p "$GO_STATE"
+"$GO_DAEMON" --tun=userspace-networking --socket="$GO_SOCKET" \
+  --statedir="$GO_STATE" --port=0 --no-logs-no-support \
+  >"$TMP/go-tailscaled.log" 2>&1 &
+GO_PID=$!
+for _ in {1..200}; do
+  [[ -S "$GO_SOCKET" ]] && break
+  kill -0 "$GO_PID" 2>/dev/null \
+    || { cat "$TMP/go-tailscaled.log" >&2; echo "$LABEL ERROR: Go tailscaled exited" >&2; exit 1; }
+  sleep 0.05
+done
+[[ -S "$GO_SOCKET" ]]
+"$GO_CLI" --socket="$GO_SOCKET" up \
+  --login-server="$CONTROL_URL" --auth-key=tskey-testcontrol \
+  --hostname=go-installed-journey --timeout=30s \
+  >>"$TMP/go-tailscaled.log" 2>&1
+GO_IP=$($GO_CLI --socket="$GO_SOCKET" ip -4 | sed -n '1p')
+[[ "$GO_IP" == 100.* ]] \
+  || { echo "$LABEL ERROR: pinned Go peer has invalid IP '$GO_IP'" >&2; exit 1; }
+[[ "$(wait_node_count 2)" -ge 2 ]]
+curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
+  | python3 -c 'import json,sys; wanted=set(sys.argv[1:]); found={(node.get("ip") or "").split("/", 1)[0] for node in json.load(sys.stdin)["nodes"]}; raise SystemExit(0 if wanted <= found else 1)' \
+      "$RUST_IP" "$GO_IP"
+PEER_PORT=18082
+"$GO_CLI" --socket="$GO_SOCKET" serve --bg --tcp="$PEER_PORT" \
+  "tcp://127.0.0.1:$BACKEND_PORT" >>"$TMP/go-tailscaled.log" 2>&1
+
+python3 - "$GO_IP" "$PEER_PORT" <<'PY'
+import socket
+import sys
+import time
+host, port = sys.argv[1], int(sys.argv[2])
+payload = b"installed-linux-replacement-roundtrip\n"
+last = None
+for _ in range(60):
+    try:
+        with socket.create_connection((host, port), timeout=2) as connection:
+            connection.settimeout(2)
+            connection.sendall(payload)
+            received = b""
+            while len(received) < len(payload):
+                chunk = connection.recv(len(payload) - len(received))
+                if not chunk:
+                    break
+                received += chunk
+            if received != payload:
+                raise RuntimeError(f"echo mismatch: {received!r}")
+            print("kernel TUN -> pinned Go peer echo: ok")
+            raise SystemExit(0)
+    except (OSError, RuntimeError) as error:
+        last = error
+        time.sleep(0.5)
+raise SystemExit(f"Go peer echo did not become reachable: {last}")
+PY
+
+# Remove the bootstrap key, then prove the persisted profile and address survive
+# an actual systemd restart without another registration credential.
+write_config no "$TMP/config-without-key.json"
+sudo -n install -m 600 "$TMP/config-without-key.json" "$CONFIG_PATH"
+PID_BEFORE=$(systemctl show -p MainPID --value rustscaled.service)
+sudo -n systemctl restart rustscaled.service
+persisted_status=$(wait_backend Running 320)
+PID_AFTER=$(systemctl show -p MainPID --value rustscaled.service)
+[[ "$PID_BEFORE" =~ ^[1-9][0-9]*$ && "$PID_AFTER" =~ ^[1-9][0-9]*$ ]]
+[[ "$PID_BEFORE" != "$PID_AFTER" ]]
+[[ "$(printf '%s' "$persisted_status" | status_ip)" == "$RUST_IP" ]]
+[[ "$(wait_node_count 2)" -ge 2 ]]
+
+python3 - "$GO_IP" "$PEER_PORT" <<'PY'
+import socket
+import sys
+import time
+payload = b"restart-persistence-roundtrip\n"
+last = None
+for _ in range(40):
+    try:
+        with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2) as connection:
+            connection.settimeout(2)
+            connection.sendall(payload)
+            received = b""
+            while len(received) < len(payload):
+                chunk = connection.recv(len(payload) - len(received))
+                if not chunk:
+                    break
+                received += chunk
+            if received == payload:
+                raise SystemExit(0)
+            raise RuntimeError(f"echo mismatch: {received!r}")
+    except (OSError, RuntimeError) as error:
+        last = error
+        time.sleep(0.5)
+raise SystemExit(f"post-restart Go peer echo failed: {last}")
+PY
+
+# Logout is durable before the LocalAPI call returns. Restart=always then starts
+# a fresh NeedsLogin generation; that generation must not retain TUN state.
+PID_BEFORE_LOGOUT=$(systemctl show -p MainPID --value rustscaled.service)
+/usr/local/bin/tailscale logout
+logged_out_status=$(wait_backend NeedsLogin 320)
+PID_AFTER_LOGOUT=$(systemctl show -p MainPID --value rustscaled.service)
+[[ "$PID_AFTER_LOGOUT" =~ ^[1-9][0-9]*$ ]]
+[[ "$PID_BEFORE_LOGOUT" != "$PID_AFTER_LOGOUT" ]]
+[[ "$(printf '%s' "$logged_out_status" | backend_state)" == NeedsLogin ]]
+[[ -S "$DEFAULT_SOCKET" ]]
+assert_kernel_clean keep-socket
+verify_official_sentinels
+
+# Exercise the public uninstaller rather than cleaning files directly. Stateful
+# identity is intentionally retained by uninstall; this isolated test removes
+# it only after checking service, route/rule, socket, and artifact cleanup.
+echo "$LABEL uninstalling through scripts/install.sh" >&2
+uninstall_release | tee "$TMP/uninstall.log"
+if systemctl is-active --quiet rustscaled.service; then
+  echo "$LABEL ERROR: rustscaled.service remains active after uninstall" >&2
+  exit 1
+fi
+if systemctl is-enabled --quiet rustscaled.service; then
+  echo "$LABEL ERROR: rustscaled.service remains enabled after uninstall" >&2
+  exit 1
+fi
+[[ ! -e /etc/systemd/system/rustscaled.service ]]
+[[ ! -e /etc/default/rustscaled ]]
+for path in \
+  /usr/local/bin/rustscale \
+  /usr/local/bin/rustscaled \
+  /usr/local/bin/tailscale \
+  /usr/local/bin/tailscaled \
+  /usr/local/bin/.rustscale-install-receipt-v1 \
+  /usr/local/lib/librustscale.so \
+  /usr/local/lib/librustscale.a \
+  /usr/local/include/rustscale.h; do
+  [[ ! -e "$path" && ! -L "$path" ]]
+done
+assert_kernel_clean
+verify_official_sentinels
+sudo -n rm -f "$CONFIG_PATH" "$JOURNEY_ENV" \
+  "$DROPIN_DIR/10-rustscale-install-journey.conf"
+sudo -n rmdir "$DROPIN_DIR"
+sudo -n systemctl daemon-reload
+sudo -n rm -rf /var/lib/rustscale /var/cache/rustscale /run/rustscale
+INSTALL_STARTED=0
+
+JOURNEY_FINISHED=1
+echo "$LABEL PASS: installed archive + explicit aliases + systemd + LocalAPI + restart/logout/uninstall" >&2
+echo "$LABEL PASS: real Linux tun0 packet roundtrip to pinned Go peer $GO_VERSION ($GO_IP:$PEER_PORT)" >&2

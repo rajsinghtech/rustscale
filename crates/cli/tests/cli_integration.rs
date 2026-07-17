@@ -5,12 +5,15 @@
 //!
 //! No external network access required — everything runs in-process.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use rustscale_key::NLPublic;
 use rustscale_localclient::LocalClient;
 use rustscale_safesocket::connect;
 use rustscale_testcontrol::Server as TestControlServer;
+use rustscale_tka::{disablement_kdf, Key, KeyKind};
 use rustscale_tsnet::Server;
 
 /// Wait for the LocalAPI socket to become connectable, polling every 200ms
@@ -33,6 +36,15 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) {
 /// Path to the `rustscale` binary Cargo built for this integration test.
 fn rustscale_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rustscale"))
+}
+
+fn run_cli(socket: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(rustscale_bin())
+        .arg("--socket")
+        .arg(socket)
+        .args(args)
+        .output()
+        .expect("spawn rustscale CLI")
 }
 
 /// Set up the test environment: start testcontrol, bring up a tsnet server
@@ -164,6 +176,43 @@ async fn cli_id_token_via_noise_control() {
         String::from_utf8_lossy(&output.stdout).trim(),
         expected_token
     );
+
+    env.server.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_local_disable_uses_the_durable_authorized_route() {
+    let mut env = setup().await;
+    let client = LocalClient::new(&env.socket_path);
+    let status = client.tailnet_lock_status().await.unwrap();
+    let public: NLPublic = status["PublicKey"].as_str().unwrap().parse().unwrap();
+    let secret = vec![0x44; 32];
+    client
+        .tailnet_lock_init(&serde_json::json!({
+            "Keys": [Key {
+                kind: KeyKind::Key25519,
+                votes: 1,
+                public: public.raw32().to_vec(),
+                meta: None,
+            }],
+            "DisablementValues": [disablement_kdf(&secret)],
+            "DisablementSecrets": [secret],
+            "SupportDisablement": [],
+            "Resume": false,
+        }))
+        .await
+        .unwrap();
+
+    let output = run_cli(&env.socket_path, &["lock", "local-disable"]);
+    assert!(
+        output.status.success(),
+        "local-disable failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("this node only"));
+    let disabled = client.tailnet_lock_status().await.unwrap();
+    assert!(disabled["LocalDisabled"].as_bool().unwrap());
+    assert_eq!(disabled["DisallowedStateIDs"].as_array().unwrap().len(), 1);
 
     env.server.close().await.unwrap();
 }
@@ -330,6 +379,171 @@ async fn cli_set_operator_replaces_and_explicitly_clears_persisted_pref() {
             .unwrap_or_default(),
         ""
     );
+    env.server.close().await.unwrap();
+}
+
+#[test]
+fn cli_exit_node_help_is_successful_without_a_daemon() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = run_cli(&temp.path().join("missing.sock"), &["exit-node", "--help"]);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("rustscale exit-node select"));
+    assert!(stdout.contains("rustscale exit-node clear"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_exit_node_selection_reaches_prefs_and_daemon_routes() {
+    let mut env = setup().await;
+
+    // Empty list is an upstream-style command failure, not a successful prose
+    // response that scripts could mistake for an available node.
+    let empty = run_cli(&env.socket_path, &["exit-node", "list"]);
+    assert_eq!(empty.status.code(), Some(1));
+    assert!(empty.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(empty.stderr).unwrap(),
+        "rustscale: no exit nodes found\n"
+    );
+
+    let target = env
+        .tc
+        .add_fake_exit_node("daily-exit.fake-control.example.net.", true);
+    let offline = env
+        .tc
+        .add_fake_exit_node("offline-exit.fake-control.example.net.", false);
+    env.tc
+        .add_fake_exit_node("ambiguous.fake-control.example.net.", true);
+    env.tc
+        .add_fake_exit_node("AMBIGUOUS.fake-control.example.net.", true);
+
+    let client = LocalClient::new(&env.socket_path);
+    let status = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = client.status_bounded().await.unwrap();
+            let visible = status
+                .get("Peer")
+                .and_then(serde_json::Value::as_object)
+                .map_or(0, |peers| {
+                    peers
+                        .values()
+                        .filter(|peer| {
+                            peer.get("ExitNodeOption")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
+                        })
+                        .count()
+                });
+            if visible == 4 {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exit peers did not reach LocalAPI status"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    let target_ip = target.Addresses[0]
+        .split('/')
+        .next()
+        .unwrap()
+        .parse::<IpAddr>()
+        .unwrap();
+    let offline_ip = offline.Addresses[0].split('/').next().unwrap();
+    assert!(status["Peer"].as_object().unwrap().values().any(|peer| {
+        peer.get("ID").and_then(serde_json::Value::as_str) == Some(target.StableID.as_str())
+    }));
+
+    let listed = run_cli(&env.socket_path, &["exit-node", "list"]);
+    assert!(listed.status.success());
+    assert!(listed.stderr.is_empty());
+    let table = String::from_utf8(listed.stdout).unwrap();
+    assert!(table.starts_with("IP"));
+    assert!(table.contains("daily-exit.fake-control.example.net"));
+    assert!(table.contains("offline-exit.fake-control.example.net"));
+    assert!(table.contains("offline"));
+
+    let listed_json = run_cli(&env.socket_path, &["exit-node", "list", "--json"]);
+    assert!(listed_json.status.success());
+    let listed_json: serde_json::Value =
+        serde_json::from_slice(&listed_json.stdout).expect("exit-node JSON list");
+    assert!(listed_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|peer| { peer["id"] == target.StableID && peer["ip"] == target_ip.to_string() }));
+
+    let ambiguous = run_cli(&env.socket_path, &["exit-node", "select", "ambiguous"]);
+    assert_eq!(ambiguous.status.code(), Some(1));
+    assert!(ambiguous.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(ambiguous.stderr).unwrap(),
+        "rustscale: ambiguous exit node name \"ambiguous\"\n"
+    );
+
+    let offline_selection = run_cli(&env.socket_path, &["exit-node", "select", "offline-exit"]);
+    assert_eq!(offline_selection.status.code(), Some(1));
+    assert!(offline_selection.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(offline_selection.stderr).unwrap(),
+        "rustscale: exit node \"offline-exit.fake-control.example.net\" is offline\n"
+    );
+    assert_eq!(
+        status["Peer"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|peer| peer["ID"] == offline.StableID)
+            .and_then(|peer| peer["TailscaleIPs"].as_array())
+            .and_then(|ips| ips.first())
+            .and_then(serde_json::Value::as_str),
+        Some(offline_ip)
+    );
+
+    let public_ip = "8.8.8.8".parse::<IpAddr>().unwrap();
+    let select_name = run_cli(&env.socket_path, &["exit-node", "select", "daily-exit"]);
+    assert!(select_name.status.success());
+    assert!(select_name.stdout.is_empty() && select_name.stderr.is_empty());
+    let prefs = client.get_prefs().await.unwrap();
+    assert_eq!(prefs.ExitNodeIP, target_ip.to_string());
+    assert!(prefs.ExitNodeID.is_empty());
+    assert_eq!(env.server.route_lookup(public_ip), Some(target.Key.clone()));
+
+    let clear = run_cli(&env.socket_path, &["exit-node", "clear"]);
+    assert!(clear.status.success());
+    assert!(clear.stdout.is_empty() && clear.stderr.is_empty());
+    let prefs = client.get_prefs().await.unwrap();
+    assert!(prefs.ExitNodeIP.is_empty() && prefs.ExitNodeID.is_empty());
+    assert!(env.server.route_lookup(public_ip).is_none());
+
+    let select_id = run_cli(
+        &env.socket_path,
+        &["exit-node", "select", target.StableID.as_str()],
+    );
+    assert!(select_id.status.success());
+    let prefs = client.get_prefs().await.unwrap();
+    assert_eq!(prefs.ExitNodeID, target.StableID);
+    assert!(prefs.ExitNodeIP.is_empty());
+    assert_eq!(env.server.route_lookup(public_ip), Some(target.Key.clone()));
+    assert!(run_cli(&env.socket_path, &["exit-node", "--clear"])
+        .status
+        .success());
+
+    let select_ip = run_cli(
+        &env.socket_path,
+        &["exit-node", "--select", &target_ip.to_string()],
+    );
+    assert!(select_ip.status.success());
+    assert_eq!(env.server.route_lookup(public_ip), Some(target.Key.clone()));
+    assert!(run_cli(&env.socket_path, &["exit-node", "clear"])
+        .status
+        .success());
+    assert!(env.server.route_lookup(public_ip).is_none());
+
     env.server.close().await.unwrap();
 }
 

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rustscale.dev/compat/provenance-v1.schema.json",
+  "title": "RustScale pinned Tailscale provenance v1",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "module",
+    "version",
+    "sum",
+    "go_mod_sum",
+    "repository",
+    "revision",
+    "tag",
+    "verification",
+    "source_paths"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "const": 1 },
+    "module": { "const": "tailscale.com" },
+    "version": { "const": "v1.100.0" },
+    "sum": { "type": "string", "pattern": "^h1:" },
+    "go_mod_sum": { "type": "string", "pattern": "^h1:" },
+    "repository": { "const": "https://github.com/tailscale/tailscale" },
+    "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "tag": { "const": "v1.100.0" },
+    "verification": { "type": "string", "minLength": 1 },
+    "source_paths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1,
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": false
+}

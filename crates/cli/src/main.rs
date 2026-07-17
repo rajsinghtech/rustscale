@@ -37,6 +37,21 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Side-effect-free machine-readable command inventory for the checked
+    // compatibility contracts. Keep this hidden from normal help/completion.
+    if args[1] == "__compat-contract" {
+        if args.len() != 2 {
+            eprintln!("rustscale: __compat-contract takes no arguments");
+            std::process::exit(2);
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&completion::contract_json())
+                .expect("static compatibility contract must serialize")
+        );
+        return;
+    }
+
     // Completion is handled before command dispatch. It is static except for
     // `nc`'s first positional, where parity requires one bounded, read-only
     // LocalAPI status lookup for peer DNS names. Failure stays silent so shell
@@ -249,14 +264,16 @@ fn usage(bin: &str) {
     eprintln!("  web [--listen <addr>] [--browser=false] run a web UI for controlling rustscale");
     eprintln!("  debug [status|ipconfig|metrics|capture] call daemon debug endpoints");
     eprintln!("  bugreport                            print diagnostic summary for bug reports");
-    eprintln!("  exit-node [--list] [--suggest]       list or select exit nodes");
+    eprintln!("  exit-node [list|select <node>|clear|suggest]  manage exit-node selection");
     eprintln!("  dns status [--json]                  print MagicDNS status");
     eprintln!("  dns query [--json] <name> [A|AAAA]   query the daemon DNS resolver");
     eprintln!("  nc <hostname-or-IP> <port>           connect stdin/stdout to a tailnet TCP port");
     eprintln!("  id-token <audience>                  fetch an OIDC ID token for this machine");
     eprintln!("  update [--yes|--dry-run] [flags]   update from RustScale GitHub releases");
     eprintln!("  wait [--timeout <duration>]          wait for backend to reach Running state");
-    eprintln!("  lock [status|init|sign|disable]       manage the supported Tailnet Lock flows");
+    eprintln!(
+        "  lock [status|init|sign|disable|local-disable]  manage supported Tailnet Lock flows"
+    );
     eprintln!("  drive [status|list|share|unshare]    manage local Taildrive shares");
     eprintln!("  completion <bash|zsh|fish>           generate shell completion script");
 }

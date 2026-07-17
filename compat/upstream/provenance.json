@@ -1,0 +1,17 @@
+{
+  "$schema": "../schema/provenance-v1.schema.json",
+  "schema_version": 1,
+  "module": "tailscale.com",
+  "version": "v1.100.0",
+  "sum": "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=",
+  "go_mod_sum": "h1:DQ9YBy85DpNlSyeU2XRIWzbAu3RsGp/frv+Khg57meE=",
+  "repository": "https://github.com/tailscale/tailscale",
+  "revision": "c811bb19bf3b0c89061ac7b7a073f6cd23b504d0",
+  "tag": "v1.100.0",
+  "verification": "go mod download -json tailscale.com@v1.100.0",
+  "source_paths": [
+    "cmd/tailscale/cli",
+    "ipn/localapi",
+    "tsnet"
+  ]
+}

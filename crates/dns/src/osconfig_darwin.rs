@@ -311,4 +311,71 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
+
+    /// Control-config-to-platform evidence corresponding to the match-domain
+    /// vectors in tailscale.com@v1.100.0 net/dns/manager_darwin_test.go.
+    #[test]
+    fn control_suffix_routes_reconfigure_resolver_files() {
+        use std::collections::HashMap;
+
+        use rustscale_tailcfg::{DNSConfig, Resolver};
+
+        let dir = TempDir::new().unwrap();
+        let mut configurator = DarwinConfigurator::new(dir.path().to_str().unwrap(), "/dev/null");
+        let dns = DNSConfig {
+            Routes: HashMap::from([
+                (
+                    ".".to_string(),
+                    vec![Resolver {
+                        Addr: "8.8.8.8".into(),
+                    }],
+                ),
+                (
+                    "corp.example.".to_string(),
+                    vec![Resolver {
+                        Addr: "10.0.0.53".into(),
+                    }],
+                ),
+            ]),
+            Proxied: true,
+            ..Default::default()
+        };
+        let os = crate::build_os_dns_config(&dns, "tailnet.ts.net.");
+        configurator.set_dns(&os).unwrap();
+
+        let expected = format!(
+            "{MAC_RESOLVER_FILE_HEADER}nameserver {}\n",
+            rustscale_tsaddr::tailscale_service_ip()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("tailnet.ts.net")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("corp.example")).unwrap(),
+            expected
+        );
+        assert!(
+            !os.match_domains.iter().any(|domain| domain == "."),
+            "the default route is not a platform match suffix"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+
+        let replacement = DNSConfig {
+            Routes: HashMap::from([(
+                "new.example.".to_string(),
+                vec![Resolver {
+                    Addr: "10.0.0.54".into(),
+                }],
+            )]),
+            Proxied: true,
+            ..Default::default()
+        };
+        configurator
+            .set_dns(&crate::build_os_dns_config(&replacement, "tailnet.ts.net."))
+            .unwrap();
+        assert!(!dir.path().join("corp.example").exists());
+        assert!(dir.path().join("new.example").exists());
+        assert!(dir.path().join("tailnet.ts.net").exists());
+    }
 }

@@ -5,7 +5,7 @@
 //! upstream resolvers, supports TCP fallback on UDP truncation, and DoH
 //! (DNS-over-HTTPS) for `https://` resolvers.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,17 +14,20 @@ use tokio_rustls::TlsConnector;
 
 use rustscale_neterror::packet_was_truncated;
 
-use crate::wire::{check_response_size_and_set_tc, truncated_flag_set};
-
-/// A DNS query timeout matching Go's `dnsQueryTimeout` (10s).
-#[allow(dead_code)]
-const DNS_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+use crate::wire::{check_response_size_and_set_tc, set_tc_flag, truncated_flag_set, HEADER_BYTES};
 
 /// TCP query timeout matching Go's `tcpQueryTimeout` (5s).
 const TCP_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// UDP query timeout.
 const UDP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Maximum classic UDP response retained by the pinned Go resolver. One extra
+/// byte is read to detect kernel/socket truncation and set TC deterministically.
+const MAX_RESPONSE_BYTES: usize = 4095;
+
+/// Hard cap for the complete HTTP response around a DoH DNS message.
+const MAX_DOH_HTTP_BYTES: u64 = 128 * 1024;
 
 /// An upstream DNS resolver — either a plain IP (classic UDP/TCP) or a
 /// `https://` URL (DNS-over-HTTPS).
@@ -43,6 +46,9 @@ pub enum ResolverKind {
     Udp(SocketAddr),
     /// DNS-over-HTTPS URL (e.g. `https://dns.google/dns-query`).
     Doh { url: String, host: String },
+    /// Malformed or unsupported resolver address. It is retained for
+    /// diagnostics but never redirected to an unrelated public resolver.
+    Invalid,
 }
 
 impl UpstreamResolver {
@@ -74,10 +80,9 @@ impl UpstreamResolver {
                 kind: ResolverKind::Udp(sa),
             }
         } else {
-            // Fallback: treat as IP:53 if it looks like an IP.
             Self {
                 addr: addr.to_string(),
-                kind: ResolverKind::Udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+                kind: ResolverKind::Invalid,
             }
         }
     }
@@ -86,8 +91,7 @@ impl UpstreamResolver {
 /// A DNS forwarder that routes queries to upstream resolvers based on
 /// split-DNS suffix matching, with TCP fallback and DoH support.
 pub struct Forwarder {
-    /// Default upstream resolvers (used when no route matches or routes
-    /// have empty resolver lists).
+    /// Default upstream resolvers used only when no suffix route matches.
     default_resolvers: Vec<UpstreamResolver>,
     /// Fallback resolvers from system resolv.conf.
     fallback: Vec<SocketAddr>,
@@ -125,35 +129,45 @@ impl Forwarder {
         Self::new(defaults)
     }
 
-    /// Forward a DNS query to the appropriate upstream resolver.
-    /// `name` is the query name (for route matching), `family` is `"udp"` or
-    /// `"tcp"`.
+    /// Forward using the configured default resolvers, followed by the base
+    /// system resolvers. `family` is the transport used by the local client,
+    /// either `"udp"` or `"tcp"`.
     pub async fn forward(&self, query: &[u8], _name: &str, family: &str) -> Option<Vec<u8>> {
-        // Try default resolvers.
-        for resolver in &self.default_resolvers {
+        self.forward_with_resolvers(query, family, None).await
+    }
+
+    /// Forward using a route selected from the responder's live resolver
+    /// snapshot.
+    ///
+    /// `Some(resolvers)` is authoritative: failures (and an explicitly empty
+    /// route) do not leak to less-specific or system resolvers. `None` means
+    /// that no route matched and enables the configured/system fallback.
+    pub async fn forward_with_resolvers(
+        &self,
+        query: &[u8],
+        family: &str,
+        resolvers: Option<&[UpstreamResolver]>,
+    ) -> Option<Vec<u8>> {
+        let selected = resolvers.unwrap_or(&self.default_resolvers);
+        for resolver in selected {
             if let Some(resp) = self.send(query, resolver, family).await {
                 return Some(resp);
             }
         }
 
-        // Fall back to system resolvers (UDP only).
-        if family == "udp" {
-            for server in &self.fallback {
-                let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
-                rustscale_netns::configure_udp_socket(&sock).ok()?;
-                if sock.send_to(query, server).await.is_err() {
-                    continue;
-                }
-                let mut buf = vec![0u8; 4096];
-                let fut = tokio::time::timeout(UDP_TIMEOUT, sock.recv(&mut buf));
-                match fut.await {
-                    Ok(Ok(n)) => return Some(buf[..n].to_vec()),
-                    Ok(Err(e)) if packet_was_truncated(&e) => continue,
-                    _ => continue,
-                }
-            }
+        if resolvers.is_some() {
+            return None;
         }
 
+        for server in &self.fallback {
+            let resolver = UpstreamResolver {
+                addr: server.to_string(),
+                kind: ResolverKind::Udp(*server),
+            };
+            if let Some(resp) = self.send(query, &resolver, family).await {
+                return Some(resp);
+            }
+        }
         None
     }
 
@@ -165,50 +179,82 @@ impl Forwarder {
         resolver: &UpstreamResolver,
         family: &str,
     ) -> Option<Vec<u8>> {
-        match &resolver.kind {
+        let response = match &resolver.kind {
             ResolverKind::Doh { url, host } => self.send_doh(query, url, host).await.ok(),
-            ResolverKind::Udp(addr) => {
-                // Try UDP first.
-                let udp_resp = self.send_udp(query, addr).await;
+            ResolverKind::Udp(addr) => self.send_classic(query, addr, family).await,
+            ResolverKind::Invalid => None,
+        }?;
+        finish_response(query, response, family)
+    }
 
-                if let Some(ref resp) = udp_resp {
-                    // If the response is not truncated, return it.
-                    if !truncated_flag_set(resp) {
-                        let mut resp = resp.clone();
-                        if family == "udp" {
-                            check_response_size_and_set_tc(&mut resp, query, "udp");
-                        }
-                        return Some(resp);
-                    }
-                    // Truncated UDP response:
-                    // - If the original query was UDP, return the truncated
-                    //   response (client can retry over TCP).
-                    if family == "udp" {
-                        return Some(resp.clone());
-                    }
-                    if rustscale_envknob::bool("TS_DNS_FORWARD_SKIP_TCP_RETRY").unwrap_or(false) {
-                        return Some(resp.clone());
-                    }
-                    // - If the original query was TCP, fall back to TCP.
-                }
+    async fn send_classic(
+        &self,
+        query: &[u8],
+        server: &SocketAddr,
+        family: &str,
+    ) -> Option<Vec<u8>> {
+        let skip_tcp = rustscale_envknob::bool("TS_DNS_FORWARD_SKIP_TCP_RETRY").unwrap_or(false);
 
-                // TCP fallback.
-                self.send_tcp(query, addr).await
+        // A TCP client can consume a full response, so match the upstream
+        // resolver's immediate UDP/TCP race. A non-truncated UDP response may
+        // still win; a truncated one waits for TCP and is retained only as a
+        // last resort.
+        if family == "tcp" && !skip_tcp {
+            let udp = self.send_udp(query, server);
+            let tcp = self.send_tcp(query, server);
+            tokio::pin!(udp);
+            tokio::pin!(tcp);
+            return tokio::select! {
+                udp_response = &mut udp => match udp_response {
+                    Some(response) if !truncated_flag_set(&response) => Some(response),
+                    Some(truncated) => tcp.await.or(Some(truncated)),
+                    None => tcp.await,
+                },
+                tcp_response = &mut tcp => match tcp_response {
+                    Some(response) => Some(response),
+                    None => udp.await,
+                },
+            };
+        }
+
+        let udp_response = self.send_udp(query, server).await;
+        if let Some(response) = udp_response {
+            // UDP clients must receive TC and retry through the local TCP
+            // listener rather than hiding an upstream truncation.
+            if family == "udp" || !truncated_flag_set(&response) || skip_tcp {
+                return Some(response);
             }
         }
+        if skip_tcp {
+            return None;
+        }
+        self.send_tcp(query, server).await
     }
 
     /// Send a DNS query over UDP. Returns `None` on failure.
     async fn send_udp(&self, query: &[u8], server: &SocketAddr) -> Option<Vec<u8>> {
-        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+        let bind = if server.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let sock = tokio::net::UdpSocket::bind(bind).await.ok()?;
         rustscale_netns::configure_udp_socket(&sock).ok()?;
-        sock.send_to(query, server).await.ok()?;
+        sock.connect(server).await.ok()?;
+        sock.send(query).await.ok()?;
 
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; MAX_RESPONSE_BYTES + 1];
         let fut = tokio::time::timeout(UDP_TIMEOUT, sock.recv(&mut buf));
         match fut.await {
-            Ok(Ok(n)) => Some(buf[..n].to_vec()),
-            Ok(Err(e)) if packet_was_truncated(&e) => None,
+            Ok(Ok(n)) => {
+                let truncated = n > MAX_RESPONSE_BYTES;
+                let mut response = buf[..n.min(MAX_RESPONSE_BYTES)].to_vec();
+                if truncated {
+                    set_tc_flag(&mut response);
+                }
+                Some(response)
+            }
+            Ok(Err(error)) if packet_was_truncated(&error) => None,
             _ => None,
         }
     }
@@ -216,37 +262,30 @@ impl Forwarder {
     /// Send a DNS query over TCP (with 2-byte length prefix).
     /// Ports Go's `sendTCP` (forwarder.go:928).
     async fn send_tcp(&self, query: &[u8], server: &SocketAddr) -> Option<Vec<u8>> {
-        let stream = tokio::time::timeout(
-            TCP_QUERY_TIMEOUT,
-            rustscale_tsdial::system_dial("tcp", &server.to_string()),
-        )
+        let query_len = u16::try_from(query.len()).ok()?;
+        tokio::time::timeout(TCP_QUERY_TIMEOUT, async {
+            let mut stream = rustscale_tsdial::system_dial("tcp", &server.to_string())
+                .await
+                .ok()?;
+            let _ = stream.set_nodelay(true);
+
+            // DNS over TCP: one 2-byte length prefix and one complete query.
+            stream.write_all(&query_len.to_be_bytes()).await.ok()?;
+            stream.write_all(query).await.ok()?;
+
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await.ok()?;
+            let response_len = usize::from(u16::from_be_bytes(len_buf));
+            if response_len < HEADER_BYTES {
+                return None;
+            }
+
+            let mut response = vec![0u8; response_len];
+            stream.read_exact(&mut response).await.ok()?;
+            Some(response)
+        })
         .await
         .ok()?
-        .ok()?;
-        let _ = stream.set_nodelay(true);
-        let (mut read_half, mut write_half) = stream.into_split();
-
-        // DNS over TCP: 2-byte length prefix + query.
-        let len = query.len() as u16;
-        write_half.write_all(&len.to_be_bytes()).await.ok()?;
-        write_half.write_all(query).await.ok()?;
-
-        // Read the 2-byte length prefix.
-        let mut len_buf = [0u8; 2];
-        tokio::time::timeout(TCP_QUERY_TIMEOUT, read_half.read_exact(&mut len_buf))
-            .await
-            .ok()?
-            .ok()?;
-        let resp_len = u16::from_be_bytes(len_buf) as usize;
-
-        // Read the response.
-        let mut resp = vec![0u8; resp_len];
-        tokio::time::timeout(TCP_QUERY_TIMEOUT, read_half.read_exact(&mut resp))
-            .await
-            .ok()?
-            .ok()?;
-
-        Some(resp)
     }
 
     /// Send a DNS query over HTTPS (DoH).
@@ -305,9 +344,17 @@ impl Forwarder {
         tls.write_all(request.as_bytes()).await?;
         tls.write_all(query).await?;
 
-        // Read the full response.
+        // Read a bounded HTTP response. A DNS/TCP message is at most 65535
+        // bytes; the additional allowance covers ordinary HTTP headers.
         let mut buf = Vec::with_capacity(4096);
-        tls.read_to_end(&mut buf).await?;
+        let mut limited = tls.take(MAX_DOH_HTTP_BYTES + 1);
+        limited.read_to_end(&mut buf).await?;
+        if buf.len() as u64 > MAX_DOH_HTTP_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "DoH response exceeds limit",
+            ));
+        }
 
         // Find the body (after \r\n\r\n).
         let body_start = buf
@@ -323,6 +370,14 @@ impl Forwarder {
 }
 
 /// Ensure the rustls ring crypto provider is installed process-wide.
+fn finish_response(query: &[u8], mut response: Vec<u8>, family: &str) -> Option<Vec<u8>> {
+    if query.len() < 2 || response.len() < HEADER_BYTES || response.get(..2) != query.get(..2) {
+        return None;
+    }
+    check_response_size_and_set_tc(&mut response, query, family);
+    Some(response)
+}
+
 fn ensure_ring_provider() {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -367,6 +422,13 @@ mod tests {
             }
             _ => panic!("expected Udp kind"),
         }
+    }
+
+    #[test]
+    fn malformed_resolver_does_not_redirect_to_public_dns() {
+        let resolver = UpstreamResolver::from_addr("not a resolver");
+        assert!(matches!(resolver.kind, ResolverKind::Invalid));
+        assert_eq!(resolver.addr, "not a resolver");
     }
 
     #[test]

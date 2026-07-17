@@ -10,10 +10,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-feature = { path = "../feature", version = "0.1.3" }
-rustscale-health = { path = "../health", version = "0.1.3" }
-rustscale-netcheck = { path = "../netcheck", version = "0.1.3" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.3" }
+rustscale-feature = { path = "../feature", version = "0.1.4" }
+rustscale-health = { path = "../health", version = "0.1.4" }
+rustscale-netcheck = { path = "../netcheck", version = "0.1.4" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.4" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

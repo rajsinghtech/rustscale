@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rustscale.dev/compat/manifest-v1.schema.json",
+  "title": "RustScale compatibility manifest v1",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "contract_version",
+    "generator_version",
+    "kind",
+    "upstream",
+    "denominator",
+    "guards",
+    "inventory",
+    "comparisons"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "const": 1 },
+    "contract_version": { "const": 1 },
+    "generator_version": { "type": "integer", "minimum": 1 },
+    "kind": { "type": "string", "minLength": 1 },
+    "upstream": { "$ref": "#/$defs/upstream" },
+    "denominator": { "$ref": "#/$defs/guard" },
+    "guards": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/guard" }
+    },
+    "inventory": { "type": "object" },
+    "comparisons": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/comparison" }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "upstream": {
+      "type": "object",
+      "required": ["module", "version", "sum", "go_mod_sum", "repository", "revision"],
+      "properties": {
+        "module": { "const": "tailscale.com" },
+        "version": { "type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "sum": { "type": "string", "pattern": "^h1:" },
+        "go_mod_sum": { "type": "string", "pattern": "^h1:" },
+        "repository": { "type": "string" },
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      },
+      "additionalProperties": false
+    },
+    "guard": {
+      "type": "object",
+      "required": ["count", "sha256", "ids"],
+      "properties": {
+        "source": { "type": "string" },
+        "count": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "comparison": {
+      "type": "object",
+      "required": [
+        "id",
+        "denominator_id",
+        "classification",
+        "upstream_ids",
+        "local_ids",
+        "note"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "denominator_id": { "type": ["string", "null"] },
+        "classification": {
+          "enum": ["exact", "semantic", "shimmed", "unsupported"]
+        },
+        "upstream_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "local_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "note": { "type": "string", "minLength": 1 },
+        "target": {}
+      },
+      "additionalProperties": true
+    }
+  }
+}

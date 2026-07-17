@@ -664,14 +664,13 @@ fn set_tun_iff(fd: RawFd, requested: &str, vnet_hdr: bool) -> Result<String, Tun
 
     // Read back the (possibly kernel-assigned) name.
     let name_end = ifr.name.iter().position(|&c| c == 0).unwrap_or(IFNAMSIZ);
-    let name = std::str::from_utf8(
-        &ifr.name[..name_end]
-            .iter()
-            .map(|&c| c as u8)
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|e| TunError::Create(format!("ifname utf8: {e}")))?
-    .to_owned();
+    let name_bytes = ifr.name[..name_end]
+        .iter()
+        .map(|&c| c.to_ne_bytes()[0])
+        .collect::<Vec<_>>();
+    let name = std::str::from_utf8(&name_bytes)
+        .map_err(|e| TunError::Create(format!("ifname utf8: {e}")))?
+        .to_owned();
 
     // Nonblocking + close-on-exec (already CLOEXEC from open, but be explicit).
     // SAFETY: fcntl on a valid fd.

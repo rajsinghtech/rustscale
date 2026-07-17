@@ -28,6 +28,7 @@ mod stream;
 pub use error::LocalClientError;
 pub use stream::{DebugCapture, WatchIpnBus};
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use rustscale_ipn::{LoginProfile, MaskedPrefs, NotifyWatchOpt, Prefs, StartOptions, WaitingFile};
@@ -178,16 +179,11 @@ impl LocalClient {
     /// a typed [`PingResult`] with latency, endpoint, and path info.
     pub async fn ping(
         &self,
-        ip: &str,
+        ip: IpAddr,
         ping_type: &str,
         size: usize,
     ) -> Result<PingResult, LocalClientError> {
-        let path = format!(
-            "/localapi/v0/ping?ip={}&type={}&size={}",
-            url_encode(ip),
-            url_encode(ping_type),
-            size,
-        );
+        let path = ping_path(ip, ping_type, size);
         let (_status, body) = self.send_request("POST", &path, &[]).await?;
         let result: PingResult =
             serde_json::from_slice(&body).map_err(|e| LocalClientError::Json(e.to_string()))?;
@@ -708,6 +704,15 @@ impl LocalClient {
     }
 }
 
+fn ping_path(ip: IpAddr, ping_type: &str, size: usize) -> String {
+    format!(
+        "/localapi/v0/ping?ip={}&type={}&size={}",
+        url_encode(&ip.to_string()),
+        url_encode(ping_type),
+        size,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Response parsing
 // ---------------------------------------------------------------------------
@@ -914,6 +919,53 @@ mod tests {
         assert_eq!(url_encode("100.64.0.1"), "100.64.0.1");
         assert_eq!(url_encode("100.64.0.1:443"), "100.64.0.1%3A443");
         assert_eq!(url_encode("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn ping_path_uses_typed_ip_addresses() {
+        assert_eq!(
+            ping_path("100.64.0.1".parse().unwrap(), "disco", 32),
+            "/localapi/v0/ping?ip=100.64.0.1&type=disco&size=32"
+        );
+        assert_eq!(
+            ping_path("fd7a:115c:a1e0::1".parse().unwrap(), "icmp", 0),
+            "/localapi/v0/ping?ip=fd7a%3A115c%3Aa1e0%3A%3A1&type=icmp&size=0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ping_sends_the_typed_ip_in_the_localapi_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("localapi.sock");
+        let listener = rustscale_safesocket::listen(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with(
+                "POST /localapi/v0/ping?ip=100.100.100.100&type=disco&size=8 HTTP/1.1\r\n"
+            ));
+            let body = br#"{"NodeIP":"100.100.100.100"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let result = LocalClient::new(&path)
+            .ping("100.100.100.100".parse().unwrap(), "disco", 8)
+            .await
+            .unwrap();
+        assert_eq!(result.NodeIP, "100.100.100.100");
+        server.await.unwrap();
     }
 
     #[test]

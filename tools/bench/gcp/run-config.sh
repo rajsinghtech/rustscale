@@ -815,6 +815,9 @@ rs_tun_cleanup_command() {
 'if wait_for_clear; then exit 0; fi' \
 'diagnose' \
 'signal_daemons KILL' \
+'# A crashed daemon can leave a persistent TUN link. Once every daemon has' \
+'# been signaled, explicitly remove that benchmark-owned interface.' \
+'ip link delete dev tailscale0 2>/dev/null || true' \
 'if wait_for_clear; then exit 0; fi' \
 'diagnose' \
 'echo "[gcp] ERROR: rs-tun cleanup left rustscaled or tailscale0 behind" >&2' \

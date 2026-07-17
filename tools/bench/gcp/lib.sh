@@ -271,7 +271,8 @@ create_vm() {
     --boot-disk-type=pd-standard \
     --network="$GCP_NETWORK" \
     --subnet=default \
-    --no-boot-disk-auto-delete \
+    --boot-disk-auto-delete \
+    --labels=rustscale-benchmark=true \
     --metadata-from-file startup-script=/dev/stdin
 }
 
@@ -409,6 +410,7 @@ gcloud_project_self_test() {
   grep -q -- 'instances create project-test --project=fixture-project' "$log" || return 1
   grep -q -- 'instances describe project-test --project=fixture-project' "$log" || return 1
   grep -q -- 'instances delete project-test --project=fixture-project' "$log" || return 1
+  grep -q -- 'disks delete project-test --project=fixture-project' "$log" || return 1
   grep -q -- 'compute ssh project-test --project=fixture-project --zone=us-central1-a --dry-run' "$log" || return 1
   grep -q -- 'compute disks describe disk --project=fixture-project' "$log" || return 1
   rm -f "$log"; GCP_PROJECT="$old_project"
@@ -487,9 +489,15 @@ deliver_source() {
 # Delete a single VM + its boot disk. Args: NAME ZONE
 # ---------------------------------------------------------------------------
 delete_vm() {
-  local name="$1" zone="$2"
+  local name="$1" zone="$2" status=0
   echo "[gcp] deleting VM $name ($zone)" >&2
-  _gc gcloud compute instances delete "$name" --project="$GCP_PROJECT" --zone="$zone" --delete-disks=all -q
+  _gc gcloud compute instances delete "$name" --project="$GCP_PROJECT" --zone="$zone" --delete-disks=all -q || status=$?
+  # Older harness versions disabled boot-disk auto-delete. Remove a same-name
+  # unattached disk even when the instance has already disappeared.
+  if _gc gcloud compute disks describe "$name" --project="$GCP_PROJECT" --zone="$zone" >/dev/null 2>&1; then
+    _gc gcloud compute disks delete "$name" --project="$GCP_PROJECT" --zone="$zone" -q || status=$?
+  fi
+  return "$status"
 }
 
 # ---------------------------------------------------------------------------

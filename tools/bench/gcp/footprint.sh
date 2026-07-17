@@ -71,12 +71,13 @@ try:
                 # RSSET monotonic_ms rss_kb cpu_pct comma-separated-pid:comm
                 parts = line.split(maxsplit=4)
                 try:
-                    observed = parts[2] != "null" and parts[3] != "null"
+                    rss_observed = parts[2] != "null"
+                    cpu_observed = parts[3] != "null"
                     set_series.append({"offset_ms": int(parts[1]),
-                                       "rss_kb": int(parts[2]) if observed else None,
-                                       "cpu_pct": float(parts[3]) if observed else None,
+                                       "rss_kb": int(parts[2]) if rss_observed else None,
+                                       "cpu_pct": float(parts[3]) if cpu_observed else None,
                                        "included_processes": parts[4].split(",") if len(parts) == 5 and parts[4] else [],
-                                       "status": "observed" if observed else "missed"})
+                                       "status": "observed" if rss_observed and cpu_observed else ("partial" if rss_observed or cpu_observed else "missed")})
                 except (ValueError, IndexError):
                     pass
                 continue
@@ -203,8 +204,11 @@ while True:
             included.append(f'{pid}:{comm}')
         except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError): pass
     shared=set(current)&set(previous); elapsed=now-previous_at
-    cpu=(sum(current[p]-previous[p] for p in shared)/os.sysconf('SC_CLK_TCK')/elapsed*100) if shared and elapsed>0 else None
+    cpu=(sum(max(0, current[p]-previous[p]) for p in shared)/os.sysconf('SC_CLK_TCK')/elapsed*100) if shared and elapsed>0 else None
     observed=bool(current)
+    # RSS is valid whenever a matching process exists. CPU needs two snapshots
+    # of a PID, so preserve the boundary RSS sample and mark it partial instead
+    # of discarding both values.
     print('RSSET', round(now*1000), rss if observed else 'null', f'{cpu:.2f}' if cpu is not None else 'null', ','.join(sorted(included)), flush=True)
     previous=current; previous_at=now; time.sleep(1)
 '''

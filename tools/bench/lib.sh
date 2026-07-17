@@ -44,15 +44,18 @@ _bench_cleanup_leftover() {
         lt=$(curl -fsS -X POST "$BENCH_API/api/v2/oauth/token" \
           -d client_id="$l_cid" -d client_secret="$l_csec" 2>/dev/null \
           | jq -r .access_token 2>/dev/null || echo "")
-        if [[ -n "$lt" && "$lt" != "null" ]]; then
-          curl -sS --retry 3 --retry-delay 3 \
+        if [[ -n "$lt" && "$lt" != "null" ]] &&
+          curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
             -o /dev/null -X DELETE \
             "$BENCH_API/api/v2/tailnet/$l_dns" -H "Authorization: Bearer $lt" \
-            >&2 2>/dev/null || true
+            >&2 2>/dev/null; then
+          rm -f "$BENCH_LAST_FILE"
+          return 0
         fi
       fi
     fi
-    rm -f "$BENCH_LAST_FILE"
+    echo "[bench] leftover tailnet cleanup failed; preserving $BENCH_LAST_FILE" >&2
+    return 1
   fi
 }
 
@@ -143,12 +146,16 @@ bench_cleanup_tailnet() {
     t=$(curl -fsS -X POST "$BENCH_API/api/v2/oauth/token" \
       -d client_id="$BENCH_CHILD_CID" -d client_secret="$BENCH_CHILD_CSEC" 2>/dev/null \
       | jq -r .access_token 2>/dev/null || echo "")
-    if [[ -n "$t" && "$t" != "null" ]]; then
-      curl -sS --retry 3 --retry-delay 3 \
+    if [[ -n "$t" && "$t" != "null" ]] &&
+      curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
         -o /dev/null -X DELETE \
-        "$BENCH_API/api/v2/tailnet/$BENCH_DNS" -H "Authorization: Bearer $t" >&2 || true
+        "$BENCH_API/api/v2/tailnet/$BENCH_DNS" -H "Authorization: Bearer $t" >&2; then
+      rm -f "$BENCH_LAST_FILE"
+      BENCH_DNS=""
+      return 0
     fi
-    rm -f "$BENCH_LAST_FILE"
+    echo "[bench] tailnet cleanup failed; preserving $BENCH_LAST_FILE" >&2
+    return 1
   fi
 }
 

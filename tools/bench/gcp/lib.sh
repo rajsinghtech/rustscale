@@ -288,10 +288,10 @@ create_vms() {
 }
 
 # ---------------------------------------------------------------------------
-# Wait for /tmp/startup-done on a VM. Args: NAME ZONE [timeout_secs=600]
+# Wait for /tmp/startup-done on a VM. Args: NAME ZONE [timeout_secs=900]
 # ---------------------------------------------------------------------------
 wait_for_startup() {
-  local name="$1" zone="$2" timeout="${3:-600}"
+  local name="$1" zone="$2" timeout="${3:-900}"
   if [[ -n "$GCP_DRY_RUN" ]]; then
     echo "[dry-run] wait_for_startup $name $zone" >&2
     return 0
@@ -308,6 +308,8 @@ wait_for_startup() {
     elapsed=$((elapsed + 10))
   done
   echo "[gcp] ERROR: timed out waiting for startup on $name" >&2
+  gcloud compute instances get-serial-port-output "$name" --project="$GCP_PROJECT" --zone="$zone" --port=1 2>/dev/null \
+    | tail -n 80 >&2 || true
   return 1
 }
 

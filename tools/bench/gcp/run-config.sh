@@ -763,37 +763,36 @@ cleanup_rs_tun() {
   local status=0
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rsb1-server.footprint >/dev/null || true
   remote_stop_footprint "$CVM" "$CZONE" /tmp/rsb1-client.footprint >/dev/null || true
-  remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-parity-server.footprint >/dev/null || true
-  remote_stop_footprint "$CVM" "$CZONE" /tmp/rs-parity-client.footprint >/dev/null || true
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-tun-srv.footprint >/dev/null || true
-  # This runs as root because rs-tun may have left root-owned benchmark files.
-  # It is deliberately idempotent: an already-absent optional iperf3 server
-  # must not make ssh_sudo retry before the next non-root config starts.
-  if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command server)"; then
-    echo "[gcp] WARN: rs-tun iperf3 cleanup failed on server $SVM; forcing VM reset" >&2
-    status=1; reset_vm "$SVM" "$SZONE" || true
-  fi
-  if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_iperf_cleanup_command client)"; then
-    echo "[gcp] WARN: rs-tun iperf3 cleanup failed on client $CVM; forcing VM reset" >&2
-    status=1; reset_vm "$CVM" "$CZONE" || true
-  fi
 
-  # Run both endpoints even if one remains dirty. Remote statuses are returned
-  # immediately, so each cleanup action is deliberately idempotent.
-  if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_cleanup_command srv)"; then
-    echo "[gcp] WARN: in-guest rs-tun cleanup failed on server $SVM; forcing VM reset" >&2
-    status=1; reset_vm "$SVM" "$SZONE" || true
-  fi
-  if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_cleanup_command cli)"; then
-    echo "[gcp] WARN: in-guest rs-tun cleanup failed on client $CVM; forcing VM reset" >&2
-    status=1; reset_vm "$CVM" "$CZONE" || true
-  fi
+  # Stop workload listeners before tearing down their transport. Leaving an
+  # RSB1 listener and sockets attached to tailscale0 can strand the SSH cleanup
+  # session behind routes owned by the daemon being terminated.
   if ! ssh_sudo "$SVM" "$SZONE" "$(rsb1_workload_cleanup_command)"; then
     echo "[gcp] WARN: rs-tun RSB1 workload cleanup failed on server $SVM; forcing VM reset" >&2
     status=1; reset_vm "$SVM" "$SZONE" || true
   fi
   if ! ssh_sudo "$CVM" "$CZONE" "$(rsb1_workload_cleanup_command)"; then
     echo "[gcp] WARN: rs-tun RSB1 workload cleanup failed on client $CVM; forcing VM reset" >&2
+    status=1; reset_vm "$CVM" "$CZONE" || true
+  fi
+
+  if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command server)"; then
+    echo "[gcp] WARN: rs-tun diagnostic cleanup failed on server $SVM; forcing VM reset" >&2
+    status=1; reset_vm "$SVM" "$SZONE" || true
+  fi
+  if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_iperf_cleanup_command client)"; then
+    echo "[gcp] WARN: rs-tun diagnostic cleanup failed on client $CVM; forcing VM reset" >&2
+    status=1; reset_vm "$CVM" "$CZONE" || true
+  fi
+
+  # Run both transport endpoints even if one remains dirty.
+  if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_cleanup_command srv)"; then
+    echo "[gcp] WARN: in-guest rs-tun cleanup failed on server $SVM; forcing VM reset" >&2
+    status=1; reset_vm "$SVM" "$SZONE" || true
+  fi
+  if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_cleanup_command cli)"; then
+    echo "[gcp] WARN: in-guest rs-tun cleanup failed on client $CVM; forcing VM reset" >&2
     status=1; reset_vm "$CVM" "$CZONE" || true
   fi
   (( status == 0 )) && CELL_CLEANED=1

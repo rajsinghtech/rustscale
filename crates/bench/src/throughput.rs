@@ -336,11 +336,11 @@ async fn run_down<S: AsyncRead + Unpin>(
 ) -> Result<(), String> {
     let mut buf = vec![0; READ_BUF_SIZE];
     let started = tokio::time::Instant::now();
-    let deadline = started + duration + Duration::from_secs(30);
+    let deadline = started + duration;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err("read completion timeout".into());
+            return Ok(());
         }
         match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
             Ok(Ok(0)) => {
@@ -353,7 +353,10 @@ async fn run_down<S: AsyncRead + Unpin>(
                 counter.fetch_add(n as u64, Ordering::Relaxed);
             }
             Ok(Err(error)) => return Err(format!("read error: {error}")),
-            Err(_) => return Err("read completion timeout".into()),
+            // The reverse sender may have bytes queued behind the exact
+            // measurement boundary. Stop at the requested wall-clock duration
+            // rather than waiting for EOF and counting post-window backlog.
+            Err(_) => return Ok(()),
         }
     }
 }

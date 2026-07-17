@@ -59,9 +59,9 @@ jobs:
           tools/packaging/test-install.sh
           python3 tools/packaging/check-pages-performance.py
           mkdir -p _site/assets
+          cp -R site/. _site/
           cp scripts/install.sh   _site/install.sh
           cp scripts/install.ps1  _site/install.ps1
-          cp site/index.html      _site/index.html
           cp assets/rustscale-logo.svg _site/assets/
 
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3

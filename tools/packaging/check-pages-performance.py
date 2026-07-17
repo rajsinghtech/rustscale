@@ -13,6 +13,9 @@ DATA = ROOT / "docs/performance/benchmarks-2026-07-15.json"
 PAGE = ROOT / "site/index.html"
 PERFORMANCE = ROOT / "PERFORMANCE.md"
 USERSPACE = ROOT / "docs/benchmarks.md"
+PARITY_RUN_ID = "gcp-20260717-100908-a708151c79"
+PARITY_DIR = ROOT / "docs/performance" / PARITY_RUN_ID
+PARITY_PAGE = ROOT / "site/performance/rsb1-parity.html"
 
 HOST_RUN_IDS = {
     "rustscale": "gcp-20260715-085022-076e87bd41",
@@ -30,6 +33,14 @@ PANEL_CONTRACTS = {
         "data-rustscale-profile": "opt-in-outbound-pipeline",
         "data-tailscaled-profile": "default",
         "data-provenance": "docs/performance/benchmarks-2026-07-15.json",
+    },
+    "rsb1-parity": {
+        "data-environment": "gcp-same-zone",
+        "data-mode": "userspace-vs-kernel-tun",
+        "data-evidence-status": "measured",
+        "data-comparison": "matched-rsb1",
+        "data-run": PARITY_RUN_ID,
+        "data-provenance": f"docs/performance/{PARITY_RUN_ID}",
     },
     "container-tun": {
         "data-environment": "container",
@@ -563,6 +574,38 @@ def validate_evidence_docs(selected: dict[str, dict], performance: str) -> None:
             raise SystemExit(f"PERFORMANCE.md is missing graph source value {value}")
 
 
+def validate_parity_evidence(parser: PerformanceParser) -> None:
+    manifest = json.loads((PARITY_DIR / "matrix.json").read_text(encoding="utf-8"))
+    if (manifest.get("run", {}).get("id") != PARITY_RUN_ID or manifest.get("repeat") != 3
+            or manifest.get("duration_s") != 10 or manifest.get("parallelism") != [1, 10, 100, 500, 1000]
+            or manifest.get("peer_count_requested") != 1):
+        raise SystemExit("tracked RSB1 parity manifest drifted")
+    parity = panel(parser, "rsb1-parity")
+    for config in ("rs-userspace", "rs-tun"):
+        result = json.loads((PARITY_DIR / f"{config}.json").read_text(encoding="utf-8"))
+        if result.get("status") != "ok" or result.get("path_class_reported") != "direct":
+            raise SystemExit(f"tracked {config} parity result is not successful direct evidence")
+        points = {row.get("parallel"): row for row in result.get("throughput", [])}
+        for streams in manifest["parallelism"]:
+            row = points.get(streams, {})
+            if len(row.get("samples_mbps", [])) != 3 or not all(value > 0 for value in row["samples_mbps"]):
+                raise SystemExit(f"tracked {config} P{streams} samples are incomplete")
+            if f"{row['mbps']:.1f} Mbps" not in str(parity["text"]):
+                raise SystemExit(f"Pages is missing tracked {config} P{streams}")
+        for endpoint in ("server", "client"):
+            series = result.get("resources", {}).get(endpoint, {}).get("series", [])
+            if not series or not any(sample.get("cpu_pct") is not None and sample.get("rss_kb") is not None for sample in series):
+                raise SystemExit(f"tracked {config} {endpoint} resource series is empty")
+        latency = result.get("latency", {})
+        if latency.get("count") != 50 or len(latency.get("samples_ns", [])) != 50:
+            raise SystemExit(f"tracked {config} latency distribution is incomplete")
+    links = parity["links"]
+    assert isinstance(links, set)
+    if "performance/rsb1-parity.html" not in links or not PARITY_PAGE.is_file():
+        raise SystemExit("Pages RSB1 parity view is not linked")
+    require_text(parity, "Measured · matched RSB1", "requested peer load: 1", "observed peer membership was not instrumented")
+
+
 def main() -> None:
     data = json.loads(DATA.read_text(encoding="utf-8"))
     page_source = PAGE.read_text(encoding="utf-8")
@@ -590,6 +633,7 @@ def main() -> None:
 
     validate_panel_contracts(parser)
     validate_matched_runs(selected)
+    validate_parity_evidence(parser)
 
     host = panel(parser, "host-tun")
     validate_host_bars(host, selected)

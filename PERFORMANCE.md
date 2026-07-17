@@ -222,3 +222,17 @@ Update the **current matched comparison** only when all of the following hold:
 Keep older A/B evidence when it explains a current default or opt-in control.
 Do not replace a matched comparison with a faster unmatched result, and do not
 claim compatibility or performance from a benchmark that cannot be reproduced.
+
+## Fresh RSB1 userspace/TUN parity (2026-07-17)
+
+Run `gcp-20260717-100908-a708151c79` measured RustScale's identical RSB1
+reverse-throughput workload over userspace tsnet and production kernel TUN on
+same-zone GCP `n2-standard-16` endpoints. Both cells observed a direct path and
+record three complete 10-second samples at 1, 10, 100, 500, and 1000 streams,
+plus 50 RTT samples and 1-second server/client process CPU and RSS timelines.
+
+The manifest, complete result JSON, and SHA-256 list are tracked in
+[`docs/performance/gcp-20260717-100908-a708151c79`](docs/performance/gcp-20260717-100908-a708151c79/).
+The requested peer-load label is 1; observed membership was not instrumented,
+so this evidence does not claim peer-load scaling. The linked Pages dashboard
+renders the retained raw series without publishing failed cells.

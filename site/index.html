@@ -137,6 +137,26 @@
         <p class="provenance">Provenance IDs: RustScale <code>gcp-20260715-085022-076e87bd41</code> · tailscaled <code>gcp-20260715-090601-02788a10b4</code> · source snapshot <a href="https://github.com/rajsinghtech/rustscale/blob/master/docs/performance/benchmarks-2026-07-15.json"><code>benchmarks-2026-07-15.json</code></a> · <a href="https://github.com/rajsinghtech/rustscale/blob/master/PERFORMANCE.md">methodology, raw samples, and caveats</a>.</p>
       </article>
 
+      <article class="performance-panel" data-benchmark="rsb1-parity" data-environment="gcp-same-zone" data-mode="userspace-vs-kernel-tun" data-evidence-status="measured" data-comparison="matched-rsb1" data-run="gcp-20260717-100908-a708151c79" data-provenance="docs/performance/gcp-20260717-100908-a708151c79">
+        <div class="panel-heading">
+          <h3>RustScale RSB1 · userspace vs kernel TUN</h3>
+          <span class="status status-measured">Measured · matched RSB1</span>
+        </div>
+        <p class="scope">Direct UDP on matched GCP <code>n2-standard-16</code> endpoints. Each point is the median of three complete 10-second RSB1 reverse-throughput samples. Both transports include 50-sample RSB1 latency distributions and complete 1-second server/client CPU and RSS timelines.</p>
+        <div class="chart-grid">
+          <div class="chart" role="img" aria-label="RustScale userspace RSB1 median throughput: P1 1231.1, P10 927.0, P100 779.5, P500 216.3, P1000 439.8 megabits per second.">
+            <h3>Userspace throughput</h3>
+            <p>P1 <strong>1231.1 Mbps</strong> · P10 <strong>927.0 Mbps</strong> · P100 <strong>779.5 Mbps</strong> · P500 <strong>216.3 Mbps</strong> · P1000 <strong>439.8 Mbps</strong></p>
+          </div>
+          <div class="chart" role="img" aria-label="RustScale kernel TUN RSB1 median throughput: P1 3169.4, P10 3130.7, P100 2395.1, P500 1316.8, P1000 993.5 megabits per second.">
+            <h3>Kernel-TUN throughput</h3>
+            <p>P1 <strong>3169.4 Mbps</strong> · P10 <strong>3130.7 Mbps</strong> · P100 <strong>2395.1 Mbps</strong> · P500 <strong>1316.8 Mbps</strong> · P1000 <strong>993.5 Mbps</strong></p>
+          </div>
+        </div>
+        <p class="performance-note">Configured/requested peer load: 1. The harness did not generate background peers, and observed peer membership was not instrumented, so this run makes no peer-load scaling claim. Userspace used bounded retries disclosed in the tracked workload metadata; only complete positive trials were retained.</p>
+        <p class="provenance">Run <code>gcp-20260717-100908-a708151c79</code> · <a href="performance/rsb1-parity.html">interactive performance view</a> · <a href="https://github.com/rajsinghtech/rustscale/tree/master/docs/performance/gcp-20260717-100908-a708151c79">raw tracked evidence, timelines, hashes, and manifest</a>.</p>
+      </article>
+
       <article class="performance-panel" data-benchmark="container-tun" data-environment="container" data-mode="kernel-tun" data-evidence-status="not-measured" data-comparison="none" data-provenance="none">
         <div class="panel-heading">
           <h3>Container · kernel TUN</h3>

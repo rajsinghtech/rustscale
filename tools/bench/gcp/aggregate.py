@@ -256,13 +256,13 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         expected_subjects = {
             "rs-userspace": {"server": ["rustscale-bench"], "client": ["rustscale-bench"]},
             "rs-tun": {"server": ["rustscaled", "rustscale-bench"], "client": ["rustscaled", "rustscale-bench"]},
-            "ts-userspace": {"server": ["tailscaled", "rustscale-bench"], "client": ["tailscaled", "socat", "rustscale-bench"]},
+            "ts-userspace": {"server": ["tailscaled", "rustscale-bench"], "client": ["tailscaled", "ncat", "rustscale-bench"]},
             "ts-tun": {"server": ["tailscaled", "rustscale-bench"], "client": ["tailscaled", "rustscale-bench"]},
         }[config]
         expected_transport_path = {
             "rs-userspace": "embedded-tsnet",
             "rs-tun": "kernel-tcp-via-rustscaled-tun",
-            "ts-userspace": "kernel-tcp-via-loopback-socat-socks5-tailscaled-serve",
+            "ts-userspace": "kernel-tcp-via-loopback-ncat-socks5-tailscaled-serve",
             "ts-tun": "kernel-tcp-via-tailscaled-tun",
         }[config]
         if obj.get("transport") != expected_transport:

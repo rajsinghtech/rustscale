@@ -110,11 +110,11 @@ def matched_result(root, config, manifest):
     subject_map = {
         "rs-userspace": (["rustscale-bench"], ["rustscale-bench"]),
         "rs-tun": (["rustscaled", "rustscale-bench"], ["rustscaled", "rustscale-bench"]),
-        "ts-userspace": (["tailscaled", "rustscale-bench"], ["tailscaled", "socat", "rustscale-bench"]),
+        "ts-userspace": (["tailscaled", "rustscale-bench"], ["tailscaled", "ncat", "rustscale-bench"]),
         "ts-tun": (["tailscaled", "rustscale-bench"], ["tailscaled", "rustscale-bench"]),
     }
     transport_path = {"rs-userspace": "embedded-tsnet", "rs-tun": "kernel-tcp-via-rustscaled-tun",
-                      "ts-userspace": "kernel-tcp-via-loopback-socat-socks5-tailscaled-serve",
+                      "ts-userspace": "kernel-tcp-via-loopback-ncat-socks5-tailscaled-serve",
                       "ts-tun": "kernel-tcp-via-tailscaled-tun"}[config]
     if config.startswith("ts-"):
         obs = valid_ts_tun()["observed"]

@@ -139,7 +139,7 @@ pub async fn run_kernel(
     direction: &str,
     parallel: usize,
 ) -> Result<ThroughputResult, Box<dyn Error>> {
-    // Establish kernel TCP streams concurrently. A SOCKS5/socat bridge accepts
+    // Establish kernel TCP streams concurrently. A SOCKS5/local bridge accepts
     // locally before opening the tailnet side, so serial connects can otherwise
     // leave early server handlers waiting for GO while the 1000th stream is
     // still being created.

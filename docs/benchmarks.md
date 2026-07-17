@@ -137,9 +137,11 @@ Every selected cell executes the same `rustscale-bench` workload: RSB1 download
 the ordered throughput points and repeats, and 50 complete 8-byte RSB1 TCP
 ping-pongs with raw nanosecond samples. `rs-userspace` uses embedded tsnet;
 `rs-tun` uses kernel TCP through `rustscaled`; `ts-userspace` uses a loopback
-kernel-TCP client through socat, tailscaled's SOCKS5 listener, and Tailscale
-Serve; `ts-tun` uses kernel TCP through tailscaled's TUN. The proxy and Serve
-processes are part of the declared `ts-userspace` configuration.
+kernel-TCP client through an ncat inetd-style bridge, tailscaled's SOCKS5
+listener, and Tailscale Serve; `ts-tun` uses kernel TCP through tailscaled's
+TUN. The bridge, proxy, and Serve processes are part of the declared
+`ts-userspace` configuration. The bridge admits 1100 simultaneous connections,
+so the P1000 contract is never silently reduced.
 
 `--parallelism` preserves order, rejects duplicates, and accepts only 1–1000.
 `--scale-streams` expands to
@@ -160,11 +162,12 @@ three-second inter-trial gaps, and latency. Dynamic exact-name process sets are:
 - `rs-userspace`: `rustscale-bench` on both endpoints.
 - `rs-tun`: `rustscaled` and `rustscale-bench` on both endpoints.
 - `ts-userspace`: server `tailscaled` + `rustscale-bench`; client `tailscaled`
-  + all `socat` processes + `rustscale-bench`.
+  + the ncat listener and all ncat SOCKS5 connector processes +
+  `rustscale-bench`.
 - `ts-tun`: `tailscaled` and `rustscale-bench` on both endpoints.
 
 These process-scope series include no descendants by inference and no kernel
-CPU. In particular, TUN kernel work is excluded and shared pages across socat
+CPU. In particular, TUN kernel work is excluded and shared pages across ncat
 workers can be counted more than once. Results retain every throughput repeat,
 every stream lifecycle count, both endpoint timelines, pre/post path gates, and
 verified cleanup. A successful JSON is published only after samplers,

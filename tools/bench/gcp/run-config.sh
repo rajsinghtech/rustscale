@@ -621,17 +621,20 @@ nofile_limit_gate_command() {
   printf 'pid=$(cat %s); set -- $(grep "^Max open files" /proc/$pid/limits); [[ "$4" =~ ^[0-9]+$ && "$5" =~ ^[0-9]+$ && "$4" -ge 65535 && "$5" -ge 65535 ]]' "$pidfile"
 }
 
-# Start and verify the loopback-only SOCKS5 bridge. Every forked socat child is
-# included by exact process name in the client resource process set.
+# Start and verify the loopback-only SOCKS5 bridge. Ubuntu's socat build does
+# not include SOCKS5-CONNECT, so an ncat inetd-style listener starts one ncat
+# SOCKS5 connector per accepted stream. The 1100-connection ceiling is above
+# the public P1000 contract, and every persistent bridge process is included by
+# exact name in the client resource process set.
 start_ts_userspace_bridge() {
   local server_ip="$1"
   [[ "$server_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
   ssh_cmd "$CVM" "$CZONE" \
-    "pkill -x socat 2>/dev/null || true; rm -f /tmp/socat.{pid,log}; nohup prlimit --nofile=65535:65535 -- socat TCP4-LISTEN:5300,bind=127.0.0.1,reuseaddr,fork,nodelay SOCKS5-CONNECT:127.0.0.1:11080:$server_ip:$PORT,nodelay >/tmp/socat.log 2>&1 & echo \$! >/tmp/socat.pid" || return 1
+    "set -e; pkill -x ncat 2>/dev/null || true; rm -f /tmp/ncat.{pid,log} /tmp/ts-socks-connect; printf '%s\\n' '#!/bin/sh' 'exec /usr/bin/ncat -4 --nodns --proxy 127.0.0.1:11080 --proxy-type socks5 $server_ip $PORT' >/tmp/ts-socks-connect; chmod 700 /tmp/ts-socks-connect; ncat --help 2>&1 | grep -q socks5; nohup prlimit --nofile=65535:65535 -- ncat -4 --listen --keep-open --max-conns 1100 --exec /tmp/ts-socks-connect 127.0.0.1 5300 >/tmp/ncat.log 2>&1 & echo \$! >/tmp/ncat.pid" || return 1
   local elapsed=0
   while (( elapsed < 30 )); do
     if ssh_cmd "$CVM" "$CZONE" \
-      'pid=$(cat /tmp/socat.pid 2>/dev/null); kill -0 "$pid" 2>/dev/null && awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits && ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''^[^ ]+[[:space:]]+[^ ]+[[:space:]]+[^ ]+[[:space:]]+127\.0\.0\.1:5300([[:space:]]|$)'\'' && ! ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''(0\.0\.0\.0|\[::\]):5300'\''' \
+      'pid=$(cat /tmp/ncat.pid 2>/dev/null); kill -0 "$pid" 2>/dev/null && test -x /tmp/ts-socks-connect && awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits && ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''^[^ ]+[[:space:]]+[^ ]+[[:space:]]+[^ ]+[[:space:]]+127\.0\.0\.1:5300([[:space:]]|$)'\'' && ! ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''(0\.0\.0\.0|\[::\]):5300'\''' \
       >/dev/null 2>&1; then
       return 0
     fi
@@ -667,8 +670,9 @@ command_shape_self_test() {
     start_ts_userspace_bridge 100.64.0.1
   ) || return 1
   bridge_definition=$(declare -f start_ts_userspace_bridge)
-  [[ "$bridge_calls" == *'SOCKS5-CONNECT:127.0.0.1:11080:100.64.0.1:5201,nodelay'* \
-    && "$bridge_calls" != *'socksport='* \
+  [[ "$bridge_calls" == *'/usr/bin/ncat -4 --nodns --proxy 127.0.0.1:11080 --proxy-type socks5 100.64.0.1 5201'* \
+    && "$bridge_calls" == *'--max-conns 1100 --exec /tmp/ts-socks-connect'* \
+    && "$bridge_calls" != *'SOCKS5-CONNECT'* && "$bridge_calls" != *'socat'* \
     && "$bridge_definition" == *'[^ ]+[[:space:]]+[^ ]+[[:space:]]+[^ ]+[[:space:]]+127\.0\.0\.1:5300'* ]] || return 1
   if start_ts_userspace_bridge '100.64.0.1;id' >/dev/null 2>&1; then return 1; fi
   rs_server_off=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
@@ -1017,17 +1021,18 @@ ts_tun_cleanup_command() {
 "socket=$socket" "state=$state" "pidfile=$pidfile" \
 'tailscale --socket="$socket" serve reset 2>/dev/null || true' \
 'tailscale --socket="$socket" down 2>/dev/null || true' \
-'for file in /tmp/rsb1-server.pid "$pidfile" /tmp/socat.pid; do pid=$(cat "$file" 2>/dev/null || true); case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac; done' \
+'for file in /tmp/rsb1-server.pid "$pidfile" /tmp/ncat.pid /tmp/socat.pid; do pid=$(cat "$file" 2>/dev/null || true); case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac; done' \
 'pkill -TERM -x rustscale-bench 2>/dev/null || true' \
+'pkill -TERM -x ncat 2>/dev/null || true' \
 'pkill -TERM -x socat 2>/dev/null || true' \
 'pkill -TERM -x tailscaled 2>/dev/null || true' \
-'is_clear() { ! pgrep -x rustscale-bench >/dev/null 2>&1 && ! pgrep -x socat >/dev/null 2>&1 && ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300)[[:space:]]"; }' \
+'is_clear() { ! pgrep -x rustscale-bench >/dev/null 2>&1 && ! pgrep -x ncat >/dev/null 2>&1 && ! pgrep -x socat >/dev/null 2>&1 && ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300)[[:space:]]"; }' \
 'elapsed=0; while (( elapsed < 15 )); do is_clear && break; sleep 1; elapsed=$((elapsed + 1)); done' \
-'if ! is_clear; then pkill -KILL -x rustscale-bench 2>/dev/null || true; pkill -KILL -x socat 2>/dev/null || true; pkill -KILL -x tailscaled 2>/dev/null || true; ip link delete dev tailscale0 2>/dev/null || true; fi' \
+'if ! is_clear; then pkill -KILL -x rustscale-bench 2>/dev/null || true; pkill -KILL -x ncat 2>/dev/null || true; pkill -KILL -x socat 2>/dev/null || true; pkill -KILL -x tailscaled 2>/dev/null || true; ip link delete dev tailscale0 2>/dev/null || true; fi' \
 'dns_ok=0' \
 'if [[ -f /etc/resolv.conf.bench-bak ]]; then cp /etc/resolv.conf.bench-bak /etc/resolv.conf && cmp -s /etc/resolv.conf.bench-bak /etc/resolv.conf && dns_ok=1; fi' \
 'rm -rf "$state" /tmp/rsb1-* /tmp/rs-footprint-set.py' \
-'rm -f /etc/resolv.conf.bench-bak "$socket" "$pidfile" /tmp/ts-tun-*.path*.log /tmp/socat.*' \
+'rm -f /etc/resolv.conf.bench-bak "$socket" "$pidfile" /tmp/ts-tun-*.path*.log /tmp/ncat.* /tmp/socat.* /tmp/ts-socks-connect' \
 '(( dns_ok == 1 )) && is_clear'
 }
 
@@ -1055,15 +1060,16 @@ userspace_cleanup_command() {
 "socket=$socket" "pidfile=$pidfile" \
 'tailscale --socket="$socket" serve reset 2>/dev/null || true' \
 'tailscale --socket="$socket" down 2>/dev/null || true' \
-'for file in /tmp/rs-srv.pid /tmp/rsb1-server.pid "$pidfile" /tmp/socat.pid; do pid=$(cat "$file" 2>/dev/null || true); case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac; done' \
+'for file in /tmp/rs-srv.pid /tmp/rsb1-server.pid "$pidfile" /tmp/ncat.pid /tmp/socat.pid; do pid=$(cat "$file" 2>/dev/null || true); case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac; done' \
 'pkill -TERM -x rustscale-bench 2>/dev/null || true' \
+'pkill -TERM -x ncat 2>/dev/null || true' \
 'pkill -TERM -x socat 2>/dev/null || true' \
 'pkill -TERM -x tailscaled 2>/dev/null || true' \
-'is_clear() { ! pgrep -x rustscale-bench >/dev/null 2>&1 && ! pgrep -x socat >/dev/null 2>&1 && ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300|11080)[[:space:]]"; }' \
+'is_clear() { ! pgrep -x rustscale-bench >/dev/null 2>&1 && ! pgrep -x ncat >/dev/null 2>&1 && ! pgrep -x socat >/dev/null 2>&1 && ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300|11080)[[:space:]]"; }' \
 'elapsed=0; while (( elapsed < 15 )); do is_clear && break; sleep 1; elapsed=$((elapsed + 1)); done' \
-'if ! is_clear; then pkill -KILL -x rustscale-bench 2>/dev/null || true; pkill -KILL -x socat 2>/dev/null || true; pkill -KILL -x tailscaled 2>/dev/null || true; fi' \
+'if ! is_clear; then pkill -KILL -x rustscale-bench 2>/dev/null || true; pkill -KILL -x ncat 2>/dev/null || true; pkill -KILL -x socat 2>/dev/null || true; pkill -KILL -x tailscaled 2>/dev/null || true; fi' \
 'rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/rs-parity-client /tmp/ts-srv /tmp/ts-cli /tmp/rsb1-*' \
-'rm -f /tmp/rs-srv.* /tmp/ts-srv.* /tmp/ts-cli.* /tmp/socat.* /tmp/rs-footprint-set.py' \
+'rm -f /tmp/rs-srv.* /tmp/ts-srv.* /tmp/ts-cli.* /tmp/ncat.* /tmp/socat.* /tmp/ts-socks-connect /tmp/rs-footprint-set.py' \
 'is_clear'
 }
 
@@ -2309,7 +2315,7 @@ mode = "userspace" if config.endswith("userspace") else "tun"
 transport_path = {
     "rs-userspace":"embedded-tsnet",
     "rs-tun":"kernel-tcp-via-rustscaled-tun",
-    "ts-userspace":"kernel-tcp-via-loopback-socat-socks5-tailscaled-serve",
+    "ts-userspace":"kernel-tcp-via-loopback-ncat-socks5-tailscaled-serve",
     "ts-tun":"kernel-tcp-via-tailscaled-tun",
 }[config]
 portmapping = "disabled" if config == "rs-userspace" else "not-applicable"
@@ -2387,8 +2393,9 @@ rsb1_lifecycle_self_test() {
     && "$command" == *'pkill -KILL -x tailscaled'* ]] || return 1
   command=$(userspace_cleanup_command cli) || return 1
   bash -n <<<"$command" || return 1
-  [[ "$command" == *'serve reset'* && "$command" == *'pkill -KILL -x socat'* \
-    && "$command" == *'11080'* && "$command" == *'ip link show dev tailscale0'* ]] || return 1
+  [[ "$command" == *'serve reset'* && "$command" == *'pkill -KILL -x ncat'* \
+    && "$command" == *'/tmp/ts-socks-connect'* && "$command" == *'11080'* \
+    && "$command" == *'ip link show dev tailscale0'* ]] || return 1
 
   # The measured suite contains retries only in the pre-sampling warmup.
   definition=$(declare -f rsb1_measure)
@@ -2627,7 +2634,7 @@ run_ts_userspace() {
     return 1
   fi
   if ! start_ts_userspace_bridge "$server_ip"; then
-    fail_userspace_config cleanup_ts_userspace "ts-userspace-socat-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/socat.log)"
+    fail_userspace_config cleanup_ts_userspace "ts-userspace-bridge-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ncat.log)"
     return 1
   fi
 
@@ -2638,7 +2645,7 @@ run_ts_userspace() {
   }
 
   RSB1_SERVER_SUBJECTS=(tailscaled rustscale-bench)
-  RSB1_CLIENT_SUBJECTS=(tailscaled socat rustscale-bench)
+  RSB1_CLIENT_SUBJECTS=(tailscaled ncat rustscale-bench)
   if ! rsb1_measure kernel-tcp kernel-tcp 127.0.0.1:5300 "$path_class"; then
     fail_userspace_config cleanup_ts_userspace "ts-userspace-rsb1-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rsb1-setup.log}")"
     return 1

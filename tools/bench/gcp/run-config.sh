@@ -1940,7 +1940,7 @@ scope = {"kind":"dynamic_process_set","includes_descendants":False,"includes_ker
 obj={"schema_version":4,"status":"ok","tool":"rustscale","mode":"userspace" if config=="rs-userspace" else "tun",
  "topology":topo,"path":requested_path,"config":config,"repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],
  "error":"","log_tail":"","path_class_reported":observed_path,"transport":transport,
- "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3},"client_lifecycle":"new_process_per_trial","latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8},
+ "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3},"client_lifecycle":"new_process_per_trial","latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"userspace_portmapping":"disabled"},
  "throughput":json.loads(tp),"latency":json.loads(lat),
  "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap"],"sample_cadence_ms":1000,"server":dict(server,endpoint="server",subjects=subjects,scope=scope),"client":dict(client,endpoint="client",subjects=subjects,scope=scope)},
  "footprint":dict(server,binary_size_bytes=int(size),subject="rustscale-bench",endpoint="server",scope=scope),

@@ -37,6 +37,7 @@ pub async fn run_userspace(
         .hostname(hostname)
         .auth_key(authkey)
         .ephemeral(true)
+        .disable_portmapping(true)
         .control_url(control_url);
     if let Some(ref d) = state_dir {
         builder = builder.state_dir(d);

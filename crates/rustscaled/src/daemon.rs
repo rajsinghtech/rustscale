@@ -890,10 +890,12 @@ mod tests {
     };
     use rustscale_tsnet::PreferencePolicy;
 
+    #[cfg(unix)]
+    use super::{drive_login_until_running, LoginLoopOutcome};
     use super::{
-        drive_login_until_running, is_only_unconfirmed_external_portmap_release, retry_close,
-        retry_logout_until_shutdown, should_resume_persisted_node, CloseRunner,
-        InstallUpdatesPolicy, LoginLoopOutcome, LogoutRunner, UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE,
+        is_only_unconfirmed_external_portmap_release, retry_close, retry_logout_until_shutdown,
+        should_resume_persisted_node, CloseRunner, InstallUpdatesPolicy, LogoutRunner,
+        UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE,
     };
 
     #[cfg(unix)]

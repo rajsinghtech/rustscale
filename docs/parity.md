@@ -13,7 +13,7 @@ Statuses below were checked against the source and tests in `crates/*` as of
 
 | Feature | Go source | Status |
 | --- | --- | --- |
-| MagicDNS + split DNS resolver | `net/dns/resolver/tsdns.go` | ✅ full resolver (A/AAAA/PTR), split-DNS via control `Routes`, DoH upstream forwarder, TCP fallback, TC bit, .onion NXDOMAIN, 4via6, Hosts/LocalDomains, atomic SetConfig, macOS `/etc/resolver` configurator |
+| MagicDNS + split DNS resolver | `net/dns/resolver/tsdns.go` | 🔶 local A/AAAA/PTR, ExtraRecords, `.onion` NXDOMAIN, 4via6, UDP forwarding, DoH, upstream TCP retry, TC handling, and macOS `/etc/resolver`; the responder still has a minimal single-question wire codec, no inbound TCP DNS listener, and does not apply per-suffix `DNSConfig.Routes` when forwarding |
 | Let's Encrypt certs via control | `ipn/ipnlocal/cert.go` | ✅ full ACME client (RFC 8555, ES256 JWS, dns-01 via set-dns, rcgen CSR); live LE-staging e2e; LocalAPI `GET /cert/<domain>`; `rustscale cert` CLI |
 | WhoIs (peer identity from conn) | `tsnet.Server.WhoIs` | ✅ `Server::whois` + `ts_whois` FFI (UserProfiles from netmap); e2e + interop tests |
 | Exit node support | LocalBackend/router/magicsock | ✅ set_exit_node/clear_exit_node, RouteTable catch-all, PATCH /prefs wiring, ExitNodeAllowLANAccess, TUN exit-node mode; unresolved requested exits retain a working peer or install capture/no-connect defaults before startup traffic; control/DERP/bootstrap/DNS/STUN/port-mapping underlay stays socket-scoped (no DNS/control destination route injection); LAN-deny captures every connected external prefix (including VPN/CGNAT/ULA) while LAN-allow uses Linux managed throw routes/direct Darwin connected routes; Darwin full-tunnel entry requires verified TCP/UDP IP_BOUND_IF capability and a verified com.apple/* PF emergency block (safe durable enable-token teardown, private owner-only rules file) around security-critical interface and kernel-route enumeration/refresh; map stream error/closure/watchdog also engages the same durable block; one ordered exit/map/link mutation gate prevents stale map or link snapshots from replacing newer API/config selections; provenance-latched map-loss/enumeration/transition blocks clear only after their owning recovery; every LAN-denied entry, refresh, exit removal, clear, or identity teardown verifies the kernel block before route/rule mutation, tracks attempted versus verified state, retains effective userspace blocking through API/config mutations and failed inverses, invalidates verification before unblock, and immediately re-establishes and verifies the block after any uncertain removal while retaining exit/underlay ownership through a successful retry; preference, pending-map, blocked-state, and router changes roll back transactionally |
@@ -253,7 +253,7 @@ state-dir fallback probing), `--json`.
 | `web` | `cli/web.go` | ✅ embedded single-file HTML; endpoints: /api/status/up/down/logout; explicit loopback default plus post-bind address enforcement; per-run cryptographic CSRF token; strict Host/Origin checks and bounded HTTP parsing; --readonly, --unsafe-any-addr; Linux loopback browser opening through the bounded freedesktop transport (`--browser=false` disables) |
 | `debug` | `cli/debug.go` | ✅ `debug <status\|metrics\|ipconfig>` |
 | `exit-node` | `cli/exitnode.go` | ✅ lists exit-node-capable peers; `--suggest` for SuggestedExitNode; cannot select exit node via CLI |
-| `dns` | `cli/dns.go` | ✅ queries daemon DNS resolver or prints MagicDNS status; `--type`, `--json` |
+| `dns` | `cli/dns.go` | 🔶 explicit `dns status [--json]` and `dns query [--json] <name> [A\|AAAA]`; query forwards the requested name/type and filters the LocalAPI address list by family |
 | `bugreport` | `cli/bugreport.go` | ✅ prints version/state/health summary |
 | `nc` | `cli/nc.go` | 🔶 stub (not-yet-supported) |
 | `id-token` | `cli/id-token.go` | ✅ OIDC machine ID token via LocalAPI and Noise `POST /machine/id-token`; raw JWT and `--json` output |
@@ -261,6 +261,16 @@ state-dir fallback probing), `--json`.
 | `drive` | `cli/drive.go` | ⬜ |
 | `lock` | `cli/lock.go` | 🔶 status, self-safe confirmed init with owner-only pre-RPC disablement receipts and `--resume`, node sign, and disable are wired through authorized LocalAPI; add/remove, re-sign, local-disable, pre-auth wrapping, log, and revoke-keys remain deferred |
 | completion/man | `cli/ffcomplete/` | ✅ bash, zsh, and fish script generation plus hidden, side-effect-free runtime completion protocol; man pages are not provided upstream |
+
+DNS CLI parity is intentionally partial. The current `dns-query` LocalAPI
+returns peer IP strings rather than a DNS wire response, so the CLI supports
+only A and AAAA; it does not yet expose arbitrary record types, response codes,
+TTLs, answer records, or resolver metadata. `dns status` reports the MagicDNS
+enablement, suffix, and certificate domains available in the status response;
+it does not yet collect preferences, the full DNS config, OS DNS config, or the
+upstream `--all` diagnostic view. The old implicit `rustscale dns [name]`
+syntax is not retained because it ambiguously treated `status` and `query` as
+hostnames; use the explicit subcommands above.
 
 `crates/localclient`: async LocalAPI HTTP client over `safesocket::connect`,
 hand-rolled HTTP/1.1 (no hyper), fake Host `local-rustscaled.sock`, typed

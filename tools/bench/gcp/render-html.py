@@ -45,7 +45,7 @@ DEFAULT_MATRIX = {"topologies": TOPOLOGIES, "paths": PATHS, "configs": CONFIGS}
 
 def valid_matrix(data: dict) -> dict | None:
     try:
-        if data.get("schema_version") not in (1, 2):
+        if data.get("schema_version") not in (1, 2, 3):
             return None
         matrix = {key: data[key] for key in DEFAULT_MATRIX}
         for key, values in matrix.items():
@@ -58,8 +58,10 @@ def valid_matrix(data: dict) -> dict | None:
         matrix["dry_run"] = data.get("dry_run", False)
         for key in ("parallelism", "duration_s", "sample_cadence_s", "peer_count_requested"):
             if key in data: matrix[key] = data[key]
-        if data.get("schema_version") == 2 and isinstance(data.get("run"), dict):
+        if data.get("schema_version") in (2, 3) and isinstance(data.get("run"), dict):
             matrix["run"] = data["run"]
+        for key in ("selection", "load"):
+            if key in data: matrix[key] = data[key]
         return matrix
     except (AttributeError, KeyError, TypeError):
         return None
@@ -69,18 +71,30 @@ def load_summary() -> tuple[list, dict]:
     if len(sys.argv) > 1 and sys.argv[1] not in ("-", ""):
         summary = os.path.abspath(sys.argv[1])
         with open(summary, "r", encoding="utf-8") as f:
-            runs = json.load(f)
+            payload = json.load(f)
+    else:
+        payload = json.load(sys.stdin)
+        summary = None
+    if isinstance(payload, dict) and payload.get("summary_schema_version") == 1:
+        matrix = valid_matrix(payload.get("manifest"))
+        cells = payload.get("cells")
+        if matrix is None or payload["manifest"].get("schema_version") != 3 or not isinstance(cells, list):
+            raise SystemExit("invalid self-contained current benchmark summary")
+        matrix["completeness"] = payload.get("completeness", {})
+        return cells, matrix
+    if not isinstance(payload, list):
+        raise SystemExit("summary must be a current envelope or historical result list")
+    if summary is not None:
         manifest = os.path.join(os.path.dirname(summary), "matrix.json")
         try:
             with open(manifest, encoding="utf-8") as f:
                 data = json.load(f)
             matrix = valid_matrix(data)
             if matrix is not None:
-                return runs, matrix
+                return payload, matrix
         except (OSError, json.JSONDecodeError):
             pass
-        return runs, DEFAULT_MATRIX
-    return json.load(sys.stdin), DEFAULT_MATRIX
+    return payload, DEFAULT_MATRIX
 
 
 def index_runs(runs: list) -> dict:
@@ -395,8 +409,10 @@ def throughput_groups(configs: list[str], runs_idx: dict, topo: str, path: str) 
     for cfg in configs:
         run = runs_idx.get((topo, path, cfg)) or {}
         workload = run.get("workload") if isinstance(run.get("workload"), dict) else {}
-        if workload.get("implementation") == "rustscale-bench" and workload.get("protocol") == "RSB1":
-            label = "RustScale RSB1 parity"
+        if run.get("schema_version") == 5 and workload.get("implementation") == "rustscale-bench" and workload.get("protocol") == "RSB1":
+            label = "Matched four-way RSB1 workload"
+        elif workload.get("implementation") == "rustscale-bench" and workload.get("protocol") == "RSB1":
+            label = "Historical RustScale RSB1 parity (not merged)"
         elif cfg.startswith("ts-"):
             label = "Tailscale iperf3 comparator (not parity-ranked)"
         else:
@@ -492,7 +508,7 @@ def emit_scale_context(matrix: dict) -> str:
         '<div class="filters">'
         f'<div class="group"><label>streams</label><strong>{html.escape(", ".join(map(str, streams)) or "historical/unspecified")}</strong></div>'
         f'<div class="group"><label>duration</label><strong>{html.escape(str(matrix.get("duration_s", "historical/unspecified")))} s</strong></div>'
-        f'<div class="group"><label>configured peer load</label><strong>{html.escape(str(matrix.get("peer_count_requested", "historical/unspecified")))}</strong></div>'
+        f'<div class="group"><label>requested peer load</label><strong>{html.escape(str(matrix.get("peer_count_requested", "historical/unspecified")))} (not applied or observed)</strong></div>'
         f'<div class="group"><label>resource cadence</label><strong>{html.escape(str(matrix.get("sample_cadence_s", "historical/unspecified")))} s</strong></div>'
         '</div>'
     )
@@ -970,7 +986,7 @@ def main() -> int:
     if not isinstance(runs, list):
         runs = []
     runs_idx = index_runs(runs)
-    parallels = configured_parallels(runs)
+    parallels = matrix.get("parallelism") or configured_parallels(runs)
 
     out = []
     out.append(HTML_HEAD)

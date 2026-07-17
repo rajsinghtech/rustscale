@@ -7,6 +7,7 @@ collection may use --allow-partial; its output retains failed cells explicitly
 so render-html.py never mistakes a failure for a measured zero.
 """
 
+import hashlib
 import json
 import math
 import sys
@@ -19,7 +20,8 @@ TOPO_ORDER = {"same-zone": 0, "cross-region": 1}
 DEFAULT_PARALLELISM = [1, 10, 100]
 DEFAULT_MATRIX = {"topologies": list(TOPO_ORDER), "paths": list(PATH_ORDER), "configs": list(CONFIG_ORDER),
                   "parallelism": DEFAULT_PARALLELISM}
-RESULT_SCHEMA_VERSION = 4
+RESULT_SCHEMA_VERSION = 5
+PRIOR_MATCHED_RESULT_SCHEMA_VERSION = 4
 HISTORICAL_RESULT_SCHEMA_VERSION = 3
 CONFIG_MODE = {"rs-userspace": "userspace", "rs-tun": "tun",
                "ts-userspace": "userspace", "ts-tun": "tun"}
@@ -40,16 +42,19 @@ def selected_matrix(root: Path, allow_partial: bool) -> dict:
             raise ValueError("matrix.json is required for strict aggregation")
         return {**DEFAULT_MATRIX, "repeat": None, "legacy_manifest": True}
     data = json.loads(manifest.read_text())
-    if data.get("schema_version") == 2:
+    if data.get("schema_version") in (2, 3):
         provenance.validate_manifest(data)
         if root.name != data["run"]["id"]:
             raise ValueError("current run directory basename must equal matrix run.id")
         matrix = {key: data[key] for key in ("topologies", "paths", "configs", "parallelism", "repeat", "dry_run", "run")}
-        for key in ("duration_s", "sample_cadence_s", "peer_count_requested"):
+        matrix["manifest_schema"] = data["schema_version"]
+        matrix["manifest_document"] = data
+        matrix["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        for key in ("duration_s", "sample_cadence_s", "peer_count_requested", "selection", "load"):
             if key in data: matrix[key] = data[key]
         return matrix
     if data.get("schema_version") != 1 or not allow_partial:
-        raise ValueError("matrix schema_version must be 2 for strict aggregation")
+        raise ValueError("matrix schema_version must be 2 or 3 for aggregation")
     matrix = {key: data[key] for key in ("topologies", "paths", "configs")}
     for key, values in matrix.items():
         if (not isinstance(values, list) or not values or len(values) != len(set(values))
@@ -91,15 +96,19 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
     topo, path, config = key
     errors = []
     schema_version = obj.get("schema_version")
-    if schema_version not in (HISTORICAL_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION):
-        errors.append(f"schema_version must be {HISTORICAL_RESULT_SCHEMA_VERSION} or {RESULT_SCHEMA_VERSION}")
+    supported_schemas = (HISTORICAL_RESULT_SCHEMA_VERSION, PRIOR_MATCHED_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION)
+    if schema_version not in supported_schemas:
+        errors.append(f"schema_version must be one of {supported_schemas}")
     current = schema_version == RESULT_SCHEMA_VERSION
+    scoped = schema_version in (PRIOR_MATCHED_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION)
+    if matrix.get("manifest_schema") == 3 and not current:
+        errors.append("schema-v3 matched manifests require schema-v5 results")
     if "run" in matrix:
         if obj.get("run") != matrix["run"]:
             errors.append("result run must exactly equal matrix run")
         try:
             zones = provenance.TOPOLOGY_ZONES[topo]
-            provenance.validate_observed(obj.get("observed"), config, matrix["dry_run"], topo, *zones, matrix["run"]["cloud"]["requested_machine_type"], current=current)
+            provenance.validate_observed(obj.get("observed"), config, matrix["dry_run"], topo, *zones, matrix["run"]["cloud"]["requested_machine_type"], current=scoped)
         except (ValueError, TypeError) as exc:
             errors.append(str(exc))
     if obj.get("status") != "ok":
@@ -168,7 +177,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         percentiles = [latency.get(name) for name in ("p50_us", "p95_us", "p99_us")]
         if not all(finite_positive(value) for value in percentiles) or percentiles != sorted(percentiles):
             errors.append("latency percentiles must be finite, positive, and ordered")
-        if current:
+        if scoped:
             expected = 50
             if (latency.get("protocol") != "RSB1-tcp-pingpong" or latency.get("requested") != expected
                     or latency.get("successful") != expected or latency.get("timed_out") != 0
@@ -199,7 +208,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         # Raw monotonic process-set series are a schema-v4 contract. Historical
         # schema-v3 cells remain valid aggregate-only records; do not fabricate
         # timing, process scope, or samples when rendering old runs.
-        if current:
+        if scoped:
             series = footprint.get("series")
             truncated = footprint.get("series_truncated")
             samples = footprint.get("samples")
@@ -227,45 +236,116 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
             elif expected_retained is not None and truncated != (samples > 3600):
                 errors.append("footprint series_truncated must equal samples > 3600")
     if current:
-        expected_transport = "userspace-tsnet" if config == "rs-userspace" else "kernel-tcp" if config == "rs-tun" else None
-        if expected_transport is not None:
-            if obj.get("transport") != expected_transport: errors.append(f"transport must be {expected_transport}")
-            workload = obj.get("workload")
-            if (not isinstance(workload, dict) or workload.get("implementation") != "rustscale-bench"
-                    or workload.get("protocol") != "RSB1" or workload.get("direction") != "down"
-                    or workload.get("payload_bytes") != 1280 or workload.get("latency_protocol") != "RSB1-tcp-pingpong"
-                    or workload.get("latency_payload_bytes") != 8 or workload.get("client_lifecycle") != "new_ephemeral_identity_per_trial"
-                    or workload.get("trial_max_attempts") != 3
-                    or workload.get("userspace_portmapping") != "disabled"):
-                errors.append("invalid RustScale parity workload identity")
-            resources = obj.get("resources")
-            if not isinstance(resources, dict) or resources.get("sample_cadence_ms") != 1000:
-                errors.append("schema-v4 resources must declare 1000 ms cadence")
-            else:
-                for endpoint in ("server", "client"):
-                    measured = resources.get(endpoint)
-                    scope = measured.get("scope") if isinstance(measured, dict) else None
-                    expected_subjects = ["rustscale-bench"] if config == "rs-userspace" else ["rustscaled", "rustscale-bench"]
-                    if (not isinstance(measured, dict) or measured.get("endpoint") != endpoint
-                            or measured.get("subjects") != expected_subjects
-                            or scope != {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
-                            or not isinstance(measured.get("series"), list) or not measured["series"]):
-                        errors.append(f"invalid {endpoint} resource process-set scope")
-        elif obj.get("transport") == "kernel-tcp":
-            errors.append("Tailscale comparator must not claim RustScale parity transport")
+        expected_transport = "userspace-tsnet" if config == "rs-userspace" else "kernel-tcp"
+        expected_implementation = "rustscale" if config.startswith("rs-") else "tailscale"
+        expected_identity = {"key": f"{topo}/{path}/{config}", "cell_id": config,
+                             "implementation": expected_implementation, "mode": CONFIG_MODE[config],
+                             "topology": topo, "path": path}
+        if obj.get("identity") != expected_identity:
+            errors.append("canonical result identity does not match its selected cell")
+        if obj.get("manifest_sha256") != matrix.get("manifest_sha256"):
+            errors.append("result manifest_sha256 does not match matrix.json")
+        load = obj.get("load")
+        expected_peer = matrix.get("load", {}).get("peer_load", {"requested": matrix.get("peer_count_requested", 1),
+                         "effective": None, "observed": None, "status": "not-applied"})
+        if (not isinstance(load, dict) or load.get("preset") != matrix.get("load", {}).get("preset", "custom")
+                or load.get("parallelism_requested") != matrix["parallelism"] or load.get("repeat") != matrix["repeat"]
+                or load.get("duration_s") != matrix.get("duration_s", 10) or load.get("peer_load") != expected_peer):
+            errors.append("result load contract does not match matrix.json")
+        expected_tool = "rustscale" if expected_implementation == "rustscale" else "tailscaled"
+        expected_subjects = {
+            "rs-userspace": {"server": ["rustscale-bench"], "client": ["rustscale-bench"]},
+            "rs-tun": {"server": ["rustscaled", "rustscale-bench"], "client": ["rustscaled", "rustscale-bench"]},
+            "ts-userspace": {"server": ["tailscaled", "rustscale-bench"], "client": ["tailscaled", "socat", "rustscale-bench"]},
+            "ts-tun": {"server": ["tailscaled", "rustscale-bench"], "client": ["tailscaled", "rustscale-bench"]},
+        }[config]
+        expected_transport_path = {
+            "rs-userspace": "embedded-tsnet",
+            "rs-tun": "kernel-tcp-via-rustscaled-tun",
+            "ts-userspace": "kernel-tcp-via-loopback-socat-socks5-tailscaled-serve",
+            "ts-tun": "kernel-tcp-via-tailscaled-tun",
+        }[config]
+        if obj.get("transport") != expected_transport:
+            errors.append(f"transport must be {expected_transport}")
+        if obj.get("implementation") != expected_implementation or obj.get("tool") != expected_tool:
+            errors.append("implementation/tool identity does not match config")
+        workload = obj.get("workload")
+        if (not isinstance(workload, dict) or workload.get("implementation") != "rustscale-bench"
+                or workload.get("protocol") != "RSB1" or workload.get("direction") != "down"
+                or workload.get("payload_bytes") != 1280
+                or workload.get("warmup") != {"parallel": 1, "duration_s": 3, "max_attempts": 3}
+                or workload.get("client_lifecycle") != "new_benchmark_process_per_trial"
+                or workload.get("measured_trial_attempts") != 1
+                or workload.get("latency_protocol") != "RSB1-tcp-pingpong"
+                or workload.get("latency_payload_bytes") != 8 or workload.get("latency_count") != 50
+                or workload.get("transport_path") != expected_transport_path
+                or workload.get("userspace_portmapping") != ("disabled" if config == "rs-userspace" else "not-applicable")):
+            errors.append("invalid four-way matched RSB1 workload identity")
+        warmup_evidence = obj.get("warmup_evidence")
+        expected_warmup_path = path if config == "rs-userspace" else "externally-gated"
+        if (not isinstance(warmup_evidence, dict) or warmup_evidence.get("transport") != expected_transport
+                or warmup_evidence.get("protocol") != "RSB1" or warmup_evidence.get("direction") != "down"
+                or warmup_evidence.get("duration_secs") != 3 or warmup_evidence.get("parallel") != 1
+                or any(warmup_evidence.get(name) != 1 for name in ("established", "handshaken", "completed"))
+                or not finite_positive(warmup_evidence.get("total_mbps"))
+                or warmup_evidence.get("path_class") != expected_warmup_path):
+            errors.append("warmup evidence must be one complete positive RSB1 P1/3s trial")
+        trials = obj.get("throughput_trials")
+        expected_trials = [(parallel, index) for parallel in requested for index in range(1, repeat + 1)]
+        if not isinstance(trials, list) or len(trials) != len(expected_trials):
+            errors.append("throughput_trials must retain every requested repeat")
+        else:
+            row_samples = {row.get("parallel"): row.get("samples_mbps") for row in rows if isinstance(row, dict)}
+            for trial, expected_trial in zip(trials, expected_trials):
+                parallel, repeat_index = expected_trial
+                expected_trial_path = path if config == "rs-userspace" else "externally-gated"
+                if (not isinstance(trial, dict) or (trial.get("parallel"), trial.get("repeat_index")) != expected_trial
+                        or trial.get("transport") != expected_transport or trial.get("protocol") != "RSB1"
+                        or trial.get("direction") != "down" or trial.get("duration_s") != matrix.get("duration_s", 10)
+                        or any(trial.get(name) != parallel for name in ("established", "handshaken", "completed"))
+                        or not finite_positive(trial.get("total_mbps")) or trial.get("path_class") != expected_trial_path):
+                    errors.append(f"P{parallel} repeat {repeat_index} has incomplete RSB1 lifecycle evidence")
+                    continue
+                samples_for_parallel = row_samples.get(parallel)
+                if (not isinstance(samples_for_parallel, list) or repeat_index > len(samples_for_parallel)
+                        or not math.isclose(trial["total_mbps"], samples_for_parallel[repeat_index - 1], rel_tol=MEDIAN_REL_TOL, abs_tol=MEDIAN_ABS_TOL)):
+                    errors.append(f"P{parallel} repeat {repeat_index} does not match samples_mbps")
+        path_gate = obj.get("path_gate")
+        if path_gate != {"requested": path, "pre": path, "post": path, "matched": True}:
+            errors.append("pre/post path gate must match the selected path")
+        cleanup = obj.get("cleanup")
+        if cleanup != {"status":"clean", "samplers_stopped":True, "workload_stopped":True,
+                       "transport_stopped":True, "postconditions_verified":True}:
+            errors.append("successful current cell requires verified clean teardown")
+        resources = obj.get("resources")
+        if (not isinstance(resources, dict) or resources.get("sample_cadence_ms") != 1000
+                or resources.get("phase_set") != ["measured_client_process_lifecycle", "inter_trial_gap", "latency"]):
+            errors.append("schema-v5 resources must declare the complete common measurement window")
+        else:
+            for endpoint in ("server", "client"):
+                measured = resources.get(endpoint)
+                scope = measured.get("scope") if isinstance(measured, dict) else None
+                if (not isinstance(measured, dict) or measured.get("endpoint") != endpoint
+                        or measured.get("subjects") != expected_subjects[endpoint]
+                        or scope != {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
+                        or not positive_int(measured.get("samples"))
+                        or measured.get("samples", 0) <= measured.get("missing_samples", measured.get("samples", 0))
+                        or not isinstance(measured.get("series"), list) or not measured["series"]):
+                    errors.append(f"invalid {endpoint} resource process-set scope")
     return errors
 
 
 def validate_failed(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]:
     errors = []
-    if obj.get("schema_version") not in (HISTORICAL_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION):
-        errors.append(f"schema_version must be {HISTORICAL_RESULT_SCHEMA_VERSION} or {RESULT_SCHEMA_VERSION}")
+    supported_schemas = (HISTORICAL_RESULT_SCHEMA_VERSION, PRIOR_MATCHED_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION)
+    if obj.get("schema_version") not in supported_schemas:
+        errors.append(f"schema_version must be one of {supported_schemas}")
     if "run" in matrix:
         if obj.get("run") != matrix["run"]:
             errors.append("result run must exactly equal matrix run")
         try:
             zones = provenance.TOPOLOGY_ZONES[key[0]]
-            provenance.validate_observed(obj.get("observed"), key[2], matrix["dry_run"], key[0], *zones, matrix["run"]["cloud"]["requested_machine_type"], current=obj.get("schema_version") == RESULT_SCHEMA_VERSION)
+            provenance.validate_observed(obj.get("observed"), key[2], matrix["dry_run"], key[0], *zones, matrix["run"]["cloud"]["requested_machine_type"], current=obj.get("schema_version") in (PRIOR_MATCHED_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION))
         except (ValueError, TypeError) as exc:
             errors.append(str(exc))
     for field, expected in zip(("topology", "path", "config"), key):
@@ -422,7 +502,7 @@ def main() -> int:
             else:
                 output.append(failed_cell(obj, key, reason))
             continue
-        if obj.get("schema_version") not in (HISTORICAL_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION) and allow_partial:
+        if obj.get("schema_version") not in (HISTORICAL_RESULT_SCHEMA_VERSION, PRIOR_MATCHED_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION) and allow_partial:
             normalized, legacy_error = normalize_legacy_success(obj, key, matrix)
             if normalized is not None:
                 output.append(normalized)
@@ -442,7 +522,19 @@ def main() -> int:
     for _, problem in problems:
         print(f"error: {problem}", file=sys.stderr)
     output.sort(key=lambda r: (TOPO_ORDER.get(r["topology"], 99), PATH_ORDER.get(r["path"], 99), CONFIG_ORDER.get(r["config"], 99)))
-    json.dump(output if allow_partial or not problems else [], sys.stdout, indent=2)
+    published = output if allow_partial or not problems else []
+    if matrix.get("manifest_schema") == 3:
+        ok_count = sum(1 for cell in output if cell.get("status") == "ok" and not cell.get("error"))
+        missing_count = sum(1 for key in selected if not found[key])
+        summary = {"summary_schema_version": 1, "manifest": matrix["manifest_document"],
+                   "completeness": {"expected": len(selected), "ok": ok_count,
+                                    "failed": max(0, len(selected) - ok_count - missing_count),
+                                    "missing": missing_count, "complete": not problems,
+                                    "normal_complete": matrix.get("selection", {}).get("preset") == "normal-v1" and not problems},
+                   "cells": published}
+        json.dump(summary, sys.stdout, indent=2)
+    else:
+        json.dump(published, sys.stdout, indent=2)
     sys.stdout.write("\n")
     if problems and not allow_partial:
         return 1

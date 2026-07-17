@@ -77,9 +77,102 @@ def valid_ts_tun():
     obj = valid(config="ts-tun")
     obj["tool"] = "tailscaled"
     products = [{"path": "/usr/sbin/tailscaled", "version": "1.2.0", "version_source": "executable --version", "sha256": "d" * 64},
-                {"path": "/usr/bin/tailscale", "version": "1.2.0", "version_source": "executable --version", "sha256": "e" * 64}]
+                {"path": "/usr/bin/tailscale", "version": "1.2.0", "version_source": "executable --version", "sha256": "e" * 64},
+                {"path": "/opt/rustscale/target/release/rustscale-bench", "version": "rustscale-bench 1.2.0", "version_source": "executable --version", "sha256": "f" * 64}]
     obj["observed"]["product"] = {"server": products, "client": products}
     return obj
+
+
+def matched_manifest(root, identity):
+    data = {"schema_version": 3, "topologies": ["same-zone"], "paths": ["direct"],
+            "configs": ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"],
+            "parallelism": [1], "repeat": 1, "duration_s": 10, "sample_cadence_s": 1,
+            "peer_count_requested": 1, "dry_run": False,
+            "warmup": {"parallel": 1, "duration_s": 3, "direction": "down", "protocol": "RSB1"},
+            "selection": {"preset": "normal-v1", "source": {"topologies": "default", "paths": "default", "configs": "default"},
+                          "cells": [{"id": config, "implementation": "rustscale" if config.startswith("rs-") else "tailscale",
+                                     "mode": "userspace" if config.endswith("userspace") else "tun"}
+                                    for config in ("rs-userspace", "rs-tun", "ts-userspace", "ts-tun")]},
+            "load": {"preset": "custom", "parallelism_target": [1], "repeat": 1, "duration_s": 10,
+                     "sample_cadence_s": 1, "peer_load": {"requested": 1, "effective": None,
+                                                            "observed": None, "status": "not-applied"}},
+            "run": identity}
+    (root / "matrix.json").write_text(json.dumps(data, indent=2) + "\n")
+    return data
+
+
+def matched_result(root, config, manifest):
+    import hashlib
+    mode = "userspace" if config.endswith("userspace") else "tun"
+    implementation = "rustscale" if config.startswith("rs-") else "tailscale"
+    tool = "rustscale" if implementation == "rustscale" else "tailscaled"
+    transport = "userspace-tsnet" if config == "rs-userspace" else "kernel-tcp"
+    subject_map = {
+        "rs-userspace": (["rustscale-bench"], ["rustscale-bench"]),
+        "rs-tun": (["rustscaled", "rustscale-bench"], ["rustscaled", "rustscale-bench"]),
+        "ts-userspace": (["tailscaled", "rustscale-bench"], ["tailscaled", "socat", "rustscale-bench"]),
+        "ts-tun": (["tailscaled", "rustscale-bench"], ["tailscaled", "rustscale-bench"]),
+    }
+    transport_path = {"rs-userspace": "embedded-tsnet", "rs-tun": "kernel-tcp-via-rustscaled-tun",
+                      "ts-userspace": "kernel-tcp-via-loopback-socat-socks5-tailscaled-serve",
+                      "ts-tun": "kernel-tcp-via-tailscaled-tun"}[config]
+    if config.startswith("ts-"):
+        obs = valid_ts_tun()["observed"]
+    else:
+        obs = observed()
+        allowed = {"rustscale-bench"} if config == "rs-userspace" else {"rustscale", "rustscaled", "rustscale-bench"}
+        obs["product"] = {endpoint: [item for item in obs["product"][endpoint]
+                                     if Path(item["path"]).name in allowed] for endpoint in ("server", "client")}
+    scope = {"kind": "dynamic_process_set", "includes_descendants": False, "includes_kernel": False}
+    def resource(endpoint, subjects):
+        return {"endpoint": endpoint, "subjects": subjects, "scope": scope, "rss_peak_kb": 2,
+                "rss_avg_kb": 1, "cpu_peak_pct": 1, "cpu_avg_pct": 0.5, "samples": 2,
+                "missing_samples": 0, "sample_cadence_s": 1, "clock": "monotonic",
+                "series": [{"offset_ms": 0, "rss_kb": 1, "cpu_pct": 0,
+                            "included_processes": [f"1:{subjects[0]}"], "status": "observed"},
+                           {"offset_ms": 1000, "rss_kb": 2, "cpu_pct": 1,
+                            "included_processes": [f"1:{subjects[0]}"], "status": "observed"}],
+                "series_truncated": False}
+    server, client = (resource("server", subject_map[config][0]), resource("client", subject_map[config][1]))
+    warmup_path = "direct" if config == "rs-userspace" else "externally-gated"
+    result = {"schema_version": 5, "status": "ok", "tool": tool, "implementation": implementation,
+              "mode": mode, "topology": "same-zone", "path": "direct", "config": config,
+              "repeat": 1, "parallelism_requested": [1], "duration_s_requested": 10,
+              "sample_cadence_s": 1, "peer_count_requested": 1, "error": "", "log_tail": "",
+              "path_class_reported": "direct", "transport": transport,
+              "warmup_evidence": {"transport": transport, "protocol": "RSB1", "direction": "down",
+                                  "duration_secs": 3, "parallel": 1, "established": 1,
+                                  "handshaken": 1, "completed": 1, "total_mbps": 10.0,
+                                  "path_class": warmup_path},
+              "throughput": [{"parallel": 1, "mbps": 100.0, "duration_s": 10,
+                              "samples_mbps": [100.0], "statistic": "median"}],
+              "throughput_trials": [{"parallel": 1, "repeat_index": 1, "transport": transport,
+                                     "protocol": "RSB1", "direction": "down", "duration_s": 10,
+                                     "established": 1, "handshaken": 1, "completed": 1,
+                                     "total_mbps": 100.0, "path_class": warmup_path}],
+              "latency": {"protocol": "RSB1-tcp-pingpong", "requested": 50, "successful": 50,
+                          "timed_out": 0, "malformed": 0, "count": 50, "p50_us": 1,
+                          "p95_us": 2, "p99_us": 3, "samples_ns": list(range(1, 51))},
+              "workload": {"implementation": "rustscale-bench", "protocol": "RSB1", "direction": "down",
+                           "payload_bytes": 1280, "warmup": {"parallel": 1, "duration_s": 3, "max_attempts": 3},
+                           "client_lifecycle": "new_benchmark_process_per_trial", "measured_trial_attempts": 1,
+                           "latency_protocol": "RSB1-tcp-pingpong", "latency_payload_bytes": 8,
+                           "latency_count": 50, "transport_path": transport_path,
+                           "userspace_portmapping": "disabled" if config == "rs-userspace" else "not-applicable"},
+              "resources": {"phase_set": ["measured_client_process_lifecycle", "inter_trial_gap", "latency"],
+                            "sample_cadence_ms": 1000, "server": server, "client": client},
+              "footprint": dict(server, binary_size_bytes=1, subject="rustscale-bench"),
+              "binary": {"subject": "rustscale-bench", "size_bytes": 1},
+              "path_gate": {"requested": "direct", "pre": "direct", "post": "direct", "matched": True},
+              "cleanup": {"status": "clean", "samplers_stopped": True, "workload_stopped": True,
+                          "transport_stopped": True, "postconditions_verified": True},
+              "identity": {"key": f"same-zone/direct/{config}", "cell_id": config,
+                           "implementation": implementation, "mode": mode, "topology": "same-zone", "path": "direct"},
+              "load": {"preset": "custom", "parallelism_requested": [1], "repeat": 1, "duration_s": 10,
+                       "peer_load": manifest["load"]["peer_load"]},
+              "manifest_sha256": hashlib.sha256((root / "matrix.json").read_bytes()).hexdigest(),
+              "run": manifest["run"], "observed": obs}
+    return result
 
 
 def legacy_success():
@@ -116,6 +209,33 @@ with tempfile.TemporaryDirectory() as tmp:
     assert manifest["parallelism"] == [1, 10, 100]
     assert all(type(value) is int for value in manifest["parallelism"])
     assert len(json.loads(result.stdout)) == 1
+
+    # A current schema-v3 run is one self-contained four-way matched envelope.
+    matched_identity = run_identity(); matched_identity["id"] = "gcp-20260714-010203-matched"
+    matched_root = Path(tmp) / matched_identity["id"]; matched_root.mkdir()
+    matched = matched_manifest(matched_root, matched_identity)
+    for config in matched["configs"]:
+        write_cell(matched_root, matched_result(matched_root, config, matched), f"{config}.json")
+    matched_summary = run("python3", GCP / "aggregate.py", matched_root)
+    envelope = json.loads(matched_summary.stdout)
+    assert envelope["summary_schema_version"] == 1
+    assert envelope["completeness"] == {"expected": 4, "ok": 4, "failed": 0, "missing": 0,
+                                          "complete": True, "normal_complete": True}
+    assert [cell["config"] for cell in envelope["cells"]] == matched["configs"]
+    moved_summary = Path(tmp) / "moved-summary.json"; moved_summary.write_text(matched_summary.stdout)
+    moved_html = run("python3", GCP / "render-html.py", moved_summary).stdout
+    assert "Matched four-way RSB1 workload" in moved_html and "requested peer load" in moved_html
+    ts_user_path = matched_root / "same-zone/direct/ts-userspace.json"
+    original_ts_user = json.loads(ts_user_path.read_text())
+    for expected_error, mutate in (
+        ("throughput_trials", lambda value: value.__setitem__("throughput_trials", [])),
+        ("clean teardown", lambda value: value["cleanup"].__setitem__("status", "failed")),
+        ("pre/post path gate", lambda value: value["path_gate"].__setitem__("post", "derp")),
+        ("manifest_sha256", lambda value: value.__setitem__("manifest_sha256", "0" * 64)),
+    ):
+        changed = json.loads(json.dumps(original_ts_user)); mutate(changed); ts_user_path.write_text(json.dumps(changed))
+        assert expected_error in run("python3", GCP / "aggregate.py", matched_root, ok=False).stderr
+    ts_user_path.write_text(json.dumps(original_ts_user))
 
     # A full current runtime object must still describe a realizable receive
     # mode. Scalar batch mode cannot claim that GRO was active.
@@ -236,7 +356,7 @@ with tempfile.TemporaryDirectory() as tmp:
     base = Path(tmp) / "base-observed.json"; selected = Path(tmp) / "selected-observed.json"
     base.write_text(json.dumps(valid_ts_tun()["observed"]))
     run("python3", GCP / "provenance.py", "select-observed", selected, "--input", base, "--config", "ts-tun", "--topology", "same-zone", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--machine", "n1-standard-4")
-    assert {Path(x["path"]).name for x in json.loads(selected.read_text())["product"]["server"]} == {"tailscaled", "tailscale"}
+    assert {Path(x["path"]).name for x in json.loads(selected.read_text())["product"]["server"]} == {"tailscaled", "tailscale", "rustscale-bench"}
     base.write_text(json.dumps(observed()))
     run("python3", GCP / "provenance.py", "select-observed", selected, "--input", base, "--config", "rs-tun", "--topology", "same-zone", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--machine", "n1-standard-4")
     assert {Path(x["path"]).name for x in json.loads(selected.read_text())["product"]["server"]} == {"rustscale", "rustscaled", "rustscale-bench"}

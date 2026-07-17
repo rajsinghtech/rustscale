@@ -297,6 +297,7 @@ fi
 
 mkdir -p "$RDIR"
 OUT="$RDIR/$CONFIG.json"
+PENDING_OUT="$OUT.pending"
 PROVENANCE_HELPER="$(dirname "$0")/provenance.py"
 
 if (( SELF_TEST )); then
@@ -331,7 +332,8 @@ fi
 
 finalize_result_metadata() {
   (( PROFILE_ONLY )) && return 0
-  python3 "$PROVENANCE_HELPER" attach --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" "$OUT"
+  local result_path="${1:-$OUT}"
+  python3 "$PROVENANCE_HELPER" attach --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" "$result_path"
 }
 
 metadata_preflight_self_test() {
@@ -404,23 +406,35 @@ finalize_rs_tun_measurement() {
   tun_emit_result rustscale rs-tun "$path_class" "$runtime_server" "$runtime_client"
 }
 
-# Wait for a tailscale peer to appear on a VM.
-# Polls `tailscale status --json` until Peer count > 0.
+# Wait for one tailscaled instance to report a running local backend.
 # Args: VM ZONE SOCK [TIMEOUT=120]
-wait_ts_peer() {
-  local vm="$1" zone="$2" sock="$3" timeout="${4:-120}"
-  local elapsed=0
+wait_ts_online() {
+  local vm="$1" zone="$2" sock="$3" timeout="${4:-120}" elapsed=0
   while (( elapsed < timeout )); do
-    local count
-    count=$(ssh_cmd "$vm" "$zone" \
-      "tailscale --socket=$sock status --json 2>/dev/null \
-       | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get(\"Peer\",{})))' 2>/dev/null" \
-      2>/dev/null || echo "0")
-    if [[ "$count" -gt 0 ]] 2>/dev/null; then
+    if ssh_cmd "$vm" "$zone" \
+      "tailscale --socket=$sock status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if d.get(\"BackendState\")==\"Running\" and d.get(\"Self\",{}).get(\"Online\") is not False else 1)'" \
+      >/dev/null 2>&1; then
       return 0
     fi
-    sleep 5
-    elapsed=$((elapsed + 5))
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  return 1
+}
+
+# Wait for the specific expected IPv4 peer, not merely any tailnet member.
+# Args: VM ZONE SOCK PEER_IP [TIMEOUT=120]
+wait_ts_peer_ip() {
+  local vm="$1" zone="$2" sock="$3" peer_ip="$4" timeout="${5:-120}" elapsed=0
+  [[ "$peer_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
+  while (( elapsed < timeout )); do
+    if ssh_cmd "$vm" "$zone" \
+      "tailscale --socket=$sock status --json 2>/dev/null | python3 -c 'import json,sys; target=sys.argv[1]; peers=json.load(sys.stdin).get(\"Peer\",{}).values(); raise SystemExit(0 if any(target in p.get(\"TailscaleIPs\",[]) and p.get(\"Online\") is not False for p in peers) else 1)' $peer_ip" \
+      >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
   done
   return 1
 }
@@ -574,6 +588,51 @@ rs_userspace_client_command() {
     "$environment" "$authkey" "$target" "$duration" "$parallel" "$hostname" "$statedir" "$logfile"
 }
 
+# Start the shared kernel-TCP RSB1 server after a configuration has prepared
+# its transport. ts-userspace binds loopback; TUN cells bind all interfaces.
+# Args: BIND_ADDRESS
+start_kernel_rsb1_server() {
+  local bind="$1"
+  [[ "$bind" == 127.0.0.1 || "$bind" == 0.0.0.0 ]] || return 2
+  ssh_cmd "$SVM" "$SZONE" \
+    "rm -f /tmp/rsb1-server.{log,pid}; nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --transport kernel-tcp --bind $bind --port $PORT >/tmp/rsb1-server.log 2>&1 & echo \$! >/tmp/rsb1-server.pid" || return 1
+  local elapsed=0
+  while (( elapsed < 30 )); do
+    if ssh_cmd "$SVM" "$SZONE" \
+      'pid=$(cat /tmp/rsb1-server.pid 2>/dev/null); kill -0 "$pid" 2>/dev/null && grep -q "BENCH_READY 1" /tmp/rsb1-server.log' \
+      >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
+# Require the exact Serve TCP forward used by the RSB1 endpoint.
+verify_ts_serve_rsb1() {
+  ssh_cmd "$SVM" "$SZONE" \
+    "tailscale --socket=/tmp/ts-srv.sock serve status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); tcp=d.get(\"TCP\",{}); entry=tcp.get(\"$PORT\", tcp.get($PORT, {})); text=json.dumps(entry,sort_keys=True); raise SystemExit(0 if \"127.0.0.1:$PORT\" in text else 1)'"
+}
+
+# Start and verify the loopback-only SOCKS5 bridge. Every forked socat child is
+# included by exact process name in the client resource process set.
+start_ts_userspace_bridge() {
+  ssh_cmd "$CVM" "$CZONE" \
+    "pkill -x socat 2>/dev/null || true; rm -f /tmp/socat.{pid,log}; nohup prlimit --nofile=65535:65535 -- socat TCP4-LISTEN:5300,bind=127.0.0.1,reuseaddr,fork,nodelay SOCKS5-CONNECT:127.0.0.1:$1:$PORT,socksport=11080,nodelay >/tmp/socat.log 2>&1 & echo \$! >/tmp/socat.pid" || return 1
+  local elapsed=0
+  while (( elapsed < 30 )); do
+    if ssh_cmd "$CVM" "$CZONE" \
+      'pid=$(cat /tmp/socat.pid 2>/dev/null); kill -0 "$pid" 2>/dev/null && awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits && ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''^[^ ]+[[:space:]]+[^ ]+[[:space:]]+127\.0\.0\.1:5300([[:space:]]|$)'\'' && ! ss -H -ltn '\''sport = :5300'\'' | grep -Eq '\''(0\.0\.0\.0|\[::\]):5300'\''' \
+      >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
 command_shape_self_test() {
   local ts_direct rs_direct ts_derp rs_derp rs_server_off rs_client_off rs_server_on rs_client_on rs_server_outbound rs_server_scalar rs_server_plain rs_server_gso_off rs_userspace_server rs_userspace_client
   ts_direct=$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)
@@ -687,8 +746,23 @@ path_gate_self_test() {
   unset PATH_GATE_TEST_TRANSCRIPT PATH_GATE_TEST_STATUS
 }
 
+rsb1_workload_cleanup_command() {
+  printf '%s\n' \
+'pidfile=/tmp/rsb1-server.pid' \
+'pid=$(cat "$pidfile" 2>/dev/null || true)' \
+'case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac' \
+'pkill -TERM -x rustscale-bench 2>/dev/null || true' \
+'elapsed=0' \
+'while (( elapsed < 10 )) && pgrep -x rustscale-bench >/dev/null 2>&1; do sleep 1; elapsed=$((elapsed + 1)); done' \
+'pkill -KILL -x rustscale-bench 2>/dev/null || true' \
+'rm -f /tmp/rsb1-server.pid /tmp/rsb1-server.log /tmp/rsb1-server.footprint* /tmp/rsb1-client.footprint* /tmp/rsb1-*.log /tmp/rs-footprint-set.py' \
+'! pgrep -x rustscale-bench >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300)[[:space:]]"'
+}
+
 cleanup_rs_tun() {
   local status=0
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/rsb1-server.footprint >/dev/null || true
+  remote_stop_footprint "$CVM" "$CZONE" /tmp/rsb1-client.footprint >/dev/null || true
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-parity-server.footprint >/dev/null || true
   remote_stop_footprint "$CVM" "$CZONE" /tmp/rs-parity-client.footprint >/dev/null || true
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-tun-srv.footprint >/dev/null || true
@@ -697,28 +771,32 @@ cleanup_rs_tun() {
   # must not make ssh_sudo retry before the next non-root config starts.
   if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command server)"; then
     echo "[gcp] WARN: rs-tun iperf3 cleanup failed on server $SVM; forcing VM reset" >&2
-    reset_vm "$SVM" "$SZONE" || status=1
+    status=1; reset_vm "$SVM" "$SZONE" || true
   fi
   if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_iperf_cleanup_command client)"; then
     echo "[gcp] WARN: rs-tun iperf3 cleanup failed on client $CVM; forcing VM reset" >&2
-    reset_vm "$CVM" "$CZONE" || status=1
+    status=1; reset_vm "$CVM" "$CZONE" || true
   fi
 
   # Run both endpoints even if one remains dirty. Remote statuses are returned
   # immediately, so each cleanup action is deliberately idempotent.
   if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_cleanup_command srv)"; then
     echo "[gcp] WARN: in-guest rs-tun cleanup failed on server $SVM; forcing VM reset" >&2
-    reset_vm "$SVM" "$SZONE" || status=1
+    status=1; reset_vm "$SVM" "$SZONE" || true
   fi
   if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_cleanup_command cli)"; then
     echo "[gcp] WARN: in-guest rs-tun cleanup failed on client $CVM; forcing VM reset" >&2
-    reset_vm "$CVM" "$CZONE" || status=1
+    status=1; reset_vm "$CVM" "$CZONE" || true
   fi
-  # Erase helpers left by a previously interrupted userspace cell as well.
-  # This is intentionally best effort; rs-tun's safety status is determined
-  # by its daemon/TUN cleanup above.
-  ssh_sudo "$SVM" "$SZONE" "pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/ts-srv /tmp/ts-cli" || true
-  ssh_sudo "$CVM" "$CZONE" "pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/ts-srv /tmp/ts-cli" || true
+  if ! ssh_sudo "$SVM" "$SZONE" "$(rsb1_workload_cleanup_command)"; then
+    echo "[gcp] WARN: rs-tun RSB1 workload cleanup failed on server $SVM; forcing VM reset" >&2
+    status=1; reset_vm "$SVM" "$SZONE" || true
+  fi
+  if ! ssh_sudo "$CVM" "$CZONE" "$(rsb1_workload_cleanup_command)"; then
+    echo "[gcp] WARN: rs-tun RSB1 workload cleanup failed on client $CVM; forcing VM reset" >&2
+    status=1; reset_vm "$CVM" "$CZONE" || true
+  fi
+  (( status == 0 )) && CELL_CLEANED=1
   return "$status"
 }
 
@@ -824,41 +902,89 @@ rs_tun_cleanup_command() {
 'exit 1'
 }
 
-cleanup_ts_tun() {
-  # Samplers are independent background processes; stopping an already-stopped
-  # sampler is harmless and keeps every post-start exit quiescent.
-  remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-tun-srv.footprint >/dev/null || true
-  ssh_sudo "$SVM" "$SZONE" \
-    "kill \$(cat $(tun_iperf_server_pid_path ts-tun) 2>/dev/null) 2>/dev/null; pkill -x iperf3 2>/dev/null; pkill -x socat 2>/dev/null; pkill -f rustscale-bench 2>/dev/null; \
-     tailscale --socket=/tmp/ts-tun-srv.sock down 2>/dev/null; \
-     kill \$(cat /tmp/ts-tun-srv.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
-     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -rf /tmp/ts-tun-srv; rm -f /etc/resolv.conf.bench-bak /tmp/ts-tun-srv.{log,pid,sock} $(tun_iperf_server_pid_path ts-tun) $(tun_iperf_server_log_path ts-tun)" || true
-  ssh_sudo "$CVM" "$CZONE" \
-    "pkill -x iperf3 2>/dev/null; pkill -x socat 2>/dev/null; pkill -f rustscale-bench 2>/dev/null; tailscale --socket=/tmp/ts-tun-cli.sock down 2>/dev/null; \
-     kill \$(cat /tmp/ts-tun-cli.pid 2>/dev/null) 2>/dev/null; pkill -x tailscaled 2>/dev/null; \
-     cp /etc/resolv.conf.bench-bak /etc/resolv.conf 2>/dev/null || true; rm -rf /tmp/ts-tun-cli; rm -f /etc/resolv.conf.bench-bak /tmp/ts-tun-cli.{log,pid,sock} $(tun_iperf_warmup_path ts-tun) $(tun_iperf_sample_path ts-tun)" || true
+ts_tun_cleanup_command() {
+  local role="$1" socket state pidfile
+  if [[ "$role" == srv ]]; then
+    socket=/tmp/ts-tun-srv.sock; state=/tmp/ts-tun-srv; pidfile=/tmp/ts-tun-srv.pid
+  else
+    socket=/tmp/ts-tun-cli.sock; state=/tmp/ts-tun-cli; pidfile=/tmp/ts-tun-cli.pid
+  fi
+  printf '%s\n' \
+"socket=$socket" "state=$state" "pidfile=$pidfile" \
+'tailscale --socket="$socket" serve reset 2>/dev/null || true' \
+'tailscale --socket="$socket" down 2>/dev/null || true' \
+'for file in /tmp/rsb1-server.pid "$pidfile" /tmp/socat.pid; do pid=$(cat "$file" 2>/dev/null || true); case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac; done' \
+'pkill -TERM -x rustscale-bench 2>/dev/null || true' \
+'pkill -TERM -x socat 2>/dev/null || true' \
+'pkill -TERM -x tailscaled 2>/dev/null || true' \
+'is_clear() { ! pgrep -x rustscale-bench >/dev/null 2>&1 && ! pgrep -x socat >/dev/null 2>&1 && ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300)[[:space:]]"; }' \
+'elapsed=0; while (( elapsed < 15 )); do is_clear && break; sleep 1; elapsed=$((elapsed + 1)); done' \
+'if ! is_clear; then pkill -KILL -x rustscale-bench 2>/dev/null || true; pkill -KILL -x socat 2>/dev/null || true; pkill -KILL -x tailscaled 2>/dev/null || true; ip link delete dev tailscale0 2>/dev/null || true; fi' \
+'dns_ok=0' \
+'if [[ -f /etc/resolv.conf.bench-bak ]]; then cp /etc/resolv.conf.bench-bak /etc/resolv.conf && cmp -s /etc/resolv.conf.bench-bak /etc/resolv.conf && dns_ok=1; fi' \
+'rm -rf "$state" /tmp/rsb1-* /tmp/rs-footprint-set.py' \
+'rm -f /etc/resolv.conf.bench-bak "$socket" "$pidfile" /tmp/ts-tun-*.path*.log /tmp/socat.*' \
+'(( dns_ok == 1 )) && is_clear'
 }
 
-# Userspace cells share VMs with later matrix cells.  Their cleanup is
-# deliberately broad and idempotent: it stops the sampler first, then removes
-# every benchmark/tunnel helper and temporary state on both endpoints.
-cleanup_rs_userspace() {
+cleanup_ts_tun() {
+  local status=0
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/rsb1-server.footprint >/dev/null || true
+  remote_stop_footprint "$CVM" "$CZONE" /tmp/rsb1-client.footprint >/dev/null || true
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-tun-srv.footprint >/dev/null || true
+  if ! ssh_sudo "$SVM" "$SZONE" "$(ts_tun_cleanup_command srv)"; then
+    echo "[gcp] ERROR: ts-tun server cleanup postconditions failed; resetting VM" >&2
+    status=1; reset_vm "$SVM" "$SZONE" || true
+  fi
+  if ! ssh_sudo "$CVM" "$CZONE" "$(ts_tun_cleanup_command cli)"; then
+    echo "[gcp] ERROR: ts-tun client cleanup postconditions failed; resetting VM" >&2
+    status=1; reset_vm "$CVM" "$CZONE" || true
+  fi
+  (( status == 0 )) && CELL_CLEANED=1
+  return "$status"
+}
+
+userspace_cleanup_command() {
+  local role="$1" socket pidfile
+  if [[ "$role" == srv ]]; then socket=/tmp/ts-srv.sock; pidfile=/tmp/ts-srv.pid; else socket=/tmp/ts-cli.sock; pidfile=/tmp/ts-cli.pid; fi
+  printf '%s\n' \
+"socket=$socket" "pidfile=$pidfile" \
+'tailscale --socket="$socket" serve reset 2>/dev/null || true' \
+'tailscale --socket="$socket" down 2>/dev/null || true' \
+'for file in /tmp/rs-srv.pid /tmp/rsb1-server.pid "$pidfile" /tmp/socat.pid; do pid=$(cat "$file" 2>/dev/null || true); case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac; done' \
+'pkill -TERM -x rustscale-bench 2>/dev/null || true' \
+'pkill -TERM -x socat 2>/dev/null || true' \
+'pkill -TERM -x tailscaled 2>/dev/null || true' \
+'is_clear() { ! pgrep -x rustscale-bench >/dev/null 2>&1 && ! pgrep -x socat >/dev/null 2>&1 && ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300|11080)[[:space:]]"; }' \
+'elapsed=0; while (( elapsed < 15 )); do is_clear && break; sleep 1; elapsed=$((elapsed + 1)); done' \
+'if ! is_clear; then pkill -KILL -x rustscale-bench 2>/dev/null || true; pkill -KILL -x socat 2>/dev/null || true; pkill -KILL -x tailscaled 2>/dev/null || true; fi' \
+'rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/rs-parity-client /tmp/ts-srv /tmp/ts-cli /tmp/rsb1-*' \
+'rm -f /tmp/rs-srv.* /tmp/ts-srv.* /tmp/ts-cli.* /tmp/socat.* /tmp/rs-footprint-set.py' \
+'is_clear'
+}
+
+cleanup_userspace_endpoints() {
+  local status=0
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/rsb1-server.footprint >/dev/null || true
+  remote_stop_footprint "$CVM" "$CZONE" /tmp/rsb1-client.footprint >/dev/null || true
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-parity-server.footprint >/dev/null || true
   remote_stop_footprint "$CVM" "$CZONE" /tmp/rs-parity-client.footprint >/dev/null || true
   remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-srv.footprint >/dev/null || true
-  ssh_cmd "$SVM" "$SZONE" \
-    "kill \$(cat /tmp/rs-srv.pid 2>/dev/null) 2>/dev/null || true; pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/rs-parity-client /tmp/ts-srv /tmp/ts-cli; rm -f /tmp/rs-srv.{pid,log,footprint} /tmp/ts-{srv,cli}.{pid,log,sock} /tmp/{socat,iperf3-srv,ncat}.{pid,log}" || true
-  ssh_cmd "$CVM" "$CZONE" \
-    "pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/rs-cli-* /tmp/rs-parity-client /tmp/rs-srv /tmp/ts-srv /tmp/ts-cli; rm -f /tmp/rs-cli-*.{log,pid} /tmp/ts-{srv,cli}.{pid,log,sock} /tmp/{socat,iperf3-cli}.{pid,log}" || true
+  remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-srv.footprint >/dev/null || true
+  if ! ssh_cmd "$SVM" "$SZONE" "$(userspace_cleanup_command srv)"; then
+    echo "[gcp] ERROR: userspace server cleanup postconditions failed; resetting VM" >&2
+    status=1; reset_vm "$SVM" "$SZONE" || true
+  fi
+  if ! ssh_cmd "$CVM" "$CZONE" "$(userspace_cleanup_command cli)"; then
+    echo "[gcp] ERROR: userspace client cleanup postconditions failed; resetting VM" >&2
+    status=1; reset_vm "$CVM" "$CZONE" || true
+  fi
+  (( status == 0 )) && CELL_CLEANED=1
+  return "$status"
 }
 
-cleanup_ts_userspace() {
-  remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-srv.footprint >/dev/null || true
-  ssh_cmd "$SVM" "$SZONE" \
-    "tailscale --socket=/tmp/ts-srv.sock serve reset 2>/dev/null || true; kill \$(cat /tmp/ts-srv.pid 2>/dev/null) \$(cat /tmp/iperf3-srv.pid 2>/dev/null) \$(cat /tmp/ncat.pid 2>/dev/null) 2>/dev/null || true; pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; pkill -x ncat 2>/dev/null || true; rm -rf /tmp/ts-srv /tmp/ts-cli /tmp/rs-srv /tmp/rs-cli-*; rm -f /tmp/ts-{srv,cli}.{pid,log,sock,footprint} /tmp/{iperf3-srv,ncat,socat}.{pid,log}" || true
-  ssh_cmd "$CVM" "$CZONE" \
-    "kill \$(cat /tmp/ts-cli.pid 2>/dev/null) \$(cat /tmp/socat.pid 2>/dev/null) 2>/dev/null || true; pkill -f rustscale-bench 2>/dev/null || true; pkill -x tailscaled 2>/dev/null || true; pkill -x socat 2>/dev/null || true; pkill -x iperf3 2>/dev/null || true; rm -rf /tmp/ts-cli /tmp/ts-srv /tmp/rs-srv /tmp/rs-cli-*; rm -f /tmp/ts-{srv,cli}.{pid,log,sock} /tmp/{socat,iperf3-cli}.{pid,log}" || true
-}
+cleanup_rs_userspace() { cleanup_userspace_endpoints; }
+cleanup_ts_userspace() { cleanup_userspace_endpoints; }
 
 # Args: CLEANUP_FUNCTION ERROR_STRING [LOG_TAIL].  This is the sole failure
 # exit used after a userspace daemon has been started, making cleanup ordering
@@ -913,7 +1039,7 @@ try:
 except OSError:
     log_tail = ""
 obj = {
-    "schema_version": 2,
+    "schema_version": 5,
     "status": "failed",
     "tool": tool,
     "mode": mode,
@@ -1032,6 +1158,7 @@ cleanup_self_test() {
   cleanup_failure=$(
     CLEANUP_TEST_SSH_CALLS=""
     remote_stop_footprint() { :; }
+    reset_vm() { return 0; }
     ssh_sudo() {
       CLEANUP_TEST_SSH_CALLS+=" $1:$2"
       [[ "$3" == "$(rs_tun_iperf_cleanup_command server)" ]] && return 1
@@ -1071,7 +1198,7 @@ import json, sys
 path, duration, latency_count, inbound_pipeline, outbound_pipeline, udp_batch, udp_gro, udp_gso, *parallels = sys.argv[1:]
 with open(path) as f:
     result = json.load(f)
-assert result["schema_version"] == 3 and result["status"] == "failed"
+assert result["schema_version"] == 5 and result["status"] == "failed"
 assert result["run"]["source"]["includes_uncommitted_changes"] is False
 assert result["run"]["runtime"] == {"rs_tun_inbound_pipeline": inbound_pipeline == "1", "rs_tun_outbound_send_pipeline": outbound_pipeline == "1", "linux_udp_batch": udp_batch == "1", "linux_udp_gro": udp_gro == "1", "linux_udp_gso": udp_gso == "1"}
 assert result["observed"]["resolved_image"] == "dry-run"
@@ -1097,7 +1224,7 @@ with open(sys.argv[1]) as f:
 match = re.search(r"window\.__chartData = (.*?);</script>", html, re.DOTALL)
 assert match, "chart registry missing"
 registry = json.loads(match.group(1))
-expected = []  # failed cells deliberately expose no numeric measurements
+expected = [int(value) for value in sys.argv[2:]]
 assert all(data["parallels"] == expected
            for chart, data in registry.items() if chart.startswith("tp-"))
 PYEOF
@@ -1885,102 +2012,196 @@ PYEOF
   unset -f ssh_sudo run_tun_command scp_from
 }
 
-# Run the exact same RSB1 application workload for both RustScale transports.
-# The explicit warmup finishes before sampling. Endpoint resource sampling
-# then covers each fresh measured client process lifecycle (including its own
-# transport setup) with the same boundary definition for both transports.
-# Args: userspace-tsnet|kernel-tcp SERVER_IP externally-gated|unknown
-rs_parity_measure() {
-  local transport="$1" server_ip="$2" gated_path="$3"
-  local auth_args="" identity path_class warmup_json tp_json="[]" lat_json server_foot client_foot bin_size
-  RS_PARITY_FAILURE_LOG=/tmp/rs-parity-setup.log
-  local server_names=(rustscale-bench) client_names=(rustscale-bench)
-  [[ "$transport" == userspace-tsnet ]] && auth_args="--authkey $AUTHKEY"
-  if [[ "$transport" == kernel-tcp ]]; then
-    server_names=(rustscaled rustscale-bench); client_names=(rustscaled rustscale-bench)
-    ssh_cmd "$SVM" "$SZONE" "nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --transport kernel-tcp --port $PORT >/tmp/rs-parity-server.log 2>&1 & echo \$! >/tmp/rs-parity-server.pid"
-    for _ in {1..30}; do ssh_cmd "$SVM" "$SZONE" 'grep -q "BENCH_READY 1" /tmp/rs-parity-server.log' 2>/dev/null && break; sleep 1; done
-    ssh_cmd "$SVM" "$SZONE" 'grep -q "BENCH_READY 1" /tmp/rs-parity-server.log' || return 1
-  fi
-  identity=$([[ "$transport" == kernel-tcp ]] && echo kernel-tcp || echo userspace)
-  RS_PARITY_FAILURE_LOG=/tmp/rs-parity-warmup.log
-  local trial_attempt
+# Run one configuration-neutral RSB1 suite after the caller has prepared its
+# transport, endpoint, path gate, process subjects, and teardown function. The
+# sole warmup may retry before sampling; every measured throughput/latency
+# process is invoked exactly once and an incomplete lifecycle fails the cell.
+# Args: CLI_TRANSPORT REPORTED_TRANSPORT TARGET PRE_GATED_PATH
+rsb1_measure() {
+  local cli_transport="$1" reported_transport="$2" target="$3" gated_path="$4"
+  local auth_args="" path_class warmup_json warmup_evidence tp_json="[]" trial_json="[]" lat_json server_foot client_foot bin_size
+  local server_subjects client_subjects
+  RS_PARITY_FAILURE_LOG=/tmp/rsb1-setup.log
+  RSB1_MEASURE_PATH_POST=unknown
+  (( ${#RSB1_SERVER_SUBJECTS[@]} > 0 && ${#RSB1_CLIENT_SUBJECTS[@]} > 0 )) || return 2
+  [[ "$cli_transport" == userspace ]] && auth_args="--authkey $AUTHKEY"
+
+  RS_PARITY_FAILURE_LOG=/tmp/rsb1-warmup.log
+  local warmup_attempt
   warmup_json=""
-  for trial_attempt in 1 2 3; do
-    warmup_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup-$trial_attempt --state-dir /tmp/rs-parity-warmup-$trial_attempt --json 2>/tmp/rs-parity-warmup.log") && break
-    echo "[gcp] parity warmup retry $trial_attempt/3" >&2
+  for warmup_attempt in 1 2 3; do
+    warmup_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $cli_transport $auth_args --target $target --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup-$warmup_attempt --state-dir /tmp/rsb1-warmup-$warmup_attempt --json 2>/tmp/rsb1-warmup.log") && break
+    echo "[gcp] RSB1 warmup retry $warmup_attempt/3" >&2
     sleep 5
     warmup_json=""
   done
   [[ -n "$warmup_json" ]] || return 1
-  path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["transport"]==sys.argv[1] and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1; print(d["path_class"])' "$transport") || return 1
-  [[ "$transport" == kernel-tcp ]] && path_class="$gated_path"
-  [[ "$PATH_TAG" == direct && "$path_class" == direct || "$PATH_TAG" == derp && "$path_class" == derp ]] || { echo "[gcp] parity warmup observed wrong path: $path_class" >&2; return 1; }
+  path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport=sys.argv[1]; assert d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1 and d["established"]==1 and d["handshaken"]==1 and d["completed"]==1; value=float(d["total_mbps"]); assert math.isfinite(value) and value>0; print(d["path_class"])' "$reported_transport") || return 1
+  warmup_evidence=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in ("transport","protocol","direction","duration_secs","parallel","established","handshaken","completed","total_mbps","path_class")}))') || return 1
+  [[ "$reported_transport" == kernel-tcp ]] && path_class="$gated_path"
+  [[ "$PATH_TAG" == direct && "$path_class" == direct || "$PATH_TAG" == derp && "$path_class" == derp ]] || {
+    echo "[gcp] RSB1 warmup observed wrong path: $path_class" >&2
+    return 1
+  }
 
-  remote_start_footprint_set "$SVM" "$SZONE" /tmp/rs-parity-server.footprint "${server_names[@]}" >/dev/null || return 1
-  remote_start_footprint_set "$CVM" "$CZONE" /tmp/rs-parity-client.footprint "${client_names[@]}" >/dev/null || return 1
+  remote_start_footprint_set "$SVM" "$SZONE" /tmp/rsb1-server.footprint "${RSB1_SERVER_SUBJECTS[@]}" >/dev/null || return 1
+  remote_start_footprint_set "$CVM" "$CZONE" /tmp/rsb1-client.footprint "${RSB1_CLIENT_SUBJECTS[@]}" >/dev/null || return 1
   sleep 2
-  ssh_cmd "$SVM" "$SZONE" "grep -q '^RSSET ' /tmp/rs-parity-server.footprint" || return 1
-  ssh_cmd "$CVM" "$CZONE" "grep -q '^RSSET ' /tmp/rs-parity-client.footprint" || return 1
+  ssh_cmd "$SVM" "$SZONE" "grep -q '^RSSET ' /tmp/rsb1-server.footprint" || return 1
+  ssh_cmd "$CVM" "$CZONE" "grep -q '^RSSET ' /tmp/rsb1-client.footprint" || return 1
+
   local sample_number=0 total_samples=$((${#PARALLELS[@]} * REPEAT)) N sample_index sample_json mbps
   for N in "${PARALLELS[@]}"; do
     local -a samples=()
     for ((sample_index=1; sample_index<=REPEAT; sample_index++)); do
-      RS_PARITY_FAILURE_LOG=/tmp/rs-parity-$N-$sample_index.log
-      sample_json=""
-      for trial_attempt in 1 2 3; do
-        sample_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index-$trial_attempt --state-dir /tmp/rs-parity-$N-$sample_index-$trial_attempt --json 2>/tmp/rs-parity-$N-$sample_index.log") && break
-        echo "[gcp] parity N=$N sample=$sample_index retry $trial_attempt/3" >&2
-        sleep 5
-        sample_json=""
-      done
-      [[ -n "$sample_json" ]] || return 1
-      mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$transport" "$N" "$PATH_TAG") || return 1
-      samples+=("$mbps"); sample_number=$((sample_number+1)); (( sample_number == total_samples )) || sleep 3
+      echo "[gcp] $CONFIG: RSB1 N=$N sample=$sample_index/$REPEAT" >&2
+      RS_PARITY_FAILURE_LOG=/tmp/rsb1-$N-$sample_index.log
+      sample_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $cli_transport $auth_args --target $target --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index --state-dir /tmp/rsb1-$N-$sample_index --json 2>/tmp/rsb1-$N-$sample_index.log") || return 1
+      mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$reported_transport" "$N" "$PATH_TAG") || return 1
+      samples+=("$mbps")
+      trial_json=$(printf '%s' "$sample_json" | python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); d=json.load(sys.stdin); rows.append({"parallel":d["parallel"],"repeat_index":int(sys.argv[2]),"transport":d["transport"],"protocol":d["protocol"],"direction":d["direction"],"duration_s":d["duration_secs"],"established":d["established"],"handshaken":d["handshaken"],"completed":d["completed"],"total_mbps":d["total_mbps"],"path_class":d["path_class"]}); print(json.dumps(rows))' "$trial_json" "$sample_index") || return 1
+      sample_number=$((sample_number+1))
+      (( sample_number == total_samples )) || sleep 3
     done
     tp_json=$(append_tun_throughput_row "$tp_json" "$N" "$DURATION" "${samples[@]}") || return 1
   done
-  RS_PARITY_FAILURE_LOG=/tmp/rs-parity-lat.log
-  lat_json=""
-  for trial_attempt in 1 2 3; do
-    lat_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport $identity $auth_args --target $server_ip:$PORT --count $LATENCY_COUNT --hostname $CHOST-lat-$trial_attempt --state-dir /tmp/rs-parity-lat-$trial_attempt --json 2>/tmp/rs-parity-lat.log") && break
-    echo "[gcp] parity latency retry $trial_attempt/3" >&2
-    sleep 5
-    lat_json=""
-  done
-  [[ -n "$lat_json" ]] || return 1
-  lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); transport,n,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n; assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$transport" "$LATENCY_COUNT" "$PATH_TAG") || return 1
-  server_foot=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-parity-server.footprint)
-  client_foot=$(remote_stop_footprint "$CVM" "$CZONE" /tmp/rs-parity-client.footprint)
-  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/rustscale-bench')
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$transport" "$bin_size" "$tp_json" "$lat_json" "$server_foot" "$client_foot" "$REPEAT" "${PARALLELS[@]}" >"$OUT" <<'PYEOF'
+
+  # Latency is the final measured trial and receives the same inter-trial gap.
+  sleep 3
+  RS_PARITY_FAILURE_LOG=/tmp/rsb1-latency.log
+  lat_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport $cli_transport $auth_args --target $target --count $LATENCY_COUNT --hostname $CHOST-latency --state-dir /tmp/rsb1-latency --json 2>/tmp/rsb1-latency.log") || return 1
+  lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); transport,n,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n and all(type(v) is int and v>0 for v in d["samples_ns"]); assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$reported_transport" "$LATENCY_COUNT" "$PATH_TAG") || return 1
+  RSB1_MEASURE_PATH_POST=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path_class"])') || return 1
+  [[ "$reported_transport" == kernel-tcp ]] && RSB1_MEASURE_PATH_POST="$gated_path"
+
+  server_foot=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rsb1-server.footprint) || return 1
+  client_foot=$(remote_stop_footprint "$CVM" "$CZONE" /tmp/rsb1-client.footprint) || return 1
+  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/rustscale-bench') || return 1
+  server_subjects=$(IFS=,; printf '%s' "${RSB1_SERVER_SUBJECTS[*]}")
+  client_subjects=$(IFS=,; printf '%s' "${RSB1_CLIENT_SUBJECTS[*]}")
+
+  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$reported_transport" "$bin_size" "$tp_json" "$trial_json" "$warmup_evidence" "$lat_json" "$server_foot" "$client_foot" "$REPEAT" "$server_subjects" "$client_subjects" "${PARALLELS[@]}" >"$PENDING_OUT" <<'PYEOF'
 import json, sys
-config, topo, requested_path, observed_path, transport, size, tp, lat, server, client, repeat, *parallels = sys.argv[1:]
+config, topo, requested_path, observed_path, transport, size, tp, trials, warmup_evidence, lat, server, client, repeat, server_subjects, client_subjects, *parallels = sys.argv[1:]
 server, client = json.loads(server), json.loads(client)
-subjects = ["rustscale-bench"] if transport == "userspace-tsnet" else ["rustscaled", "rustscale-bench"]
+subject_sets = [server_subjects.split(","), client_subjects.split(",")]
 for endpoint in (server, client):
     assert endpoint["samples"] > 0 and endpoint["samples"] > endpoint["missing_samples"]
     assert endpoint["rss_peak_kb"] > 0 and endpoint["series"]
 scope = {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
-obj={"schema_version":4,"status":"ok","tool":"rustscale","mode":"userspace" if config=="rs-userspace" else "tun",
- "topology":topo,"path":requested_path,"config":config,"repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],
- "error":"","log_tail":"","path_class_reported":observed_path,"transport":transport,
- "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3},"client_lifecycle":"new_ephemeral_identity_per_trial","trial_max_attempts":3,"latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"userspace_portmapping":"disabled"},
- "throughput":json.loads(tp),"latency":json.loads(lat),
- "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap"],"sample_cadence_ms":1000,"server":dict(server,endpoint="server",subjects=subjects,scope=scope),"client":dict(client,endpoint="client",subjects=subjects,scope=scope)},
+implementation = "rustscale" if config.startswith("rs-") else "tailscale"
+mode = "userspace" if config.endswith("userspace") else "tun"
+transport_path = {
+    "rs-userspace":"embedded-tsnet",
+    "rs-tun":"kernel-tcp-via-rustscaled-tun",
+    "ts-userspace":"kernel-tcp-via-loopback-socat-socks5-tailscaled-serve",
+    "ts-tun":"kernel-tcp-via-tailscaled-tun",
+}[config]
+portmapping = "disabled" if config == "rs-userspace" else "not-applicable"
+obj={"schema_version":5,"status":"ok","tool":"rustscale" if implementation=="rustscale" else "tailscaled",
+ "implementation":implementation,"mode":mode,"topology":topo,"path":requested_path,"config":config,
+ "repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],"error":"","log_tail":"",
+ "path_class_reported":observed_path,"transport":transport,
+ "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,
+             "warmup":{"parallel":1,"duration_s":3,"max_attempts":3},
+             "client_lifecycle":"new_benchmark_process_per_trial","measured_trial_attempts":1,
+             "latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,
+             "latency_count":50,"transport_path":transport_path,"userspace_portmapping":portmapping},
+ "warmup_evidence":json.loads(warmup_evidence),"throughput":json.loads(tp),
+ "throughput_trials":json.loads(trials),"latency":json.loads(lat),
+ "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,
+              "server":dict(server,endpoint="server",subjects=subject_sets[0],scope=scope),
+              "client":dict(client,endpoint="client",subjects=subject_sets[1],scope=scope)},
  "footprint":dict(server,binary_size_bytes=int(size),subject="rustscale-bench",endpoint="server",scope=scope),
  "binary":{"subject":"rustscale-bench","size_bytes":int(size)}}
 print(json.dumps(obj,indent=2))
 PYEOF
-  finalize_result_metadata
+}
+
+# Publish only after a post-suite path gate and verified clean teardown. The
+# pending file is never considered by aggregate.py's three-level cell scan.
+publish_rsb1_result() {
+  local pre_path="$1" post_path="$2"
+  [[ -f "$PENDING_OUT" && "$pre_path" == "$post_path" && "$post_path" == "$PATH_TAG" ]] || return 1
+  python3 - "$PENDING_OUT" "$pre_path" "$post_path" <<'PYEOF'
+import json, os, sys, tempfile
+path, pre, post = sys.argv[1:]
+with open(path) as f: obj=json.load(f)
+obj["path_class_reported"] = post
+obj["path_gate"] = {"requested": obj["path"], "pre": pre, "post": post, "matched": pre == post == obj["path"]}
+obj["cleanup"] = {"status":"clean","samplers_stopped":True,"workload_stopped":True,"transport_stopped":True,"postconditions_verified":True}
+fd, temporary = tempfile.mkstemp(prefix=".rsb1-publish.", dir=os.path.dirname(path))
+with os.fdopen(fd, "w") as f: json.dump(obj, f, indent=2); f.write("\n")
+os.replace(temporary, path)
+PYEOF
+  finalize_result_metadata "$PENDING_OUT" || return 1
+  mv -f "$PENDING_OUT" "$OUT"
+}
+
+CELL_CLEANUP_FN=""
+CELL_MUTATED=0
+CELL_CLEANED=1
+arm_cell_cleanup() {
+  CELL_CLEANUP_FN="$1"
+  CELL_MUTATED=1
+  CELL_CLEANED=0
+}
+
+# Unexpected set -e exits and signals cannot hand a dirty VM to the next cell.
+cell_exit_cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  set +e
+  if (( CELL_MUTATED && ! CELL_CLEANED )) && [[ -n "$CELL_CLEANUP_FN" ]]; then
+    "$CELL_CLEANUP_FN"
+    local cleanup_status=$?
+    (( status == 0 )) && status=1
+    (( cleanup_status == 0 )) || status=$FATAL_HANDOFF_STATUS
+  fi
+  rm -f "$PENDING_OUT"
+  exit "$status"
+}
+
+rsb1_lifecycle_self_test() {
+  local command event status definition
+  command=$(ts_tun_cleanup_command srv) || return 1
+  bash -n <<<"$command" || return 1
+  [[ "$command" == *'tailscale --socket="$socket" down'* \
+    && "$command" == *'cmp -s /etc/resolv.conf.bench-bak /etc/resolv.conf'* \
+    && "$command" == *'ip link delete dev tailscale0'* \
+    && "$command" == *'pkill -KILL -x tailscaled'* ]] || return 1
+  command=$(userspace_cleanup_command cli) || return 1
+  bash -n <<<"$command" || return 1
+  [[ "$command" == *'serve reset'* && "$command" == *'pkill -KILL -x socat'* \
+    && "$command" == *'11080'* && "$command" == *'ip link show dev tailscale0'* ]] || return 1
+
+  # The measured suite contains retries only in the pre-sampling warmup.
+  definition=$(declare -f rsb1_measure)
+  [[ $(grep -c 'RSB1 warmup retry' <<<"$definition") -eq 1 \
+    && "$definition" != *'measured retry'* \
+    && "$definition" == *'throughput_trials'* ]] || return 1
+
+  event=$(mktemp "$RDIR/cell-exit-test.XXXXXX") || return 1
+  if ( set +e; CELL_MUTATED=1; CELL_CLEANED=0; CELL_CLEANUP_FN=self_test_cleanup; self_test_cleanup() { printf clean >"$event"; return 0; }; false; cell_exit_cleanup ); then
+    rm -f "$event"; return 1
+  else
+    status=$?
+  fi
+  [[ "$status" == 1 && "$(<"$event")" == clean ]] || { rm -f "$event"; return 1; }
+  if ( set +e; CELL_MUTATED=1; CELL_CLEANED=0; CELL_CLEANUP_FN=self_test_cleanup; self_test_cleanup() { return 1; }; false; cell_exit_cleanup ); then
+    rm -f "$event"; return 1
+  else
+    status=$?
+  fi
+  [[ "$status" == "$FATAL_HANDOFF_STATUS" ]] || { rm -f "$event"; return 1; }
+  rm -f "$event"
 }
 
 # ===========================================================================
 # Config: rs-userspace — rustscale-bench server + client
 # ===========================================================================
 run_rs_userspace() {
-  local receive_environment
-  receive_environment=$(linux_udp_environment "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO")
+  arm_cell_cleanup cleanup_rs_userspace
   echo "[gcp] rs-userspace: starting bench server on $SVM" >&2
   ssh_cmd "$SVM" "$SZONE" \
     "$(rs_userspace_server_start_command "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" "$AUTHKEY" "$PORT" "$SHOST" /tmp/rs-srv /tmp/rs-srv.log /tmp/rs-srv.pid)"
@@ -2009,12 +2230,22 @@ run_rs_userspace() {
   server_ip=$(ssh_cmd "$SVM" "$SZONE" "grep '^BENCH_IP ' /tmp/rs-srv.log | awk '{print \$2}'")
   echo "[gcp] rs-userspace: server IP=$server_ip" >&2
 
-  if rs_parity_measure userspace-tsnet "$server_ip" unknown; then
-    cleanup_rs_userspace
-    echo "[gcp] rs-userspace: wrote parity result $OUT" >&2
-    return 0
+  RSB1_SERVER_SUBJECTS=(rustscale-bench)
+  RSB1_CLIENT_SUBJECTS=(rustscale-bench)
+  if rsb1_measure userspace userspace-tsnet "$server_ip:$PORT" "$PATH_TAG"; then
+    local post_path="$RSB1_MEASURE_PATH_POST"
+    if ! cleanup_rs_userspace; then
+      emit_stub "rs-userspace-cleanup-failed"
+      return 1
+    fi
+    if publish_rsb1_result "$PATH_TAG" "$post_path"; then
+      echo "[gcp] rs-userspace: wrote matched RSB1 result $OUT" >&2
+      return 0
+    fi
+    emit_stub "rs-userspace-result-publish-failed"
+    return 1
   fi
-  fail_userspace_config cleanup_rs_userspace "rs-userspace-parity-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rs-parity-setup.log}")"
+  fail_userspace_config cleanup_rs_userspace "rs-userspace-rsb1-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rsb1-setup.log}")"
   return 1
 
 }
@@ -2023,6 +2254,7 @@ run_rs_userspace() {
 # Config: rs-tun — production rustscaled path + kernel-TCP RSB1 workload
 # ===========================================================================
 run_rs_tun() {
+  arm_cell_cleanup cleanup_rs_tun
   echo "[gcp] rs-tun: starting production rustscaled daemons" >&2
   if (( PROFILE || PROFILE_ONLY )) && ! profile_prepare; then
     emit_stub "rs-tun-perf-prepare-failed"
@@ -2073,7 +2305,20 @@ run_rs_tun() {
     return 0
   fi
 
-  if rs_parity_measure kernel-tcp "$server_ip" "$path_class"; then
+  if ! start_kernel_rsb1_server 0.0.0.0; then
+    emit_stub "rs-tun-rsb1-server-not-ready" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rsb1-server.log)"
+    cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
+    return 1
+  fi
+  RSB1_SERVER_SUBJECTS=(rustscaled rustscale-bench)
+  RSB1_CLIENT_SUBJECTS=(rustscaled rustscale-bench)
+  if rsb1_measure kernel-tcp kernel-tcp "$server_ip:$PORT" "$path_class"; then
+    local post_path
+    post_path=$(tun_path_gate 1 "$CVM" "$CZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/rs-tun-cli.path-post.log) || {
+      emit_stub "rs-post-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.path-post.log)"
+      cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
+      return 1
+    }
     if (( PROFILE )) && ! profile_rs_tun; then
       emit_stub "rs-tun-profile-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rs-tun-perf-server.log)"
       cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
@@ -2083,10 +2328,14 @@ run_rs_tun() {
       emit_stub "rs-tun-cleanup-failed"
       return "$FATAL_HANDOFF_STATUS"
     fi
-    echo "[gcp] rs-tun: wrote parity result $OUT" >&2
-    return 0
+    if publish_rsb1_result "$path_class" "$post_path"; then
+      echo "[gcp] rs-tun: wrote matched RSB1 result $OUT" >&2
+      return 0
+    fi
+    emit_stub "rs-tun-result-publish-failed"
+    return 1
   fi
-  emit_stub "rs-tun-parity-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-parity-lat.log)"
+  emit_stub "rs-tun-rsb1-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rsb1-latency.log}")"
   cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
   return 1
 
@@ -2097,200 +2346,110 @@ run_rs_tun() {
 # Config: ts-userspace — tailscaled userspace-networking + SOCKS5
 # ===========================================================================
 run_ts_userspace() {
-  echo "[gcp] ts-userspace: starting tailscaled on both VMs" >&2
+  arm_cell_cleanup cleanup_ts_userspace
+  echo "[gcp] ts-userspace: preparing loopback RSB1 server and tailscaled userspace path" >&2
 
-  # Server VM: tailscaled A + iperf3 + serve.
+  # The local RSB1 listener is authoritative readiness gate one and is never
+  # exposed on a host interface; tailscale Serve owns the tailnet-side port.
+  if ! start_kernel_rsb1_server 127.0.0.1; then
+    fail_userspace_config cleanup_ts_userspace "ts-userspace-rsb1-server-not-ready" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rsb1-server.log)"
+    return 1
+  fi
+
   ssh_cmd "$SVM" "$SZONE" \
-    "nohup tailscaled --tun=userspace-networking --socket=/tmp/ts-srv.sock \
-       --statedir=/tmp/ts-srv --port=41642 > /tmp/ts-srv.log 2>&1 & echo \$! > /tmp/ts-srv.pid"
-  sleep 3
+    "rm -rf /tmp/ts-srv; rm -f /tmp/ts-srv.{sock,log,pid}; nohup prlimit --nofile=65535:65535 -- tailscaled --tun=userspace-networking --socket=/tmp/ts-srv.sock --statedir=/tmp/ts-srv --port=41642 >/tmp/ts-srv.log 2>&1 & echo \$! >/tmp/ts-srv.pid" || {
+      fail_userspace_config cleanup_ts_userspace "ts-userspace-daemon-start-failed-srv"
+      return 1
+    }
+  sleep 2
   if ! ssh_cmd "$SVM" "$SZONE" \
     "tailscale --socket=/tmp/ts-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-srv.log"; then
-    echo "[gcp] ERROR: tailscale up failed on server" >&2
-    local _lt
-    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
-    fail_userspace_config cleanup_ts_userspace "ts-up-failed-srv" "$_lt"
+    fail_userspace_config cleanup_ts_userspace "ts-up-failed-srv" "$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)"
     return 1
   fi
   local server_ip
-  server_ip=$(ssh_cmd "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-srv.sock ip -4 2>>/tmp/ts-srv.log")
-  if [[ -z "$server_ip" ]]; then
-    echo "[gcp] ERROR: no tailnet IP on server" >&2
-    local _lt
-    _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)
-    fail_userspace_config cleanup_ts_userspace "ts-no-ip-srv" "$_lt"
+  server_ip=$(wait_tun_ip 0 "$SVM" "$SZONE" tailscale /tmp/ts-srv.sock /tmp/ts-srv.log) || {
+    fail_userspace_config cleanup_ts_userspace "ts-no-ip-srv" "$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)"
     return 1
-  fi
-  echo "[gcp] ts-userspace: server IP=$server_ip" >&2
+  }
 
-  # Clear any stale serve config from a prior run before setting up ours.
-  ssh_cmd "$SVM" "$SZONE" "tailscale --socket=/tmp/ts-srv.sock serve reset 2>>/tmp/ts-srv.log" || true
-  ssh_cmd "$SVM" "$SZONE" \
-    "tailscale --socket=/tmp/ts-srv.sock serve --tcp $PORT --bg 127.0.0.1:$PORT 2>>/tmp/ts-srv.log"
-  ssh_cmd "$SVM" "$SZONE" \
-    "pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT -B 127.0.0.1 > /tmp/iperf3-srv.log 2>&1 & echo \$! > /tmp/iperf3-srv.pid"
-  sleep 2
-
-  # Client VM: tailscaled B with SOCKS5.
   ssh_cmd "$CVM" "$CZONE" \
-    "nohup tailscaled --tun=userspace-networking --socket=/tmp/ts-cli.sock \
-       --statedir=/tmp/ts-cli --port=41643 --socks5-server=127.0.0.1:11080 \
-       > /tmp/ts-cli.log 2>&1 & echo \$! > /tmp/ts-cli.pid"
-  sleep 3
+    "rm -rf /tmp/ts-cli; rm -f /tmp/ts-cli.{sock,log,pid}; nohup prlimit --nofile=65535:65535 -- tailscaled --tun=userspace-networking --socket=/tmp/ts-cli.sock --statedir=/tmp/ts-cli --port=41643 --socks5-server=127.0.0.1:11080 >/tmp/ts-cli.log 2>&1 & echo \$! >/tmp/ts-cli.pid" || {
+      fail_userspace_config cleanup_ts_userspace "ts-userspace-daemon-start-failed-cli"
+      return 1
+    }
+  sleep 2
   if ! ssh_cmd "$CVM" "$CZONE" \
     "tailscale --socket=/tmp/ts-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-cli.log"; then
-    echo "[gcp] ERROR: tailscale up failed on client" >&2
-    local _lt
-    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
-    fail_userspace_config cleanup_ts_userspace "ts-up-failed-cli" "$_lt"
+    fail_userspace_config cleanup_ts_userspace "ts-up-failed-cli" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)"
+    return 1
+  fi
+  local client_ip
+  client_ip=$(wait_tun_ip 0 "$CVM" "$CZONE" tailscale /tmp/ts-cli.sock /tmp/ts-cli.log) || {
+    fail_userspace_config cleanup_ts_userspace "ts-no-ip-cli" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)"
+    return 1
+  }
+
+  # Both local backends and both exact peer identities must be online before
+  # Serve or SOCKS setup can be treated as benchmark readiness.
+  if ! wait_ts_online "$SVM" "$SZONE" /tmp/ts-srv.sock 120 \
+      || ! wait_ts_online "$CVM" "$CZONE" /tmp/ts-cli.sock 120 \
+      || ! wait_ts_peer_ip "$SVM" "$SZONE" /tmp/ts-srv.sock "$client_ip" 120 \
+      || ! wait_ts_peer_ip "$CVM" "$CZONE" /tmp/ts-cli.sock "$server_ip" 120; then
+    fail_userspace_config cleanup_ts_userspace "ts-specific-peer-not-online" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)"
+    return 1
+  fi
+  if ! ssh_cmd "$SVM" "$SZONE" 'pid=$(cat /tmp/ts-srv.pid); awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits' \
+      || ! ssh_cmd "$CVM" "$CZONE" 'pid=$(cat /tmp/ts-cli.pid); awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits'; then
+    fail_userspace_config cleanup_ts_userspace "ts-userspace-nofile-limit-too-low"
     return 1
   fi
 
-  # Wait for the peer to appear (replaces fixed sleep 5 which was too short
-  # on slower VMs, causing iperf3 to connect before the peer was established).
-  if ! wait_ts_peer "$CVM" "$CZONE" /tmp/ts-cli.sock 120; then
-    echo "[gcp] ERROR: no tailscale peer appeared on client after 120s" >&2
-    local _lt
-    _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)
-    fail_userspace_config cleanup_ts_userspace "ts-no-peer" "$_lt"
+  if ! ssh_cmd "$SVM" "$SZONE" \
+      "tailscale --socket=/tmp/ts-srv.sock serve reset 2>>/tmp/ts-srv.log || true; tailscale --socket=/tmp/ts-srv.sock serve --tcp $PORT --bg 127.0.0.1:$PORT 2>>/tmp/ts-srv.log" \
+      || ! verify_ts_serve_rsb1; then
+    fail_userspace_config cleanup_ts_userspace "ts-userspace-serve-gate-failed" "$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)"
+    return 1
+  fi
+  if ! start_ts_userspace_bridge "$server_ip"; then
+    fail_userspace_config cleanup_ts_userspace "ts-userspace-socat-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/socat.log)"
     return 1
   fi
 
-  # socat SOCKS5 bridge on client.
-  ssh_cmd "$CVM" "$CZONE" \
-    "pkill -x socat 2>/dev/null; nohup socat TCP-LISTEN:5300,fork,reuseaddr \
-       SOCKS5-CONNECT:127.0.0.1:11080:$server_ip:$PORT > /tmp/socat.log 2>&1 & echo \$! > /tmp/socat.pid"
-  sleep 2
-
-  # Footprint sampler for tailscaled PID on server VM.
-  local srv_pid
-  srv_pid=$(ssh_cmd "$SVM" "$SZONE" 'cat /tmp/ts-srv.pid')
-  remote_start_footprint "$SVM" "$SZONE" "$srv_pid" /tmp/ts-srv.footprint
-
-  # Throughput sweep via socat bridge.
-  local tp_json="[]"
-  for N in "${PARALLELS[@]}"; do
-    local -a samples=()
-    for ((sample_index = 1; sample_index <= REPEAT; sample_index++)); do
-      echo "[gcp] ts-userspace: iperf3 N=$N sample=$sample_index/$REPEAT via socat" >&2
-      local mbps
-      mbps=$(ssh_cmd "$CVM" "$CZONE" \
-        "iperf3 -c 127.0.0.1 -p 5300 -t $DURATION -P $N -R -J --connect-timeout 5000 2>/tmp/iperf3-cli-$N-$sample_index.log" \
-        | tun_iperf3_mbps 2>/dev/null) || { fail_userspace_config cleanup_ts_userspace "ts-userspace-throughput-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/iperf3-cli-$N-$sample_index.log)"; return 1; }
-      samples+=("$mbps")
-    done
-    tp_json=$(append_tun_throughput_row "$tp_json" "$N" "$DURATION" "${samples[@]}") || { fail_userspace_config cleanup_ts_userspace "ts-userspace-throughput-invalid"; return 1; }
-    sleep 3
-  done
-
-  # Latency: python ping-pong through SOCKS5 to ncat echo on server.
-  echo "[gcp] ts-userspace: latency via SOCKS5 ping-pong" >&2
-  ssh_cmd "$SVM" "$SZONE" \
-    "tailscale --socket=/tmp/ts-srv.sock serve reset 2>>/tmp/ts-srv.log; \
-     pkill -x ncat 2>/dev/null; \
-     nohup ncat -l 5202 --exec '/bin/cat' --keep-open > /tmp/ncat.log 2>&1 & echo \$! > /tmp/ncat.pid; \
-     sleep 1; \
-     tailscale --socket=/tmp/ts-srv.sock serve --tcp 5202 --bg 127.0.0.1:5202 2>>/tmp/ts-srv.log || \
-     tailscale --socket=/tmp/ts-srv.sock serve --tcp 5202 --bg 127.0.0.1:5202 2>>/tmp/ts-srv.log"
-  sleep 2
-
-  local lat_json
-  lat_json=$(ssh_cmd "$CVM" "$CZONE" \
-    "python3 - '$server_ip' 5202 11080 $LATENCY_COUNT" <<'PYEOF'
-import socket, struct, sys, time, json, statistics
-target_ip, target_port, socks_port, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(10)
-    s.connect(('127.0.0.1', socks_port))
-    s.sendall(b'\x05\x01\x00')
-    resp = s.recv(2)
-    if resp != b'\x05\x00':
-        print(json.dumps({"error": f"socks5 auth failed: {resp.hex()}"})); sys.exit(0)
-    ip_bytes = socket.inet_aton(target_ip)
-    s.sendall(b'\x05\x01\x00\x01' + ip_bytes + struct.pack('>H', target_port))
-    resp = s.recv(10)
-    if resp[1] != 0:
-        print(json.dumps({"error": f"socks5 connect failed: {resp[1]}"})); sys.exit(0)
-    rtts = []
-    for i in range(count):
-        start = time.perf_counter_ns()
-        s.sendall(b'PING')
-        data = b''
-        while len(data) < 4:
-            chunk = s.recv(4 - len(data))
-            if not chunk: break
-            data += chunk
-        rtts.append((time.perf_counter_ns() - start) // 1000)
-        time.sleep(0.1)
-    s.close()
-    rtts.sort()
-    n = len(rtts)
-    def pct(p):
-        return rtts[min(int(round((n-1)*p)), n-1)] if rtts else 0
-    print(json.dumps({
-        "p50_us": int(pct(0.50)), "p95_us": int(pct(0.95)), "p99_us": int(pct(0.99)),
-        "count": n,
-    }))
-except Exception as e:
-    print(json.dumps({"p50_us":0,"p95_us":0,"p99_us":0,"count":0,"error":str(e)}))
-PYEOF
-)
-
-  # Path class from tailscale status.
   local path_class
-  path_class=$(ssh_cmd "$CVM" "$CZONE" \
-    "tailscale --socket=/tmp/ts-cli.sock status --json 2>/dev/null" \
-    | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-peers=d.get('Peer',{})
-for k,v in peers.items():
-    if v.get('CurAddr',''): print('direct'); sys.exit(0)
-    if v.get('Relay',''): print('derp'); sys.exit(0)
-print('unknown')
-" 2>/dev/null || echo unknown)
+  path_class=$(tun_path_gate 0 "$CVM" "$CZONE" tailscale /tmp/ts-cli.sock "$server_ip" "$PATH_TAG" /tmp/ts-cli.path.log) || {
+    fail_userspace_config cleanup_ts_userspace "ts-userspace-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.path.log)"
+    return 1
+  }
 
-  # Stop footprint.
-  local foot_json
-  foot_json=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/ts-srv.footprint)
+  RSB1_SERVER_SUBJECTS=(tailscaled rustscale-bench)
+  RSB1_CLIENT_SUBJECTS=(tailscaled socat rustscale-bench)
+  if ! rsb1_measure kernel-tcp kernel-tcp 127.0.0.1:5300 "$path_class"; then
+    fail_userspace_config cleanup_ts_userspace "ts-userspace-rsb1-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rsb1-setup.log}")"
+    return 1
+  fi
 
-  # Binary size of tailscaled.
-  local bin_size
-  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /usr/sbin/tailscaled 2>/dev/null || echo 0')
-
-  cleanup_ts_userspace
-
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$bin_size" "$tp_json" "$lat_json" "$foot_json" "$REPEAT" "${PARALLELS[@]}" >"$OUT" <<'PYEOF'
-import json, sys
-config, topo, path_tag, path_class, bin_size, tp, lat, foot, repeat, *parallel_values = sys.argv[1:]
-obj = {
-    "schema_version": 2,
-    "status": "ok",
-    "tool": "tailscaled",
-    "mode": "userspace",
-    "topology": topo,
-    "path": path_tag,
-    "config": config,
-    "repeat": int(repeat),
-    "parallelism_requested": [int(value) for value in parallel_values],
-    "error": "",
-    "log_tail": "",
-    "throughput": json.loads(tp),
-    "latency": json.loads(lat),
-    "footprint": dict(json.loads(foot), binary_size_bytes=int(bin_size)),
-    "path_class_reported": path_class,
-}
-print(json.dumps(obj, indent=2))
-PYEOF
-  finalize_result_metadata
-  echo "[gcp] ts-userspace: wrote $OUT" >&2
+  local post_path
+  post_path=$(tun_path_gate 0 "$CVM" "$CZONE" tailscale /tmp/ts-cli.sock "$server_ip" "$PATH_TAG" /tmp/ts-cli.path-post.log) || {
+    fail_userspace_config cleanup_ts_userspace "ts-userspace-post-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.path-post.log)"
+    return 1
+  }
+  if ! cleanup_ts_userspace; then
+    emit_stub "ts-userspace-cleanup-failed"
+    return "$FATAL_HANDOFF_STATUS"
+  fi
+  if ! publish_rsb1_result "$path_class" "$post_path"; then
+    emit_stub "ts-userspace-result-publish-failed"
+    return 1
+  fi
+  echo "[gcp] ts-userspace: wrote matched RSB1 result $OUT" >&2
 }
 
 # ===========================================================================
 # Config: ts-tun — default tailscaled with kernel TUN
 # ===========================================================================
 run_ts_tun() {
+  arm_cell_cleanup cleanup_ts_tun
   echo "[gcp] ts-tun: starting tailscaled on both VMs (kernel TUN)" >&2
 
   # Use unique paths so root-owned files from ts-tun don't clash with
@@ -2305,11 +2464,15 @@ run_ts_tun() {
   # MagicDNS.  If tailscaled is killed without `tailscale down', resolv.conf
   # stays pointed at 100.100.100.100 and every subsequent config that relies
   # on system DNS (rustscale) fails with "Temporary failure in name resolution".
-  ssh_sudo "$SVM" "$SZONE"  'cp /etc/resolv.conf /etc/resolv.conf.bench-bak 2>/dev/null || true'
-  ssh_sudo "$CVM" "$CZONE"  'cp /etc/resolv.conf /etc/resolv.conf.bench-bak 2>/dev/null || true'
+  if ! ssh_sudo "$SVM" "$SZONE" "cp /etc/resolv.conf /etc/resolv.conf.bench-bak" \
+      || ! ssh_sudo "$CVM" "$CZONE" "cp /etc/resolv.conf /etc/resolv.conf.bench-bak"; then
+    emit_stub "ts-tun-dns-backup-failed"
+    cleanup_ts_tun || true
+    return "$FATAL_HANDOFF_STATUS"
+  fi
 
   ssh_sudo "$SVM" "$SZONE" \
-    "nohup tailscaled --socket=/tmp/ts-tun-srv.sock --statedir=/tmp/ts-tun-srv > /tmp/ts-tun-srv.log 2>&1 & echo \$! > /tmp/ts-tun-srv.pid"
+    "nohup prlimit --nofile=65535:65535 -- tailscaled --socket=/tmp/ts-tun-srv.sock --statedir=/tmp/ts-tun-srv > /tmp/ts-tun-srv.log 2>&1 & echo \$! > /tmp/ts-tun-srv.pid"
   sleep 3
   if ! ssh_sudo "$SVM" "$SZONE" \
     "tailscale --socket=/tmp/ts-tun-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-tun-srv.log"; then
@@ -2332,7 +2495,7 @@ run_ts_tun() {
   echo "[gcp] ts-tun: server IP=$server_ip" >&2
 
   ssh_sudo "$CVM" "$CZONE" \
-    "nohup tailscaled --socket=/tmp/ts-tun-cli.sock --statedir=/tmp/ts-tun-cli > /tmp/ts-tun-cli.log 2>&1 & echo \$! > /tmp/ts-tun-cli.pid"
+    "nohup prlimit --nofile=65535:65535 -- tailscaled --socket=/tmp/ts-tun-cli.sock --statedir=/tmp/ts-tun-cli > /tmp/ts-tun-cli.log 2>&1 & echo \$! > /tmp/ts-tun-cli.pid"
   sleep 3
   if ! ssh_sudo "$CVM" "$CZONE" \
     "tailscale --socket=/tmp/ts-tun-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-tun-cli.log"; then
@@ -2344,11 +2507,26 @@ run_ts_tun() {
     return 1
   fi
 
-  if ! wait_tun_ip 1 "$CVM" "$CZONE" tailscale /tmp/ts-tun-cli.sock /tmp/ts-tun-cli.log >/dev/null; then
+  local client_ip
+  if ! client_ip=$(wait_tun_ip 1 "$CVM" "$CZONE" tailscale /tmp/ts-tun-cli.sock /tmp/ts-tun-cli.log); then
     echo "[gcp] ERROR: tailscale CLI did not report a client IP" >&2
     local _lt
     _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.log)
     emit_stub "ts-no-ip-cli" "$_lt"
+    cleanup_ts_tun
+    return 1
+  fi
+  if ! wait_ts_online "$SVM" "$SZONE" /tmp/ts-tun-srv.sock 120 \
+      || ! wait_ts_online "$CVM" "$CZONE" /tmp/ts-tun-cli.sock 120 \
+      || ! wait_ts_peer_ip "$SVM" "$SZONE" /tmp/ts-tun-srv.sock "$client_ip" 120 \
+      || ! wait_ts_peer_ip "$CVM" "$CZONE" /tmp/ts-tun-cli.sock "$server_ip" 120; then
+    emit_stub "ts-specific-peer-not-online" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.log)"
+    cleanup_ts_tun
+    return 1
+  fi
+  if ! ssh_sudo "$SVM" "$SZONE" 'pid=$(cat /tmp/ts-tun-srv.pid); awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits' \
+      || ! ssh_sudo "$CVM" "$CZONE" 'pid=$(cat /tmp/ts-tun-cli.pid); awk '\''/Max open files/ {exit !($4 >= 65535 && $5 >= 65535)}'\'' /proc/$pid/limits'; then
+    emit_stub "ts-tun-nofile-limit-too-low"
     cleanup_ts_tun
     return 1
   fi
@@ -2363,22 +2541,33 @@ run_ts_tun() {
     emit_stub "ts-$path_error" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.path.log)"; cleanup_ts_tun; return 1
   fi
 
-  if ! ts_tun_measurement_preflight; then
-    emit_stub "ts-tun-iperf-preflight-failed" "$(capture_log_tail "$SVM" "$SZONE" "$(tun_iperf_server_log_path ts-tun)")"
-    cleanup_ts_tun
+  if ! start_kernel_rsb1_server 0.0.0.0; then
+    emit_stub "ts-tun-rsb1-server-not-ready" "$(capture_log_tail "$SVM" "$SZONE" /tmp/rsb1-server.log)"
+    cleanup_ts_tun || return "$FATAL_HANDOFF_STATUS"
     return 1
   fi
-
-  if ! tun_measure ts-tun 1 "$server_ip" /tmp/ts-tun-srv.pid \
-    /tmp/ts-tun-srv.footprint /usr/sbin/tailscaled; then
-    emit_stub "ts-tun-measure-failed" "$(tun_measure_failure_tail ts-tun "$TUN_MEASURE_FAILURE_STAGE")"
-    cleanup_ts_tun
+  RSB1_SERVER_SUBJECTS=(tailscaled rustscale-bench)
+  RSB1_CLIENT_SUBJECTS=(tailscaled rustscale-bench)
+  if ! rsb1_measure kernel-tcp kernel-tcp "$server_ip:$PORT" "$path_class"; then
+    emit_stub "ts-tun-rsb1-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rsb1-setup.log}")"
+    cleanup_ts_tun || return "$FATAL_HANDOFF_STATUS"
     return 1
   fi
-
-  cleanup_ts_tun
-
-  tun_emit_result tailscaled ts-tun "$path_class"
+  local post_path
+  post_path=$(tun_path_gate 1 "$CVM" "$CZONE" tailscale /tmp/ts-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/ts-tun-cli.path-post.log) || {
+    emit_stub "ts-tun-post-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.path-post.log)"
+    cleanup_ts_tun || return "$FATAL_HANDOFF_STATUS"
+    return 1
+  }
+  if ! cleanup_ts_tun; then
+    emit_stub "ts-tun-cleanup-failed"
+    return "$FATAL_HANDOFF_STATUS"
+  fi
+  if ! publish_rsb1_result "$path_class" "$post_path"; then
+    emit_stub "ts-tun-result-publish-failed"
+    return 1
+  fi
+  echo "[gcp] ts-tun: wrote matched RSB1 result $OUT" >&2
 }
 
 # ---------------------------------------------------------------------------
@@ -2387,10 +2576,14 @@ run_ts_tun() {
 if (( SELF_TEST )); then
   profile_command_self_test
   tun_measure_self_test
+  rsb1_lifecycle_self_test
   rm -rf "$RDIR"
   echo "run-config self-tests: OK" >&2
   exit 0
 fi
+trap cell_exit_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 case "$CONFIG" in
   rs-userspace)  run_rs_userspace ;;
   rs-tun)        run_rs_tun ;;

@@ -57,21 +57,11 @@ pub async fn run_userspace(
         super::throughput::wait_for_peer(&server, ip, Duration::from_secs(90)).await;
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let mut connected = None;
-    for attempt in 1..=3 {
-        match tokio::time::timeout(Duration::from_secs(45), server.dial(&target)).await {
-            Ok(Ok(stream)) => {
-                connected = Some(stream);
-                break;
-            }
-            Ok(Err(error)) => eprintln!("dial attempt {attempt} failed: {error}"),
-            Err(_) => eprintln!("dial attempt {attempt} timed out"),
-        }
-        if attempt < 3 {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    }
-    let stream = connected.ok_or("failed to dial after 3 attempts")?;
+    // A measured latency process gets one connection attempt. Retrying here
+    // would add unreported setup work to the endpoint resource window.
+    let stream = tokio::time::timeout(Duration::from_secs(180), server.dial(&target))
+        .await
+        .map_err(|_| "RSB1 latency connection setup timeout")??;
     let path = super::throughput::extract_path_class(&server.status(), &target);
     let result = measure(stream, "userspace-tsnet", target, count, path, my_ip).await?;
     super::throughput::close_userspace(&mut server).await?;
@@ -80,7 +70,7 @@ pub async fn run_userspace(
 
 pub async fn run_kernel(target: String, count: usize) -> Result<LatencyResult, Box<dyn Error>> {
     let stream =
-        tokio::time::timeout(Duration::from_secs(45), TcpStream::connect(&target)).await??;
+        tokio::time::timeout(Duration::from_secs(180), TcpStream::connect(&target)).await??;
     stream.set_nodelay(true)?;
     measure(
         stream,

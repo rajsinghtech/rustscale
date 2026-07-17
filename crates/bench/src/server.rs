@@ -12,7 +12,10 @@ use crate::protocol::{
     MODE_LATENCY, MODE_THROUGHPUT, PING_SIZE, READ_BUF_SIZE,
 };
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+// The client has one 180-second deadline for a complete 1000-stream fan-out.
+// Keep each accepted handler alive slightly longer so early connections do not
+// expire while the final SOCKS5/TUN handshakes complete before common GO.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(210);
 const IO_GRACE: Duration = Duration::from_secs(30);
 const LATENCY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 2048;
@@ -46,8 +49,8 @@ pub async fn run_userspace(
             _ => None,
         })
         .ok_or("no IPv4 tailnet address")?;
-    eprintln!("BENCH_IP {ip}\nBENCH_PORT {port}\nBENCH_READY 1");
     let mut listener = server.listen(port).await?;
+    eprintln!("BENCH_IP {ip}\nBENCH_PORT {port}\nBENCH_READY 1");
     eprintln!("listening on {ip}:{port} via userspace-tsnet");
     // Both transports have the same lifecycle and handler limit: they remain
     // available until explicitly stopped by the matrix cleanup path.

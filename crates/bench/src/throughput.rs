@@ -14,6 +14,11 @@ use crate::protocol::{
     MODE_THROUGHPUT, READ_BUF_SIZE,
 };
 
+// One bounded setup deadline applies to the complete connection and RSB1
+// handshake fan-out. It is deliberately longer than the server's normal
+// direct-path setup while remaining finite for failed 1000-stream trials.
+const SETUP_DEADLINE: Duration = Duration::from_secs(180);
+
 pub struct Sample {
     pub elapsed_secs: u64,
     pub mbps: f64,
@@ -73,26 +78,23 @@ pub async fn run_userspace(
         wait_for_peer(&server, ip, Duration::from_secs(90)).await;
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let mut streams = Vec::with_capacity(parallel);
-    for index in 0..parallel {
-        let mut connected = None;
-        for attempt in 1..=3 {
-            match tokio::time::timeout(Duration::from_secs(45), server.dial(&target)).await {
-                Ok(Ok(stream)) => {
-                    connected = Some(stream);
-                    break;
-                }
-                Ok(Err(error)) => eprintln!("dial {index} attempt {attempt} failed: {error}"),
-                Err(_) => eprintln!("dial {index} attempt {attempt} timed out"),
-            }
-            if attempt < 3 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+    // tsnet's public dial operation borrows the embedded server mutably, so
+    // these connections are serialized. Bound the complete fan-out with the
+    // same common deadline as kernel setup and never retry an individual
+    // measured connection inside the resource window.
+    let connect_all = async {
+        let mut streams = Vec::with_capacity(parallel);
+        for index in 0..parallel {
+            let stream = server.dial(&target).await.map_err(|error| {
+                format!("capacity error: established {index} of {parallel} requested connections: {error}")
+            })?;
+            streams.push(stream);
         }
-        streams.push(connected.ok_or_else(|| {
-            format!("capacity error: established {index} of {parallel} requested connections")
-        })?);
-    }
+        Ok::<_, String>(streams)
+    };
+    let streams = tokio::time::timeout(SETUP_DEADLINE, connect_all)
+        .await
+        .map_err(|_| format!("capacity error: did not establish all {parallel} requested userspace connections before the common setup deadline"))??;
     let path_class = extract_path_class(&server.status(), &target);
     let result = measure(
         streams,
@@ -137,14 +139,36 @@ pub async fn run_kernel(
     direction: &str,
     parallel: usize,
 ) -> Result<ThroughputResult, Box<dyn Error>> {
-    let mut streams = Vec::with_capacity(parallel);
-    for index in 0..parallel {
-        let stream = tokio::time::timeout(Duration::from_secs(45), TcpStream::connect(&target)).await
-            .map_err(|_| format!("capacity error: established {index} of {parallel} requested connections (timeout)"))?
-            .map_err(|error| format!("capacity error: established {index} of {parallel} requested connections: {error}"))?;
-        stream.set_nodelay(true)?;
-        streams.push(stream);
-    }
+    // Establish kernel TCP streams concurrently. A SOCKS5/socat bridge accepts
+    // locally before opening the tailnet side, so serial connects can otherwise
+    // leave early server handlers waiting for GO while the 1000th stream is
+    // still being created.
+    let connect_target = target.clone();
+    let connect_all = async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..parallel {
+            let target = connect_target.clone();
+            tasks.spawn(async move {
+                let stream = TcpStream::connect(&target)
+                    .await
+                    .map_err(|error| format!("connection {index}: {error}"))?;
+                stream
+                    .set_nodelay(true)
+                    .map_err(|error| format!("connection {index} TCP_NODELAY: {error}"))?;
+                Ok::<_, String>((index, stream))
+            });
+        }
+        let mut connected = Vec::with_capacity(parallel);
+        while let Some(joined) = tasks.join_next().await {
+            let item = joined.map_err(|error| format!("connection worker failed: {error}"))??;
+            connected.push(item);
+        }
+        connected.sort_unstable_by_key(|(index, _)| *index);
+        Ok::<_, String>(connected.into_iter().map(|(_, stream)| stream).collect())
+    };
+    let streams = tokio::time::timeout(SETUP_DEADLINE, connect_all)
+        .await
+        .map_err(|_| format!("capacity error: did not establish all {parallel} requested connections before the common setup deadline"))??;
     measure(
         streams,
         "kernel-tcp",
@@ -184,16 +208,37 @@ where
         count: 0,
     };
     let established = streams.len();
-    let setup = async {
-        for stream in &mut streams {
-            write_header(stream, &header)
-                .await
-                .map_err(|error| error.to_string())?;
-            read_ack(stream).await.map_err(|error| error.to_string())?;
+    // Send every header and await every ACK concurrently under one deadline.
+    // The returned streams are reassembled by index before the common GO
+    // barrier; no workload byte can flow while any handshake is incomplete.
+    let setup = async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, mut stream) in streams.drain(..).enumerate() {
+            tasks.spawn(async move {
+                write_header(&mut stream, &header)
+                    .await
+                    .map_err(|error| format!("stream {index} header: {error}"))?;
+                read_ack(&mut stream)
+                    .await
+                    .map_err(|error| format!("stream {index} ACK: {error}"))?;
+                Ok::<_, String>((index, stream))
+            });
         }
-        Ok::<_, String>(())
+        let mut ready = Vec::with_capacity(parallel);
+        while let Some(joined) = tasks.join_next().await {
+            let item =
+                joined.map_err(|error| format!("protocol setup worker failed: {error}"))??;
+            ready.push(item);
+        }
+        ready.sort_unstable_by_key(|(index, _)| *index);
+        Ok::<_, String>(
+            ready
+                .into_iter()
+                .map(|(_, stream)| stream)
+                .collect::<Vec<_>>(),
+        )
     };
-    tokio::time::timeout(Duration::from_secs(90), setup)
+    let streams = tokio::time::timeout(SETUP_DEADLINE, setup)
         .await
         .map_err(|_| {
             format!("protocol setup timeout: established={established} requested={parallel}")
@@ -439,4 +484,49 @@ pub(crate) fn extract_path_class(status: &ServerStatus, target: &str) -> String 
                 .into()
             },
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{read_go, read_header, write_ack};
+    use tokio::net::TcpListener;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kernel_setup_completes_all_one_thousand_streams() {
+        const STREAMS: usize = 1000;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            for _ in 0..STREAMS {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handlers.spawn(async move {
+                    let header = read_header(&mut stream).await.unwrap();
+                    assert_eq!(header.mode, MODE_THROUGHPUT);
+                    write_ack(&mut stream).await.unwrap();
+                    read_go(&mut stream).await.unwrap();
+                });
+            }
+            while let Some(result) = handlers.join_next().await {
+                result.unwrap();
+            }
+        });
+
+        // A zero-duration internal trial isolates setup from data-plane speed.
+        // The public CLI rejects zero, so production measurements still run
+        // for their declared positive duration.
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_kernel(address.to_string(), 0, "down", STREAMS),
+        )
+        .await
+        .expect("1000-stream setup exceeded the local gate")
+        .unwrap();
+        assert_eq!(
+            (result.established, result.handshaken, result.completed),
+            (STREAMS, STREAMS, STREAMS)
+        );
+        server.await.unwrap();
+    }
 }

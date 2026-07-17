@@ -50,14 +50,14 @@ import json, pathlib, sys
 root = next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json")).parent
 m = json.load(open(root / "matrix.json"))
 assert (m["topologies"], m["paths"], m["configs"]) == (
-    ["same-zone"], ["direct"], ["rs-tun", "ts-tun"])
-assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 2
-assert m["schema_version"] == 2 and root.name == m["run"]["id"]
+    ["same-zone"], ["direct"], ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"])
+assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 4
+assert m["schema_version"] == 3 and m["selection"]["preset"] == "normal-v1" and m["load"]["preset"] == "routine-v1" and root.name == m["run"]["id"]
 assert m["run"]["cloud"]["requested_machine_type"] == "n1-standard-4"
 assert m["run"]["runtime"] == {"rs_tun_inbound_pipeline": False, "rs_tun_outbound_send_pipeline": False, "linux_udp_batch": True, "linux_udp_gro": True, "linux_udp_gso": True}
 for cell in (root / "same-zone" / "direct").glob("*.json"):
     r = json.load(open(cell))
-    assert r["schema_version"] == 3 and r["run"] == m["run"] and r["observed"]["resolved_image"] == "dry-run"
+    assert r["schema_version"] == 5 and r["run"] == m["run"] and r["observed"]["resolved_image"] == "dry-run"
 PYEOF
 run env GCP_MACHINE=n2-standard-4 MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/machine-n2" tools/bench/gcp/run-matrix.sh --dry-run --config rs-tun
 run python3 - "$tmp/machine-n2" <<'PYEOF'
@@ -142,7 +142,7 @@ for cell in (root / "same-zone" / "direct").glob("*.json"):
     assert r["duration_s_requested"] == 20 and r["sample_cadence_s"] == 1
     assert r["peer_count_requested"] == 250
 html = (root / "dashboard.html").read_text()
-assert "configured peer load" in html and ">250<" in html
+assert "requested peer load" in html and "250 (not applied or observed)" in html
 PYEOF
 expect_status 2 tools/bench/gcp/run-matrix.sh --dry-run --parallelism 1,1001
 expect_status 2 tools/bench/gcp/run-matrix.sh --dry-run --parallelism 1,1
@@ -168,7 +168,7 @@ run python3 - "$tmp/full" <<'PYEOF'
 import json, pathlib, sys
 m = json.load(open(next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json"))))
 assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 16
-assert m["schema_version"] == 2
+assert m["schema_version"] == 3 and m["selection"]["preset"] == "full-v1"
 PYEOF
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/focused-filter" tools/bench/gcp/run-matrix.sh --dry-run --topology cross-region --path derp --config rs-userspace
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/full-filter" tools/bench/gcp/run-matrix.sh --full --dry-run --topology same-zone --path direct --config ts-tun

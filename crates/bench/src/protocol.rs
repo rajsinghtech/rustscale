@@ -27,6 +27,7 @@ pub const PING_SIZE: usize = 8;
 use std::error::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[derive(Clone, Copy)]
 pub struct Header {
     pub mode: u8,
     pub direction: u8,

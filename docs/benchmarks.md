@@ -115,79 +115,77 @@ target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5
   --count 1000 --json
 ```
 
-### GCP matrix and opt-in scale runs
+### GCP four-way matched matrix
 
-The paid GCP runner keeps its routine default at TUN mode with 1, 10, and 100
-streams. Userspace and scale points are explicit selections, so pull requests
-and ordinary operator runs do not accidentally expand cost:
+The ordinary paid GCP run is one affordable same-region/cross-zone, direct-path
+slice with all four cells and the routine load: three 10-second repeats at 1,
+10, and 100 streams.
 
 ```bash
-# Credential-free command/provenance/dashboard validation only.
-MATRIX_SKIP_COLLECT=1 tools/bench/gcp/run-matrix.sh --dry-run \
-  --config rs-userspace,rs-tun,ts-userspace,ts-tun \
-  --scale-streams --duration 20 --peer-count 1
+# Credential-free command, provenance, aggregation, and dashboard validation.
+MATRIX_SKIP_COLLECT=1 tools/bench/gcp/run-matrix.sh --dry-run
 
-# Native userspace scale run (maximum supported requested count is 1000).
-tools/bench/gcp/run-matrix.sh \
-  --config rs-userspace \
-  --parallelism 1,10,100,500,1000 --duration 20 --repeat 7
+# Ordinary four-way matched run (the defaults shown above).
+tools/bench/gcp/run-matrix.sh
+
+# Explicit all-cell scale contract.
+tools/bench/gcp/run-matrix.sh --scale-streams
 ```
 
+Every selected cell executes the same `rustscale-bench` workload: RSB1 download
+(direction `down`, 1280-byte writes), one P1/3-second warmup before sampling,
+the ordered throughput points and repeats, and 50 complete 8-byte RSB1 TCP
+ping-pongs with raw nanosecond samples. `rs-userspace` uses embedded tsnet;
+`rs-tun` uses kernel TCP through `rustscaled`; `ts-userspace` uses a loopback
+kernel-TCP client through socat, tailscaled's SOCKS5 listener, and Tailscale
+Serve; `ts-tun` uses kernel TCP through tailscaled's TUN. The proxy and Serve
+processes are part of the declared `ts-userspace` configuration.
+
 `--parallelism` preserves order, rejects duplicates, and accepts only 1–1000.
-`--scale-streams` expands to `1,2,4,8,16,32,64,100,200,500,1000` and conflicts
-with an explicit list. Duration is bounded to 3–120 seconds. The manifest and
-each attached result record the exact stream list, duration, configured peer
-load, and 1 Hz resource cadence. Endpoint provenance also records paths,
-versions, and hashes for available iperf3, socat, ncat, pidstat, and Python
-utilities. CPU/RSS raw samples are bounded to one hour
-per cell and retained alongside the existing average/peak summaries; Pages
-shows both userspace and TUN stream curves, peer-load context, and successful
-resource sample tables. CPU is derived from per-PID `/proc` tick deltas over
-each interval, not lifetime-averaged `ps %CPU`. Each cell is downsampled
-independently for display, while summaries cover the full source; displayed,
-retained, and total counts plus source truncation are disclosed. Sampling uses
-the same measured-client-process-lifecycle boundary for both RustScale modes,
-including transport setup inherent in each fresh client command and the common
-inter-trial gaps. Userspace commands use a fresh ephemeral identity per trial;
-this avoids reusing a closed tsnet engine while ensuring the control plane can
-remove each trial node after disconnect. Each requested sample has at most three
-transport attempts; only the first complete positive sample is retained, and a
-sample with three failed attempts fails the whole cell. Samples are not attributed to a
-particular stream point or peer effect. Missing files, empty series, or no observed process sample fail
-the cell rather than becoming zero. Failed cells remain null and are never
-resource rows.
+`--scale-streams` expands to
+`1,2,4,8,16,32,64,100,200,500,1000` and conflicts with an explicit list. No
+cell is capped or silently truncated: every trial must report the requested
+`established`, `handshaken`, and `completed` counts. Kernel connections and all
+RSB1 handshakes fan out concurrently under one bounded deadline. Embedded tsnet
+connection creation remains serialized by its mutable dial API but shares that
+complete-setup deadline; publication therefore also requires the paid P1000
+gate. A local 1000-stream kernel setup gate runs in the `rustscale-bench` tests.
 
-Both `rs-userspace` and `rs-tun` use the same `rustscale-bench` RSB1 download
-and TCP ping-pong workload. They share payload sizes, warmup, duration, repeat
-lifecycle, stream counts, raw samples, median calculation, and latency count.
-`rs-userspace` selects `userspace-tsnet`; `rs-tun` selects `kernel-tcp` after
-the RustScale CLI has proved the requested direct/DERP path. Counts through
-1000 are accepted for both RustScale modes and fail honestly if all requested
-connections cannot be established.
+The warmup may retry up to three times before resource sampling starts.
+Measured throughput and latency processes are never retried inside the resource
+window; one failed or incomplete trial discards the cell. Both endpoint
+samplers run continuously from after warmup through the throughput trials,
+three-second inter-trial gaps, and latency. Dynamic exact-name process sets are:
 
-Tailscale comparator cells remain a separate iperf3 series. Ubuntu's packaged
-iperf3 is conservatively capped at 128 streams, so paid `ts-userspace` and
-`ts-tun` runs above that point are rejected before provisioning.
+- `rs-userspace`: `rustscale-bench` on both endpoints.
+- `rs-tun`: `rustscaled` and `rustscale-bench` on both endpoints.
+- `ts-userspace`: server `tailscaled` + `rustscale-bench`; client `tailscaled`
+  + all `socat` processes + `rustscale-bench`.
+- `ts-tun`: `tailscaled` and `rustscale-bench` on both endpoints.
 
-`--peer-count` is a **configured-load label**, not a peer generator or an
-observed-count claim. Use values above one only with a separately controlled
-loader deployment, exact endpoint peer-count checks, and cleanup evidence.
-This focused change deliberately does not fabricate observed peer membership;
-the dashboard therefore says “configured peer load” and does not attribute
-resource samples to peer effects. Publication-quality peer-load conclusions
-still require real GCP runs and recorded loader/control-plane evidence. A
-1000-stream dry-run proves command and schema support only, not socket capacity
-or throughput.
+These process-scope series include no descendants by inference and no kernel
+CPU. In particular, TUN kernel work is excluded and shared pages across socat
+workers can be counted more than once. Results retain every throughput repeat,
+every stream lifecycle count, both endpoint timelines, pre/post path gates, and
+verified cleanup. A successful JSON is published only after samplers,
+workloads, Serve/SOCKS helpers, daemons, listeners, state, DNS changes, and TUN
+interfaces satisfy the cell's teardown postconditions. Unsafe handoff aborts
+the matrix.
 
-RustScale userspace-to-TUN comparisons are RSB1 workload-parity comparisons.
-Tailscale iperf3 comparator values are labeled separately and are not ranked
-against the RustScale parity series. Resource values declare endpoint,
-dynamic process-set scope, included PID/name observations, monotonic offsets,
-cadence, and workload phase coverage; unlike or legacy scopes are descriptive
-only and cannot receive “best” highlighting.
-The historical `same-zone` label currently selects two zones in one region;
-report its observed zones as same-region/cross-zone rather than silently
-reinterpreting old data.
+Manifest schema 3 records the normal/full/custom selection source and the
+routine/scale/custom load preset. Result schema 5 binds canonical
+implementation/mode identity, the manifest digest, requested load, RSB1
+workload, resources, path gates, and cleanup evidence. Historical manifest 1/2
+and result 3/4 data remain parseable as historical/partial evidence, but are not
+merged into current matched charts. The self-contained summary envelope can be
+moved or streamed without a sibling manifest.
+
+`--peer-count` records requested context only. Peer generation and observed
+peer load are not implemented, so current manifests explicitly record
+`effective=null`, `observed=null`, and `status=not-applied`; dashboards must not
+call it configured or effective load. The historical `same-zone` harness label
+currently provisions `us-central1-a` and `us-central1-b`, so reports describe
+it accurately as same-region/cross-zone.
 
 ### CI (GitHub Actions)
 

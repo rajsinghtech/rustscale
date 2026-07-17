@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # tools/bench/gcp/run-matrix.sh — main orchestrator for the GCP bench matrix.
 #
-# Defaults to the focused same-zone/direct rs-tun,ts-tun matrix. --full
-# restores the historical 2x2x4 = 16-cell matrix on dedicated
+# Defaults to the routine same-zone/direct four-way matched matrix. --full
+# expands topology/path coverage to the 2x2x4 = 16-cell matrix on dedicated
 # GCP VMs, writing per-run JSON + a combined summary.json + a standalone HTML
 # dashboard into bench-results/gcp-<stamp>/.
 #
 # Reuses tools/bench/lib.sh for ephemeral tailnet provisioning.
 #
 # Usage:
-#   tools/bench/gcp/run-matrix.sh            # focused run
+#   tools/bench/gcp/run-matrix.sh            # four-way routine run
 #   tools/bench/gcp/run-matrix.sh --dry-run  # validate args, no gcloud/API
 #
 # Environment:
@@ -48,6 +48,11 @@ MATRIX_OBSERVED_PATH="/dev/null"
 DURATION=10
 PEER_COUNT=1
 PARALLELISM_CSV="1,10,100"
+MATRIX_PRESET="custom"
+LOAD_PRESET="routine-v1"
+TOPOLOGY_SOURCE="explicit"
+PATH_SOURCE="explicit"
+CONFIG_SOURCE="explicit"
 
 MATRIX_SELF_TEST=0
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -65,7 +70,7 @@ rust_build_command() {
 
   for config in "${CONFIGS[@]}"; do
     case "$config" in
-      rs-userspace) requested=(rustscale-bench) ;;
+      rs-userspace|ts-userspace|ts-tun) requested=(rustscale-bench) ;;
       rs-tun) requested=(rustscale-bench rustscale-cli rustscale-rustscaled) ;;
       *) continue ;;
     esac
@@ -101,7 +106,8 @@ matrix_command_shape_self_test() {
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
   CONFIGS=(ts-userspace ts-tun)
-  [[ -z "$(rust_build_command)" ]] || return 1
+  actual=$(rust_build_command)
+  [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench' ]] || return 1
   CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
@@ -258,6 +264,7 @@ matrix_parse_args() {
   DURATION=10
   PEER_COUNT=1
   SCALE_STREAMS=0
+  LOAD_PRESET="routine-v1"
   SHOW_HELP=0
   TOPOLOGY_FILTER=""
   PATH_FILTER=""
@@ -307,10 +314,10 @@ matrix_parse_args() {
         (( seen_parallelism == 0 && seen_scale == 0 )) || { echo "--parallelism conflicts with a duplicate or --scale-streams" >&2; return 2; }
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--parallelism requires a value" >&2; return 2; }
         validate_matrix_parallelism_csv "$2" || return 2
-        PARALLELISM_CSV="$2"; seen_parallelism=1; shift 2 ;;
+        PARALLELISM_CSV="$2"; LOAD_PRESET=custom; seen_parallelism=1; shift 2 ;;
       --scale-streams)
         (( seen_scale == 0 && seen_parallelism == 0 )) || { echo "--scale-streams conflicts with a duplicate or --parallelism" >&2; return 2; }
-        PARALLELISM_CSV="1,2,4,8,16,32,64,100,200,500,1000"; SCALE_STREAMS=1; seen_scale=1; shift ;;
+        PARALLELISM_CSV="1,2,4,8,16,32,64,100,200,500,1000"; LOAD_PRESET=scale-streams-v1; SCALE_STREAMS=1; seen_scale=1; shift ;;
       --duration)
         (( seen_duration == 0 )) || { echo "duplicate option: --duration" >&2; return 2; }
         [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 3 && "$2" -le 120 ]] || { echo "--duration must be an integer in 3..=120" >&2; return 2; }
@@ -576,6 +583,9 @@ matrix_write_manifest() {
   read -r -a configs <<<"${groups[2]}"; read -r -a parallelism <<<"${groups[3]}"
   [[ "$repeat" =~ ^[1-9][0-9]*$ ]] || return 1
   for value in "${parallelism[@]}"; do [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1; done
+  local selected_load_preset="$LOAD_PRESET"
+  [[ "$selected_load_preset" != routine-v1 || "${parallelism[*]}" == "1 10 100" ]] || selected_load_preset=custom
+  [[ "$selected_load_preset" != scale-streams-v1 || "${parallelism[*]}" == "1 2 4 8 16 32 64 100 200 500 1000" ]] || selected_load_preset=custom
   [[ "$dry_run" == 1 ]] && dry_flag=(--dry-run)
   python3 tools/bench/gcp/provenance.py manifest "$output" \
     --run-id "$MATRIX_RUN_ID" --started-at-utc "$MATRIX_STARTED_AT_UTC" --commit "$MATRIX_SOURCE_COMMIT" \
@@ -587,7 +597,9 @@ matrix_write_manifest() {
     --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
     "${dry_flag[@]}" --topologies "${topologies[@]}" --paths "${paths[@]}" \
     --configs "${configs[@]}" --parallelism "${parallelism[@]}" --repeat "$repeat" \
-    --duration "$DURATION" --peer-count "$PEER_COUNT"
+    --duration "$DURATION" --peer-count "$PEER_COUNT" --matrix-preset "$MATRIX_PRESET" \
+    --load-preset "$selected_load_preset" --topology-source "$TOPOLOGY_SOURCE" \
+    --path-source "$PATH_SOURCE" --config-source "$CONFIG_SOURCE"
 }
 
 # Render into a sibling temporary file and publish only a complete document.
@@ -670,6 +682,7 @@ matrix_finalization_self_test() {
   MATRIX_PROJECT=fixture-project
   MATRIX_MANIFEST_DRY_RUN=0 matrix_write_manifest "$prod_dir/matrix.json" 1 same-zone -- direct -- rs-tun -- 1
   if ! python3 - "$dry_dir" "$prod_dir" "$GCP_MACHINE" <<'PYEOF'
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -679,28 +692,32 @@ dry, prod = map(Path, sys.argv[1:3])
 def endpoint(zone): return {"zone":zone,"machine_type":machine,"cpu_platform":"fixture","cpu_model":"fixture","logical_cpus":4,"kernel_release":"fixture","os_pretty_name":"fixture"}
 def observed(dry_run):
     if dry_run: return {"resolved_image":"dry-run","server":"dry-run","client":"dry-run","toolchain":"dry-run","product":"dry-run"}
-    products=[{"path":"/opt/rustscale/target/release/rustscale","version":"rustscale 1.0","version_source":"executable --version","sha256":"a"*64},{"path":"/opt/rustscale/target/release/rustscaled","version":"rustscaled 1.0","version_source":"executable --version","sha256":"b"*64}]
+    products=[{"path":"/opt/rustscale/target/release/rustscale","version":"rustscale 1.0","version_source":"executable --version","sha256":"a"*64},{"path":"/opt/rustscale/target/release/rustscaled","version":"rustscaled 1.0","version_source":"executable --version","sha256":"b"*64},{"path":"/opt/rustscale/target/release/rustscale-bench","version":"rustscale-bench 1.0","version_source":"executable --version","sha256":"c"*64}]
     return {"resolved_image":"fixture-image","server":endpoint("us-central1-a"),"client":endpoint("us-central1-b"),"toolchain":{"server_cargo":"cargo fixture","server_rustc_verbose":"rustc fixture","client_cargo":"cargo fixture","client_rustc_verbose":"rustc fixture"},"product":{"server":products,"client":products}}
 def result(root, status):
-    run=json.loads((root/"matrix.json").read_text())["run"]
-    common={"schema_version":3,"run":run,"observed":observed(status=="failed"),"status":status,"tool":"rustscale","mode":"tun",
-          "topology": "same-zone", "path": "direct", "config": "rs-tun", "repeat": 1,
-          "parallelism_requested": [1], "duration_s_requested": 10, "sample_cadence_s": 1,
-          "peer_count_requested": 1, "error": "dry-run", "log_tail": "",
-          "throughput": None, "latency": None, "footprint": None, "path_class_reported": "unknown"}
-    if status=="ok": common.update({"error":"","throughput":[{"parallel": 1, "mbps": 1.0, "duration_s": 10.0,
-                      "samples_mbps": [1.0], "statistic": "median"}],
-      "latency": {"requested": 50, "transmitted": 50, "received": 50, "loss": 0,
-                  "p50_us": 1, "p95_us": 2, "p99_us": 3, "count": 50},
-      "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 1, "rss_avg_kb": 1,
-                  "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1,
-                  "sample_cadence_s": 1,
-                  "series": [{"elapsed_s": 1, "rss_kb": 1, "cpu_pct": 0}],
-                  "series_truncated": False},
-      "path_class_reported": "direct"})
+    manifest=json.loads((root/"matrix.json").read_text()); run=manifest["run"]
+    common={"schema_version":5,"run":run,"observed":observed(status=="failed"),"status":status,"tool":"rustscale","implementation":"rustscale","mode":"tun",
+          "topology":"same-zone","path":"direct","config":"rs-tun","repeat":1,
+          "parallelism_requested":[1],"duration_s_requested":10,"sample_cadence_s":1,
+          "peer_count_requested":1,"error":"dry-run","log_tail":"","throughput":None,"latency":None,"footprint":None,"path_class_reported":"unknown"}
+    if status=="ok":
+        series={"rss_peak_kb":1,"rss_avg_kb":1,"cpu_peak_pct":0,"cpu_avg_pct":0,"samples":1,"missing_samples":0,"sample_cadence_s":1,"clock":"monotonic","series":[{"offset_ms":0,"rss_kb":1,"cpu_pct":0,"included_processes":["1:rustscaled"],"status":"observed"}],"series_truncated":False}
+        scope={"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
+        samples=list(range(1,51))
+        common.update({"error":"","transport":"kernel-tcp","throughput":[{"parallel":1,"mbps":1.0,"duration_s":10,"samples_mbps":[1.0],"statistic":"median"}],
+          "warmup_evidence":{"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_secs":3,"parallel":1,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"},
+          "throughput_trials":[{"parallel":1,"repeat_index":1,"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_s":10,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"}],
+          "latency":{"protocol":"RSB1-tcp-pingpong","requested":50,"successful":50,"timed_out":0,"malformed":0,"count":50,"p50_us":1,"p95_us":2,"p99_us":3,"samples_ns":samples},
+          "footprint":dict(series,binary_size_bytes=1,scope=scope),
+          "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3,"max_attempts":3},"client_lifecycle":"new_benchmark_process_per_trial","measured_trial_attempts":1,"latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"latency_count":50,"transport_path":"kernel-tcp-via-rustscaled-tun","userspace_portmapping":"not-applicable"},
+          "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,"server":dict(series,endpoint="server",subjects=["rustscaled","rustscale-bench"],scope=scope),"client":dict(series,endpoint="client",subjects=["rustscaled","rustscale-bench"],scope=scope)},
+          "path_class_reported":"direct","path_gate":{"requested":"direct","pre":"direct","post":"direct","matched":True},"cleanup":{"status":"clean","samplers_stopped":True,"workload_stopped":True,"transport_stopped":True,"postconditions_verified":True},
+          "identity":{"key":"same-zone/direct/rs-tun","cell_id":"rs-tun","implementation":"rustscale","mode":"tun","topology":"same-zone","path":"direct"},
+          "load":{"preset":manifest["load"]["preset"],"parallelism_requested":[1],"repeat":1,"duration_s":10,"peer_load":manifest["load"]["peer_load"]},
+          "manifest_sha256":hashlib.sha256((root/"matrix.json").read_bytes()).hexdigest()})
     return common
-(dry / "same-zone/direct/rs-tun.json").write_text(json.dumps(result(dry,"failed")))
-(prod / "same-zone/direct/rs-tun.json").write_text(json.dumps(result(prod,"ok")))
+(dry/"same-zone/direct/rs-tun.json").write_text(json.dumps(result(dry,"failed")))
+(prod/"same-zone/direct/rs-tun.json").write_text(json.dumps(result(prod,"ok")))
 PYEOF
   then rm -rf "$temp_dir"; return 1; fi
 
@@ -737,7 +754,7 @@ matrix_manifest_self_test() {
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
   python3 - "$manifest" "$GCP_MACHINE" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; assert data["schema_version"] == 2 and data["parallelism"] == [1,10,100] and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; assert data["schema_version"] == 3 and data["parallelism"] == [1,10,100] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1
@@ -843,15 +860,15 @@ fi
 matrix_usage() {
   cat <<EOF
 usage: $0 [--dry-run] [--full] [--profile] [--repeat N] [--parallelism LIST] [--scale-streams] [--duration N] [--peer-count N] [--topology LIST] [--path LIST] [--config LIST]
-Runs the focused same-zone/direct rs-tun,ts-tun GCP bench matrix.
+Runs same-zone/direct rs-userspace,rs-tun,ts-userspace,ts-tun with one matched RSB1 workload.
   --dry-run  validate args + script structure without gcloud or API calls.
-  --full     restore the historical two-topology, two-path, four-config matrix.
+  --full     expand to both topologies and both paths; all four configs remain selected.
   --topology comma-separated subset: same-zone,cross-region
   --path     comma-separated subset: direct,derp
   --config   comma-separated subset: rs-userspace,rs-tun,ts-userspace,ts-tun
   --repeat N run each throughput point N times (1..=9; default 3)
   --parallelism LIST ordered unique stream counts in 1..=1000 (default 1,10,100)
-  --scale-streams opt in to 1,2,4,8,16,32,64,100,200,500,1000 streams
+  --scale-streams opt in to the honest all-cell 1,2,4,8,16,32,64,100,200,500,1000 RSB1 sweep
   --duration N measured throughput seconds (3..=120; default 10)
   --peer-count N record configured remote-peer load (1..=1000; default 1)
   --profile  profile only the selected rs-tun cell after normal metrics
@@ -884,7 +901,7 @@ if (( FULL )); then
 else
   TOPOLOGIES=(same-zone)
   PATHS=(direct)
-  CONFIGS=(rs-tun ts-tun)
+  CONFIGS=("${ALL_CONFIGS[@]}")
 fi
 # This is serialized into matrix.json and must exactly match every result's
 # parallelism_requested list; changing the sweep is therefore self-describing.
@@ -914,21 +931,19 @@ select_values() {
 select_values "$TOPOLOGY_FILTER" "${ALL_TOPOLOGIES[@]}"; [[ -n "$TOPOLOGY_FILTER" ]] && TOPOLOGIES=("${SELECTED[@]}")
 select_values "$PATH_FILTER" "${ALL_PATHS[@]}"; [[ -n "$PATH_FILTER" ]] && PATHS=("${SELECTED[@]}")
 select_values "$CONFIG_FILTER" "${ALL_CONFIGS[@]}"; [[ -n "$CONFIG_FILTER" ]] && CONFIGS=("${SELECTED[@]}")
-# Tailscale comparator cells retain iperf3 and its conservative per-process
-# ceiling. Both RustScale cells use rustscale-bench and may attempt the full
-# opt-in range; capacity errors fail the cell rather than reducing concurrency.
-if (( ! DRY_RUN )); then
-  for parallel in "${PARALLELS[@]}"; do
-    if (( parallel > 128 )); then
-      for cfg in "${CONFIGS[@]}"; do
-        if [[ "$cfg" == ts-userspace || "$cfg" == ts-tun ]]; then
-          echo "--parallelism $parallel exceeds the safe iperf3 per-process limit (128) for $cfg; select a RustScale parity cell or use counts <=128" >&2
-          exit 2
-        fi
-      done
-    fi
-  done
+TOPOLOGY_SOURCE=$([[ -n "$TOPOLOGY_FILTER" ]] && echo explicit || { (( FULL )) && echo full || echo default; })
+PATH_SOURCE=$([[ -n "$PATH_FILTER" ]] && echo explicit || { (( FULL )) && echo full || echo default; })
+CONFIG_SOURCE=$([[ -n "$CONFIG_FILTER" ]] && echo explicit || { (( FULL )) && echo full || echo default; })
+if (( FULL )) && [[ -z "$TOPOLOGY_FILTER$PATH_FILTER$CONFIG_FILTER" ]]; then
+  MATRIX_PRESET=full-v1
+elif (( ! FULL )) && [[ -z "$TOPOLOGY_FILTER$PATH_FILTER$CONFIG_FILTER" ]]; then
+  MATRIX_PRESET=normal-v1
+else
+  MATRIX_PRESET=custom
 fi
+# Every selected cell uses rustscale-bench RSB1 and the exact requested list.
+# Capacity or lifecycle shortfalls fail the whole cell; the harness never caps,
+# truncates, or substitutes an effective stream count.
 if (( PROFILE )); then
   found=0
   for cfg in "${CONFIGS[@]}"; do [[ "$cfg" == rs-tun ]] && found=1; done
@@ -1023,17 +1038,18 @@ CLEANUP_RAN=0
  # Set AFTER bench_provision_tailnet calls its own trap, so this overrides it.
  # ---------------------------------------------------------------------------
  gcp_bench_cleanup() {
-   [[ $CLEANUP_RAN -eq 0 ]] || return
+   [[ $CLEANUP_RAN -eq 0 ]] || return 0
    CLEANUP_RAN=1
-   set +e
-   echo "[gcp] cleanup: deleting VMs + tailnet" >&2
-   if [[ -n "$ACTIVE_SRV" ]]; then
-     delete_vm "$ACTIVE_SRV" "$ACTIVE_SRV_ZONE"
+   local status=0
+   echo "[gcp] cleanup: finalizing VMs + tailnet before result publication" >&2
+   if [[ -z "${SKIP_VM_DELETE:-}" ]]; then
+     if [[ -n "$ACTIVE_SRV" ]]; then delete_vm "$ACTIVE_SRV" "$ACTIVE_SRV_ZONE" || status=1; fi
+     if [[ -n "$ACTIVE_CLI" ]]; then delete_vm "$ACTIVE_CLI" "$ACTIVE_CLI_ZONE" || status=1; fi
+   elif [[ -n "$ACTIVE_SRV$ACTIVE_CLI" ]]; then
+     echo "[gcp] cleanup: retaining requested debug VMs: $ACTIVE_SRV $ACTIVE_CLI" >&2
    fi
-   if [[ -n "$ACTIVE_CLI" ]]; then
-     delete_vm "$ACTIVE_CLI" "$ACTIVE_CLI_ZONE"
-   fi
-   bench_cleanup_tailnet
+   bench_cleanup_tailnet || status=1
+   return "$status"
  }
 
 gcp_bench_on_signal() {
@@ -1166,11 +1182,13 @@ for TOPO in "${TOPOLOGIES[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Aggregate + render. Any finalization return exits through gcp_bench_cleanup,
-# including the successful DRY_RUN contract and renderer failures.
+# Shared resources must be gone (or explicitly retained) before any complete
+# summary/dashboard is published. The EXIT trap remains an idempotent fallback.
 # ---------------------------------------------------------------------------
+if ! gcp_bench_cleanup; then
+  echo "[gcp] ERROR: run-level cleanup failed; refusing to publish complete results" >&2
+  exit 1
+fi
 matrix_finalize_results "$RESULTS_DIR" "$DRY_RUN" || exit $?
-
-# Clear the trap's VM deletion now that we're done; tailnet cleanup still runs.
 ACTIVE_SRV=""
 ACTIVE_CLI=""

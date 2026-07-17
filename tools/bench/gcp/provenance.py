@@ -7,6 +7,7 @@ atomic publication.  It must never serialize credentials.
 """
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -19,11 +20,18 @@ COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 RUN_ID = re.compile(r"gcp-[0-9]{8}-[0-9]{6}-[a-z0-9_-]+\Z")
 TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 SHA = re.compile(r"[0-9a-f]{64}\Z")
+CELL_IDENTITIES = {
+    "rs-userspace": {"implementation": "rustscale", "mode": "userspace"},
+    "rs-tun": {"implementation": "rustscale", "mode": "tun"},
+    "ts-userspace": {"implementation": "tailscale", "mode": "userspace"},
+    "ts-tun": {"implementation": "tailscale", "mode": "tun"},
+}
+SCALE_STREAMS = [1, 2, 4, 8, 16, 32, 64, 100, 200, 500, 1000]
 CONFIG_PRODUCTS = {
     "rs-tun": ("rustscaled", "rustscale", "rustscale-bench"),
-    "ts-tun": ("tailscaled", "tailscale"),
+    "ts-tun": ("tailscaled", "tailscale", "rustscale-bench"),
     "rs-userspace": ("rustscale-bench",),
-    "ts-userspace": ("tailscaled", "tailscale"),
+    "ts-userspace": ("tailscaled", "tailscale", "rustscale-bench"),
 }
 TOPOLOGY_ZONES = {"same-zone": ("us-central1-a", "us-central1-b"), "cross-region": ("us-central1-a", "us-west1-a")}
 
@@ -111,10 +119,12 @@ def validate_run(run):
 
 
 def validate_manifest(manifest):
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2: raise ValueError("matrix schema_version must be 2")
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in (2, 3):
+        raise ValueError("matrix schema_version must be 2 or 3")
     for key, choices in (("topologies", {"same-zone", "cross-region"}), ("paths", {"direct", "derp"}), ("configs", set(CONFIG_PRODUCTS))):
         values = manifest.get(key)
-        if not isinstance(values, list) or not values or len(values) != len(set(values)) or any(v not in choices for v in values): raise ValueError(f"invalid {key}")
+        if not isinstance(values, list) or not values or len(values) != len(set(values)) or any(v not in choices for v in values):
+            raise ValueError(f"invalid {key}")
     if type(manifest.get("repeat")) is not int or manifest["repeat"] <= 0: raise ValueError("invalid repeat")
     if not isinstance(manifest.get("parallelism"), list) or not manifest["parallelism"] or len(manifest["parallelism"]) != len(set(manifest["parallelism"])) or any(type(v) is not int or v <= 0 or v > 1000 for v in manifest["parallelism"]): raise ValueError("invalid parallelism")
     if "duration_s" in manifest and (type(manifest["duration_s"]) is not int or not 3 <= manifest["duration_s"] <= 120): raise ValueError("invalid duration_s")
@@ -122,7 +132,39 @@ def validate_manifest(manifest):
     if "peer_count_requested" in manifest and (type(manifest["peer_count_requested"]) is not int or not 1 <= manifest["peer_count_requested"] <= 1000): raise ValueError("invalid peer_count_requested")
     if type(manifest.get("dry_run")) is not bool: raise ValueError("invalid dry_run")
     if not manifest["dry_run"] and has_reserved(manifest.get("run")): raise ValueError("reserved sentinel in production run metadata")
-    if manifest.get("warmup") != {"parallel": 1, "duration_s": 3, "reverse": True}: raise ValueError("invalid warmup")
+
+    if manifest["schema_version"] == 2:
+        if manifest.get("warmup") != {"parallel": 1, "duration_s": 3, "reverse": True}: raise ValueError("invalid historical warmup")
+    else:
+        if manifest.get("warmup") != {"parallel": 1, "duration_s": 3, "direction": "down", "protocol": "RSB1"}:
+            raise ValueError("invalid RSB1 warmup")
+        selection = manifest.get("selection")
+        if not isinstance(selection, dict) or selection.get("preset") not in {"normal-v1", "full-v1", "custom"}:
+            raise ValueError("invalid selection preset")
+        source = selection.get("source")
+        if (not isinstance(source, dict) or set(source) != {"topologies", "paths", "configs"}
+                or any(value not in {"default", "full", "explicit"} for value in source.values())):
+            raise ValueError("invalid selection source")
+        expected_cells = [dict(id=config, **CELL_IDENTITIES[config]) for config in manifest["configs"]]
+        if selection.get("cells") != expected_cells:
+            raise ValueError("selection cells do not match configs")
+        if selection["preset"] == "normal-v1" and (manifest["topologies"], manifest["paths"], manifest["configs"]) != (["same-zone"], ["direct"], list(CELL_IDENTITIES)):
+            raise ValueError("normal-v1 requires exactly the routine four-cell slice")
+        if selection["preset"] == "full-v1" and (manifest["topologies"], manifest["paths"], manifest["configs"]) != (["same-zone", "cross-region"], ["direct", "derp"], list(CELL_IDENTITIES)):
+            raise ValueError("full-v1 requires the complete 16-cell matrix")
+        load = manifest.get("load")
+        if not isinstance(load, dict) or load.get("preset") not in {"routine-v1", "scale-streams-v1", "custom"}:
+            raise ValueError("invalid load preset")
+        if (load.get("parallelism_target") != manifest["parallelism"] or load.get("repeat") != manifest["repeat"]
+                or load.get("duration_s") != manifest.get("duration_s") or load.get("sample_cadence_s") != 1):
+            raise ValueError("load contract does not match flat manifest fields")
+        peer = load.get("peer_load")
+        if peer != {"requested": manifest.get("peer_count_requested"), "effective": None, "observed": None, "status": "not-applied"}:
+            raise ValueError("invalid peer-load evidence")
+        if load["preset"] == "routine-v1" and manifest["parallelism"] != [1, 10, 100]:
+            raise ValueError("routine-v1 requires streams 1,10,100")
+        if load["preset"] == "scale-streams-v1" and manifest["parallelism"] != SCALE_STREAMS:
+            raise ValueError("scale-streams-v1 requires the complete scale list")
     validate_run(manifest.get("run"))
 
 
@@ -190,7 +232,17 @@ def command_manifest(args):
                        "linux_udp_batch": args.linux_udp_batch == "1",
                        "linux_udp_gro": args.linux_udp_gro == "1",
                        "linux_udp_gso": args.linux_udp_gso == "1"}}
-    data = {"schema_version": 2, "topologies": args.topologies, "paths": args.paths, "configs": args.configs, "parallelism": args.parallelism, "repeat": args.repeat, "duration_s": args.duration, "sample_cadence_s": 1, "peer_count_requested": args.peer_count, "dry_run": args.dry_run, "warmup": {"parallel": 1, "duration_s": 3, "reverse": True}, "run": run}
+    selection = {"preset": args.matrix_preset,
+                 "source": {"topologies": args.topology_source, "paths": args.path_source, "configs": args.config_source},
+                 "cells": [dict(id=config, **CELL_IDENTITIES[config]) for config in args.configs]}
+    load = {"preset": args.load_preset, "parallelism_target": args.parallelism, "repeat": args.repeat,
+            "duration_s": args.duration, "sample_cadence_s": 1,
+            "peer_load": {"requested": args.peer_count, "effective": None, "observed": None, "status": "not-applied"}}
+    data = {"schema_version": 3, "topologies": args.topologies, "paths": args.paths, "configs": args.configs,
+            "parallelism": args.parallelism, "repeat": args.repeat, "duration_s": args.duration,
+            "sample_cadence_s": 1, "peer_count_requested": args.peer_count, "dry_run": args.dry_run,
+            "warmup": {"parallel": 1, "duration_s": 3, "direction": "down", "protocol": "RSB1"},
+            "selection": selection, "load": load, "run": run}
     validate_manifest(data); atomic(args.output, data)
 
 
@@ -251,8 +303,21 @@ def command_attach(args):
     if zones is None: raise ValueError("invalid result topology")
     validate_observed(observed, config, manifest["dry_run"], topology, *zones, manifest["run"]["cloud"]["requested_machine_type"])
     source_schema = result.get("schema_version")
-    if source_schema not in (2, 4): raise ValueError("producer result schema_version must be 2 or 4")
-    result["schema_version"] = 4 if source_schema == 4 else 3
+    if source_schema not in (2, 4, 5): raise ValueError("producer result schema_version must be 2, 4, or 5")
+    result["schema_version"] = {2: 3, 4: 4, 5: 5}[source_schema]
+    if source_schema == 5:
+        identity = CELL_IDENTITIES[config]
+        result["implementation"] = identity["implementation"]
+        result["identity"] = {"key": f"{topology}/{path}/{config}", "cell_id": config,
+                              "implementation": identity["implementation"], "mode": identity["mode"],
+                              "topology": topology, "path": path}
+        result["load"] = {"preset": manifest.get("load", {}).get("preset", "custom"),
+                          "parallelism_requested": copy.deepcopy(manifest["parallelism"]),
+                          "repeat": manifest["repeat"], "duration_s": manifest.get("duration_s", 10),
+                          "peer_load": copy.deepcopy(manifest.get("load", {}).get("peer_load", {
+                              "requested": manifest.get("peer_count_requested", 1), "effective": None,
+                              "observed": None, "status": "not-applied"}))}
+        result["manifest_sha256"] = hashlib.sha256(Path(args.manifest).read_bytes()).hexdigest()
     for key, result_key in (("duration_s", "duration_s_requested"),
                             ("sample_cadence_s", "sample_cadence_s"),
                             ("peer_count_requested", "peer_count_requested")):
@@ -266,10 +331,10 @@ def command_validate(args):
     manifest = read(args.manifest); validate_manifest(manifest)
     if args.result:
         result = read(args.result)
-        if result.get("schema_version") not in (3, 4) or result.get("run") != manifest["run"]: raise ValueError("result run does not exactly equal matrix run")
+        if result.get("schema_version") not in (3, 4, 5) or result.get("run") != manifest["run"]: raise ValueError("result run does not exactly equal matrix run")
         topology = result.get("topology"); zones = TOPOLOGY_ZONES.get(topology)
         if result.get("config") not in manifest["configs"] or topology not in manifest["topologies"] or result.get("path") not in manifest["paths"] or zones is None: raise ValueError("result identity is not selected by manifest")
-        validate_observed(result.get("observed"), result.get("config"), manifest["dry_run"], topology, *zones, manifest["run"]["cloud"]["requested_machine_type"], current=result.get("schema_version") == 4)
+        validate_observed(result.get("observed"), result.get("config"), manifest["dry_run"], topology, *zones, manifest["run"]["cloud"]["requested_machine_type"], current=result.get("schema_version") in (4, 5))
 
 
 def command_preflight(args):
@@ -309,7 +374,7 @@ def command_profile(args):
 
 def main():
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="command", required=True)
-    m = sub.add_parser("manifest"); m.add_argument("output"); m.add_argument("--run-id", required=True); m.add_argument("--started-at-utc", required=True); m.add_argument("--commit", required=True); m.add_argument("--dirty", choices=("0", "1"), required=True); m.add_argument("--project", required=True); m.add_argument("--image-project", required=True); m.add_argument("--image-family", required=True); m.add_argument("--machine", required=True); m.add_argument("--network", required=True); m.add_argument("--disk-type", required=True); m.add_argument("--disk-gb", type=int, required=True); m.add_argument("--build-command", default=""); m.add_argument("--rustflags", default=""); m.add_argument("--lto", default=""); m.add_argument("--codegen-units", default=""); m.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), default="0"); m.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), default="0"); m.add_argument("--linux-udp-batch", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gro", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gso", choices=("0", "1"), default="1"); m.add_argument("--dry-run", action="store_true"); m.add_argument("--topologies", nargs="+", required=True); m.add_argument("--paths", nargs="+", required=True); m.add_argument("--configs", nargs="+", required=True); m.add_argument("--parallelism", type=int, nargs="+", required=True); m.add_argument("--repeat", type=int, required=True); m.add_argument("--duration", type=int, default=10); m.add_argument("--peer-count", type=int, default=1); m.set_defaults(func=command_manifest)
+    m = sub.add_parser("manifest"); m.add_argument("output"); m.add_argument("--run-id", required=True); m.add_argument("--started-at-utc", required=True); m.add_argument("--commit", required=True); m.add_argument("--dirty", choices=("0", "1"), required=True); m.add_argument("--project", required=True); m.add_argument("--image-project", required=True); m.add_argument("--image-family", required=True); m.add_argument("--machine", required=True); m.add_argument("--network", required=True); m.add_argument("--disk-type", required=True); m.add_argument("--disk-gb", type=int, required=True); m.add_argument("--build-command", default=""); m.add_argument("--rustflags", default=""); m.add_argument("--lto", default=""); m.add_argument("--codegen-units", default=""); m.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), default="0"); m.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), default="0"); m.add_argument("--linux-udp-batch", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gro", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gso", choices=("0", "1"), default="1"); m.add_argument("--dry-run", action="store_true"); m.add_argument("--topologies", nargs="+", required=True); m.add_argument("--paths", nargs="+", required=True); m.add_argument("--configs", nargs="+", required=True); m.add_argument("--parallelism", type=int, nargs="+", required=True); m.add_argument("--repeat", type=int, required=True); m.add_argument("--duration", type=int, default=10); m.add_argument("--peer-count", type=int, default=1); m.add_argument("--matrix-preset", choices=("normal-v1", "full-v1", "custom"), default="custom"); m.add_argument("--load-preset", choices=("routine-v1", "scale-streams-v1", "custom"), default="custom"); m.add_argument("--topology-source", choices=("default", "full", "explicit"), default="explicit"); m.add_argument("--path-source", choices=("default", "full", "explicit"), default="explicit"); m.add_argument("--config-source", choices=("default", "full", "explicit"), default="explicit"); m.set_defaults(func=command_manifest)
     d = sub.add_parser("dry-observed"); d.add_argument("output"); d.set_defaults(func=command_dry_observed)
     o = sub.add_parser("observed-real"); o.add_argument("output"); o.add_argument("--server-instance", required=True); o.add_argument("--client-instance", required=True); o.add_argument("--server-boot-disk", required=True); o.add_argument("--client-boot-disk", required=True); o.add_argument("--server-endpoint", required=True); o.add_argument("--client-endpoint", required=True); o.set_defaults(func=command_observed_real)
     s = sub.add_parser("select-observed"); s.add_argument("output"); s.add_argument("--input", required=True); s.add_argument("--config", required=True, choices=CONFIG_PRODUCTS); s.add_argument("--topology", required=True); s.add_argument("--server-zone", required=True); s.add_argument("--client-zone", required=True); s.add_argument("--machine", required=True); s.add_argument("--dry-run", action="store_true"); s.set_defaults(func=command_select_observed)

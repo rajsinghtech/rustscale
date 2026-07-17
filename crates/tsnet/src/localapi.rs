@@ -7414,6 +7414,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn response_etag(response: &str) -> String {
         response
             .lines()

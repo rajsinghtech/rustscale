@@ -31,6 +31,8 @@
     .performance-heading p, .performance-note { color: var(--muted); font-size: .85rem; }
     .performance-panel { margin-top: 1rem; padding: 1.15rem; border: 1px solid var(--border); border-radius: 10px; background: Canvas; }
     .performance-panel h3 { margin: 0; font-size: 1.12rem; }
+    .performance-panel details { margin: .85rem 0 1rem; padding: .7rem .85rem; border: 1px solid var(--border); border-radius: 8px; }
+    .performance-panel summary { cursor: pointer; font-weight: 700; }
     .panel-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem 1rem; margin-bottom: .7rem; }
     .status { padding: .15rem .55rem; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
     .status-measured { border-color: color-mix(in srgb, #287a3d 50%, transparent); color: #287a3d; }
@@ -102,12 +104,15 @@
         <p>Environment and evidence status are part of every result</p>
       </div>
 
-      <article class="performance-panel" data-benchmark="host-tun" data-environment="host-vm" data-mode="kernel-tun" data-evidence-status="measured" data-comparison="matched" data-rustscale-run="gcp-20260715-085022-076e87bd41" data-tailscaled-run="gcp-20260715-090601-02788a10b4" data-rustscale-profile="opt-in-outbound-pipeline" data-tailscaled-profile="default" data-provenance="docs/performance/benchmarks-2026-07-15.json">
+      <article class="performance-panel" data-benchmark="performance" data-environment="gcp-host-vm" data-mode="userspace-and-kernel-tun" data-evidence-status="measured" data-comparison="matched-evidence-sets" data-run="gcp-20260717-100908-a708151c79" data-rustscale-run="gcp-20260715-085022-076e87bd41" data-tailscaled-run="gcp-20260715-090601-02788a10b4" data-rustscale-profile="opt-in-outbound-pipeline" data-tailscaled-profile="default" data-provenance="docs/performance">
         <div class="panel-heading">
-          <h3>Host VM · kernel TUN</h3>
-          <span class="status status-measured">Measured · matched</span>
+          <h3>Performance · userspace and kernel TUN</h3>
+          <span class="status status-measured">Measured evidence</span>
         </div>
-        <p class="scope">Direct UDP on matched GCP <code>n1-standard-4</code> hosts, Linux 6.8, three 10-second samples per throughput point. This is a host benchmark; neither daemon ran in a container.</p>
+        <p class="scope">The current matched RSB1 scale run is summarized below. The older tailscaled comparison uses a different machine and workload, so it remains available as a separate, collapsed reference rather than a second competing result card.</p>
+        <details>
+          <summary>Earlier kernel-TUN comparison with tailscaled</summary>
+          <p class="scope">Direct UDP on matched GCP <code>n1-standard-4</code> hosts, Linux 6.8, three 10-second samples per throughput point. This is a host benchmark; neither daemon ran in a container.</p>
         <div class="chart-grid">
           <div class="chart" role="img" aria-label="Matched host TUN direct throughput in megabits per second. At one stream RustScale 2152 and tailscaled 2071. At ten streams RustScale 2238 and tailscaled 2356. At one hundred streams RustScale 1818 and tailscaled 1602.">
             <h3>Throughput · higher is better</h3>
@@ -134,13 +139,12 @@
         </div>
         <div class="legend" aria-hidden="true"><span class="rs">RustScale 0.1.1</span><span class="ts">tailscaled 1.98.9</span></div>
         <p class="performance-note">RustScale used its <strong>opt-in outbound pipeline</strong>; Linux UDP batching and GRO were recorded as enabled. TX-GSO state was not recorded for these matched runs, so the graph does not assume it. tailscaled used its <strong>default kernel-TUN settings</strong>. Both runs reported zero ping packet loss; the 50-ping sample is too small for a strong tail-latency claim.</p>
-        <p class="provenance">Provenance IDs: RustScale <code>gcp-20260715-085022-076e87bd41</code> · tailscaled <code>gcp-20260715-090601-02788a10b4</code> · source snapshot <a href="https://github.com/rajsinghtech/rustscale/blob/master/docs/performance/benchmarks-2026-07-15.json"><code>benchmarks-2026-07-15.json</code></a> · <a href="https://github.com/rajsinghtech/rustscale/blob/master/PERFORMANCE.md">methodology, raw samples, and caveats</a>.</p>
-      </article>
+          <p class="provenance">Provenance IDs: RustScale <code>gcp-20260715-085022-076e87bd41</code> · tailscaled <code>gcp-20260715-090601-02788a10b4</code> · source snapshot <a href="https://github.com/rajsinghtech/rustscale/blob/master/docs/performance/benchmarks-2026-07-15.json"><code>benchmarks-2026-07-15.json</code></a> · <a href="https://github.com/rajsinghtech/rustscale/blob/master/PERFORMANCE.md">methodology, raw samples, and caveats</a>.</p>
+        </details>
 
-      <article class="performance-panel" data-benchmark="rsb1-parity" data-environment="gcp-same-zone" data-mode="userspace-vs-kernel-tun" data-evidence-status="measured" data-comparison="matched-rsb1" data-run="gcp-20260717-100908-a708151c79" data-provenance="docs/performance/gcp-20260717-100908-a708151c79">
         <div class="panel-heading">
-          <h3>RustScale RSB1 · userspace vs kernel TUN</h3>
-          <span class="status status-measured">Measured · matched RSB1</span>
+          <h3>Current RSB1 scale run</h3>
+          <span class="status status-measured">Matched userspace ↔ TUN</span>
         </div>
         <p class="scope">Direct UDP on matched GCP <code>n2-standard-16</code> endpoints. Each point is the median of three complete 10-second RSB1 reverse-throughput samples. Both transports include 50-sample RSB1 latency distributions and complete 1-second server/client CPU and RSS timelines.</p>
         <div class="chart-grid">
@@ -153,7 +157,7 @@
             <p>P1 <strong>3169.4 Mbps</strong> · P10 <strong>3130.7 Mbps</strong> · P100 <strong>2395.1 Mbps</strong> · P500 <strong>1316.8 Mbps</strong> · P1000 <strong>993.5 Mbps</strong></p>
           </div>
         </div>
-        <p class="performance-note">Configured/requested peer load: 1. The harness did not generate background peers, and observed peer membership was not instrumented, so this run makes no peer-load scaling claim. Userspace used bounded retries disclosed in the tracked workload metadata; only complete positive trials were retained.</p>
+        <p class="performance-note"><strong>Latency p50/p95/p99:</strong> userspace 13.06/65.21/96.52 ms · kernel TUN 0.909/0.992/1.010 ms. Requested peer load: 1; observed peer membership was not instrumented, so this run makes no peer-scaling claim.</p>
         <p class="provenance">Run <code>gcp-20260717-100908-a708151c79</code> · <a href="performance/rsb1-parity.html">interactive performance view</a> · <a href="https://github.com/rajsinghtech/rustscale/tree/master/docs/performance/gcp-20260717-100908-a708151c79">raw tracked evidence, timelines, hashes, and manifest</a>.</p>
       </article>
 

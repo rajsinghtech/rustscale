@@ -23,24 +23,17 @@ HOST_RUN_IDS = {
 }
 
 PANEL_CONTRACTS = {
-    "host-tun": {
-        "data-environment": "host-vm",
-        "data-mode": "kernel-tun",
+    "performance": {
+        "data-environment": "gcp-host-vm",
+        "data-mode": "userspace-and-kernel-tun",
         "data-evidence-status": "measured",
-        "data-comparison": "matched",
+        "data-comparison": "matched-evidence-sets",
+        "data-run": PARITY_RUN_ID,
         "data-rustscale-run": HOST_RUN_IDS["rustscale"],
         "data-tailscaled-run": HOST_RUN_IDS["tailscaled"],
         "data-rustscale-profile": "opt-in-outbound-pipeline",
         "data-tailscaled-profile": "default",
-        "data-provenance": "docs/performance/benchmarks-2026-07-15.json",
-    },
-    "rsb1-parity": {
-        "data-environment": "gcp-same-zone",
-        "data-mode": "userspace-vs-kernel-tun",
-        "data-evidence-status": "measured",
-        "data-comparison": "matched-rsb1",
-        "data-run": PARITY_RUN_ID,
-        "data-provenance": f"docs/performance/{PARITY_RUN_ID}",
+        "data-provenance": "docs/performance",
     },
     "container-tun": {
         "data-environment": "container",
@@ -462,7 +455,7 @@ def validate_host_charts(host: dict[str, object], selected: dict[str, dict]) -> 
     ]
     charts = host["charts"]
     assert isinstance(charts, list)
-    actual = [chart.get("aria-label", "") for chart in charts]
+    actual = [chart.get("aria-label", "") for chart in charts[:len(expected)]]
     if actual != expected:
         raise SystemExit(f"Pages host TUN accessible chart labels drifted: {actual!r}")
 
@@ -580,7 +573,7 @@ def validate_parity_evidence(parser: PerformanceParser) -> None:
             or manifest.get("duration_s") != 10 or manifest.get("parallelism") != [1, 10, 100, 500, 1000]
             or manifest.get("peer_count_requested") != 1):
         raise SystemExit("tracked RSB1 parity manifest drifted")
-    parity = panel(parser, "rsb1-parity")
+    parity = panel(parser, "performance")
     for config in ("rs-userspace", "rs-tun"):
         result = json.loads((PARITY_DIR / f"{config}.json").read_text(encoding="utf-8"))
         if result.get("status") != "ok" or result.get("path_class_reported") != "direct":
@@ -603,7 +596,7 @@ def validate_parity_evidence(parser: PerformanceParser) -> None:
     assert isinstance(links, set)
     if "performance/rsb1-parity.html" not in links or not PARITY_PAGE.is_file():
         raise SystemExit("Pages RSB1 parity view is not linked")
-    require_text(parity, "Measured · matched RSB1", "requested peer load: 1", "observed peer membership was not instrumented")
+    require_text(parity, "Matched userspace ↔ TUN", "Requested peer load: 1", "observed peer membership was not instrumented")
 
 
 def main() -> None:
@@ -635,12 +628,13 @@ def main() -> None:
     validate_matched_runs(selected)
     validate_parity_evidence(parser)
 
-    host = panel(parser, "host-tun")
+    host = panel(parser, "performance")
     validate_host_bars(host, selected)
     validate_host_charts(host, selected)
     require_text(
         host,
-        "Measured · matched",
+        "Measured evidence",
+        "Earlier kernel-TUN comparison with tailscaled",
         "This is a host benchmark; neither daemon ran in a container.",
         "opt-in outbound pipeline",
         "Linux UDP batching and GRO were recorded as enabled",

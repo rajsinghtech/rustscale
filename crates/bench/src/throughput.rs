@@ -52,7 +52,9 @@ pub async fn run_userspace(
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(authkey)
-        .ephemeral(true)
+        // Reuse the benchmark state directory across trials so scale sweeps do
+        // not create one control-plane peer per sample.
+        .ephemeral(false)
         .disable_portmapping(true)
         .control_url(control_url);
     if let Some(ref d) = state_dir {
@@ -124,8 +126,10 @@ pub(crate) async fn close_userspace(server: &mut Server) -> Result<(), Box<dyn E
         }
     }
     Err(last_error
-        .map(|error| format!("userspace shutdown incomplete after 5 attempts: {error}"))
-        .unwrap_or_else(|| "userspace shutdown incomplete".into())
+        .map_or_else(
+            || "userspace shutdown incomplete".into(),
+            |error| format!("userspace shutdown incomplete after 5 attempts: {error}"),
+        )
         .into())
 }
 

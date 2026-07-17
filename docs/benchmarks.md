@@ -148,7 +148,8 @@ independently for display, while summaries cover the full source; displayed,
 retained, and total counts plus source truncation are disclosed. Sampling uses
 the same measured-client-process-lifecycle boundary for both RustScale modes,
 including transport setup inherent in each fresh client command and the common
-inter-trial gaps. Samples are not attributed to a particular stream point or
+inter-trial gaps. Userspace commands reuse one persisted client identity across
+the sweep so repeats do not create control-plane peers. Samples are not attributed to a particular stream point or
 peer effect. Missing files, empty series, or no observed process sample fail
 the cell rather than becoming zero. Failed cells remain null and are never
 resource rows.

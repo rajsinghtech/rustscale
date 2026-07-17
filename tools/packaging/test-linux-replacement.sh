@@ -60,10 +60,18 @@ done
 if ! sudo -n true 2>/dev/null; then
   skip "passwordless sudo is unavailable"
 fi
-systemd_state=$(systemctl is-system-running 2>/dev/null || true)
+systemd_state=unknown
+for ((systemd_attempt = 0; systemd_attempt < 60; systemd_attempt++)); do
+  systemd_state=$(systemctl is-system-running 2>/dev/null || true)
+  case "$systemd_state" in
+    running|degraded) break ;;
+    starting|initializing) sleep 1 ;;
+    *) break ;;
+  esac
+done
 case "$systemd_state" in
   running|degraded) ;;
-  *) skip "systemd manager is not running (state=${systemd_state:-unknown})" ;;
+  *) skip "systemd manager did not become ready (state=${systemd_state:-unknown})" ;;
 esac
 [[ -c /dev/net/tun ]] || skip "/dev/net/tun is not a character device"
 if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then

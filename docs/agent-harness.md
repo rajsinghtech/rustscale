@@ -45,7 +45,7 @@ RUSTSCALE_REMOTE_TARGET=builder-alias \
   tools/agent/remote-validate.sh check rustscale-tsnet
 ```
 
-The preflight records Linux distribution/kernel, architecture, CPUs, memory, free disk, archive integrity, and Rust/Go/optional-tool availability. It installs nothing. Missing prerequisites produce exact, copyable bootstrap commands in the terminal and result JSON; a user or administrator must review and run them separately. In particular, toolchain setup is never hidden inside a validation run.
+The preflight records Linux distribution/kernel, architecture, CPUs, memory, free disk, open-file limits, archive integrity, and Rust/Go/optional-tool availability. It installs nothing. The ephemeral remote runner raises only its inherited soft open-file limit, up to 65,536 or the existing hard limit, and requires at least 4,096 so the 1,000-stream workspace acceptance test is not weakened; it never changes persistent host limits. Missing prerequisites produce exact, copyable bootstrap commands in the terminal and result JSON; a user or administrator must review and run them separately. In particular, toolchain setup is never hidden inside a validation run.
 
 Each run captures `HEAD`, the current index tree, and a SHA-256 of the complete tracked diff from `HEAD`. It constructs a temporary candidate tree by applying the captured unstaged tracked diff to the reviewed Git index, then sends a hash-verified source archive. Staged new files are included; untracked and ignored files are not. Stage a new file only after reviewing it if it must be part of the candidate. The archive rejects `.git`, `target`, `.agent-runs`, `.worktrees`, secret directories, private-key/credential-like paths, and environment files. No existing remote checkout is read or modified.
 

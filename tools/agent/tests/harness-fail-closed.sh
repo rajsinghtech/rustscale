@@ -283,10 +283,14 @@ EOF
     REAL_TAR="$REAL_TAR" REAL_SHASUM="$REAL_SHASUM" \
     "$REPO/tools/agent/remote-validate.sh" check rustscale-key)
   assert_contains "$output" 'remote check args:rustscale-key'
+  assert_contains "$output" $'RUSTSCALE_REMOTE\tfact.open_files_soft\t'
+  assert_contains "$output" $'RUSTSCALE_REMOTE\tfact.open_files_hard\t'
   assert_contains "$output" $'RUSTSCALE_REMOTE\tstatus\tpassed'
   result=$(find "$REPO/.agent-runs/remote-validation" -type f -name '*.json' -print | sed -n '1p')
   assert_contains "$(cat "$result")" '"status": "passed"'
   assert_contains "$(cat "$result")" '"cleanup": "confirmed"'
+  assert_contains "$(cat "$result")" '"open_files_soft"'
+  assert_contains "$(cat "$result")" '"open_files_hard"'
 }
 
 test_remote_validation_disable_privilege_and_timeout_guards() {

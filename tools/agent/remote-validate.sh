@@ -363,6 +363,22 @@ else
 fi
 disk_kib=$(df -Pk "$ROOT" 2>/dev/null | awk 'NR == 2 {print $4; exit}')
 
+# Workspace acceptance includes a 1,000-stream barrier test that needs more
+# than the common SSH-session soft limit of 1,024 descriptors. Raise only this
+# ephemeral runner's soft limit, never the host hard limit or persistent state.
+nofile_soft=$(ulimit -Sn 2>/dev/null || printf unknown)
+nofile_hard=$(ulimit -Hn 2>/dev/null || printf unknown)
+nofile_target=65536
+if [[ "$nofile_hard" =~ ^[0-9]+$ ]] && (( nofile_hard < nofile_target )); then
+  nofile_target=$nofile_hard
+elif [[ "$nofile_hard" != unlimited && ! "$nofile_hard" =~ ^[0-9]+$ ]]; then
+  nofile_target=0
+fi
+if [[ "$nofile_soft" =~ ^[0-9]+$ ]] && (( nofile_target > nofile_soft )); then
+  ulimit -Sn "$nofile_target" 2>/dev/null || true
+  nofile_soft=$(ulimit -Sn 2>/dev/null || printf unknown)
+fi
+
 emit fact.os "$os_name"
 emit fact.os_id "${os_id:-unknown}"
 emit fact.os_version "${os_version:-unknown}"
@@ -372,6 +388,8 @@ emit fact.arch "$arch"
 emit fact.cpu_count "${cpus:-0}"
 emit fact.memory_kib "${memory_kib:-0}"
 emit fact.disk_available_kib "${disk_kib:-0}"
+emit fact.open_files_soft "$nofile_soft"
+emit fact.open_files_hard "$nofile_hard"
 
 [[ "$os_name" == Linux ]] || add_required "Linux operating system"
 case "$arch" in
@@ -386,6 +404,11 @@ fi
 if [[ ! "${disk_kib:-}" =~ ^[0-9]+$ ]] \
     || (( disk_kib < MIN_DISK_MIB * 1024 )); then
   add_required "at least ${MIN_DISK_MIB} MiB free disk"
+fi
+if [[ "$nofile_soft" != unlimited ]] \
+    && { [[ ! "$nofile_soft" =~ ^[0-9]+$ ]] || (( nofile_soft < 4096 )); }; then
+  add_required "soft open-file limit of at least 4096"
+  emit bootstrap "Raise the SSH session soft open-file limit to at least 4096 (for example: ulimit -Sn 65536)"
 fi
 
 SYSTEM_BOOTSTRAP=0

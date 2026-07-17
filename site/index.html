@@ -109,8 +109,8 @@
           <h3>Performance · userspace and kernel TUN</h3>
           <span class="status status-measured">Measured evidence</span>
         </div>
-        <p class="scope">The current matched RSB1 scale run is summarized below. The older tailscaled comparison uses a different machine and workload, so it remains available as a separate, collapsed reference rather than a second competing result card.</p>
-        <details>
+        <p class="scope">One matched GCP run, one RSB1 workload, and one direct comparison from 1 to 1000 streams.</p>
+        <details hidden>
           <summary>Earlier kernel-TUN comparison with tailscaled</summary>
           <p class="scope">Direct UDP on matched GCP <code>n1-standard-4</code> hosts, Linux 6.8, three 10-second samples per throughput point. This is a host benchmark; neither daemon ran in a container.</p>
         <div class="chart-grid">
@@ -148,20 +148,27 @@
         </div>
         <p class="scope">Direct UDP on matched GCP <code>n2-standard-16</code> endpoints. Each point is the median of three complete 10-second RSB1 reverse-throughput samples. Both transports include 50-sample RSB1 latency distributions and complete 1-second server/client CPU and RSS timelines.</p>
         <div class="chart-grid">
-          <div class="chart" role="img" aria-label="RustScale userspace RSB1 median throughput: P1 1231.1, P10 927.0, P100 779.5, P500 216.3, P1000 439.8 megabits per second.">
-            <h3>Userspace throughput</h3>
-            <p>P1 <strong>1231.1 Mbps</strong> · P10 <strong>927.0 Mbps</strong> · P100 <strong>779.5 Mbps</strong> · P500 <strong>216.3 Mbps</strong> · P1000 <strong>439.8 Mbps</strong></p>
-          </div>
-          <div class="chart" role="img" aria-label="RustScale kernel TUN RSB1 median throughput: P1 3169.4, P10 3130.7, P100 2395.1, P500 1316.8, P1000 993.5 megabits per second.">
-            <h3>Kernel-TUN throughput</h3>
-            <p>P1 <strong>3169.4 Mbps</strong> · P10 <strong>3130.7 Mbps</strong> · P100 <strong>2395.1 Mbps</strong> · P500 <strong>1316.8 Mbps</strong> · P1000 <strong>993.5 Mbps</strong></p>
-          </div>
+        <div class="chart" role="img" aria-label="Unified RustScale RSB1 median throughput comparison. Userspace versus kernel TUN: P1 1231.1 versus 3169.4, P10 927.0 versus 3130.7, P100 779.5 versus 2395.1, P500 216.3 versus 1316.8, and P1000 439.8 versus 993.5 megabits per second.">
+          <h3>Median throughput · Mbps · higher is better</h3>
+          <div class="metric"><span class="metric-name">1 stream</span><div class="bars"><div class="bar bar-rs" data-product="userspace" data-metric="rsb1-throughput" data-parallel="1" data-value="1231.131392" style="width:38.8%">Userspace 1231.1 Mbps</div><div class="bar bar-ts" data-product="tun" data-metric="rsb1-throughput" data-parallel="1" data-value="3169.3504288" style="width:100%">TUN 3169.4 Mbps</div></div></div>
+          <div class="metric"><span class="metric-name">10 streams</span><div class="bars"><div class="bar bar-rs" data-product="userspace" data-metric="rsb1-throughput" data-parallel="10" data-value="926.9508224" style="width:29.2%">Userspace 927.0 Mbps</div><div class="bar bar-ts" data-product="tun" data-metric="rsb1-throughput" data-parallel="10" data-value="3130.6521272" style="width:98.8%">TUN 3130.7 Mbps</div></div></div>
+          <div class="metric"><span class="metric-name">100 streams</span><div class="bars"><div class="bar bar-rs" data-product="userspace" data-metric="rsb1-throughput" data-parallel="100" data-value="779.475424" style="width:24.6%">Userspace 779.5 Mbps</div><div class="bar bar-ts" data-product="tun" data-metric="rsb1-throughput" data-parallel="100" data-value="2395.0926496" style="width:75.6%">TUN 2395.1 Mbps</div></div></div>
+          <div class="metric"><span class="metric-name">500 streams</span><div class="bars"><div class="bar bar-rs" data-product="userspace" data-metric="rsb1-throughput" data-parallel="500" data-value="216.325056" style="width:6.8%">Userspace 216.3 Mbps</div><div class="bar bar-ts" data-product="tun" data-metric="rsb1-throughput" data-parallel="500" data-value="1316.786848" style="width:41.5%">TUN 1316.8 Mbps</div></div></div>
+          <div class="metric"><span class="metric-name">1000 streams</span><div class="bars"><div class="bar bar-rs" data-product="userspace" data-metric="rsb1-throughput" data-parallel="1000" data-value="439.8244672" style="width:13.9%">Userspace 439.8 Mbps</div><div class="bar bar-ts" data-product="tun" data-metric="rsb1-throughput" data-parallel="1000" data-value="993.4558176" style="width:31.3%">TUN 993.5 Mbps</div></div></div>
         </div>
-        <p class="performance-note"><strong>Latency p50/p95/p99:</strong> userspace 13.06/65.21/96.52 ms · kernel TUN 0.909/0.992/1.010 ms. Requested peer load: 1; observed peer membership was not instrumented, so this run makes no peer-scaling claim.</p>
-        <p class="provenance">Run <code>gcp-20260717-100908-a708151c79</code> · <a href="performance/rsb1-parity.html">interactive performance view</a> · <a href="https://github.com/rajsinghtech/rustscale/tree/master/docs/performance/gcp-20260717-100908-a708151c79">raw tracked evidence, timelines, hashes, and manifest</a>.</p>
+        <div class="chart" role="img" aria-label="Unified RustScale RSB1 latency comparison in milliseconds. Userspace versus kernel TUN: p50 13.06 versus 0.909, p95 65.21 versus 0.992, and p99 96.52 versus 1.010. Lower is better.">
+          <h3>Latency · ms · lower is better</h3>
+          <div class="metric"><span class="metric-name">p50</span><div class="bars"><div class="bar bar-rs" style="width:100%">Userspace 13.06</div><div class="bar bar-ts" style="width:7%">TUN 0.909</div></div></div>
+          <div class="metric"><span class="metric-name">p95</span><div class="bars"><div class="bar bar-rs" style="width:100%">Userspace 65.21</div><div class="bar bar-ts" style="width:1.5%">TUN 0.992</div></div></div>
+          <div class="metric"><span class="metric-name">p99</span><div class="bars"><div class="bar bar-rs" style="width:100%">Userspace 96.52</div><div class="bar bar-ts" style="width:1%">TUN 1.010</div></div></div>
+        </div>
+        </div>
+        <div class="legend" aria-hidden="true"><span class="rs">Userspace</span><span class="ts">Kernel TUN</span></div>
+        <p class="performance-note">Requested peer load: 1; observed peer membership was not instrumented, so this run makes no peer-scaling claim.</p>
+        <p class="provenance">Run <code>gcp-20260717-100908-a708151c79</code> · <a href="https://github.com/rajsinghtech/rustscale/tree/master/docs/performance/gcp-20260717-100908-a708151c79">raw evidence and methodology</a>.</p>
       </article>
 
-      <article class="performance-panel" data-benchmark="container-tun" data-environment="container" data-mode="kernel-tun" data-evidence-status="not-measured" data-comparison="none" data-provenance="none">
+      <article hidden class="performance-panel" data-benchmark="container-tun" data-environment="container" data-mode="kernel-tun" data-evidence-status="not-measured" data-comparison="none" data-provenance="none">
         <div class="panel-heading">
           <h3>Container · kernel TUN</h3>
           <span class="status status-missing">Not yet measured</span>
@@ -172,7 +179,7 @@
         <p class="provenance">Provenance IDs: none. Numbers will remain unpublished until a matched container run is retained as credential-free tracked evidence.</p>
       </article>
 
-      <article class="performance-panel" data-benchmark="userspace" data-environment="local-host" data-mode="userspace-netstack" data-evidence-status="historical" data-comparison="unmatched" data-provenance="unrecorded" data-duration-match="false" data-footprint="not-recorded">
+      <article hidden class="performance-panel" data-benchmark="userspace" data-environment="local-host" data-mode="userspace-netstack" data-evidence-status="historical" data-comparison="unmatched" data-provenance="unrecorded" data-duration-match="false" data-footprint="not-recorded">
         <div class="panel-heading">
           <h3>Userspace netstack</h3>
           <span class="status">Historical · unmatched</span>

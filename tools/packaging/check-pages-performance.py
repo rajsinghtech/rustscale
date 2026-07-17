@@ -15,7 +15,6 @@ PERFORMANCE = ROOT / "PERFORMANCE.md"
 USERSPACE = ROOT / "docs/benchmarks.md"
 PARITY_RUN_ID = "gcp-20260717-100908-a708151c79"
 PARITY_DIR = ROOT / "docs/performance" / PARITY_RUN_ID
-PARITY_PAGE = ROOT / "site/performance/rsb1-parity.html"
 
 HOST_RUN_IDS = {
     "rustscale": "gcp-20260715-085022-076e87bd41",
@@ -592,11 +591,7 @@ def validate_parity_evidence(parser: PerformanceParser) -> None:
         latency = result.get("latency", {})
         if latency.get("count") != 50 or len(latency.get("samples_ns", [])) != 50:
             raise SystemExit(f"tracked {config} latency distribution is incomplete")
-    links = parity["links"]
-    assert isinstance(links, set)
-    if "performance/rsb1-parity.html" not in links or not PARITY_PAGE.is_file():
-        raise SystemExit("Pages RSB1 parity view is not linked")
-    require_text(parity, "Matched userspace ↔ TUN", "Requested peer load: 1", "observed peer membership was not instrumented")
+    require_text(parity, "Matched userspace ↔ TUN", "Requested peer load: 1", "observed peer membership was not instrumented", "raw evidence and methodology")
 
 
 def main() -> None:
@@ -627,32 +622,6 @@ def main() -> None:
     validate_panel_contracts(parser)
     validate_matched_runs(selected)
     validate_parity_evidence(parser)
-
-    host = panel(parser, "performance")
-    validate_host_bars(host, selected)
-    validate_host_charts(host, selected)
-    require_text(
-        host,
-        "Measured evidence",
-        "Earlier kernel-TUN comparison with tailscaled",
-        "This is a host benchmark; neither daemon ran in a container.",
-        "opt-in outbound pipeline",
-        "Linux UDP batching and GRO were recorded as enabled",
-        "TX-GSO state was not recorded for these matched runs",
-        "default kernel-TUN settings",
-        "RustScale 0.1.1",
-        "tailscaled 1.98.9",
-        "zero ping packet loss",
-        "50-ping sample is too small for a strong tail-latency claim",
-    )
-    host_links = host["links"]
-    assert isinstance(host_links, set)
-    for expected_link in (
-        "https://github.com/rajsinghtech/rustscale/blob/master/PERFORMANCE.md",
-        "https://github.com/rajsinghtech/rustscale/blob/master/docs/performance/benchmarks-2026-07-15.json",
-    ):
-        if expected_link not in host_links:
-            raise SystemExit(f"Pages host TUN evidence is missing link {expected_link}")
 
     container = panel(parser, "container-tun")
     if container["bars"] or container["facts"]:

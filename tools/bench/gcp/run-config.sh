@@ -696,23 +696,23 @@ cleanup_rs_tun() {
   # It is deliberately idempotent: an already-absent optional iperf3 server
   # must not make ssh_sudo retry before the next non-root config starts.
   if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_iperf_cleanup_command server)"; then
-    echo "[gcp] ERROR: rs-tun iperf3 cleanup failed on server $SVM" >&2
-    status=1
+    echo "[gcp] WARN: rs-tun iperf3 cleanup failed on server $SVM; forcing VM reset" >&2
+    reset_vm "$SVM" "$SZONE" || status=1
   fi
   if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_iperf_cleanup_command client)"; then
-    echo "[gcp] ERROR: rs-tun iperf3 cleanup failed on client $CVM" >&2
-    status=1
+    echo "[gcp] WARN: rs-tun iperf3 cleanup failed on client $CVM; forcing VM reset" >&2
+    reset_vm "$CVM" "$CZONE" || status=1
   fi
 
   # Run both endpoints even if one remains dirty. Remote statuses are returned
   # immediately, so each cleanup action is deliberately idempotent.
   if ! ssh_sudo "$SVM" "$SZONE" "$(rs_tun_cleanup_command srv)"; then
-    echo "[gcp] ERROR: rs-tun cleanup failed on server $SVM" >&2
-    status=1
+    echo "[gcp] WARN: in-guest rs-tun cleanup failed on server $SVM; forcing VM reset" >&2
+    reset_vm "$SVM" "$SZONE" || status=1
   fi
   if ! ssh_sudo "$CVM" "$CZONE" "$(rs_tun_cleanup_command cli)"; then
-    echo "[gcp] ERROR: rs-tun cleanup failed on client $CVM" >&2
-    status=1
+    echo "[gcp] WARN: in-guest rs-tun cleanup failed on client $CVM; forcing VM reset" >&2
+    reset_vm "$CVM" "$CZONE" || status=1
   fi
   # Erase helpers left by a previously interrupted userspace cell as well.
   # This is intentionally best effort; rs-tun's safety status is determined

@@ -488,6 +488,18 @@ deliver_source() {
 }
 
 # ---------------------------------------------------------------------------
+# Reset a VM when an in-guest TUN transition has made SSH unreachable.
+# Args: NAME ZONE
+# ---------------------------------------------------------------------------
+reset_vm() {
+  local name="$1" zone="$2"
+  echo "[gcp] resetting VM $name ($zone) to quiesce unreachable TUN state" >&2
+  _gc gcloud compute instances reset "$name" --project="$GCP_PROJECT" --zone="$zone" -q || return 1
+  unset '_SSH_IP[$name]' '_SSH_USER[$name]'
+  wait_for_startup "$name" "$zone" 300
+}
+
+# ---------------------------------------------------------------------------
 # Delete a single VM + its boot disk. Args: NAME ZONE
 # ---------------------------------------------------------------------------
 delete_vm() {

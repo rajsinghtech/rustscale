@@ -462,7 +462,7 @@ impl Server {
             if let Err(error) = sync_router(
                 router,
                 &inner.tailscale_ips,
-                &routes,
+                &mut routes,
                 &inner.magicsock,
                 &self.config.control_url,
                 next_prefs.ExitNodeAllowLANAccess,
@@ -480,6 +480,7 @@ impl Server {
         }
         let committed_peer = routes.exit_node().cloned();
         set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), committed_peer, true);
+        inner.peer_map.advance_dial_epoch_locked();
         *prefs_guard = next_prefs;
         inner.exit_node_selection.write().await.clear_pending();
         if matches!(inner.data_plane, DataPlane::Tun) {
@@ -519,7 +520,7 @@ impl Server {
             if let Err(error) = sync_router(
                 router,
                 &inner.tailscale_ips,
-                &routes,
+                &mut routes,
                 &inner.magicsock,
                 &self.config.control_url,
                 next_prefs.ExitNodeAllowLANAccess,
@@ -536,6 +537,7 @@ impl Server {
             }
         }
         set_exit_route_state_latch_aware(&mut routes, inner.router.as_ref(), None, false);
+        inner.peer_map.advance_dial_epoch_locked();
         *prefs_guard = next_prefs;
         inner.exit_node_selection.write().await.clear_pending();
         if matches!(inner.data_plane, DataPlane::Tun) {

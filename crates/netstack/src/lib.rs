@@ -30,6 +30,7 @@ mod device;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
@@ -55,6 +56,10 @@ pub const DEFAULT_MTU: usize = 1280;
 /// before backpressure kicks in. (Go's gVisor netstack uses similar or
 /// larger defaults.)
 const TCP_BUF: usize = 256 * 1024;
+
+/// Hard bound for a userspace TCP handshake even when the caller remains
+/// alive. LocalAPI applies its own whole-operation deadline as well.
+const TCP_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Number of passive listening sockets maintained per port. Each smoltcp
 /// TCP socket can only handle one connection at a time (Listen →
@@ -120,6 +125,45 @@ pub struct Netstack {
     cmd_tx: mpsc::Sender<Command>,
     notify: Arc<Notify>,
     tx_notify: Arc<Notify>,
+    next_dial_id: AtomicU64,
+    dial_stats: Arc<DialStatsInner>,
+}
+
+/// Live resource counts for pending userspace TCP dials.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DialStats {
+    /// Dials whose TCP handshake has not completed.
+    pub pending_dials: usize,
+    /// smoltcp receive/transmit buffer bytes owned by pending dials.
+    pub pending_buffer_bytes: usize,
+}
+
+#[derive(Default)]
+struct DialStatsInner {
+    pending_dials: std::sync::atomic::AtomicUsize,
+    pending_buffer_bytes: std::sync::atomic::AtomicUsize,
+}
+
+struct PendingDialGuard {
+    id: u64,
+    cmd_tx: mpsc::Sender<Command>,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl PendingDialGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingDialGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.cmd_tx.try_send(Command::CancelDial { id: self.id });
+            self.notify.notify_one();
+        }
+    }
 }
 
 /// A TCP listener accepting incoming tailnet connections.
@@ -379,6 +423,7 @@ impl Netstack {
         let tx_notify = Arc::new(Notify::new());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let inbound_flows = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let dial_stats = Arc::new(DialStatsInner::default());
 
         let device =
             LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu, tx_notify.clone());
@@ -388,6 +433,7 @@ impl Netstack {
             cmd_rx,
             notify.clone(),
             inbound_flows.clone(),
+            Arc::clone(&dial_stats),
         ));
 
         Ok(Self {
@@ -398,6 +444,8 @@ impl Netstack {
             cmd_tx,
             notify,
             tx_notify,
+            next_dial_id: AtomicU64::new(1),
+            dial_stats,
         })
     }
 
@@ -516,16 +564,38 @@ impl Netstack {
     }
 
     /// Dial a remote `ip:port` over the tailnet.
+    ///
+    /// Dropping this future sends an explicit cancellation command to the
+    /// poll loop so a pending TCP socket and its fixed buffers are reclaimed
+    /// without waiting for the handshake state machine to time out.
     pub async fn dial(&self, remote: SocketAddr) -> Result<NetstackStream, NetstackError> {
+        let id = self.next_dial_id.fetch_add(1, Ordering::Relaxed);
+        let mut guard = PendingDialGuard {
+            id,
+            cmd_tx: self.cmd_tx.clone(),
+            notify: Arc::clone(&self.notify),
+            armed: true,
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Dial {
+                id,
                 remote,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| NetstackError::ShuttingDown)?;
-        reply_rx.await.map_err(|_| NetstackError::ShuttingDown)?
+        let result = reply_rx.await.map_err(|_| NetstackError::ShuttingDown)?;
+        guard.disarm();
+        result
+    }
+
+    /// Return current pending-dial socket and buffer ownership counts.
+    pub fn dial_stats(&self) -> DialStats {
+        DialStats {
+            pending_dials: self.dial_stats.pending_dials.load(Ordering::Acquire),
+            pending_buffer_bytes: self.dial_stats.pending_buffer_bytes.load(Ordering::Acquire),
+        }
     }
 
     /// Start listening for UDP datagrams on `addr:port`.
@@ -593,8 +663,12 @@ enum Command {
         reply: oneshot::Sender<Result<(), NetstackError>>,
     },
     Dial {
+        id: u64,
         remote: SocketAddr,
         reply: oneshot::Sender<Result<NetstackStream, NetstackError>>,
+    },
+    CancelDial {
+        id: u64,
     },
     ListenPacket {
         addr: IpAddr,
@@ -630,8 +704,10 @@ struct ListenerEntry {
 
 /// A pending dial awaiting connection establishment.
 struct PendingDial {
+    id: u64,
     reply: oneshot::Sender<Result<NetstackStream, NetstackError>>,
     remote: SocketAddr,
+    deadline: tokio::time::Instant,
 }
 
 /// Outbound UDP packet sent from `UdpListener::send_to` to the poll loop.
@@ -742,6 +818,7 @@ async fn poll_loop(
     mut cmd_rx: mpsc::Receiver<Command>,
     notify: Arc<Notify>,
     inbound_flows: Arc<std::sync::Mutex<HashMap<TcpFlow, NodePublic>>>,
+    dial_stats: Arc<DialStatsInner>,
 ) {
     let start = std::time::Instant::now();
     let smol_now = || SmolInstant::from_millis(start.elapsed().as_millis() as i64);
@@ -769,14 +846,18 @@ async fn poll_loop(
     tokio::pin!(sleep);
 
     loop {
-        let fallback = match iface.poll_delay(smol_now(), &sockets) {
+        let mut fallback = match iface.poll_delay(smol_now(), &sockets) {
             Some(d) => {
                 let micros = d.total_micros();
                 std::time::Duration::from_micros(micros.max(1))
             }
             None => std::time::Duration::from_secs(1),
         };
-        sleep.as_mut().reset(tokio::time::Instant::now() + fallback);
+        let now = tokio::time::Instant::now();
+        if let Some(deadline) = pending_dials.values().map(|pending| pending.deadline).min() {
+            fallback = fallback.min(deadline.saturating_duration_since(now));
+        }
+        sleep.as_mut().reset(now + fallback);
 
         tokio::select! {
             () = &mut sleep => {}
@@ -795,8 +876,27 @@ async fn poll_loop(
                         let result = do_add_addr(&mut iface, add_addr);
                         let _ = reply.send(result);
                     }
-                    Some(Command::Dial { remote, reply }) => {
-                        do_dial(&mut iface, &mut sockets, &mut pending_dials, addr, remote, reply);
+                    Some(Command::Dial { id, remote, reply }) => {
+                        if !reply.is_closed() {
+                            do_dial(
+                                &mut iface,
+                                &mut sockets,
+                                &mut pending_dials,
+                                addr,
+                                id,
+                                remote,
+                                reply,
+                            );
+                        }
+                    }
+                    Some(Command::CancelDial { id }) => {
+                        if let Some(handle) = pending_dials
+                            .iter()
+                            .find_map(|(handle, pending)| (pending.id == id).then_some(*handle))
+                        {
+                            pending_dials.remove(&handle);
+                            let _ = sockets.remove(handle);
+                        }
                     }
                     Some(Command::ListenPacket { addr: bind_addr, port, reply }) => {
                         let result = do_listen_packet(
@@ -931,23 +1031,45 @@ async fn poll_loop(
             }
         }
 
-        // Pass 2: process pending dials.
+        // Pass 2: process pending dials. A dropped reply receiver is explicit
+        // cancellation even if its CancelDial command has not yet been polled.
         let dial_handles: Vec<SocketHandle> = pending_dials.keys().copied().collect();
         for handle in dial_handles {
+            if pending_dials
+                .get(&handle)
+                .is_some_and(|pending| pending.reply.is_closed())
+            {
+                pending_dials.remove(&handle);
+                let _ = sockets.remove(handle);
+                continue;
+            }
+            if pending_dials
+                .get(&handle)
+                .is_some_and(|pending| tokio::time::Instant::now() >= pending.deadline)
+            {
+                if let Some(pending) = pending_dials.remove(&handle) {
+                    let _ = pending.reply.send(Err(NetstackError::DialFailed(
+                        "dial deadline exceeded".into(),
+                    )));
+                }
+                let _ = sockets.remove(handle);
+                continue;
+            }
             let state = sockets.get::<tcp::Socket>(handle).state();
             match state {
                 State::Established => {
-                    let pd = pending_dials.remove(&handle);
-                    if let Some(pd) = pd {
+                    if let Some(pd) = pending_dials.remove(&handle) {
                         let (stream, conn) =
                             make_stream_and_conn(notify.clone(), Some(pd.remote), None);
                         conns.insert(handle, conn);
-                        let _ = pd.reply.send(Ok(stream));
+                        if pd.reply.send(Ok(stream)).is_err() {
+                            conns.remove(&handle);
+                            let _ = sockets.remove(handle);
+                        }
                     }
                 }
                 State::Closed | State::TimeWait => {
-                    let pd = pending_dials.remove(&handle);
-                    if let Some(pd) = pd {
+                    if let Some(pd) = pending_dials.remove(&handle) {
                         let _ = pd.reply.send(Err(NetstackError::ConnectionRefused));
                     }
                     let _ = sockets.remove(handle);
@@ -955,6 +1077,15 @@ async fn poll_loop(
                 _ => {}
             }
         }
+        dial_stats
+            .pending_dials
+            .store(pending_dials.len(), Ordering::Release);
+        dial_stats.pending_buffer_bytes.store(
+            pending_dials
+                .len()
+                .saturating_mul(TCP_BUF.saturating_mul(2)),
+            Ordering::Release,
+        );
 
         // Pass 3: pump data for established connections.
         let conn_handles: Vec<SocketHandle> = conns.keys().copied().collect();
@@ -979,6 +1110,8 @@ async fn poll_loop(
         // Pass 5: clean up closed connections.
         cleanup_closed(&mut sockets, &mut conns, &mut listeners);
     }
+    dial_stats.pending_dials.store(0, Ordering::Release);
+    dial_stats.pending_buffer_bytes.store(0, Ordering::Release);
 }
 
 /// Create a listening socket for `addr:port`.
@@ -1043,6 +1176,7 @@ fn do_dial(
     sockets: &mut SocketSet<'static>,
     pending_dials: &mut HashMap<SocketHandle, PendingDial>,
     local_addr: Ipv4Addr,
+    id: u64,
     remote: SocketAddr,
     reply: oneshot::Sender<Result<NetstackStream, NetstackError>>,
 ) {
@@ -1065,7 +1199,15 @@ fn do_dial(
         return;
     }
     let handle = sockets.add(socket);
-    pending_dials.insert(handle, PendingDial { reply, remote });
+    pending_dials.insert(
+        handle,
+        PendingDial {
+            id,
+            reply,
+            remote,
+            deadline: tokio::time::Instant::now() + TCP_DIAL_TIMEOUT,
+        },
+    );
 }
 
 /// Create a bound UDP socket for `addr:port` and register it in the poll loop.

@@ -20,6 +20,6 @@ bytes.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 rustscale-wg = { path = "../wg", version = "0.1.3" }
 rustscale-key = { path = "../key", version = "0.1.3" }

@@ -14,6 +14,19 @@ pub async fn system_control_and_connect(addr: SocketAddr) -> Result<TcpStream, s
     connect(addr, true).await
 }
 
+pub fn create_tun_tcp_socket(
+    addr: SocketAddr,
+    tun_name: &str,
+) -> Result<TcpSocket, std::io::Error> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket2::SockRef::from(&socket).bind_device(Some(tun_name.as_bytes()))?;
+    Ok(socket)
+}
+
 async fn connect(addr: SocketAddr, force_bypass: bool) -> Result<TcpStream, std::io::Error> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?

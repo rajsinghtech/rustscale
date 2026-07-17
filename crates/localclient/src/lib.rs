@@ -47,6 +47,10 @@ const LOCAL_API_HOST: &str = "local-rustscaled.sock";
 const MAX_STATUS_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DRIVE_BODY_BYTES: usize = 1024 * 1024;
 const DRIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_UPGRADE_HEADER_BYTES: usize = 64 * 1024;
+const MAX_UPGRADE_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_UPGRADE_HEADERS: usize = 128;
+const MAX_UPGRADE_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 /// Complete local Taildrive configuration replaced by one CAS mutation.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -98,6 +102,22 @@ impl LocalClient {
     pub async fn status(&self) -> Result<serde_json::Value, LocalClientError> {
         let body = self.get_json("/localapi/v0/status").await?;
         Ok(body)
+    }
+
+    /// GET /localapi/v0/status with a strict response-body bound. This is
+    /// suitable for read-only completion and control-flow callers that must
+    /// not accept an unbounded peer status response.
+    pub async fn status_bounded(&self) -> Result<serde_json::Value, LocalClientError> {
+        let raw = self
+            .send_request_raw_with_limit(
+                "GET",
+                "/localapi/v0/status",
+                &[],
+                &[],
+                Some(MAX_STATUS_BODY_BYTES),
+            )
+            .await?;
+        serde_json::from_slice(&raw.body).map_err(|error| LocalClientError::Json(error.to_string()))
     }
 
     /// GET /localapi/v0/status?peers=false with a strict response-body bound.
@@ -597,50 +617,20 @@ impl LocalClient {
     /// POST /localapi/v0/dial with `Upgrade: ts-dial`, returning the raw
     /// LocalAPI connection after the daemon has connected it to `host:port`
     /// through the tailnet.
+    ///
+    /// This always connects directly to the configured safesocket. It does
+    /// not consult proxy environment variables and deliberately rejects a
+    /// daemon request to dial the destination directly from the CLI process.
     pub async fn dial_tcp_stream(
         &self,
         host: &str,
         port: u16,
     ) -> Result<Connection, LocalClientError> {
-        if host.is_empty() || host.contains(['\r', '\n']) {
-            return Err(LocalClientError::Io("invalid dial host".into()));
-        }
+        validate_dial_host(host)?;
 
-        let mut stream = rustscale_safesocket::connect(&self.socket_path)
+        let stream = rustscale_safesocket::connect(&self.socket_path)
             .map_err(|e| LocalClientError::Connect(e.to_string()))?;
-        let request = format!(
-            "POST /localapi/v0/dial HTTP/1.1\r\nHost: {LOCAL_API_HOST}\r\n\
-             Upgrade: ts-dial\r\nConnection: upgrade\r\nDial-Host: {host}\r\n\
-             Dial-Port: {port}\r\nDial-Network: tcp\r\nContent-Length: 0\r\n\r\n"
-        );
-        stream.write_all(request.as_bytes()).await?;
-        stream.flush().await?;
-
-        let header = read_upgrade_response_header(&mut stream).await?;
-        let header_text = std::str::from_utf8(&header)
-            .map_err(|_| LocalClientError::Io("non-utf8 response header".into()))?;
-        let mut lines = header_text.split("\r\n");
-        let status_line = lines
-            .next()
-            .ok_or_else(|| LocalClientError::Io("missing response status".into()))?;
-        let status = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(0);
-        let upgraded = lines
-            .filter_map(|line| line.split_once(':'))
-            .any(|(name, value)| {
-                name.trim().eq_ignore_ascii_case("upgrade")
-                    && value.trim().eq_ignore_ascii_case("ts-dial")
-            });
-        if status != 101 || !upgraded {
-            return Err(LocalClientError::HttpStatus {
-                status,
-                message: format!("unexpected dial upgrade response: {status_line}"),
-            });
-        }
-        Ok(stream)
+        dial_tcp_stream_on(stream, host, port).await
     }
 
     /// GET /localapi/v0/dns-query?name=<name>&type=<type> — query the
@@ -919,22 +909,251 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Read an upgrade response one byte at a time so no raw proxied bytes are
-/// consumed along with the HTTP headers. After this returns, `stream` starts
-/// exactly at the dialed TCP stream.
+fn validate_dial_host(host: &str) -> Result<(), LocalClientError> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.is_empty()
+        || name.len() > 253
+        || !name.is_ascii()
+        || name.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || !label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+    {
+        return Err(LocalClientError::Io(format!(
+            "invalid dial hostname or IP {host:?}"
+        )));
+    }
+    Ok(())
+}
+
+async fn dial_tcp_stream_on<S>(mut stream: S, host: &str, port: u16) -> Result<S, LocalClientError>
+where
+    S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    validate_dial_host(host)?;
+    let request = format!(
+        "POST /localapi/v0/dial HTTP/1.1\r\nHost: {LOCAL_API_HOST}\r\n\
+         Upgrade: ts-dial\r\nConnection: upgrade\r\nDial-Host: {host}\r\n\
+         Dial-Port: {port}\r\nDial-Network: tcp\r\nContent-Length: 0\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let header = read_upgrade_response_header(&mut stream).await?;
+    let response = parse_upgrade_response(&header)?;
+    if response.status != 101 {
+        let body = read_upgrade_error_body(&mut stream, response.content_length).await?;
+        let message = if response.dial_self {
+            "daemon requested a direct host dial; refusing to bypass LocalAPI".to_owned()
+        } else if body.is_empty() {
+            format!("unexpected dial upgrade response: {}", response.status_line)
+        } else {
+            extract_error_message(&body)
+        };
+        return match response.status {
+            403 => Err(LocalClientError::AccessDenied(message)),
+            412 => Err(LocalClientError::PreconditionsFailed(message)),
+            status => Err(LocalClientError::HttpStatus { status, message }),
+        };
+    }
+    if response.dial_self {
+        return Err(LocalClientError::Io(
+            "invalid dial upgrade response requested a direct dial".into(),
+        ));
+    }
+    if response.content_length.is_some_and(|length| length != 0) {
+        return Err(LocalClientError::Io(
+            "dial upgrade response declared a body".into(),
+        ));
+    }
+    if !response.connection_upgrade || !response.upgrade_ts_dial {
+        return Err(LocalClientError::Io(
+            "invalid dial upgrade response headers".into(),
+        ));
+    }
+    Ok(stream)
+}
+
+#[derive(Debug)]
+struct UpgradeResponse {
+    status: u16,
+    status_line: String,
+    content_length: Option<usize>,
+    connection_upgrade: bool,
+    upgrade_ts_dial: bool,
+    dial_self: bool,
+}
+
+/// Read exactly through the HTTP header terminator. Reading one byte at a
+/// time is intentional: the first tunneled byte must remain unread and binary
+/// data cannot be mistaken for HTTP buffering leftovers.
 async fn read_upgrade_response_header(
     stream: &mut (impl AsyncRead + Unpin),
 ) -> Result<Vec<u8>, LocalClientError> {
-    let mut header = Vec::with_capacity(256);
+    let mut header = Vec::with_capacity(512);
     let mut byte = [0u8; 1];
     while !header.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte).await?;
-        header.push(byte[0]);
-        if header.len() > 256 * 1024 {
-            return Err(LocalClientError::Io("header too large".into()));
+        if header.len() == MAX_UPGRADE_HEADER_BYTES {
+            return Err(LocalClientError::Io(
+                "dial upgrade response header too large".into(),
+            ));
         }
+        stream.read_exact(&mut byte).await.map_err(|error| {
+            LocalClientError::Io(format!(
+                "dial connection closed before complete upgrade response: {error}"
+            ))
+        })?;
+        header.push(byte[0]);
     }
     Ok(header)
+}
+
+fn parse_upgrade_response(header: &[u8]) -> Result<UpgradeResponse, LocalClientError> {
+    if !header.ends_with(b"\r\n\r\n") || !header.is_ascii() {
+        return Err(LocalClientError::Io(
+            "invalid dial upgrade response header".into(),
+        ));
+    }
+    let text = std::str::from_utf8(header)
+        .map_err(|_| LocalClientError::Io("invalid dial upgrade response header".into()))?;
+    let mut lines = text[..text.len() - 4].split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| LocalClientError::Io("missing dial response status".into()))?;
+    if status_line.len() > MAX_UPGRADE_HEADER_LINE_BYTES {
+        return Err(LocalClientError::Io(
+            "dial upgrade response line too large".into(),
+        ));
+    }
+    let mut status_parts = status_line.splitn(3, ' ');
+    if status_parts.next() != Some("HTTP/1.1") {
+        return Err(LocalClientError::Io(
+            "dial upgrade response is not HTTP/1.1".into(),
+        ));
+    }
+    let status_text = status_parts
+        .next()
+        .filter(|status| status.len() == 3 && status.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| LocalClientError::Io("invalid dial response status".into()))?;
+    let status = status_text
+        .parse::<u16>()
+        .map_err(|_| LocalClientError::Io("invalid dial response status".into()))?;
+
+    let mut content_length = None;
+    let mut connection_upgrade = false;
+    let mut saw_connection = false;
+    let mut upgrade_ts_dial = false;
+    let mut saw_upgrade = false;
+    let mut dial_self = false;
+    let mut saw_dial_self = false;
+    let mut header_count = 0usize;
+    for line in lines {
+        header_count += 1;
+        if header_count > MAX_UPGRADE_HEADERS || line.len() > MAX_UPGRADE_HEADER_LINE_BYTES {
+            return Err(LocalClientError::Io(
+                "dial upgrade response has excessive headers".into(),
+            ));
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| LocalClientError::Io("malformed dial upgrade response header".into()))?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+            || value.bytes().any(|byte| byte < b' ' && byte != b'\t')
+        {
+            return Err(LocalClientError::Io(
+                "malformed dial upgrade response header".into(),
+            ));
+        }
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some()
+                || value.is_empty()
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(LocalClientError::Io(
+                    "invalid dial response content length".into(),
+                ));
+            }
+            let length = value
+                .parse::<usize>()
+                .map_err(|_| LocalClientError::Io("invalid dial response content length".into()))?;
+            if length > MAX_UPGRADE_ERROR_BODY_BYTES {
+                return Err(LocalClientError::Io("dial response body too large".into()));
+            }
+            content_length = Some(length);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(LocalClientError::Io(
+                "transfer-encoded dial response is not supported".into(),
+            ));
+        } else if name.eq_ignore_ascii_case("connection") {
+            if saw_connection {
+                return Err(LocalClientError::Io(
+                    "duplicate dial connection response header".into(),
+                ));
+            }
+            saw_connection = true;
+            connection_upgrade = value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+        } else if name.eq_ignore_ascii_case("upgrade") {
+            if saw_upgrade {
+                return Err(LocalClientError::Io(
+                    "duplicate dial upgrade response header".into(),
+                ));
+            }
+            saw_upgrade = true;
+            upgrade_ts_dial = value.eq_ignore_ascii_case("ts-dial");
+        } else if name.eq_ignore_ascii_case("dial-self") {
+            if saw_dial_self {
+                return Err(LocalClientError::Io(
+                    "duplicate Dial-Self response header".into(),
+                ));
+            }
+            saw_dial_self = true;
+            dial_self = value.eq_ignore_ascii_case("true");
+        }
+    }
+
+    Ok(UpgradeResponse {
+        status,
+        status_line: status_line.to_owned(),
+        content_length,
+        connection_upgrade,
+        upgrade_ts_dial,
+        dial_self,
+    })
+}
+
+async fn read_upgrade_error_body(
+    stream: &mut (impl AsyncRead + Unpin),
+    content_length: Option<usize>,
+) -> Result<Vec<u8>, LocalClientError> {
+    let Some(length) = content_length else {
+        return Ok(Vec::new());
+    };
+    let mut body = vec![0; length];
+    stream
+        .read_exact(&mut body)
+        .await
+        .map_err(|error| LocalClientError::Io(format!("truncated dial error response: {error}")))?;
+    Ok(body)
 }
 
 /// Split a `type=pair` PEM blob into `(cert_pem, key_pem)`. The wire format
@@ -1121,7 +1340,9 @@ mod tests {
         let (mut reader, mut writer) = tokio::io::duplex(1024);
         let server = tokio::spawn(async move {
             writer
-                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: ts-dial\r\n\r\nhello")
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: ts-dial\r\n\r\nhello",
+                )
                 .await
                 .unwrap();
         });
@@ -1129,12 +1350,99 @@ mod tests {
         let header = read_upgrade_response_header(&mut reader).await.unwrap();
         assert_eq!(
             header,
-            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: ts-dial\r\n\r\n"
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: ts-dial\r\n\r\n"
         );
         let mut proxied = [0u8; 5];
         reader.read_exact(&mut proxied).await.unwrap();
         assert_eq!(&proxied, b"hello");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn dial_upgrade_parser_is_strict_and_bounded() {
+        let valid = parse_upgrade_response(
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive, Upgrade\r\nUpgrade: ts-dial\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(valid.status, 101);
+        assert!(valid.connection_upgrade);
+        assert!(valid.upgrade_ts_dial);
+
+        assert!(parse_upgrade_response(
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 65537\r\n\r\n"
+        )
+        .is_err());
+        for malformed in [
+            &b"HTTP/1.0 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: ts-dial\r\n\r\n"[..],
+            &b"HTTP/1.1 two OK\r\nConnection: upgrade\r\nUpgrade: ts-dial\r\n\r\n"[..],
+            &b"HTTP/1.1 101 Switching Protocols\nConnection: upgrade\n\n"[..],
+            &b"HTTP/1.1 101 Switching Protocols\r\nBroken\r\n\r\n"[..],
+            &b"HTTP/1.1 101 Switching Protocols\r\nTransfer-Encoding: chunked\r\nConnection: upgrade\r\nUpgrade: ts-dial\r\n\r\n"[..],
+            &b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: ts-dial\r\nUpgrade: ts-dial\r\nConnection: upgrade\r\n\r\n"[..],
+        ] {
+            assert!(parse_upgrade_response(malformed).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_upgrade_header_reader_enforces_aggregate_bound() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let writer = tokio::spawn(async move {
+            server
+                .write_all(&vec![b'x'; MAX_UPGRADE_HEADER_BYTES + 1])
+                .await
+        });
+        let error = read_upgrade_response_header(&mut client).await.unwrap_err();
+        assert!(error.to_string().contains("header too large"));
+        drop(client);
+        let _ = writer.await;
+    }
+
+    #[tokio::test]
+    async fn dial_upgrade_rejects_direct_dial_bypass() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                server.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            assert!(request
+                .windows(b"Dial-Host: peer".len())
+                .any(|window| window == b"Dial-Host: peer"));
+            server
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nDial-Self: true\r\nDial-Addr: 203.0.113.9:80\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let error = dial_tcp_stream_on(client, "peer", 80).await.unwrap_err();
+        assert!(error.to_string().contains("refusing to bypass LocalAPI"));
+        server_task.await.unwrap();
+    }
+
+    #[test]
+    fn dial_host_validation_accepts_dns_and_unbracketed_ips() {
+        for valid in [
+            "peer",
+            "peer.example.ts.net.",
+            "100.64.0.1",
+            "fd7a:115c:a1e0::1",
+        ] {
+            assert!(validate_dial_host(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "",
+            "peer..example",
+            "-peer",
+            "[fd7a:115c:a1e0::1]",
+            "peer\r\nX: y",
+        ] {
+            assert!(validate_dial_host(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

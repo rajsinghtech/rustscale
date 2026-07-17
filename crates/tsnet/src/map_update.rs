@@ -238,7 +238,7 @@ async fn clear_exit_routes_for_identity_mismatch(
         match sync_router(
             router,
             tailscale_ips,
-            &routes,
+            &mut routes,
             magicsock,
             control_url,
             exit_node_allow_lan_access,
@@ -404,7 +404,7 @@ impl PeerAuthorityRuntime {
             if let Err(error) = sync_router(
                 router,
                 &self.tailscale_ips,
-                &routes,
+                &mut routes,
                 &self.magicsock,
                 &self.control_url,
                 live_prefs.ExitNodeAllowLANAccess,
@@ -538,6 +538,8 @@ pub(crate) fn spawn_map_update_task(
     accept_routes: bool,
     advertise_routes: Vec<String>,
     resolver: Arc<RwLock<MagicDnsResolver>>,
+    user_dialer: Arc<rustscale_tsdial::Dialer>,
+    mut dial_self_node: Option<Node>,
     dns_config: Arc<RwLock<Option<DNSConfig>>>,
     user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
     ssh_policy: Arc<RwLock<Option<SSHPolicy>>>,
@@ -618,15 +620,17 @@ pub(crate) fn spawn_map_update_task(
                     if resp.KeepAlive {
                         if let Some(router) = router.as_ref() {
                             let _exit_map_guard = exit_map_gate.lock().await;
+                            let _peer_gate = peer_map.gate.write().await;
                             let exit_node_allow_lan_access =
                                 prefs.read().await.ExitNodeAllowLANAccess;
                             let mut routes = route_table.write().await;
                             let security_critical =
                                 routes.exit_node_requested() && !exit_node_allow_lan_access;
+                            let localapi_was_blocked = routes.localapi_dial_blocked();
                             match sync_router(
                                 router,
                                 &tailscale_ips,
-                                &routes,
+                                &mut routes,
                                 &magicsock,
                                 &control_url,
                                 exit_node_allow_lan_access,
@@ -643,8 +647,13 @@ pub(crate) fn spawn_map_update_task(
                                         routes.unblock_exit_traffic();
                                         health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                                     }
+                                    routes.unblock_localapi_dial();
                                 }
                                 Err(error) if security_critical => {
+                                    if !localapi_was_blocked {
+                                        peer_map.advance_dial_epoch_locked();
+                                    }
+                                    routes.block_localapi_dial();
                                     routes.block_exit_traffic();
                                     let kernel = engage_kernel_security_block(
                                         router,
@@ -660,6 +669,10 @@ pub(crate) fn spawn_map_update_task(
                                     send_health_notify(&health, &ipn_backend);
                                 }
                                 Err(error) => {
+                                    if !localapi_was_blocked {
+                                        peer_map.advance_dial_epoch_locked();
+                                    }
+                                    routes.block_localapi_dial();
                                     log::warn!("tsnet: map route refresh failed: {error}");
                                 }
                             }
@@ -710,6 +723,13 @@ pub(crate) fn spawn_map_update_task(
                             );
                         }
                         resolver.write().await.set_peers(Vec::new());
+                        user_dialer
+                            .set_net_map(&MapResponse {
+                                Domain: tailnet_identity.clone(),
+                                Peers: Some(Vec::new()),
+                                ..Default::default()
+                            })
+                            .await;
                         drop(drive_epoch);
                         drop(map_commit);
                         ipn_backend.set_blocked(true);
@@ -967,7 +987,16 @@ pub(crate) fn spawn_map_update_task(
                     // Taildrive publication epochs all use the TKA-verified
                     // stable-ID intersection.
                     let map_commit = peer_map.gate.write().await;
-                    let current_exit_state = route_table.read().await.exit_route_state();
+                    let routes_snapshot = route_table.read().await;
+                    let current_exit_state = routes_snapshot.exit_route_state();
+                    let (local_addrs, connected_prefixes, allow_lan) =
+                        routes_snapshot.local_interface_routes();
+                    next_routes.set_local_interface_routes(
+                        local_addrs.to_vec(),
+                        connected_prefixes.to_vec(),
+                        allow_lan,
+                    );
+                    drop(routes_snapshot);
                     restore_exit_state_for_map(
                         &mut next_routes,
                         current_exit_state,
@@ -1026,6 +1055,11 @@ pub(crate) fn spawn_map_update_task(
                     }
                     peers_arc.write().await.clone_from(&next_peers);
                     *wg_tunnels.write().await = next_tunnels;
+                    // The peer/map generation becomes visible before native
+                    // router work below. Keep LocalAPI TUN dialing closed over
+                    // that publication gap; otherwise a newly approved route
+                    // could fall through the host routing table.
+                    next_routes.block_localapi_dial();
                     *route_table.write().await = next_routes;
                     peer_map
                         .install_locked(&next_peers)
@@ -1097,7 +1131,7 @@ pub(crate) fn spawn_map_update_task(
                         sync_router(
                             router,
                             &tailscale_ips,
-                            &routes,
+                            &mut routes,
                             &magicsock,
                             &control_url,
                             live_prefs.ExitNodeAllowLANAccess,
@@ -1143,6 +1177,7 @@ pub(crate) fn spawn_map_update_task(
                             routes.unblock_exit_traffic();
                             health.set_healthy(WARN_EXIT_ROUTE_SECURITY);
                         }
+                        routes.unblock_localapi_dial();
                     }
                     drop(routes);
                     drop(exit_map_guard);
@@ -1168,6 +1203,20 @@ pub(crate) fn spawn_map_update_task(
                         let new_config = config_from_dns(cfg, &domain, &peers);
                         r.set_config(new_config);
                     }
+                    // tsdial must see one complete, authorization-filtered
+                    // snapshot rather than the control delta; replacing its
+                    // map from PeersChanged alone would erase unchanged names.
+                    if resp.Node.is_some() {
+                        dial_self_node.clone_from(&resp.Node);
+                    }
+                    let complete_dial_map = MapResponse {
+                        Node: dial_self_node.clone(),
+                        Domain: tailnet_identity.clone(),
+                        Peers: Some(peers.clone()),
+                        DNSConfig: dns_config.read().await.clone(),
+                        ..Default::default()
+                    };
+                    user_dialer.set_net_map(&complete_dial_map).await;
 
                     // Merge UserProfiles delta (add/update; never removed).
                     if !resp.UserProfiles.is_empty() {

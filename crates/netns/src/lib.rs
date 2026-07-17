@@ -9,17 +9,20 @@ mod socks;
 #[cfg(target_os = "linux")]
 use linux::{
     configure_udp_socket as configure_platform_udp_socket, control_and_connect,
-    system_control_and_connect, validate_underlay_bypass,
+    create_tun_tcp_socket as create_platform_tun_tcp_socket, system_control_and_connect,
+    validate_underlay_bypass,
 };
 #[cfg(target_os = "macos")]
 use macos::{
     configure_udp_socket as configure_platform_udp_socket, control_and_connect,
-    system_control_and_connect, validate_underlay_bypass,
+    create_tun_tcp_socket as create_platform_tun_tcp_socket, system_control_and_connect,
+    validate_underlay_bypass,
 };
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use other::{
     configure_udp_socket as configure_platform_udp_socket, control_and_connect,
-    system_control_and_connect, validate_underlay_bypass,
+    create_tun_tcp_socket as create_platform_tun_tcp_socket, system_control_and_connect,
+    validate_underlay_bypass,
 };
 
 use std::net::{IpAddr, SocketAddr};
@@ -194,6 +197,34 @@ pub async fn dial_tcp_addr(addr: SocketAddr) -> Result<tokio::net::TcpStream, st
         return Ok(stream);
     }
     control_and_connect(addr).await
+}
+
+/// Dial user traffic according to the ordinary OS route table, without the
+/// physical-underlay mark/interface binding reserved for control, DERP, and
+/// magicsock infrastructure. In TUN mode this is what sends a daemon-owned
+/// LocalAPI UserDial into the managed tunnel routes.
+pub async fn dial_user_tcp_addr(addr: SocketAddr) -> Result<tokio::net::TcpStream, std::io::Error> {
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    stream.set_nodelay(true).ok();
+    Ok(stream)
+}
+
+/// Create a nonblocking TCP socket pinned to the exact managed TUN.
+///
+/// LocalAPI uses this after route-generation validation. The interface bind
+/// prevents a route withdrawal from turning an in-flight user dial into an
+/// underlay or local-interface connection.
+pub fn create_tun_tcp_socket(
+    addr: SocketAddr,
+    tun_name: &str,
+) -> Result<tokio::net::TcpSocket, std::io::Error> {
+    if tun_name.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "managed TUN name is unavailable",
+        ));
+    }
+    create_platform_tun_tcp_socket(addr, tun_name)
 }
 
 /// Apply this process's route-loop bypass policy to a UDP socket.

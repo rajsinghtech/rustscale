@@ -94,11 +94,11 @@ pub(crate) async fn race_dial(addrs: &[SocketAddr]) -> std::io::Result<TcpStream
     Err(last_err)
 }
 
-/// Dial a single address. The `use_netstack_for_ip` and route decisions are
-/// made by the caller ([`crate::Dialer::user_dial`]); this function just
-/// does a plain connect (via netns for non-tailnet addresses).
+/// Dial one user address through ordinary OS routing. This deliberately does
+/// not inherit infrastructure's physical-underlay bypass; managed TUN routes
+/// must receive peer, subnet, and exit-node user traffic.
 async fn dial_one(addr: SocketAddr) -> std::io::Result<TcpStream> {
-    rustscale_netns::dial_tcp(&addr.ip().to_string(), addr.port()).await
+    rustscale_netns::dial_user_tcp_addr(addr).await
 }
 
 /// Compute the [`UserDialPlan`] for a given address — resolve it and determine

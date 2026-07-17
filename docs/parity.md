@@ -30,7 +30,7 @@ Statuses below were checked against the source and tests in `crates/*` as of
 | Serve/Funnel (ListenFunnel, ServeConfig, TCP fwd, reverse proxy) | `tsnet`, `ipn/serve*` | ✅ ServeConfig serde + ETag + persistence; TCP/HTTP/HTTPS dispatch; reverse proxy with WhoIs headers (Tailscale-User-Login/Name); TLS-terminate via ControlCertProvider; HTTP-to-HTTPS redirect; HTTPHandler.Redirect with `${HOST}`/`${REQUEST_URI}` expansion; Ingress-Target header dispatch; listen_funnel port validation (443/8443/10000); LocalAPI GET/POST serve-config; CLI serve/funnel with status/reset |
 | Tailscale Services (ListenService, PROXY protocol) | `tsnet.Server.ListenService` | ✅ listen_service(svc_name, ServiceMode) with VIP v4 addrs from CapMap (ServiceIPMappings); PROXY protocol v2 binary header encoder (byte-exact IPv4/IPv6/LOCAL); ServiceStream wrapping (Plain/WithProxy/Tls/TlsWithProxy); IPv6 VIPs skipped (smoltcp proto-ipv4 only); TLS termination for service FQDN via ControlCertProvider (HTTPS mode with cert fallback to self-signed); serve-config Services TCP forwarding path (TCPForward/TerminateTLS on service VIPs via ServeRunner) |
 | SOCKS5 proxy | `net/socks5/` | ✅ RFC 1928 CONNECT (v4/domain/v6); RFC 1929 username/password auth; pluggable SocksDialer; FFI; e2e tests |
-| LocalAPI | `ipn/localapi/` | ✅ 18+ endpoints (status, whois, prefs GET+PATCH, netmap, metrics, health, ping (disco/icmp/tsmp/peerapi), watch-ipn-bus, start, login-interactive, logout, serve-config, profiles, cert, id-token (Noise control forwarding), Tailnet Lock status/init/sign/disable, file-targets, bounded Taildrive runtime status/config GET+PUT, debug, dial, dns-query, check-ip-forwarding) |
+| LocalAPI | `ipn/localapi/` | ✅ 18+ endpoints (status, whois, prefs GET+PATCH, netmap, metrics, health, ping (disco/icmp/tsmp/peerapi), watch-ipn-bus, start, login-interactive, logout, serve-config, profiles, cert, id-token (Noise control forwarding), Tailnet Lock status/init/sign/disable, file-targets, bounded Taildrive runtime status/config GET+PUT, debug, dial, dns-query, check-ip-forwarding); dial is read-write/operator-only, globally/per-identity admitted and deadline/cancellation bounded, using netstack in userspace mode or the current generation's tailnet-routed tsdial UserDial in TUN mode; TUN proxying resolves once and admits only an epoch-checked `UserDialPlan` backed by a live peer, accepted subnet, or proven selected-exit route; local-interface and directly preserved LAN targets are rejected, and the exact socket is protected to the managed TUN before asynchronous connect |
 | Auto-update / ClientVersion | — | 🔶 control-plane ClientVersion notifications and status are wired; `crates/clientupdate` provides fail-closed manual GitHub release selection, bounded archive parsing, receipt-gated binary replacement, and journaled rollback. Homebrew is planning-only and unattended `auto_apply` remains intentionally unsupported. |
 | Multi-profile/login management | `ipn/ipnlocal/profiles.go` | ✅ ProfileManager with profiles.json + current-profile persistence; LocalAPI CRUD endpoints; CLI switch command; backend teardown+restart on switch (`Server::switch_profile` → close + reload prefs + `up()`, `DaemonCommand::SwitchProfile` wired through daemon loop); durable node/TKA identity, authority Chonk, and netmap caches are isolated by ProfileID plus control identity and reject tailnet-identity changes; remaining: Windows LocalUserID |
 
@@ -58,7 +58,7 @@ real JSON).
 | Package | Go source | Rust status |
 | --- | --- | --- |
 | Tailscale IP addr helpers | `net/tsaddr/` | ✅ `crates/tsaddr`: CGNAT/ULA/4via6/4to6/ephemeral ranges, service VIPs, `is_tailscale_ip`, `map_via`/`unmap_via`, exit-route helpers; all call sites migrated |
-| Outbound dial abstraction | `net/tsdial/` | ✅ `crates/tsdial`: `Dialer` with SystemDial/UserDial/PeerDial paths, `DnsMap` MagicDNS resolution, `UserDialPlan`, netmon link-change callback stub, `ActiveConns` tracking; all 10 `TcpStream::connect` call sites migrated |
+| Outbound dial abstraction | `net/tsdial/` | ✅ `crates/tsdial`: `Dialer` with SystemDial/UserDial/PeerDial paths, `DnsMap` MagicDNS resolution, `UserDialPlan`, netmon link-change callback stub, `ActiveConns` tracking; UserDial follows ordinary OS/TUN routes without infrastructure's physical-underlay bypass and its generation map is refreshed from complete authorization-filtered map snapshots; route-aware callers can classify one exact resolved address to avoid DNS TOCTOU, while LocalAPI submits it to an epoch-revalidating worker that creates a managed-TUN-bound socket; all direct product dial call sites use an explicit dial class |
 | Localhost port proxy map | `net/proxymap/` | ✅ `crates/proxymap`: `Mapper` (register/unregister/whois_ipport with 0/10/20/50/100ms retry, reverse whois_by_ip); wired into `tsnet::Server` (RunningState.proxy_mapper, WhoIs fallback, register_proxy_identity/unregister_proxy_identity) |
 | HTTP CONNECT proxy | `net/connectproxy/` | ✅ `crates/connectproxy`: `ConnectProxyConfig`, `parse_connect_request`, `handle_connect` with bidirectional tunnel |
 | HTTP proxy env detection | `net/tshttpproxy/` | ✅ `crates/tshttpproxy`: `proxy_from_environment` + `http_connect` (HTTP/1.1 CONNECT tunnel w/ Proxy-Authorization); wired into controlhttp (`dial_control`, `fetch_server_pub_key`, `tls_connect`) and derp (`connect_insecure`, `connect_with_upgrade_dial_insecure` — downgrades upgrade→direct TLS over tunnel when proxied) |
@@ -259,7 +259,7 @@ state-dir fallback probing), `--json`.
 | `exit-node` | `cli/exitnode.go` | ✅ lists exit-node-capable peers; `--suggest` for SuggestedExitNode; cannot select exit node via CLI |
 | `dns` | `cli/dns.go` | 🔶 explicit `dns status [--json]` and `dns query [--json] <name> [A\|AAAA]`; query forwards the requested name/type and filters the LocalAPI address list by family |
 | `bugreport` | `cli/bugreport.go` | ✅ prints version/state/health summary |
-| `nc` | `cli/nc.go` | 🔶 stub (not-yet-supported) |
+| `nc` | `cli/nc.go` | ✅ `nc <hostname-or-IP> <port>` uses only the authorized LocalAPI `ts-dial` upgrade; strict target/HTTP validation, binary-safe bounded duplex pumps, stdin half-close with remote drain, Ctrl-C cancellation, bounded peer-DNS completion, command help, and hermetic process/duplex coverage |
 | `id-token` | `cli/id-token.go` | ✅ OIDC machine ID token via LocalAPI and Noise `POST /machine/id-token`; raw JWT and `--json` output |
 | `update` | `cli/update.go` | 🔶 `--yes`, `--dry-run`, `--track`, and `--version`; Linux/macOS archive apply is limited to intact `scripts/install.sh` ownership receipts with checksum integrity, bounded parsing, post-install version verification, and journaled rollback. Homebrew is dry-run planning only; other layouts fail explicitly without elevation. |
 | `drive` | `cli/drive.go` | 🔶 first truthful local-share slice: read-write-authorized `status`/`list`; daemon/root-only `share` (add or replace) and `unshare` until per-caller filesystem authority exists; text/JSON output, static completion, strict no-follow canonical root/name validation, bounded/cancellable LocalAPI calls, and mandatory restart-unique nonce+generation+config-hash ETag CAS. PUT/DELETE/MOVE/COPY reject and publication-barrier re-stat every special object. Remote mounts/composition, rename/share-as, bookmarks, and persistence remain deferred and are rejected explicitly. |
@@ -290,9 +290,22 @@ get_prefs(), status(), whois(), health(), metrics(), ping(), get_serve_config(),
 set_serve_config(), drive_status(), get_drive_config(), set_drive_config(), cert_pair(), tailnet_lock_status(), tailnet_lock_init(),
 tailnet_lock_ack_init(), tailnet_lock_sign(), tailnet_lock_disable(), list_profiles(), current_profile(),
 switch_profile(), delete_profile(), push_file(), waiting_files(),
-get_waiting_file(), delete_waiting_file(), debug(), dial(), dns_query(),
-check_ip_forwarding(). Integration tests: testcontrol + daemon over temp
-socket, interactive auth flow.
+get_waiting_file(), delete_waiting_file(), debug(), dial(), dial_tcp_stream(),
+dns_query(), check_ip_forwarding(). The streaming dial path directly uses the
+configured safesocket (never proxy environment or a raw destination socket),
+strictly bounds and validates the HTTP/1.1 upgrade, and rejects `Dial-Self`
+bypass responses. Server-side outbound admission requires read-write/operator
+authorization, has global/per-identity limits and a whole-dial deadline, and
+propagates disconnect cancellation into either netstack or TUN UserDial. TUN
+proxying rejects every plan not classified through the current peer/subnet/exit
+route snapshot, including local-interface and allow-LAN connected routes. It
+snapshots in peer-gate→route order, releases locks before await, then revalidates
+the epoch while creating an exact-IP socket protected to the managed TUN; map
+changes cancel pending connects.
+Canceled userspace dials explicitly unregister their pending TCP socket and
+fixed buffers (with reply-closure fallback) rather than awaiting handshake
+timeout. Integration tests: testcontrol + daemon over temp socket,
+interactive auth flow, plus hermetic `nc` duplex/error/cancellation cases.
 
 ## Windows port (x86_64-pc-windows-msvc)
 

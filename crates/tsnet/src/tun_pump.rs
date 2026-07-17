@@ -2026,7 +2026,7 @@ pub(crate) fn set_exit_route_state_latch_aware(
 pub(crate) fn sync_router(
     router: &SharedRouter,
     local_addrs: &[IpAddr],
-    route_table: &RouteTable,
+    route_table: &mut RouteTable,
     magicsock: &Magicsock,
     control_url: &str,
     exit_node_allow_lan_access: bool,
@@ -2045,7 +2045,7 @@ pub(crate) fn sync_router(
 pub(crate) fn sync_router_with_connected_prefixes(
     router: &SharedRouter,
     local_addrs: &[IpAddr],
-    route_table: &RouteTable,
+    route_table: &mut RouteTable,
     magicsock: &Magicsock,
     control_url: &str,
     exit_node_allow_lan_access: bool,
@@ -2065,7 +2065,7 @@ pub(crate) fn sync_router_with_connected_prefixes(
 fn sync_router_inner(
     router: &SharedRouter,
     local_addrs: &[IpAddr],
-    route_table: &RouteTable,
+    route_table: &mut RouteTable,
     magicsock: &Magicsock,
     _control_url: &str,
     exit_node_allow_lan_access: bool,
@@ -2082,12 +2082,19 @@ fn sync_router_inner(
     let leaving_exit_node = !exit_node && managed.exit_node;
     // Interface enumeration is part of the fail-closed desired-state build;
     // do it before acquiring process policy or touching the live router.
-    let config = if let Some(prefixes) = connected_prefixes {
+    let interface_routes = if connected_prefixes.is_none() {
+        rustscale_netmon::gather_state().and_then(|state| {
+            crate::link_monitor::connected_prefixes_from_state(&state, &managed.tun_name).ok()
+        })
+    } else {
+        None
+    };
+    let config = if let Some(ref prefixes) = connected_prefixes {
         build_router_config_with_local_routes(
             local_addrs,
             route_table,
             exit_node_allow_lan_access,
-            prefixes,
+            prefixes.clone(),
         )
     } else {
         build_router_config(
@@ -2131,6 +2138,16 @@ fn sync_router_inner(
         // Release only after catch-all teardown, so no underlay packet can
         // briefly recurse through the TUN during the transition.
         rustscale_netns::release_physical_underlay_bypass(&managed.tun_name);
+    }
+    if let Some(mut snapshot) = interface_routes {
+        snapshot.addrs.extend_from_slice(local_addrs);
+        route_table.set_local_interface_routes(
+            snapshot.addrs,
+            config.local_routes.clone(),
+            exit_node_allow_lan_access,
+        );
+    } else if connected_prefixes.is_none() {
+        route_table.block_localapi_dial();
     }
     Ok(())
 }
@@ -2238,6 +2255,9 @@ pub(crate) async fn create_tun_device(
             }
             security_block_verified = true;
         }
+        let localapi_interface_routes = rustscale_netmon::gather_state().and_then(|state| {
+            crate::link_monitor::connected_prefixes_from_state(&state, dev.name()).ok()
+        });
         let route_config = {
             let route_table = b.route_table.read().await;
             match build_router_config(
@@ -2356,6 +2376,19 @@ pub(crate) async fn create_tun_device(
             }
             security_block_verified = false;
         }
+        {
+            let mut routes = b.route_table.write().await;
+            if let Some(mut snapshot) = localapi_interface_routes {
+                snapshot.addrs.extend_from_slice(&b.tailscale_ips);
+                routes.set_local_interface_routes(
+                    snapshot.addrs,
+                    route_config.local_routes.clone(),
+                    exit_node_allow_lan_access,
+                );
+            } else {
+                routes.block_localapi_dial();
+            }
+        }
         Some(Arc::new(std::sync::Mutex::new(ManagedRouter {
             router,
             tun_name: dev.name().to_owned(),
@@ -2365,6 +2398,9 @@ pub(crate) async fn create_tun_device(
             security_block_reasons: 0,
         })))
     } else {
+        // Without managed OS routes there is no proof that a daemon-owned
+        // LocalAPI socket can enter this TUN rather than an underlay route.
+        b.route_table.write().await.block_localapi_dial();
         None
     };
     Ok((Arc::new(dev), router))

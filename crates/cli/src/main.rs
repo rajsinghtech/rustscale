@@ -37,16 +37,38 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Completion is handled before socket resolution or runtime creation. The
-    // hidden protocol only reads its static command description and can never
-    // execute a CLI operation while the shell is completing input.
+    // Completion is handled before command dispatch. It is static except for
+    // `nc`'s first positional, where parity requires one bounded, read-only
+    // LocalAPI status lookup for peer DNS names. Failure stays silent so shell
+    // completion can never turn daemon reachability into an interactive error.
     if args[1] == "__complete" {
         let completion_args = if args.get(2).is_some_and(|arg| arg == "--") {
             &args[3..]
         } else {
             &args[2..]
         };
-        for candidate in completion::complete(completion_args) {
+        let mut candidates = completion::complete(completion_args);
+        if candidates.is_empty() {
+            if let Some((socket, prefix)) = completion::nc_host_request(completion_args) {
+                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    let socket_path = socket::resolve_socket_path(socket);
+                    let client = rustscale_localclient::LocalClient::new(socket_path);
+                    if let Ok(Ok(status)) = runtime.block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            client.status_bounded(),
+                        )
+                        .await
+                    }) {
+                        candidates = completion::nc_hosts_from_status(&status, &prefix);
+                    }
+                }
+            }
+        }
+        for candidate in candidates {
             println!("{candidate}");
         }
         return;
@@ -119,6 +141,19 @@ fn main() {
 
     let socket_path = socket::resolve_socket_path(socket);
     let result = rt.block_on(dispatch(&subcommand, sub_args, socket_path, json));
+
+    // Tokio's terminal stdin adapter uses an internal blocking reader that
+    // cannot always be canceled after remote EOF. At this point block_on has
+    // dropped both nc pump futures and closed the LocalAPI stream; exit the
+    // one-shot process directly rather than detaching a runtime or waiting on
+    // that internal reader.
+    if subcommand == "nc" {
+        if let Err(e) = result {
+            eprintln!("rustscale: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
 
     if let Err(e) = result {
         eprintln!("rustscale: {e}");
@@ -217,7 +252,7 @@ fn usage(bin: &str) {
     eprintln!("  exit-node [--list] [--suggest]       list or select exit nodes");
     eprintln!("  dns status [--json]                  print MagicDNS status");
     eprintln!("  dns query [--json] <name> [A|AAAA]   query the daemon DNS resolver");
-    eprintln!("  nc <host:port>                       netcat via tailnet (not yet supported)");
+    eprintln!("  nc <hostname-or-IP> <port>           connect stdin/stdout to a tailnet TCP port");
     eprintln!("  id-token <audience>                  fetch an OIDC ID token for this machine");
     eprintln!("  update [--yes|--dry-run] [flags]   update from RustScale GitHub releases");
     eprintln!("  wait [--timeout <duration>]          wait for backend to reach Running state");

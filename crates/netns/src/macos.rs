@@ -14,6 +14,26 @@ pub async fn system_control_and_connect(addr: SocketAddr) -> Result<TcpStream, s
     connect(addr, true).await
 }
 
+pub fn create_tun_tcp_socket(
+    addr: SocketAddr,
+    tun_name: &str,
+) -> Result<TcpSocket, std::io::Error> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    let index = std::num::NonZeroU32::new(interface_index_for_name(tun_name)?)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "TUN index is zero"))?;
+    let socket_ref = socket2::SockRef::from(&socket);
+    if addr.is_ipv4() {
+        socket_ref.bind_device_by_index_v4(Some(index))?;
+    } else {
+        socket_ref.bind_device_by_index_v6(Some(index))?;
+    }
+    Ok(socket)
+}
+
 async fn connect(addr: SocketAddr, force_bypass: bool) -> Result<TcpStream, std::io::Error> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?
@@ -114,7 +134,11 @@ fn default_interface_index(rustscale_tun_name: Option<&str>) -> std::io::Result<
             "default interface is the RustScale tunnel",
         ));
     }
-    let cname = CString::new(name.as_str())
+    interface_index_for_name(&name)
+}
+
+fn interface_index_for_name(name: &str) -> std::io::Result<u32> {
+    let cname = CString::new(name)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
     if idx == 0 {

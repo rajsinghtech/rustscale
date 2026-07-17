@@ -873,10 +873,10 @@ impl ServerBuilder {
 /// Internal running state.
 /// Serializes every map-driven and explicit exit-route mutation.
 ///
-/// Lock order is `exit_map_gate` -> prefs/peer snapshots -> `peer_map.gate`
-/// -> route table -> synchronous router. Map code releases `peer_map.gate`
-/// before taking the route-table/router locks. No caller may acquire
-/// `exit_map_gate` while holding any of those inner locks.
+/// Lock order is `exit_map_gate` -> `peer_map.gate` -> prefs/snapshots ->
+/// route table -> synchronous router. A router-only apply may run after the
+/// peer gate is released, but no caller may acquire the peer gate while
+/// holding the route table, or acquire `exit_map_gate` from an inner lock.
 pub(crate) type ExitMapGate = Arc<tokio::sync::Mutex<()>>;
 
 pub(crate) struct RunningState {
@@ -914,6 +914,8 @@ pub(crate) struct RunningState {
     pub(crate) capture_handles: std::sync::Mutex<Vec<capture::CaptureHandle>>,
     /// Shared MagicDNS resolver (dial path + DNS responder).
     pub(crate) resolver: Arc<RwLock<MagicDnsResolver>>,
+    /// Generation-bound TUN user dialer retained with LocalAPI ownership.
+    pub(crate) user_dialer: Arc<rustscale_tsdial::Dialer>,
     /// Our node's FQDN (with trailing dot), from the netmap.
     pub(crate) our_fqdn: String,
     /// Tailnet domain / MagicDNS suffix (e.g. "tailnet.ts.net").
@@ -1070,6 +1072,10 @@ pub(crate) struct Bootstrap {
     pub(crate) packet_drops: Arc<AtomicU64>,
     /// Shared MagicDNS resolver (dial path + DNS responder).
     pub(crate) resolver: Arc<RwLock<MagicDnsResolver>>,
+    /// Generation-bound user dialer initialized from this complete netmap.
+    pub(crate) user_dialer: Arc<rustscale_tsdial::Dialer>,
+    /// Last complete self node retained when control sends peer-only deltas.
+    pub(crate) dial_self_node: Option<Node>,
     /// Our node's FQDN (with trailing dot).
     pub(crate) our_fqdn: String,
     /// Tailnet domain / MagicDNS suffix (from `MapResponse.Domain`).
@@ -1660,7 +1666,7 @@ impl Server {
                     if let Err(error) = sync_router(
                         router,
                         &inner.tailscale_ips,
-                        &routes,
+                        &mut routes,
                         &inner.magicsock,
                         control_url,
                         next_prefs.ExitNodeAllowLANAccess,
@@ -1683,6 +1689,7 @@ impl Server {
                     committed_peer,
                     requested,
                 );
+                inner.peer_map.advance_dial_epoch_locked();
                 if pending {
                     selection.replace_from_prefs(&next_prefs);
                 } else {

@@ -555,7 +555,7 @@ rs_tun_daemon_start_command() {
   [[ "$pipeline" == 1 ]] && environment="RUSTSCALE_TUN_INBOUND_PIPELINE=1 $environment"
   [[ "$outbound" == 1 ]] && environment="RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 $environment"
   nohup_background_command "$environment" \
-    "/opt/rustscale/target/release/rustscaled run --tun --statedir $statedir --socket $socket --hostname $hostname" \
+    "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir $statedir --socket $socket --hostname $hostname" \
     "$logfile" "$pidfile"
 }
 
@@ -563,7 +563,7 @@ rs_userspace_server_start_command() {
   local batch="$1" gro="$2" gso="$3" authkey="$4" port="$5" hostname="$6" statedir="$7" logfile="$8" pidfile="$9" environment
   environment="$(linux_udp_environment "$batch" "$gro" "$gso")"
   nohup_background_command "$environment" \
-    "/opt/rustscale/target/release/rustscale-bench server --authkey $authkey --port $port --hostname $hostname --state-dir $statedir" \
+    "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --authkey $authkey --port $port --hostname $hostname --state-dir $statedir" \
     "$logfile" "$pidfile"
 }
 
@@ -591,22 +591,22 @@ command_shape_self_test() {
   rs_server_off=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
   rs_client_off=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/cli /tmp/cli.sock cli /tmp/cli.log /tmp/cli.pid)
   [[ "$rs_server_off" != *RUSTSCALE_TUN_INBOUND_PIPELINE* && "$rs_client_off" != *RUSTSCALE_TUN_INBOUND_PIPELINE* ]] || return 1
-  [[ "$rs_server_off" == 'TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
-  [[ "$rs_client_off" == 'TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
+  [[ "$rs_server_off" == 'TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_client_off" == 'TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
   rs_server_on=$(rs_tun_daemon_start_command 1 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
   rs_client_on=$(rs_tun_daemon_start_command 1 1 1 tskey-auth-selftest /tmp/cli /tmp/cli.sock cli /tmp/cli.log /tmp/cli.pid)
-  [[ "$rs_server_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
-  [[ "$rs_client_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
+  [[ "$rs_server_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_client_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
   [[ "${rs_server_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* && "${rs_client_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* ]] || return 1
   rs_server_outbound=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 1)
-  [[ "$rs_server_outbound" == 'RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_server_outbound" == 'RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   rs_server_scalar=$(rs_tun_daemon_start_command 0 0 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
-  [[ "$rs_server_scalar" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 RUSTSCALE_DISABLE_UDP_GSO=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_server_scalar" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 RUSTSCALE_DISABLE_UDP_GSO=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   [[ "$(linux_udp_environment 0 0)" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 RUSTSCALE_DISABLE_UDP_GSO=1 ' ]] || return 1
   rs_server_plain=$(rs_tun_daemon_start_command 0 1 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
-  [[ "$rs_server_plain" == 'RUSTSCALE_DISABLE_UDP_GRO=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_server_plain" == 'RUSTSCALE_DISABLE_UDP_GRO=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   rs_server_gso_off=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 0 0)
-  [[ "$rs_server_gso_off" == 'RUSTSCALE_DISABLE_UDP_GSO=1 TS_AUTHKEY=tskey-auth-selftest nohup /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_server_gso_off" == 'RUSTSCALE_DISABLE_UDP_GSO=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   if rs_tun_daemon_start_command 0 0 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid >/dev/null 2>&1; then return 1; else status=$?; fi
   (( status == 2 )) || return 1
   if rs_tun_daemon_start_command 0 0 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 0 1 >/dev/null 2>&1; then return 1; else status=$?; fi
@@ -614,7 +614,7 @@ command_shape_self_test() {
   if linux_udp_environment 0 0 1 >/dev/null 2>&1; then return 1; else status=$?; fi
   (( status == 2 )) || return 1
   rs_userspace_server=$(rs_userspace_server_start_command 1 1 0 tskey-auth-selftest 7777 srv /tmp/rs-srv /tmp/rs-srv.log /tmp/rs-srv.pid)
-  [[ "$rs_userspace_server" == 'RUSTSCALE_DISABLE_UDP_GSO=1 nohup /opt/rustscale/target/release/rustscale-bench server --authkey tskey-auth-selftest --port 7777 --hostname srv --state-dir /tmp/rs-srv > /tmp/rs-srv.log 2>&1 & echo $! > /tmp/rs-srv.pid' ]] || return 1
+  [[ "$rs_userspace_server" == 'RUSTSCALE_DISABLE_UDP_GSO=1 nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --authkey tskey-auth-selftest --port 7777 --hostname srv --state-dir /tmp/rs-srv > /tmp/rs-srv.log 2>&1 & echo $! > /tmp/rs-srv.pid' ]] || return 1
   rs_userspace_client=$(rs_userspace_client_command 1 1 0 tskey-auth-selftest 100.64.0.1:7777 10 1 cli /tmp/rs-cli /tmp/rs-cli.log)
   [[ "$rs_userspace_client" == 'RUSTSCALE_DISABLE_UDP_GSO=1 /opt/rustscale/target/release/rustscale-bench client --authkey tskey-auth-selftest --target 100.64.0.1:7777 --duration 10 --parallel 1 --hostname cli --state-dir /tmp/rs-cli --json 2>/tmp/rs-cli.log' ]] || return 1
 }
@@ -1890,33 +1890,40 @@ PYEOF
 rs_parity_measure() {
   local transport="$1" server_ip="$2" gated_path="$3"
   local auth_args="" identity path_class warmup_json tp_json="[]" lat_json server_foot client_foot bin_size
+  RS_PARITY_FAILURE_LOG=/tmp/rs-parity-setup.log
   local server_names=(rustscale-bench) client_names=(rustscale-bench)
   [[ "$transport" == userspace-tsnet ]] && auth_args="--authkey $AUTHKEY"
   if [[ "$transport" == kernel-tcp ]]; then
     server_names=(rustscaled rustscale-bench); client_names=(rustscaled rustscale-bench)
-    ssh_cmd "$SVM" "$SZONE" "nohup /opt/rustscale/target/release/rustscale-bench server --transport kernel-tcp --port $PORT >/tmp/rs-parity-server.log 2>&1 & echo \$! >/tmp/rs-parity-server.pid"
+    ssh_cmd "$SVM" "$SZONE" "nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --transport kernel-tcp --port $PORT >/tmp/rs-parity-server.log 2>&1 & echo \$! >/tmp/rs-parity-server.pid"
     for _ in {1..30}; do ssh_cmd "$SVM" "$SZONE" 'grep -q "BENCH_READY 1" /tmp/rs-parity-server.log' 2>/dev/null && break; sleep 1; done
     ssh_cmd "$SVM" "$SZONE" 'grep -q "BENCH_READY 1" /tmp/rs-parity-server.log' || return 1
   fi
   identity=$([[ "$transport" == kernel-tcp ]] && echo kernel-tcp || echo userspace)
-  warmup_json=$(ssh_cmd "$CVM" "$CZONE" "/opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup --state-dir /tmp/rs-parity-warmup --json 2>/tmp/rs-parity-warmup.log") || return 1
+  RS_PARITY_FAILURE_LOG=/tmp/rs-parity-warmup.log
+  warmup_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup --state-dir /tmp/rs-parity-warmup --json 2>/tmp/rs-parity-warmup.log") || return 1
   path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["transport"]==sys.argv[1] and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1; print(d["path_class"])' "$transport") || return 1
   [[ "$transport" == kernel-tcp ]] && path_class="$gated_path"
   [[ "$PATH_TAG" == direct && "$path_class" == direct || "$PATH_TAG" == derp && "$path_class" == derp ]] || { echo "[gcp] parity warmup observed wrong path: $path_class" >&2; return 1; }
 
-  remote_start_footprint_set "$SVM" "$SZONE" /tmp/rs-parity-server.footprint "${server_names[@]}" >/dev/null
-  remote_start_footprint_set "$CVM" "$CZONE" /tmp/rs-parity-client.footprint "${client_names[@]}" >/dev/null
+  remote_start_footprint_set "$SVM" "$SZONE" /tmp/rs-parity-server.footprint "${server_names[@]}" >/dev/null || return 1
+  remote_start_footprint_set "$CVM" "$CZONE" /tmp/rs-parity-client.footprint "${client_names[@]}" >/dev/null || return 1
+  sleep 2
+  ssh_cmd "$SVM" "$SZONE" "grep -q '^RSSET ' /tmp/rs-parity-server.footprint" || return 1
+  ssh_cmd "$CVM" "$CZONE" "grep -q '^RSSET ' /tmp/rs-parity-client.footprint" || return 1
   local sample_number=0 total_samples=$((${#PARALLELS[@]} * REPEAT)) N sample_index sample_json mbps
   for N in "${PARALLELS[@]}"; do
     local -a samples=()
     for ((sample_index=1; sample_index<=REPEAT; sample_index++)); do
-      sample_json=$(ssh_cmd "$CVM" "$CZONE" "/opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index --state-dir /tmp/rs-parity-$N-$sample_index --json 2>/tmp/rs-parity-$N-$sample_index.log") || return 1
+      RS_PARITY_FAILURE_LOG=/tmp/rs-parity-$N-$sample_index.log
+      sample_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $identity $auth_args --target $server_ip:$PORT --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index --state-dir /tmp/rs-parity-$N-$sample_index --json 2>/tmp/rs-parity-$N-$sample_index.log") || return 1
       mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$transport" "$N" "$PATH_TAG") || return 1
       samples+=("$mbps"); sample_number=$((sample_number+1)); (( sample_number == total_samples )) || sleep 3
     done
     tp_json=$(append_tun_throughput_row "$tp_json" "$N" "$DURATION" "${samples[@]}") || return 1
   done
-  lat_json=$(ssh_cmd "$CVM" "$CZONE" "/opt/rustscale/target/release/rustscale-bench latency --transport $identity $auth_args --target $server_ip:$PORT --count $LATENCY_COUNT --hostname $CHOST-lat --state-dir /tmp/rs-parity-lat --json 2>/tmp/rs-parity-lat.log") || return 1
+  RS_PARITY_FAILURE_LOG=/tmp/rs-parity-lat.log
+  lat_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport $identity $auth_args --target $server_ip:$PORT --count $LATENCY_COUNT --hostname $CHOST-lat --state-dir /tmp/rs-parity-lat --json 2>/tmp/rs-parity-lat.log") || return 1
   lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); transport,n,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n; assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$transport" "$LATENCY_COUNT" "$PATH_TAG") || return 1
   server_foot=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rs-parity-server.footprint)
   client_foot=$(remote_stop_footprint "$CVM" "$CZONE" /tmp/rs-parity-client.footprint)
@@ -1982,7 +1989,7 @@ run_rs_userspace() {
     echo "[gcp] rs-userspace: wrote parity result $OUT" >&2
     return 0
   fi
-  fail_userspace_config cleanup_rs_userspace "rs-userspace-parity-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-parity-lat.log)"
+  fail_userspace_config cleanup_rs_userspace "rs-userspace-parity-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rs-parity-setup.log}")"
   return 1
 
 }

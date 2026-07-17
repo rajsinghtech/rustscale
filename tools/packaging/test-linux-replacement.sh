@@ -33,26 +33,29 @@ fi
 os=$(uname -s)
 [[ "$os" == Linux ]] || skip "requires Linux; found $os"
 
-# Keep teardown inside the child: GNU timeout sends TERM first, allowing the
-# EXIT trap to stop systemd and remove kernel state, and escalates only if that
-# bounded cleanup itself hangs.
+# Keep teardown inside the child. The repository deadline helper owns a new
+# process group, sends TERM to the whole build/journey tree, gives the EXIT trap
+# time to stop systemd and remove kernel state, then escalates to KILL.
 if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
-  command -v timeout >/dev/null 2>&1 || skip "GNU timeout is required for bounded teardown"
+  command -v python3 >/dev/null 2>&1 || skip "python3 is required for bounded teardown"
+  deadline_runner="$ROOT/tools/agent/run-with-deadline.py"
+  [[ -f "$deadline_runner" ]] || skip "deadline helper is unavailable"
   deadline=${RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT:-900}
   case "$deadline" in
     ''|*[!0-9]*) echo "$LABEL ERROR: timeout must be a positive integer" >&2; exit 2 ;;
   esac
   (( deadline > 0 )) || { echo "$LABEL ERROR: timeout must be positive" >&2; exit 2; }
-  echo "$LABEL bounded journey deadline: ${deadline}s" >&2
-  exec timeout --signal=TERM --kill-after=60s "${deadline}s" \
-    env RUSTSCALE_LINUX_REPLACEMENT_INNER=1 \
-      RUSTSCALE_REQUIRE_LINUX_REPLACEMENT="$REQUIRE" \
-      RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT="$deadline" \
-      bash "$ROOT/tools/packaging/test-linux-replacement.sh"
+  echo "$LABEL bounded process-group journey deadline: ${deadline}s" >&2
+  exec env RUSTSCALE_DEADLINE_GRACE_SECONDS=60 \
+    python3 "$deadline_runner" "$deadline" -- \
+      env RUSTSCALE_LINUX_REPLACEMENT_INNER=1 \
+        RUSTSCALE_REQUIRE_LINUX_REPLACEMENT="$REQUIRE" \
+        RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT="$deadline" \
+        bash "$ROOT/tools/packaging/test-linux-replacement.sh"
 fi
 
 for command_name in awk cargo curl find getconf go grep id install ip mktemp \
-  python3 readlink sed sha256sum sudo systemctl tar tee tr wc; do
+  python3 readlink sed sha256sum sudo systemctl tar tee timeout tr wc; do
   command -v "$command_name" >/dev/null 2>&1 \
     || skip "required command '$command_name' is not available"
 done

@@ -533,7 +533,7 @@ test_codex_wrapper_signal_updates_metadata() {
 }
 
 test_deadline_process_group_cleanup() {
-  local linger pidfile runner status output
+  local grace_script linger marker pidfile runner status output
   linger="$TMP/linger.py"
   printf '%s\n' \
     'import subprocess, sys, time' \
@@ -554,6 +554,27 @@ test_deadline_process_group_cleanup() {
   done
   ! kill -0 "$(cat "$pidfile")" 2>/dev/null || fail 'grandchild survived deadline cleanup'
   assert_contains "$output" 'deadline reached'
+
+  grace_script="$TMP/deadline-grace.py"
+  marker="$TMP/deadline-grace.marker"
+  printf '%s\n' \
+    'import signal, sys, time' \
+    'def terminate(_signum, _frame):' \
+    '    with open(sys.argv[1], "a", encoding="ascii") as handle: handle.write("term\\n")' \
+    '    time.sleep(0.5)' \
+    '    with open(sys.argv[1], "a", encoding="ascii") as handle: handle.write("done\\n")' \
+    '    raise SystemExit(143)' \
+    'signal.signal(signal.SIGTERM, terminate)' \
+    'time.sleep(30)' >"$grace_script"
+  set +e
+  output="$(env RUSTSCALE_DEADLINE_GRACE_SECONDS=2 \
+    python3 "$ROOT/tools/agent/run-with-deadline.py" 1 -- \
+      python3 "$grace_script" "$marker" 2>&1)"
+  status=$?
+  set -e
+  [[ "$status" == 124 ]] || fail "deadline helper grace exit was $status, expected 124"
+  [[ -f "$marker" ]] || fail 'deadline helper did not deliver TERM during configurable grace'
+  assert_contains "$(cat "$marker")" 'done'
 
   pidfile="$TMP/term-child.pid"
   python3 "$ROOT/tools/agent/run-with-deadline.py" 30 -- python3 "$linger" "$pidfile" >"$TMP/term.log" 2>&1 &

@@ -187,6 +187,10 @@ jobs:
         env:
           RUSTSCALE_REQUIRE_LINUX_REPLACEMENT: '1'
           RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT: '900'
+          # This is a functional install/TUN gate. release.yml separately builds
+          # and smokes the production thin-LTO artifacts.
+          CARGO_PROFILE_RELEASE_LTO: 'off'
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
         run: tools/packaging/test-linux-replacement.sh
 
   ignore-guard:

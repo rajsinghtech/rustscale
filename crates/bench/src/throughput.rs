@@ -52,9 +52,7 @@ pub async fn run_userspace(
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(authkey)
-        // Reuse the benchmark state directory across trials so scale sweeps do
-        // not create one control-plane peer per sample.
-        .ephemeral(false)
+        .ephemeral(true)
         .disable_portmapping(true)
         .control_url(control_url);
     if let Some(ref d) = state_dir {

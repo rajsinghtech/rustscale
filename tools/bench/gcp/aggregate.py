@@ -234,7 +234,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
             if (not isinstance(workload, dict) or workload.get("implementation") != "rustscale-bench"
                     or workload.get("protocol") != "RSB1" or workload.get("direction") != "down"
                     or workload.get("payload_bytes") != 1280 or workload.get("latency_protocol") != "RSB1-tcp-pingpong"
-                    or workload.get("latency_payload_bytes") != 8 or workload.get("client_lifecycle") != "new_process_per_trial_persistent_identity"
+                    or workload.get("latency_payload_bytes") != 8 or workload.get("client_lifecycle") != "new_ephemeral_identity_per_trial"
                     or workload.get("userspace_portmapping") != "disabled"):
                 errors.append("invalid RustScale parity workload identity")
             resources = obj.get("resources")

@@ -36,7 +36,7 @@ pub async fn run_userspace(
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(authkey)
-        .ephemeral(false)
+        .ephemeral(true)
         .disable_portmapping(true)
         .control_url(control_url);
     if let Some(ref d) = state_dir {

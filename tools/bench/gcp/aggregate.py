@@ -275,6 +275,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
                 or workload.get("payload_bytes") != 1280
                 or workload.get("warmup") != {"parallel": 1, "duration_s": 3, "max_attempts": 3}
                 or workload.get("client_lifecycle") != "new_benchmark_process_per_trial"
+                or workload.get("transport_identity_lifecycle") != "one_persisted_identity_per_endpoint_cell"
                 or workload.get("measured_trial_attempts") != 1
                 or workload.get("latency_protocol") != "RSB1-tcp-pingpong"
                 or workload.get("latency_payload_bytes") != 8 or workload.get("latency_count") != 50

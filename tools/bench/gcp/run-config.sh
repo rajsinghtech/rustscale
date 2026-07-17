@@ -2247,11 +2247,16 @@ rsb1_measure() {
   (( ${#RSB1_SERVER_SUBJECTS[@]} > 0 && ${#RSB1_CLIENT_SUBJECTS[@]} > 0 )) || return 2
   [[ "$cli_transport" == userspace ]] && auth_args="--authkey $AUTHKEY"
 
+  # Every cell keeps one transport identity per endpoint while each warmup,
+  # measured trial, and latency trial still gets a new benchmark process. For
+  # embedded tsnet this stable state directory avoids registering a new
+  # ephemeral peer before every measured fan-out; kernel transports ignore it.
+  local client_state_dir=/tmp/rsb1-client-state
   RS_PARITY_FAILURE_LOG=/tmp/rsb1-warmup.log
   local warmup_attempt
   warmup_json=""
   for warmup_attempt in 1 2 3; do
-    warmup_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $cli_transport $auth_args --target $target --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup-$warmup_attempt --state-dir /tmp/rsb1-warmup-$warmup_attempt --json 2>/tmp/rsb1-warmup.log") && break
+    warmup_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $cli_transport $auth_args --target $target --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup-$warmup_attempt --state-dir $client_state_dir --json 2>/tmp/rsb1-warmup.log") && break
     echo "[gcp] RSB1 warmup retry $warmup_attempt/3" >&2
     sleep 5
     warmup_json=""
@@ -2277,7 +2282,7 @@ rsb1_measure() {
     for ((sample_index=1; sample_index<=REPEAT; sample_index++)); do
       echo "[gcp] $CONFIG: RSB1 N=$N sample=$sample_index/$REPEAT" >&2
       RS_PARITY_FAILURE_LOG=/tmp/rsb1-$N-$sample_index.log
-      sample_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $cli_transport $auth_args --target $target --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index --state-dir /tmp/rsb1-$N-$sample_index --json 2>/tmp/rsb1-$N-$sample_index.log") || return 1
+      sample_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $cli_transport $auth_args --target $target --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index --state-dir $client_state_dir --json 2>/tmp/rsb1-$N-$sample_index.log") || return 1
       mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$reported_transport" "$N" "$PATH_TAG") || return 1
       samples+=("$mbps")
       trial_json=$(printf '%s' "$sample_json" | python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); d=json.load(sys.stdin); rows.append({"parallel":d["parallel"],"repeat_index":int(sys.argv[2]),"transport":d["transport"],"protocol":d["protocol"],"direction":d["direction"],"duration_s":d["duration_secs"],"established":d["established"],"handshaken":d["handshaken"],"completed":d["completed"],"total_mbps":d["total_mbps"],"path_class":d["path_class"]}); print(json.dumps(rows))' "$trial_json" "$sample_index") || return 1
@@ -2290,7 +2295,7 @@ rsb1_measure() {
   # Latency is the final measured trial and receives the same inter-trial gap.
   sleep 3
   RS_PARITY_FAILURE_LOG=/tmp/rsb1-latency.log
-  lat_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport $cli_transport $auth_args --target $target --count $LATENCY_COUNT --hostname $CHOST-latency --state-dir /tmp/rsb1-latency --json 2>/tmp/rsb1-latency.log") || return 1
+  lat_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport $cli_transport $auth_args --target $target --count $LATENCY_COUNT --hostname $CHOST-latency --state-dir $client_state_dir --json 2>/tmp/rsb1-latency.log") || return 1
   lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); transport,n,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n and all(type(v) is int and v>0 for v in d["samples_ns"]); assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$reported_transport" "$LATENCY_COUNT" "$PATH_TAG") || return 1
   RSB1_MEASURE_PATH_POST=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path_class"])') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && RSB1_MEASURE_PATH_POST="$gated_path"
@@ -2325,7 +2330,8 @@ obj={"schema_version":5,"status":"ok","tool":"rustscale" if implementation=="rus
  "path_class_reported":observed_path,"transport":transport,
  "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,
              "warmup":{"parallel":1,"duration_s":3,"max_attempts":3},
-             "client_lifecycle":"new_benchmark_process_per_trial","measured_trial_attempts":1,
+             "client_lifecycle":"new_benchmark_process_per_trial",
+             "transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,
              "latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,
              "latency_count":50,"transport_path":transport_path,"userspace_portmapping":portmapping},
  "warmup_evidence":json.loads(warmup_evidence),"throughput":json.loads(tp),
@@ -2401,6 +2407,8 @@ rsb1_lifecycle_self_test() {
   definition=$(declare -f rsb1_measure)
   [[ $(grep -c 'RSB1 warmup retry' <<<"$definition") -eq 1 \
     && "$definition" != *'measured retry'* \
+    && "$definition" == *'client_state_dir=/tmp/rsb1-client-state'* \
+    && $(grep -o -- '--state-dir \$client_state_dir' <<<"$definition" | wc -l | tr -d ' ') -eq 3 \
     && "$definition" == *'throughput_trials'* ]] || return 1
 
   event=$(mktemp "$RDIR/cell-exit-test.XXXXXX") || return 1

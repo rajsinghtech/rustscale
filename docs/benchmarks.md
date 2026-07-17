@@ -155,8 +155,11 @@ gate. A local 1000-stream kernel setup gate runs in the `rustscale-bench` tests.
 
 The warmup may retry up to three times before resource sampling starts.
 Measured throughput and latency processes are never retried inside the resource
-window; one failed or incomplete trial discards the cell. Both endpoint
-samplers run continuously from after warmup through the throughput trials,
+window; one failed or incomplete trial discards the cell. Every trial uses a
+new benchmark process, while all four cells retain one transport identity per
+endpoint for the complete cell; embedded tsnet reopens one persisted client
+state rather than registering a new ephemeral peer before every fan-out. Both
+endpoint samplers run continuously from after warmup through the throughput trials,
 three-second inter-trial gaps, and latency. Dynamic exact-name process sets are:
 
 - `rs-userspace`: `rustscale-bench` on both endpoints.

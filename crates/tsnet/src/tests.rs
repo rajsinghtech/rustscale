@@ -5524,13 +5524,25 @@ fn have_root() -> bool {
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
 }
 
-/// Require interop env + root, or skip.
+/// Require interop env + root. Plain ignored-test runs may skip, but the
+/// privileged release harness sets `RUSTSCALE_REQUIRE_TUN_INTEROP=1` so
+/// missing, malformed, or unprivileged context is a hard failure rather than
+/// a false passing test.
 fn require_tun_interop(test_name: &str) -> Option<InteropEnv> {
+    let required = std::env::var("RUSTSCALE_REQUIRE_TUN_INTEROP").is_ok_and(|value| value == "1");
     let Some(ienv) = interop_env() else {
+        assert!(
+            !required,
+            "{test_name}: required TUN interop environment is missing or invalid"
+        );
         log::debug!("{test_name}: skipping (interop env not set)");
         return None;
     };
     if !have_root() {
+        assert!(
+            !required,
+            "{test_name}: required TUN interop test is not running as root"
+        );
         log::debug!("{test_name}: skipping (not root — TUN mode requires sudo)");
         return None;
     }

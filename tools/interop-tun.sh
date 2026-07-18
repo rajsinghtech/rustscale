@@ -241,7 +241,7 @@ echo "[interop-tun] test binary: $TEST_BIN" >&2
 # Fail closed if the selected executable does not contain the required ignored
 # test. libtest exits successfully when an exact filter matches zero tests.
 if ! "$TEST_BIN" --ignored --list \
-    | grep -Fxq 'tests::interop_tun_rust_dials_go: test'; then
+    | grep -Fx 'tests::interop_tun_rust_dials_go: test' >/dev/null; then
   echo "[interop-tun] ERROR: selected binary lacks the exact TUN regression test" >&2
   exit 1
 fi
@@ -261,6 +261,7 @@ sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_NAME,TS_INTERO
       echo '[interop-tun] ERROR: sudo did not preserve the required interop environment' >&2
       exit 1
     fi
+    export RUSTSCALE_REQUIRE_TUN_INTEROP=1
     exec \"\$@\"
   " sh "$TEST_BIN" \
   --ignored --exact tests::interop_tun_rust_dials_go \

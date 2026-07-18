@@ -191,7 +191,27 @@ jobs:
           # and smokes the production thin-LTO artifacts.
           CARGO_PROFILE_RELEASE_LTO: 'off'
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
-        run: tools/packaging/test-linux-replacement.sh
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '1'
+        run: |
+          # Keep privileged descendant descriptors off the runner log pipe so
+          # the process-group deadline can return even during forced teardown.
+          log="$RUNNER_TEMP/linux-replacement.log"
+          set +e
+          tools/packaging/test-linux-replacement.sh >"$log" 2>&1 &
+          journey_pid=$!
+          (
+            while kill -0 "$journey_pid" 2>/dev/null; do
+              sleep 60
+              echo "[linux-replacement] bounded journey still running"
+            done
+          ) &
+          heartbeat_pid=$!
+          wait "$journey_pid"
+          status=$?
+          kill "$heartbeat_pid" 2>/dev/null || true
+          wait "$heartbeat_pid" 2>/dev/null || true
+          cat "$log"
+          exit "$status"
 
   ignore-guard:
     name: #[ignore] count guard (L6)

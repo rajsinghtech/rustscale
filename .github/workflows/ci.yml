@@ -172,7 +172,13 @@ jobs:
   linux-replacement:
     name: Installed Linux replacement journey
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 50
+    env:
+      # This is a functional install/TUN gate. release.yml separately builds
+      # and smokes the production thin-LTO artifacts.
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -183,16 +189,16 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26'
+      - name: Build functional replacement artifacts
+        run: >-
+          python3 tools/agent/run-with-deadline.py 1800 --
+          cargo build --release --locked
+          -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
       - name: Run bounded installed replacement journey
         env:
           RUSTSCALE_REQUIRE_LINUX_REPLACEMENT: '1'
           RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT: '900'
           RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE: ${{ runner.temp }}/linux-replacement.phase
-          # This is a functional install/TUN gate. release.yml separately builds
-          # and smokes the production thin-LTO artifacts.
-          CARGO_PROFILE_RELEASE_LTO: 'off'
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
-          CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
         run: |
           # Keep privileged descendant descriptors off the runner log pipe so
           # the process-group deadline can return even during forced teardown.

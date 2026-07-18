@@ -190,59 +190,35 @@ jobs:
         with:
           go-version: '1.26'
       - name: Build functional replacement artifacts
-        run: >-
-          python3 tools/agent/run-with-deadline.py 1800 --
-          cargo build --release --locked
-          -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
+        run: |
+          echo "[linux-replacement] $(date -u '+%Y-%m-%dT%H:%M:%SZ') build start (deadline=1200s)"
+          python3 tools/agent/run-with-deadline.py 1200 -- \
+            cargo build --release --locked \
+              -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
+          echo "[linux-replacement] $(date -u '+%Y-%m-%dT%H:%M:%SZ') build complete"
       - name: Run bounded installed replacement journey
         env:
           RUSTSCALE_REQUIRE_LINUX_REPLACEMENT: '1'
           RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT: '900'
+          RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT: '90'
           RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE: ${{ runner.temp }}/linux-replacement.phase
         run: |
-          # Keep privileged descendant descriptors off the runner log pipe so
-          # the process-group deadline can return even during forced teardown.
-          log="$RUNNER_TEMP/linux-replacement.log"
-          set +e
-          timeout_marker="$RUNNER_TEMP/linux-replacement.timed-out"
-          tools/packaging/test-linux-replacement.sh >"$log" 2>&1 &
-          journey_pid=$!
-          python3 - "$journey_pid" "$timeout_marker" <<'PY' &
-          import os
-          import signal
-          import sys
-          import time
-
-          time.sleep(970)
-          open(sys.argv[2], "w", encoding="ascii").close()
-          try:
-              os.kill(int(sys.argv[1]), signal.SIGKILL)
-          except ProcessLookupError:
-              pass
-          PY
-          watchdog_pid=$!
-          (
-            last_phase=
-            while kill -0 "$journey_pid" 2>/dev/null; do
-              phase=$(cat "$RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE" 2>/dev/null || echo starting)
-              if [[ "$phase" != "$last_phase" ]]; then
-                echo "::notice title=Linux replacement::phase=$phase"
-                last_phase=$phase
-              fi
-              echo "[linux-replacement] bounded journey still running (phase=$phase)"
-              sleep 60
-            done
-          ) &
-          heartbeat_pid=$!
-          wait "$journey_pid"
-          status=$?
-          kill "$heartbeat_pid" "$watchdog_pid" 2>/dev/null || true
-          wait "$heartbeat_pid" "$watchdog_pid" 2>/dev/null || true
-          if [[ -e "$timeout_marker" ]]; then
-            status=124
+          # The script runs as the runner uid inside a root-manager-owned
+          # transient cgroup. Its 900-second execution limit plus 90-second
+          # diagnostic/teardown grace can kill root descendants and closes
+          # well before this job's 50-minute outer limit.
+          set -o pipefail
+          tools/packaging/test-linux-replacement.sh 2>&1 \
+            | tee "$RUNNER_TEMP/linux-replacement.log"
+      - name: Replay replacement failure diagnostics
+        if: failure()
+        run: |
+          phase=$(cat "$RUNNER_TEMP/linux-replacement.phase" 2>/dev/null || echo not-started)
+          echo "::error title=Linux replacement failed::last phase=$phase"
+          if [[ -f "$RUNNER_TEMP/linux-replacement.log" ]]; then
+            echo "[linux-replacement] final bounded log replay (phase=$phase)"
+            tail -n 400 "$RUNNER_TEMP/linux-replacement.log"
           fi
-          cat "$log"
-          exit "$status"
 
   ignore-guard:
     name: #[ignore] count guard (L6)

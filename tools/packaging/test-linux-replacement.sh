@@ -20,11 +20,78 @@ skip() {
   exit 0
 }
 
+timestamp() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+CURRENT_PHASE=starting
 record_phase() {
-  local phase=$1
-  echo "$LABEL phase: $phase" >&2
+  local phase=$1 now
+  now=$(timestamp)
+  CURRENT_PHASE=$phase
+  echo "$LABEL $now phase: $phase" >&2
+  if [[ "${GITHUB_ACTIONS:-false}" == true ]]; then
+    echo "::notice title=Linux replacement::$phase at $now" >&2
+  fi
   if [[ -n "${RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE:-}" ]]; then
     printf '%s\n' "$phase" >"$RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE"
+  fi
+}
+
+run_bounded() {
+  local seconds=$1 operation=$2 status
+  shift 2
+  echo "$LABEL $(timestamp) start: $operation (deadline=${seconds}s)" >&2
+  if timeout --signal=TERM --kill-after=5s "${seconds}s" "$@"; then
+    echo "$LABEL $(timestamp) finish: $operation" >&2
+  else
+    status=$?
+    echo "$LABEL $(timestamp) ERROR: $operation failed (status=$status, deadline=${seconds}s)" >&2
+    return "$status"
+  fi
+}
+
+run_root_bounded() {
+  local seconds=$1 operation=$2 status
+  shift 2
+  echo "$LABEL $(timestamp) start: $operation (root deadline=${seconds}s)" >&2
+  if sudo -n timeout --signal=TERM --kill-after=5s "${seconds}s" "$@"; then
+    echo "$LABEL $(timestamp) finish: $operation" >&2
+  else
+    status=$?
+    echo "$LABEL $(timestamp) ERROR: $operation failed (status=$status, root deadline=${seconds}s)" >&2
+    return "$status"
+  fi
+}
+
+run_runner_supervised_bounded() {
+  local seconds=$1 operation=$2 status runner_uid runner_gid
+  shift 2
+  runner_uid=$(id -u)
+  runner_gid=$(id -g)
+  echo "$LABEL $(timestamp) start: $operation (runner uid=$runner_uid, root-supervised deadline=${seconds}s)" >&2
+  if sudo -n timeout --signal=TERM --kill-after=5s "${seconds}s" \
+      setpriv --reuid="$runner_uid" --regid="$runner_gid" --init-groups -- \
+        env "HOME=${HOME:-/tmp}" "PATH=$PATH" "$@"; then
+    echo "$LABEL $(timestamp) finish: $operation" >&2
+  else
+    status=$?
+    echo "$LABEL $(timestamp) ERROR: $operation failed (status=$status, root-supervised deadline=${seconds}s)" >&2
+    return "$status"
+  fi
+}
+
+run_as_user_bounded() {
+  local user=$1 seconds=$2 operation=$3 status
+  shift 3
+  echo "$LABEL $(timestamp) start: $operation (user=$user deadline=${seconds}s)" >&2
+  if sudo -n -u "$user" -- timeout --signal=TERM --kill-after=5s \
+      "${seconds}s" "$@"; then
+    echo "$LABEL $(timestamp) finish: $operation" >&2
+  else
+    status=$?
+    echo "$LABEL $(timestamp) ERROR: $operation failed (status=$status, user=$user deadline=${seconds}s)" >&2
+    return "$status"
   fi
 }
 
@@ -41,30 +108,91 @@ fi
 os=$(uname -s)
 [[ "$os" == Linux ]] || skip "requires Linux; found $os"
 
-# Keep teardown inside the child. The repository deadline helper owns a new
-# process group, sends TERM to the whole build/journey tree, gives the EXIT trap
-# time to stop systemd and remove kernel state, then escalates to KILL.
+# Run the journey itself as the invoking user inside a root-manager-owned
+# transient service. KillMode=control-group sends TERM to the runner shell and
+# every current child so the shell can run its EXIT diagnostics/cleanup; after
+# the bounded grace the system manager can kill every process in the cgroup
+# regardless of uid. This closes the process-group privilege gap for sudo
+# descendants.
 if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
-  command -v python3 >/dev/null 2>&1 || skip "python3 is required for bounded teardown"
-  deadline_runner="$ROOT/tools/agent/run-with-deadline.py"
-  [[ -f "$deadline_runner" ]] || skip "deadline helper is unavailable"
+  for command_name in date id setpriv sudo systemctl systemd-run timeout; do
+    command -v "$command_name" >/dev/null 2>&1 \
+      || skip "required supervisor command '$command_name' is not available"
+  done
+  sudo -n true 2>/dev/null || skip "passwordless sudo is unavailable"
+
   deadline=${RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT:-900}
-  case "$deadline" in
-    ''|*[!0-9]*) echo "$LABEL ERROR: timeout must be a positive integer" >&2; exit 2 ;;
+  teardown_deadline=${RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT:-90}
+  for value_name in deadline teardown_deadline; do
+    value=${!value_name}
+    case "$value" in
+      ''|*[!0-9]*) echo "$LABEL ERROR: $value_name must be a positive integer" >&2; exit 2 ;;
+    esac
+    (( value > 0 )) \
+      || { echo "$LABEL ERROR: $value_name must be positive" >&2; exit 2; }
+  done
+
+  manager_state=$(sudo -n timeout --signal=KILL 10s \
+    systemctl is-system-running 2>/dev/null || true)
+  case "$manager_state" in
+    running|degraded) ;;
+    *) skip "systemd manager is unavailable for privileged cgroup supervision (state=${manager_state:-unknown})" ;;
   esac
-  (( deadline > 0 )) || { echo "$LABEL ERROR: timeout must be positive" >&2; exit 2; }
-  echo "$LABEL bounded process-group journey deadline: ${deadline}s" >&2
-  exec env RUSTSCALE_DEADLINE_GRACE_SECONDS=60 \
-    python3 "$deadline_runner" "$deadline" -- \
-      env RUSTSCALE_LINUX_REPLACEMENT_INNER=1 \
-        RUSTSCALE_REQUIRE_LINUX_REPLACEMENT="$REQUIRE" \
-        RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT="$deadline" \
-        bash "$ROOT/tools/packaging/test-linux-replacement.sh"
+
+  unit="rustscale-linux-replacement-$(id -u)-$$.service"
+  stop_supervised_unit() {
+    trap - HUP INT TERM
+    echo "$LABEL $(timestamp) supervisor: forcing $unit closed" >&2
+    sudo -n timeout --signal=KILL 10s systemctl stop "$unit" >/dev/null 2>&1 || true
+    sudo -n timeout --signal=KILL 10s \
+      systemctl kill --kill-whom=all --signal=KILL "$unit" >/dev/null 2>&1 || true
+  }
+  trap 'stop_supervised_unit; exit 129' HUP
+  trap 'stop_supervised_unit; exit 130' INT
+  trap 'stop_supervised_unit; exit 143' TERM
+
+  environment=(
+    "HOME=${HOME:-/tmp}"
+    "PATH=$PATH"
+    "RUSTSCALE_LINUX_REPLACEMENT_INNER=1"
+    "RUSTSCALE_REQUIRE_LINUX_REPLACEMENT=$REQUIRE"
+    "RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT=$deadline"
+    "RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT=$teardown_deadline"
+  )
+  for variable in CARGO_HOME CARGO_TARGET_DIR CI GITHUB_ACTIONS \
+    RUSTUP_HOME RUSTFLAGS TMPDIR \
+    CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS \
+    CARGO_PROFILE_RELEASE_OPT_LEVEL RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE; do
+    if [[ -n "${!variable:-}" ]]; then
+      environment+=("$variable=${!variable}")
+    fi
+  done
+
+  echo "$LABEL $(timestamp) supervisor: unit=$unit run=${deadline}s teardown=${teardown_deadline}s uid=$(id -u)" >&2
+  set +e
+  sudo -n systemd-run --quiet --wait --pipe --collect \
+    --unit="$unit" --service-type=exec \
+    --uid="$(id -u)" --gid="$(id -g)" --working-directory="$ROOT" \
+    --property="RuntimeMaxSec=${deadline}s" \
+    --property="TimeoutStopSec=${teardown_deadline}s" \
+    --property=KillMode=control-group --property=SendSIGKILL=yes \
+    /usr/bin/env "${environment[@]}" \
+      bash "$ROOT/tools/packaging/test-linux-replacement.sh"
+  status=$?
+  set -e
+  trap - HUP INT TERM
+  if sudo -n timeout --signal=KILL 5s systemctl is-active --quiet "$unit" 2>/dev/null; then
+    echo "$LABEL $(timestamp) ERROR: supervised unit remained active after systemd-run" >&2
+    stop_supervised_unit
+    [[ "$status" != 0 ]] || status=1
+  fi
+  exit "$status"
 fi
 
 record_phase preflight
-for command_name in awk cargo curl find getconf go grep id install ip mktemp \
-  python3 readlink sed sha256sum sudo systemctl tar tee timeout tr wc; do
+for command_name in awk cargo curl date find getconf go grep id install ip journalctl \
+  mktemp ps python3 readlink sed setpriv sha256sum sudo systemctl systemd-run tail tar \
+  tee timeout tr wc; do
   command -v "$command_name" >/dev/null 2>&1 \
     || skip "required command '$command_name' is not available"
 done
@@ -73,8 +201,9 @@ if ! sudo -n true 2>/dev/null; then
   skip "passwordless sudo is unavailable"
 fi
 systemd_state=unknown
+echo "$LABEL $(timestamp) wait: systemd ready (deadline=60s)" >&2
 for ((systemd_attempt = 0; systemd_attempt < 60; systemd_attempt++)); do
-  systemd_state=$(systemctl is-system-running 2>/dev/null || true)
+  systemd_state=$(timeout --signal=KILL 2s systemctl is-system-running 2>/dev/null || true)
   case "$systemd_state" in
     running|degraded) break ;;
     starting|initializing) sleep 1 ;;
@@ -112,7 +241,7 @@ for command_name in rustscale rustscaled tailscale tailscaled; do
     skip "command '$command_name' already exists at $(command -v "$command_name")"
   fi
 done
-if systemctl cat rustscaled.service >/dev/null 2>&1; then
+if timeout --signal=KILL 5s systemctl cat rustscaled.service >/dev/null 2>&1; then
   skip "rustscaled.service already exists"
 fi
 for path in \
@@ -141,12 +270,13 @@ for path in \
     skip "safety path already exists: $path"
   fi
 done
-if ip -4 -details rule show | grep -q 'proto 201' \
-    || ip -6 -details rule show | grep -q 'proto 201'; then
+if timeout --signal=KILL 5s ip -4 -details rule show | grep -q 'proto 201' \
+    || timeout --signal=KILL 5s ip -6 -details rule show | grep -q 'proto 201'; then
   skip "an existing protocol-201 policy rule makes cleanup attribution ambiguous"
 fi
 
-if ! tun_preflight=$("$ROOT/tools/interop-tun-preflight.sh" 2>&1); then
+if ! tun_preflight=$(run_bounded 30 real-tun-preflight \
+    "$ROOT/tools/interop-tun-preflight.sh" 2>&1); then
   tun_preflight=${tun_preflight//$'\n'/'; '}
   skip "Linux TUN preflight failed: $tun_preflight"
 fi
@@ -169,6 +299,7 @@ TUN_NAME=tun0
 
 stop_pid() {
   local pid=$1 label=$2
+  echo "$LABEL $(timestamp) cleanup: stop $label (deadline=4s)" >&2
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
   if kill -0 "$pid" 2>/dev/null; then
     kill -TERM "$pid" 2>/dev/null || true
@@ -189,7 +320,7 @@ stop_pid() {
 }
 
 uninstall_release() {
-  timeout --signal=TERM --kill-after=10s 30s \
+  run_runner_supervised_bounded 30 public-uninstall \
     env INSTALL_SERVICE=1 PREFIX="$PREFIX" RUSTSCALE_UNAME_S=Linux \
       RUSTSCALE_UNAME_M="$MACHINE" RUSTSCALE_LIBC=gnu \
       sh "$ROOT/scripts/install.sh" --uninstall
@@ -201,7 +332,8 @@ uninstall_release() {
 # assertions happen before this function can be used.
 emergency_kernel_cleanup() {
   local family preference table ifindex
-  sudo -n systemctl kill --kill-whom=all --signal=KILL rustscaled.service \
+  sudo -n timeout --signal=KILL 5s \
+    systemctl kill --kill-whom=all --signal=KILL rustscaled.service \
     >/dev/null 2>&1 || true
   if [[ -z "$RULE_BASE" && -r "/sys/class/net/$TUN_NAME/ifindex" ]]; then
     ifindex=$(<"/sys/class/net/$TUN_NAME/ifindex")
@@ -215,28 +347,33 @@ emergency_kernel_cleanup() {
         $((RULE_BASE + 30)) $((RULE_BASE + 10)); do
         case "$preference" in
           $((RULE_BASE + 70)))
-            sudo -n ip "$family" rule del pref "$preference" protocol 201 table 52 \
+            sudo -n timeout --signal=KILL 3s \
+              ip "$family" rule del pref "$preference" protocol 201 table 52 \
               >/dev/null 2>&1 || true
             ;;
           $((RULE_BASE + 50)))
-            sudo -n ip "$family" rule del pref "$preference" \
+            sudo -n timeout --signal=KILL 3s \
+              ip "$family" rule del pref "$preference" \
               fwmark 0x80000/0xff0000 protocol 201 type unreachable \
               >/dev/null 2>&1 || true
             ;;
           *)
             table=main
             [[ "$preference" == $((RULE_BASE + 30)) ]] && table=default
-            sudo -n ip "$family" rule del pref "$preference" \
+            sudo -n timeout --signal=KILL 3s \
+              ip "$family" rule del pref "$preference" \
               fwmark 0x80000/0xff0000 protocol 201 table "$table" \
               >/dev/null 2>&1 || true
             ;;
         esac
       done
     done
-    sudo -n rm -f "/run/rustscale/rule-owners/$RULE_BASE"
+    sudo -n timeout --signal=KILL 3s \
+      rm -f "/run/rustscale/rule-owners/$RULE_BASE" || true
   fi
-  sudo -n ip link delete dev "$TUN_NAME" >/dev/null 2>&1 || true
-  sudo -n rm -f "$DEFAULT_SOCKET"
+  sudo -n timeout --signal=KILL 3s \
+    ip link delete dev "$TUN_NAME" >/dev/null 2>&1 || true
+  sudo -n timeout --signal=KILL 3s rm -f "$DEFAULT_SOCKET" || true
 }
 
 assert_kernel_clean() {
@@ -253,7 +390,7 @@ assert_kernel_clean() {
   fi
   if [[ -n "$RULE_BASE" ]]; then
     for family in -4 -6; do
-      rules=$(ip "$family" -details rule show 2>/dev/null || true)
+      rules=$(timeout --signal=KILL 3s ip "$family" -details rule show 2>/dev/null || true)
       for preference in $((RULE_BASE + 10)) $((RULE_BASE + 30)) \
         $((RULE_BASE + 50)) $((RULE_BASE + 70)); do
         if printf '%s\n' "$rules" \
@@ -269,7 +406,7 @@ assert_kernel_clean() {
       leaked=1
     fi
   fi
-  routes=$(ip -4 route show table 52 2>/dev/null || true)
+  routes=$(timeout --signal=KILL 3s ip -4 route show table 52 2>/dev/null || true)
   if printf '%s\n' "$routes" | grep -F "dev $TUN_NAME" >/dev/null; then
     echo "$LABEL cleanup leak: table 52 still routes through $TUN_NAME" >&2
     leaked=1
@@ -280,60 +417,87 @@ assert_kernel_clean() {
 verify_official_sentinels() {
   [[ "$OFFICIAL_SENTINELS" == 1 ]] || return 0
   local expected='official-tailscale-state-must-not-change'
-  [[ "$(sudo -n cat /var/lib/tailscale/.rustscale-install-journey 2>/dev/null || true)" == "$expected" ]] \
+  [[ "$(sudo -n timeout --signal=KILL 3s cat /var/lib/tailscale/.rustscale-install-journey 2>/dev/null || true)" == "$expected" ]] \
     || { echo "$LABEL official state sentinel changed" >&2; return 1; }
-  [[ "$(sudo -n cat /run/tailscale/.rustscale-install-journey 2>/dev/null || true)" == "$expected" ]] \
+  [[ "$(sudo -n timeout --signal=KILL 3s cat /run/tailscale/.rustscale-install-journey 2>/dev/null || true)" == "$expected" ]] \
     || { echo "$LABEL official runtime sentinel changed" >&2; return 1; }
-  [[ "$(sudo -n find /var/lib/tailscale -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d ' ')" == 1 ]] \
+  [[ "$(sudo -n timeout --signal=KILL 3s find /var/lib/tailscale -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d ' ')" == 1 ]] \
     || { echo "$LABEL official state directory gained unexpected entries" >&2; return 1; }
-  [[ "$(sudo -n find /run/tailscale -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d ' ')" == 1 ]] \
+  [[ "$(sudo -n timeout --signal=KILL 3s find /run/tailscale -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d ' ')" == 1 ]] \
     || { echo "$LABEL official runtime directory gained unexpected entries" >&2; return 1; }
 }
 
+capture_failure_diagnostics() {
+  local log_file
+  echo "$LABEL $(timestamp) diagnostics: failure in phase=$CURRENT_PHASE" >&2
+  if [[ "$INSTALL_STARTED" == 1 ]]; then
+    sudo -n timeout --signal=KILL 8s \
+      systemctl status rustscaled.service --no-pager >&2 || true
+    sudo -n timeout --signal=KILL 8s \
+      systemctl show rustscaled.service \
+        -p ActiveState -p SubState -p Result -p MainPID -p ControlPID >&2 || true
+    sudo -n timeout --signal=KILL 10s \
+      journalctl -u rustscaled.service -n 120 --no-pager >&2 || true
+    timeout --signal=KILL 5s \
+      /usr/local/bin/tailscale status --json >&2 || true
+  fi
+  timeout --signal=KILL 5s ip -brief link show >&2 || true
+  timeout --signal=KILL 5s ip -4 -details rule show >&2 || true
+  timeout --signal=KILL 5s ip -4 route show table 52 >&2 || true
+  timeout --signal=KILL 5s ps -eo pid,ppid,pgid,sid,uid,stat,comm,args >&2 || true
+  for log_file in testcontrol.log go-tailscaled.log echo.log install.log uninstall.log; do
+    if [[ -f "$TMP/$log_file" ]]; then
+      echo "$LABEL diagnostics: tail $log_file" >&2
+      tail -n 120 "$TMP/$log_file" >&2 || true
+    fi
+  done
+  echo "$LABEL $(timestamp) diagnostics: capture complete" >&2
+}
+
 cleanup() {
-  local status=$? cleanup_failed=0
+  local status=$? cleanup_failed=0 alias target
   trap - EXIT INT TERM
   set +e
 
-  if [[ "$status" != 0 && "$INSTALL_STARTED" == 1 ]] \
-      && command -v journalctl >/dev/null 2>&1; then
-    echo "$LABEL last rustscaled journal entries:" >&2
-    sudo -n journalctl -u rustscaled.service -n 80 --no-pager >&2 || true
+  # Capture the live service, LocalAPI, kernel, process, and fixture evidence
+  # before any teardown mutates it.
+  if [[ "$status" != 0 ]]; then
+    capture_failure_diagnostics
   fi
+  echo "$LABEL $(timestamp) cleanup: begin (deadline=${RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT:-90}s)" >&2
 
   if [[ "$INSTALL_STARTED" == 1 ]]; then
-    # Root owns systemd's client and service processes, so put the deadline
-    # inside sudo. This leaves time for the remaining EXIT cleanup before the
-    # outer timeout's 60-second KILL escalation.
-    if ! sudo -n timeout --signal=TERM --kill-after=5s 20s \
+    if ! run_root_bounded 20 cleanup-stop-service \
         systemctl disable --now rustscaled.service >/dev/null 2>&1; then
       cleanup_failed=1
       emergency_kernel_cleanup
     fi
-    timeout --signal=TERM --kill-after=5s 15s \
+    run_runner_supervised_bounded 20 cleanup-uninstall \
       env INSTALL_SERVICE=1 PREFIX="$PREFIX" RUSTSCALE_UNAME_S=Linux \
         RUSTSCALE_UNAME_M="$MACHINE" RUSTSCALE_LIBC=gnu \
         sh "$ROOT/scripts/install.sh" --uninstall >/dev/null 2>&1 \
       || cleanup_failed=1
     # Failure fallback. Safety preflight proved these names were free before
     # this journey set INSTALL_STARTED.
-    sudo -n rm -f /etc/systemd/system/rustscaled.service /etc/default/rustscaled \
-      "$DROPIN_DIR/10-rustscale-install-journey.conf" "$JOURNEY_ENV"
-    sudo -n rmdir "$DROPIN_DIR" >/dev/null 2>&1 || true
-    sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+    run_root_bounded 5 cleanup-public-files rm -f \
+      /etc/systemd/system/rustscaled.service /etc/default/rustscaled \
+      "$DROPIN_DIR/10-rustscale-install-journey.conf" "$JOURNEY_ENV" \
+      "$PREFIX/bin/rustscale" "$PREFIX/bin/rustscaled" \
+      "$PREFIX/bin/.rustscale-install-receipt-v1" \
+      "$PREFIX/lib/librustscale.so" "$PREFIX/lib/librustscale.a" \
+      "$PREFIX/include/rustscale.h" || cleanup_failed=1
+    run_root_bounded 5 cleanup-drop-in rmdir "$DROPIN_DIR" >/dev/null 2>&1 || true
+    run_root_bounded 5 cleanup-daemon-reload systemctl daemon-reload \
+      >/dev/null 2>&1 || cleanup_failed=1
     for alias in tailscale tailscaled; do
       target=rustscale
       [[ "$alias" == tailscaled ]] && target=rustscaled
       if [[ -L "$PREFIX/bin/$alias" ]] \
           && [[ "$(readlink "$PREFIX/bin/$alias")" == "$target" ]]; then
-        sudo -n rm -f "$PREFIX/bin/$alias"
+        run_root_bounded 3 "cleanup-$alias-alias" rm -f "$PREFIX/bin/$alias" \
+          || cleanup_failed=1
       fi
     done
-    sudo -n rm -f \
-      "$PREFIX/bin/rustscale" "$PREFIX/bin/rustscaled" \
-      "$PREFIX/bin/.rustscale-install-receipt-v1" \
-      "$PREFIX/lib/librustscale.so" "$PREFIX/lib/librustscale.a" \
-      "$PREFIX/include/rustscale.h"
   fi
 
   stop_pid "$GO_PID" 'Go tailscaled'
@@ -346,27 +510,33 @@ cleanup() {
     assert_kernel_clean || cleanup_failed=1
   fi
   if [[ "$INSTALL_STARTED" == 1 ]]; then
-    sudo -n rm -f "$CONFIG_PATH" "$JOURNEY_ENV" \
-      "$DROPIN_DIR/10-rustscale-install-journey.conf"
-    sudo -n rmdir "$DROPIN_DIR" >/dev/null 2>&1 || true
-    sudo -n rm -rf /var/lib/rustscale /var/cache/rustscale /run/rustscale
+    run_root_bounded 8 cleanup-rustscale-state rm -rf \
+      "$CONFIG_PATH" "$JOURNEY_ENV" \
+      "$DROPIN_DIR/10-rustscale-install-journey.conf" \
+      /var/lib/rustscale /var/cache/rustscale /run/rustscale \
+      || cleanup_failed=1
+    run_root_bounded 3 cleanup-empty-drop-in rmdir "$DROPIN_DIR" \
+      >/dev/null 2>&1 || true
   fi
 
   if ! verify_official_sentinels; then
     cleanup_failed=1
   fi
   if [[ "$OFFICIAL_SENTINELS" == 1 ]]; then
-    sudo -n rm -f /var/lib/tailscale/.rustscale-install-journey \
-      /run/tailscale/.rustscale-install-journey
-    sudo -n rmdir /var/lib/tailscale /run/tailscale 2>/dev/null || cleanup_failed=1
+    run_root_bounded 5 cleanup-official-sentinels rm -f \
+      /var/lib/tailscale/.rustscale-install-journey \
+      /run/tailscale/.rustscale-install-journey || cleanup_failed=1
+    run_root_bounded 5 cleanup-official-directories \
+      rmdir /var/lib/tailscale /run/tailscale >/dev/null 2>&1 \
+      || cleanup_failed=1
   fi
 
-  rm -rf "$TMP"
+  run_bounded 5 cleanup-temporary-files rm -rf "$TMP" || cleanup_failed=1
   if [[ "$cleanup_failed" != 0 ]]; then
-    echo "$LABEL ERROR: bounded cleanup did not restore the isolated host" >&2
+    echo "$LABEL $(timestamp) ERROR: bounded cleanup did not restore the isolated host" >&2
     [[ "$status" != 0 ]] || status=1
   elif [[ "$JOURNEY_FINISHED" == 1 ]]; then
-    echo "$LABEL cleanup: service, processes, fixture state, and sentinels removed" >&2
+    echo "$LABEL $(timestamp) cleanup: service, processes, fixture state, and sentinels removed" >&2
   fi
   exit "$status"
 }
@@ -383,20 +553,23 @@ status_ip() {
 }
 
 wait_backend() {
-  local expected=$1 attempts=${2:-240} output state
-  for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if output=$(/usr/local/bin/tailscale status --json 2>/dev/null); then
+  local expected=$1 seconds=${2:-60} output state deadline
+  deadline=$((SECONDS + seconds))
+  echo "$LABEL $(timestamp) wait: LocalAPI BackendState=$expected (deadline=${seconds}s)" >&2
+  while (( SECONDS < deadline )); do
+    if output=$(timeout --signal=KILL 3s \
+        /usr/local/bin/tailscale status --json 2>/dev/null); then
       state=$(printf '%s' "$output" | backend_state 2>/dev/null || true)
       if [[ "$state" == "$expected" ]]; then
         printf '%s' "$output"
         return 0
       fi
     fi
-    systemctl is-active --quiet rustscaled.service || break
+    timeout --signal=KILL 3s systemctl is-active --quiet rustscaled.service || break
     sleep 0.25
   done
-  echo "$LABEL ERROR: timed out waiting for LocalAPI BackendState=$expected" >&2
-  systemctl status rustscaled.service --no-pager >&2 || true
+  echo "$LABEL $(timestamp) ERROR: timed out waiting for LocalAPI BackendState=$expected" >&2
+  timeout --signal=KILL 5s systemctl status rustscaled.service --no-pager >&2 || true
   return 1
 }
 
@@ -406,8 +579,10 @@ node_count() {
 }
 
 wait_node_count() {
-  local wanted=$1 count=
-  for _ in {1..120}; do
+  local wanted=$1 seconds=${2:-30} count='' deadline
+  deadline=$((SECONDS + seconds))
+  echo "$LABEL $(timestamp) wait: testcontrol nodes >= $wanted (deadline=${seconds}s)" >&2
+  while (( SECONDS < deadline )); do
     count=$(node_count 2>/dev/null || true)
     if [[ "$count" =~ ^[0-9]+$ ]] && (( count >= wanted )); then
       echo "$count"
@@ -415,7 +590,7 @@ wait_node_count() {
     fi
     sleep 0.25
   done
-  echo "$LABEL ERROR: testcontrol did not reach $wanted nodes (last=${count:-unavailable})" >&2
+  echo "$LABEL $(timestamp) ERROR: testcontrol did not reach $wanted nodes (last=${count:-unavailable})" >&2
   return 1
 }
 
@@ -440,17 +615,19 @@ PY
 # Build every artifact before touching system state.
 record_phase rust-release-build
 echo "$LABEL building real release binaries and libraries" >&2
-cargo build --release --locked \
-  -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
+run_bounded 600 rust-release-build \
+  cargo build --release --locked \
+    -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
 
 record_phase pinned-go-build
 TESTCONTROL_BIN="$TMP/testcontrol"
 GO_CLIENT_DIR="$TMP/go-client"
-TESTCONTROL_OUTPUT="$TESTCONTROL_BIN" TESTCONTROL_GO_CLIENT_DIR="$GO_CLIENT_DIR" \
-  "$ROOT/tools/testcontrol/build.sh"
+run_bounded 300 pinned-go-build \
+  env TESTCONTROL_OUTPUT="$TESTCONTROL_BIN" TESTCONTROL_GO_CLIENT_DIR="$GO_CLIENT_DIR" \
+    "$ROOT/tools/testcontrol/build.sh"
 GO_CLI="$GO_CLIENT_DIR/tailscale"
 GO_DAEMON="$GO_CLIENT_DIR/tailscaled"
-GO_VERSION=$($GO_CLI version | sed -n '1p')
+GO_VERSION=$(timeout --signal=KILL 10s "$GO_CLI" version | sed -n '1p')
 [[ "$GO_VERSION" == 1.100.0* ]] \
   || { echo "$LABEL ERROR: unexpected pinned Go client version: $GO_VERSION" >&2; exit 1; }
 
@@ -470,7 +647,8 @@ install -m 644 "$ROOT/include/rustscale.h" "$STAGE/rustscale.h"
 install -m 644 "$ROOT/packaging/systemd/rustscaled.service" "$STAGE/rustscaled.service"
 install -m 644 "$ROOT/packaging/systemd/rustscaled.default" "$STAGE/rustscaled.default"
 install -m 644 "$ROOT/LICENSE" "$STAGE/LICENSE"
-tar --format=ustar -czf "$RELEASE_DIR/$ARCHIVE" -C "$STAGE" .
+run_bounded 30 package-release-archive \
+  tar --format=ustar -czf "$RELEASE_DIR/$ARCHIVE" -C "$STAGE" .
 printf '%s  %s\n' "$(sha256sum "$RELEASE_DIR/$ARCHIVE" | awk '{print $1}')" "$ARCHIVE" \
   >"$RELEASE_DIR/SHA256SUMS"
 
@@ -497,11 +675,14 @@ curl --max-time 2 -fsS "$CONTROL_URL/testapi/health" >/dev/null
 # aliases must remain command-name shims only; RustScale uses its own unit,
 # state directory, and LocalAPI socket.
 printf '%s\n' 'official-tailscale-state-must-not-change' >"$TMP/official-sentinel"
-sudo -n install -d -m 700 /var/lib/tailscale /run/tailscale
-sudo -n install -m 600 "$TMP/official-sentinel" \
-  /var/lib/tailscale/.rustscale-install-journey
-sudo -n install -m 600 "$TMP/official-sentinel" \
-  /run/tailscale/.rustscale-install-journey
+run_root_bounded 10 install-official-sentinels \
+  install -d -m 700 /var/lib/tailscale /run/tailscale
+run_root_bounded 10 install-official-state-sentinel \
+  install -m 600 "$TMP/official-sentinel" \
+    /var/lib/tailscale/.rustscale-install-journey
+run_root_bounded 10 install-official-runtime-sentinel \
+  install -m 600 "$TMP/official-sentinel" \
+    /run/tailscale/.rustscale-install-journey
 OFFICIAL_SENTINELS=1
 
 OPERATOR=$(id -un)
@@ -513,7 +694,8 @@ INSTALL_STARTED=1
 # unchanged. The public uninstaller handles the public files; trap cleanup owns
 # only this drop-in and its environment file.
 write_config no "$TMP/config-without-key.json"
-sudo -n install -m 600 "$TMP/config-without-key.json" "$CONFIG_PATH"
+run_root_bounded 10 install-keyless-config \
+  install -m 600 "$TMP/config-without-key.json" "$CONFIG_PATH"
 printf 'FLAGS="--config %s --no-logs-no-support"\n' "$CONFIG_PATH" \
   >"$TMP/rustscaled-install-journey.env"
 cat >"$TMP/rustscaled-install-journey.conf" <<EOF
@@ -521,17 +703,21 @@ cat >"$TMP/rustscaled-install-journey.conf" <<EOF
 EnvironmentFile=
 EnvironmentFile=$JOURNEY_ENV
 EOF
-sudo -n install -m 644 "$TMP/rustscaled-install-journey.env" "$JOURNEY_ENV"
-sudo -n install -d -m 755 "$DROPIN_DIR"
-sudo -n install -m 644 "$TMP/rustscaled-install-journey.conf" \
-  "$DROPIN_DIR/10-rustscale-install-journey.conf"
+run_root_bounded 10 install-journey-environment \
+  install -m 644 "$TMP/rustscaled-install-journey.env" "$JOURNEY_ENV"
+run_root_bounded 10 create-service-drop-in install -d -m 755 "$DROPIN_DIR"
+run_root_bounded 10 install-service-drop-in \
+  install -m 644 "$TMP/rustscaled-install-journey.conf" \
+    "$DROPIN_DIR/10-rustscale-install-journey.conf"
 
 record_phase install-and-first-start
 echo "$LABEL installing archive with explicit aliases and shipped systemd service" >&2
-INSTALL_SERVICE=1 PREFIX="$PREFIX" RUSTSCALE_RELEASE_BASE="file://$TMP/releases" \
-  RUSTSCALE_HTTP_CLIENT=curl RUSTSCALE_UNAME_S=Linux \
-  RUSTSCALE_UNAME_M="$MACHINE" RUSTSCALE_LIBC=gnu \
-  sh "$ROOT/scripts/install.sh" --version "$VERSION" --tailscale-compatible \
+run_runner_supervised_bounded 120 archive-install \
+  env INSTALL_SERVICE=1 PREFIX="$PREFIX" \
+    RUSTSCALE_RELEASE_BASE="file://$TMP/releases" \
+    RUSTSCALE_HTTP_CLIENT=curl RUSTSCALE_UNAME_S=Linux \
+    RUSTSCALE_UNAME_M="$MACHINE" RUSTSCALE_LIBC=gnu \
+    sh "$ROOT/scripts/install.sh" --version "$VERSION" --tailscale-compatible \
   | tee "$TMP/install.log"
 
 [[ "$(readlink /usr/local/bin/tailscale)" == rustscale ]]
@@ -548,8 +734,8 @@ INSTALL_SERVICE=1 PREFIX="$PREFIX" RUSTSCALE_RELEASE_BASE="file://$TMP/releases"
    == "$(sha256sum "$STAGE/rustscale.h" | awk '{print $1}')" ]]
 [[ "$(sha256sum /etc/default/rustscaled | awk '{print $1}')" \
    == "$(sha256sum "$STAGE/rustscaled.default" | awk '{print $1}')" ]]
-systemctl is-enabled --quiet rustscaled.service
-systemctl is-active --quiet rustscaled.service
+run_bounded 5 verify-service-enabled systemctl is-enabled --quiet rustscaled.service
+run_bounded 5 verify-service-active systemctl is-active --quiet rustscaled.service
 initial_status=$(wait_backend NeedsLogin)
 [[ -S "$DEFAULT_SOCKET" ]]
 [[ "$(printf '%s' "$initial_status" | backend_state)" == NeedsLogin ]]
@@ -557,11 +743,12 @@ verify_official_sentinels
 
 # Point the exact shipped service at local testcontrol and enroll with its
 # documented test key. The key is removed before persistence is tested.
-write_config yes "$TMP/config-with-key.json"
-sudo -n install -m 600 "$TMP/config-with-key.json" "$CONFIG_PATH"
-sudo -n systemctl restart rustscaled.service
 record_phase rust-node-enrollment
-running_status=$(wait_backend Running 320)
+write_config yes "$TMP/config-with-key.json"
+run_root_bounded 10 install-enrollment-config \
+  install -m 600 "$TMP/config-with-key.json" "$CONFIG_PATH"
+run_root_bounded 45 restart-for-enrollment systemctl restart rustscaled.service
+running_status=$(wait_backend Running 80)
 RUST_IP=$(printf '%s' "$running_status" | status_ip)
 [[ "$RUST_IP" == 100.* ]] \
   || { echo "$LABEL ERROR: enrolled Rust node has invalid IP '$RUST_IP'" >&2; exit 1; }
@@ -572,11 +759,15 @@ curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
 [[ -S "$DEFAULT_SOCKET" ]]
 
 # Exercise kernel peer credentials through the default LocalAPI socket.
-sudo -n -u nobody -- /usr/local/bin/tailscale status --json >/dev/null
-if nobody_logout=$(sudo -n -u nobody -- /usr/local/bin/tailscale logout 2>&1); then
+run_as_user_bounded nobody 10 unrelated-status \
+  /usr/local/bin/tailscale status --json >/dev/null
+echo "$LABEL $(timestamp) start: unrelated-logout denial (deadline=10s)" >&2
+if nobody_logout=$(sudo -n -u nobody -- timeout --signal=TERM --kill-after=5s \
+    10s /usr/local/bin/tailscale logout 2>&1); then
   echo "$LABEL ERROR: unrelated LocalAPI identity performed logout" >&2
   exit 1
 fi
+echo "$LABEL $(timestamp) finish: unrelated-logout denied" >&2
 printf '%s\n' "$nobody_logout" >"$TMP/nobody-logout.out"
 grep -q 'access denied' "$TMP/nobody-logout.out"
 
@@ -590,7 +781,7 @@ mtu=$(<"/sys/class/net/$TUN_NAME/mtu")
 (( (16#${flags#0x} & 1) != 0 ))
 [[ "$mtu" == 1280 ]]
 RULE_BASE=$((5000 + (ifindex % 200) * 100))
-rules=$(ip -4 -details rule show)
+rules=$(timeout --signal=KILL 5s ip -4 -details rule show)
 for expectation in \
   "$((RULE_BASE + 10)):lookup main" \
   "$((RULE_BASE + 30)):lookup default" \
@@ -603,7 +794,7 @@ for expectation in \
   [[ -n "$rule" && "$rule" == *"$target"* ]] \
     || { echo "$LABEL ERROR: missing policy rule $preference ($target)" >&2; exit 1; }
 done
-ip -4 route show table 52 \
+timeout --signal=KILL 5s ip -4 route show table 52 \
   | grep -E "^100[.]64[.]0[.]0/10 .*dev $TUN_NAME([[:space:]]|$)" >/dev/null
 
 # Start a real userspace-networking Go peer from the same pinned module as the
@@ -653,11 +844,13 @@ for _ in {1..200}; do
   sleep 0.05
 done
 [[ -S "$GO_SOCKET" ]]
-"$GO_CLI" --socket="$GO_SOCKET" up \
-  --login-server="$CONTROL_URL" --auth-key=tskey-testcontrol \
-  --hostname=go-installed-journey --timeout=30s \
+run_bounded 45 go-peer-enrollment \
+  "$GO_CLI" --socket="$GO_SOCKET" up \
+    --login-server="$CONTROL_URL" --auth-key=tskey-testcontrol \
+    --hostname=go-installed-journey --timeout=30s \
   >>"$TMP/go-tailscaled.log" 2>&1
-GO_IP=$($GO_CLI --socket="$GO_SOCKET" ip -4 | sed -n '1p')
+GO_IP=$(timeout --signal=KILL 10s "$GO_CLI" --socket="$GO_SOCKET" ip -4 \
+  | sed -n '1p')
 [[ "$GO_IP" == 100.* ]] \
   || { echo "$LABEL ERROR: pinned Go peer has invalid IP '$GO_IP'" >&2; exit 1; }
 [[ "$(wait_node_count 2)" -ge 2 ]]
@@ -665,11 +858,12 @@ curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
   | python3 -c 'import json,sys; wanted=set(sys.argv[1:]); found={(node.get("ip") or "").split("/", 1)[0] for node in json.load(sys.stdin)["nodes"]}; raise SystemExit(0 if wanted <= found else 1)' \
       "$RUST_IP" "$GO_IP"
 PEER_PORT=18082
-"$GO_CLI" --socket="$GO_SOCKET" serve --bg --tcp="$PEER_PORT" \
-  "tcp://127.0.0.1:$BACKEND_PORT" >>"$TMP/go-tailscaled.log" 2>&1
+run_bounded 15 go-peer-serve \
+  "$GO_CLI" --socket="$GO_SOCKET" serve --bg --tcp="$PEER_PORT" \
+    "tcp://127.0.0.1:$BACKEND_PORT" >>"$TMP/go-tailscaled.log" 2>&1
 
 record_phase kernel-roundtrip
-python3 - "$GO_IP" "$PEER_PORT" <<'PY'
+run_bounded 180 kernel-roundtrip python3 - "$GO_IP" "$PEER_PORT" <<'PY'
 import socket
 import sys
 import time
@@ -701,17 +895,23 @@ PY
 # an actual systemd restart without another registration credential.
 record_phase restart-persistence
 write_config no "$TMP/config-without-key.json"
-sudo -n install -m 600 "$TMP/config-without-key.json" "$CONFIG_PATH"
-PID_BEFORE=$(systemctl show -p MainPID --value rustscaled.service)
-sudo -n systemctl restart rustscaled.service
-persisted_status=$(wait_backend Running 320)
-PID_AFTER=$(systemctl show -p MainPID --value rustscaled.service)
+run_root_bounded 10 remove-bootstrap-key \
+  install -m 600 "$TMP/config-without-key.json" "$CONFIG_PATH"
+sudo -n timeout --signal=KILL 5s cat /var/lib/rustscale/prefs.json \
+  | python3 -c 'import json,sys; prefs=json.load(sys.stdin); assert prefs.get("WantRunning") is True; assert prefs.get("LoggedOut", False) is False; assert not any("auth" in key.lower() for key in prefs)'
+PID_BEFORE=$(timeout --signal=KILL 5s \
+  systemctl show -p MainPID --value rustscaled.service)
+run_root_bounded 45 restart-without-key systemctl restart rustscaled.service
+persisted_status=$(wait_backend Running 80)
+PID_AFTER=$(timeout --signal=KILL 5s \
+  systemctl show -p MainPID --value rustscaled.service)
 [[ "$PID_BEFORE" =~ ^[1-9][0-9]*$ && "$PID_AFTER" =~ ^[1-9][0-9]*$ ]]
 [[ "$PID_BEFORE" != "$PID_AFTER" ]]
 [[ "$(printf '%s' "$persisted_status" | status_ip)" == "$RUST_IP" ]]
 [[ "$(wait_node_count 2)" -ge 2 ]]
 
-python3 - "$GO_IP" "$PEER_PORT" <<'PY'
+run_bounded 120 restart-persistence-roundtrip \
+  python3 - "$GO_IP" "$PEER_PORT" <<'PY'
 import socket
 import sys
 import time
@@ -740,10 +940,12 @@ PY
 # Logout is durable before the LocalAPI call returns. Restart=always then starts
 # a fresh NeedsLogin generation; that generation must not retain TUN state.
 record_phase logout
-PID_BEFORE_LOGOUT=$(systemctl show -p MainPID --value rustscaled.service)
-/usr/local/bin/tailscale logout
-logged_out_status=$(wait_backend NeedsLogin 320)
-PID_AFTER_LOGOUT=$(systemctl show -p MainPID --value rustscaled.service)
+PID_BEFORE_LOGOUT=$(timeout --signal=KILL 5s \
+  systemctl show -p MainPID --value rustscaled.service)
+run_bounded 45 localapi-logout /usr/local/bin/tailscale logout
+logged_out_status=$(wait_backend NeedsLogin 80)
+PID_AFTER_LOGOUT=$(timeout --signal=KILL 5s \
+  systemctl show -p MainPID --value rustscaled.service)
 [[ "$PID_AFTER_LOGOUT" =~ ^[1-9][0-9]*$ ]]
 [[ "$PID_BEFORE_LOGOUT" != "$PID_AFTER_LOGOUT" ]]
 [[ "$(printf '%s' "$logged_out_status" | backend_state)" == NeedsLogin ]]
@@ -757,11 +959,11 @@ verify_official_sentinels
 record_phase uninstall
 echo "$LABEL uninstalling through scripts/install.sh" >&2
 uninstall_release | tee "$TMP/uninstall.log"
-if systemctl is-active --quiet rustscaled.service; then
+if timeout --signal=KILL 5s systemctl is-active --quiet rustscaled.service; then
   echo "$LABEL ERROR: rustscaled.service remains active after uninstall" >&2
   exit 1
 fi
-if systemctl is-enabled --quiet rustscaled.service; then
+if timeout --signal=KILL 5s systemctl is-enabled --quiet rustscaled.service; then
   echo "$LABEL ERROR: rustscaled.service remains enabled after uninstall" >&2
   exit 1
 fi
@@ -780,11 +982,13 @@ for path in \
 done
 assert_kernel_clean
 verify_official_sentinels
-sudo -n rm -f "$CONFIG_PATH" "$JOURNEY_ENV" \
+run_root_bounded 10 remove-journey-config rm -f \
+  "$CONFIG_PATH" "$JOURNEY_ENV" \
   "$DROPIN_DIR/10-rustscale-install-journey.conf"
-sudo -n rmdir "$DROPIN_DIR"
-sudo -n systemctl daemon-reload
-sudo -n rm -rf /var/lib/rustscale /var/cache/rustscale /run/rustscale
+run_root_bounded 5 remove-journey-drop-in rmdir "$DROPIN_DIR"
+run_root_bounded 10 reload-after-uninstall systemctl daemon-reload
+run_root_bounded 10 remove-retained-rustscale-state \
+  rm -rf /var/lib/rustscale /var/cache/rustscale /run/rustscale
 INSTALL_STARTED=0
 
 JOURNEY_FINISHED=1

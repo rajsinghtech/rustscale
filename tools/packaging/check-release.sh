@@ -77,6 +77,13 @@ test -s docs/release-first-run.md
 grep -q 'Protected real-control smoke gate' docs/release-first-run.md
 grep -q 'Installed Linux replacement journey' docs/release-first-run.md
 grep -q 'RUSTSCALE_REQUIRE_LINUX_REPLACEMENT' .github/workflows/ci.yml
+grep -q 'RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT' .github/workflows/ci.yml
+grep -q 'python3 tools/agent/run-with-deadline.py 1200' .github/workflows/ci.yml
+grep -q 'Replay replacement failure diagnostics' .github/workflows/ci.yml
+grep -q 'systemd-run --quiet --wait --pipe --collect' tools/packaging/test-linux-replacement.sh
+grep -q 'KillMode=control-group' tools/packaging/test-linux-replacement.sh
+grep -q 'RuntimeMaxSec=' tools/packaging/test-linux-replacement.sh
+grep -q 'timeout-minutes: 50' .github/workflows/ci.yml
 grep -q 'TESTCONTROL_GO_CLIENT_DIR' tools/testcontrol/build.sh
 
 # The privileged TUN job must establish local kernel prerequisites before it

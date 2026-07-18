@@ -65,8 +65,10 @@ job with a credential-free, installed-service journey. It builds release-mode
 CLI and daemon binaries, packages them with the checked-in systemd files, and
 feeds that archive through `scripts/install.sh` at `/usr/local` with the
 explicit `--tailscale-compatible` option. CI runs it in the dedicated
-**Installed Linux replacement journey** job with a 900-second child deadline
-inside the job's 25-minute outer deadline.
+**Installed Linux replacement journey** job. The artifact build has a
+1200-second process-group deadline; the installed journey has a 900-second
+execution limit plus a 90-second diagnostic/teardown grace inside the job's
+50-minute outer deadline.
 
 The script refuses to mutate an occupied host. Before installation it requires
 an active systemd manager, passwordless sudo, an unused standard RustScale
@@ -100,8 +102,17 @@ The journey proves all of the following on its isolated Linux runner:
   and LocalAPI socket without touching official-state canaries. The test then
   removes RustScale's intentionally retained identity state as fixture cleanup.
 
-Every owned child PID is recorded. `TERM`, interruption, normal exit, and the
-outer timeout all run the same teardown, which stops the service, escalates
+The journey runs as the invoking runner user inside a root-systemd-manager
+transient cgroup. Every build, LocalAPI call, systemctl operation, wait, logout,
+uninstall, and cleanup phase has its own deadline. The cgroup uses
+`KillMode=control-group`: TERM lets the common EXIT trap capture the live
+service journal, status, process tree, and kernel state before cleanup, while
+the manager can KILL root-owned descendants after the 90-second grace. Phase
+changes and operation boundaries carry UTC timestamps; CI retains a phase file
+and replays the bounded log tail on failure.
+
+Every owned child PID is also recorded. `TERM`, interruption, normal exit, and
+the execution limit run the same teardown, which stops the service, escalates
 stuck child processes, removes only installer-owned aliases/files, and fails if
 the TUN, protocol-201 rules, table-52 route, or socket remains. This gate tests
 a locally assembled candidate archive from the exact checkout; the release

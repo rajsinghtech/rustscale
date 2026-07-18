@@ -138,6 +138,19 @@ INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
     RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
     sh "$ROOT/scripts/install.sh" >/dev/null
 test -x "$prefix/bin/rustscale"
+test "$(readlink "$prefix/bin/tailscale")" = rustscale
+test "$(readlink "$prefix/bin/tailscaled")" = rustscaled
+
+# Replacement aliases can still be disabled explicitly for a RustScale-only
+# command namespace.
+prefix="$TMP/prefix-no-compatible-aliases"
+INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
+    sh "$ROOT/scripts/install.sh" --version "$VERSION" \
+        --no-tailscale-compatible >/dev/null
+test -x "$prefix/bin/rustscale"
+test ! -e "$prefix/bin/tailscale"
+test ! -e "$prefix/bin/tailscaled"
 
 # Uninstall must not remove an upstream installation that rustscale did not
 # create. This is the safety boundary for drop-in replacement mode.

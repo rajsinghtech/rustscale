@@ -4,7 +4,7 @@ use std::time::Duration;
 use rustscale_ipn::{MaskedPrefs, StartOptions, NOTIFY_INITIAL_STATE};
 use rustscale_localclient::LocalClient;
 
-use crate::flags::{parse_bool_flag, parse_str_flag};
+use crate::flags::{parse_bool_flag, parse_csv_flag, parse_str_flag};
 use crate::qrcode;
 use crate::CliError;
 
@@ -32,31 +32,37 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         update.Prefs.Hostname = h;
         update.HostnameSet = true;
     }
-    if let Some(r) = parse_str_flag(&args, "advertise-routes") {
-        update.Prefs.AdvertiseRoutes = r.split(',').map(|s| s.trim().to_string()).collect();
+    if let Some(routes) = parse_csv_flag(&args, "advertise-routes") {
+        update.Prefs.AdvertiseRoutes = routes;
         update.AdvertiseRoutesSet = true;
     }
-    if parse_bool_flag(&args, "advertise-exit-node").unwrap_or(false) {
-        update.Prefs.AdvertiseExitNode = true;
+    if let Some(value) = parse_bool_flag(&args, "advertise-exit-node") {
+        update.Prefs.AdvertiseExitNode = value;
         update.AdvertiseExitNodeSet = true;
     }
     if let Some(selector) = parse_str_flag(&args, "exit-node") {
         super::exit_node::apply_exit_node_arg(&mut update, &status, &selector, false)?;
     }
-    if parse_bool_flag(&args, "shields-up").unwrap_or(false) {
-        update.Prefs.ShieldsUp = true;
+    if let Some(value) = parse_bool_flag(&args, "shields-up") {
+        update.Prefs.ShieldsUp = value;
         update.ShieldsUpSet = true;
     }
-    if parse_bool_flag(&args, "accept-routes").unwrap_or(false) {
-        update.Prefs.AcceptRoutes = true;
+    if let Some(value) = parse_bool_flag(&args, "accept-routes") {
+        update.Prefs.AcceptRoutes = value;
         update.AcceptRoutesSet = true;
     }
-    if parse_bool_flag(&args, "accept-dns").unwrap_or(false) {
+    if let Some(value) = parse_bool_flag(&args, "accept-dns") {
+        update.Prefs.CorpDNS = value;
+        update.CorpDNSSet = true;
+    } else if backend_state == "NeedsLogin" {
+        // Tailscale's first-run `up` defaults to accepting control-plane DNS.
+        // Preserve an established node's explicit choice, but do not make a
+        // fresh replacement install silently opt out of MagicDNS.
         update.Prefs.CorpDNS = true;
         update.CorpDNSSet = true;
     }
-    if let Some(tags) = parse_str_flag(&args, "advertise-tags") {
-        update.Prefs.AdvertiseTags = tags.split(',').map(|s| s.trim().to_string()).collect();
+    if let Some(tags) = parse_csv_flag(&args, "advertise-tags") {
+        update.Prefs.AdvertiseTags = tags;
         update.AdvertiseTagsSet = true;
     }
     // Omitted preserves the persisted operator. `--operator ""` explicitly

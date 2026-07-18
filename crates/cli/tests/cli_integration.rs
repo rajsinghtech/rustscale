@@ -383,6 +383,81 @@ async fn cli_set_operator_replaces_and_explicitly_clears_persisted_pref() {
 }
 
 #[test]
+fn cli_set_help_is_successful_without_a_daemon() {
+    let temp = tempfile::tempdir().unwrap();
+    for spelling in ["--help", "-h", "help"] {
+        let output = run_cli(&temp.path().join("missing.sock"), &["set", spelling]);
+        assert!(
+            output.status.success(),
+            "set {spelling} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("Usage: rustscale set [flags]"));
+        assert!(stdout.contains("--accept-dns[=true|false]"));
+        assert!(stdout.contains("empty clears routes"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_set_can_disable_booleans_and_clear_advertised_lists() {
+    let mut env = setup().await;
+    let enabled = run_cli(
+        &env.socket_path,
+        &[
+            "set",
+            "--accept-routes=true",
+            "--accept-dns=true",
+            "--shields-up=true",
+            "--advertise-exit-node=true",
+            "--advertise-routes=10.0.0.0/8",
+            "--advertise-tags=tag:test",
+        ],
+    );
+    assert!(
+        enabled.status.success(),
+        "enable prefs failed: {}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+
+    let disabled = run_cli(
+        &env.socket_path,
+        &[
+            "set",
+            "--accept-routes=false",
+            "--accept-dns=false",
+            "--shields-up=false",
+            "--advertise-exit-node=false",
+            "--advertise-routes=",
+            "--advertise-tags=",
+        ],
+    );
+    assert!(
+        disabled.status.success(),
+        "disable prefs failed: {}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+
+    let prefs = LocalClient::new(&env.socket_path)
+        .get_prefs()
+        .await
+        .expect("read cleared prefs");
+    assert!(!prefs.AcceptRoutes);
+    assert!(!prefs.CorpDNS);
+    assert!(!prefs.ShieldsUp);
+    assert!(!prefs.AdvertiseExitNode);
+    assert!(
+        prefs.AdvertiseRoutes.is_empty(),
+        "{:?}",
+        prefs.AdvertiseRoutes
+    );
+    assert!(prefs.AdvertiseTags.is_empty(), "{:?}", prefs.AdvertiseTags);
+
+    env.server.close().await.unwrap();
+}
+
+#[test]
 fn cli_exit_node_help_is_successful_without_a_daemon() {
     let temp = tempfile::tempdir().unwrap();
     let output = run_cli(&temp.path().join("missing.sock"), &["exit-node", "--help"]);

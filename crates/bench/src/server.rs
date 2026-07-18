@@ -27,9 +27,8 @@ pub async fn run_userspace(
     control_url: String,
     state_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
-    // A supplied state directory denotes a durable endpoint identity. The
-    // disposable tailnet, rather than control-plane ephemeral-node reaping,
-    // owns benchmark cleanup.
+    // A supplied state directory denotes a durable node identity. Its disco
+    // identity is process-local; the disposable tailnet owns final cleanup.
     let ephemeral = state_dir.is_none();
     let mut builder = Server::builder()
         .hostname(hostname)
@@ -44,6 +43,7 @@ pub async fn run_userspace(
     }
     let mut server = builder.build()?;
     Box::pin(server.up()).await?;
+    crate::throughput::log_userspace_identity(&server, "server")?;
     let ip = server
         .status()
         .tailscale_ips

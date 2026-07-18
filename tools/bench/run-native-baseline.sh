@@ -107,53 +107,23 @@ done
 }
 
 echo "[native-baseline] warmup P1" >&2
-warmup=""
-last_warmup=""
-for attempt in 1 2 3; do
-  if warmup="$(run_client 1 3 "warmup-$attempt" 2>/dev/null)" && validate_throughput "$warmup" 1 warmup; then break; fi
-  last_warmup="$warmup"
-  warmup=""
-  sleep 2
-done
-[[ -n "$warmup" ]] || {
+if ! warmup="$(run_client 1 3 warmup 2>/dev/null)" || ! validate_throughput "$warmup" 1 warmup; then
   echo "warmup failed" >&2
-  if [[ -n "$last_warmup" ]]; then
-    python3 - "$last_warmup" <<'PY' >&2 || true
-import json,sys
-r=json.loads(sys.argv[1])
-print("warmup evidence:", {key:r.get(key) for key in ("tool","transport","protocol","parallel","path_class","established","handshaken","completed","total_mbps","total_bytes")})
-PY
-  fi
   tail -n 30 "$CLIENT_LOG" >&2 || true
   tail -n 30 "$SERVER_LOG" >&2 || true
   exit 1
-}
+fi
 sleep "$INTER_TRIAL_GAP"
 
 for parallel in "${PARALLELS[@]}"; do
   for repeat in $(seq 1 "$REPEAT"); do
-    result=""
-    setup_attempt=0
-    for setup_attempt in 1 2 3; do
-      echo "[native-baseline] P$parallel repeat $repeat/$REPEAT setup $setup_attempt/3" >&2
-      if result="$(run_client "$parallel" "$DURATION" "p$parallel-r$repeat-a$setup_attempt")"; then
-        break
-      fi
-      result=""
-      if (( setup_attempt == 3 )) || ! grep -Fq "capacity error: established 0 of $parallel requested connections" "$CLIENT_LOG"; then
-        echo "P$parallel client failed" >&2
-        tail -n 30 "$CLIENT_LOG" >&2 || true
-        exit 1
-      fi
-      echo "[native-baseline] retrying zero-connection setup failure before measurement" >&2
-      sleep "$INTER_TRIAL_GAP"
-    done
+    echo "[native-baseline] P$parallel repeat $repeat/$REPEAT" >&2
+    if ! result="$(run_client "$parallel" "$DURATION" "p$parallel-r$repeat")"; then
+      echo "P$parallel client failed" >&2
+      tail -n 30 "$CLIENT_LOG" >&2 || true
+      exit 1
+    fi
     validate_throughput "$result" "$parallel" "$EXPECTED_PATH"
-    result="$(python3 - "$result" "$setup_attempt" <<'PY'
-import json,sys
-r=json.loads(sys.argv[1]); r["baseline_setup_attempt"]=int(sys.argv[2]); print(json.dumps(r,separators=(",",":")))
-PY
-)"
     printf '%s\n' "$result" >>"$TRIALS"
     if [[ "${RUSTSCALE_REMOTE_EVIDENCE:-0}" == 1 ]]; then
       python3 - "$result" <<'PY'
@@ -174,8 +144,7 @@ for p in (1,10,100):
     selected=[r for r in rows if r["parallel"]==p]
     vals=[float(r["total_mbps"]) for r in selected]
     paths=[r["path_class"] for r in selected]
-    attempts=[r["baseline_setup_attempt"] for r in selected]
-    points.append({"parallel":p,"mbps":vals,"median_mbps":statistics.median(vals),"paths":paths,"setup_attempts":attempts})
+    points.append({"parallel":p,"mbps":vals,"median_mbps":statistics.median(vals),"paths":paths,"setup_attempts":[1] * len(selected)})
 paths=sorted(set(path for point in points for path in point["paths"]))
 print(json.dumps({"schema_version":1,"tool":"rustscale-bench","mode":"embedded-rust-tsnet","identity_scope":"one-ephemeral-client-per-trial","duration_s":int(sys.argv[2]),"repeats":int(sys.argv[3]),"paths":paths,"points":points,"binary_sha256":sys.argv[4]},separators=(",",":")))
 PY

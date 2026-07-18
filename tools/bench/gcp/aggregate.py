@@ -320,7 +320,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         if (not isinstance(workload, dict) or workload.get("implementation") != expected_workload
                 or workload.get("protocol") != "RSB1" or workload.get("direction") != "down"
                 or workload.get("payload_bytes") != 1280
-                or workload.get("warmup") != {"parallel": 1, "duration_s": 3, "max_attempts": 3}
+                or workload.get("warmup") != {"parallel": 1, "duration_s": 3, "max_attempts": 1}
                 or workload.get("client_lifecycle") != "new_benchmark_process_per_trial"
                 or workload.get("transport_identity_lifecycle") != "one_persisted_identity_per_endpoint_cell"
                 or workload.get("measured_trial_attempts") != 1

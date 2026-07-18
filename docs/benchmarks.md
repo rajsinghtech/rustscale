@@ -177,12 +177,13 @@ The Go package has a hermetic P100 lifecycle gate; Rust retains its local P1000
 kernel setup gate. Paid P1000 publication still requires all selected cells to
 complete the requested point.
 
-The warmup may retry up to three times before resource sampling starts.
-Measured throughput and latency processes are never retried inside the resource
-window; one failed or incomplete trial discards the cell. Every trial uses a
-new client process, while every cell retains one transport identity per
+The warmup, each measured throughput trial, and latency are each attempted
+exactly once. One failed or incomplete trial discards the cell. Every trial uses
+a new client process, while every cell retains one transport identity per
 endpoint. Embedded Rust and Go clients reopen durable, non-ephemeral state
-under one stable hostname between trials. Both endpoint samplers run
+under one stable hostname between trials. Rust rotates its process-local disco
+identity, and peers replace stale WireGuard session state when that disco key
+changes. Both endpoint samplers run
 continuously from after warmup through throughput, three-second gaps, and
 latency. Dynamic exact-name process sets are:
 
@@ -235,9 +236,7 @@ exact lifecycle counts, observed path classification, and the benchmark
 executable SHA-256 inside the disposable remote source tree.
 Unlike a matched matrix cell, this smoke baseline intentionally gives each trial its own ephemeral named
 client identity and records that identity scope; the connected ephemeral
-server identity remains live until tailnet teardown. A zero-established-stream
-setup failure may retry twice before measurement, and the successful setup
-attempt is recorded; no partially established or measured trial is retried:
+server identity remains live until tailnet teardown. Every workload process is attempted exactly once; partial setup is a failed run:
 
 ```bash
 # With credentials already provisioned in the remote SSH environment:

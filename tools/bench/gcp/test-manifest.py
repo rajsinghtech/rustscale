@@ -191,7 +191,7 @@ def matched_result(root, config, manifest):
                           "p50_us": .026, "p95_us": .048, "p99_us": .05, "samples_ns": raw_latency},
               "workload": {"implementation": "go-tsnet-rsb1" if config == "ts-embedded" else "rustscale-bench",
                            "protocol": "RSB1", "direction": "down", "payload_bytes": 1280,
-                           "warmup": {"parallel": 1, "duration_s": 3, "max_attempts": 3},
+                           "warmup": {"parallel": 1, "duration_s": 3, "max_attempts": 1},
                            "client_lifecycle": "new_benchmark_process_per_trial",
                            "transport_identity_lifecycle": "one_persisted_identity_per_endpoint_cell",
                            "measured_trial_attempts": 1, "latency_protocol": "RSB1-tcp-pingpong",

@@ -43,6 +43,18 @@ pub struct ThroughputResult {
     pub completed: usize,
 }
 
+pub(crate) fn log_userspace_identity(server: &Server, role: &str) -> Result<(), Box<dyn Error>> {
+    let node = server
+        .node_key()
+        .ok_or("userspace node identity unavailable")?;
+    let disco = server
+        .magicsock()
+        .ok_or("userspace discovery identity unavailable")?
+        .disco_public();
+    eprintln!("BENCH_IDENTITY role={role} node={node} disco={disco}");
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_userspace(
     authkey: String,
@@ -54,9 +66,8 @@ pub async fn run_userspace(
     control_url: String,
     state_dir: Option<std::path::PathBuf>,
 ) -> Result<ThroughputResult, Box<dyn Error>> {
-    // A supplied state directory is a restart-stable transport identity. Do
-    // not ask control to reap that identity while the next benchmark process
-    // is reopening the same durable keys.
+    // A supplied state directory is a restart-stable node identity. Its disco
+    // identity remains process-local so peers invalidate the prior UDP path.
     let ephemeral = state_dir.is_none();
     let mut builder = Server::builder()
         .hostname(hostname)
@@ -68,51 +79,64 @@ pub async fn run_userspace(
         builder = builder.state_dir(d);
     }
     let mut server = builder.build()?;
-    Box::pin(server.up()).await?;
-    let my_ip = server
-        .status()
-        .tailscale_ips
-        .iter()
-        .find_map(|ip| match ip {
-            std::net::IpAddr::V4(v4) => Some(v4.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    if let Some(ip) = extract_target_ip(&target) {
-        wait_for_peer(&server, ip, Duration::from_secs(90)).await;
-    }
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    // tsnet's public dial operation borrows the embedded server mutably, so
-    // these connections are serialized. Bound the complete fan-out with the
-    // same common deadline as kernel setup and never retry an individual
-    // measured connection inside the resource window.
-    let connect_all = async {
-        let mut streams = Vec::with_capacity(parallel);
-        for index in 0..parallel {
-            let stream = server.dial(&target).await.map_err(|error| {
-                format!("capacity error: established {index} of {parallel} requested connections: {error}")
-            })?;
-            streams.push(stream);
+    let operation: Result<ThroughputResult, Box<dyn Error>> = async {
+        Box::pin(server.up()).await?;
+        log_userspace_identity(&server, "client")?;
+        let my_ip = server
+            .status()
+            .tailscale_ips
+            .iter()
+            .find_map(|ip| match ip {
+                std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if let Some(ip) = extract_target_ip(&target) {
+            wait_for_peer(&server, ip, Duration::from_secs(90)).await?;
         }
-        Ok::<_, String>(streams)
-    };
-    let streams = tokio::time::timeout(SETUP_DEADLINE, connect_all)
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // tsnet's public dial operation borrows the embedded server mutably,
+        // so these connections are serialized. One common deadline covers
+        // the complete fan-out; an individual measured stream is never retried.
+        let connect_all = async {
+            let mut streams = Vec::with_capacity(parallel);
+            for index in 0..parallel {
+                let stream = server.dial(&target).await.map_err(|error| {
+                    format!("capacity error: established {index} of {parallel} requested connections: {error}")
+                })?;
+                streams.push(stream);
+            }
+            Ok::<_, String>(streams)
+        };
+        let streams = tokio::time::timeout(SETUP_DEADLINE, connect_all)
+            .await
+            .map_err(|_| format!("capacity error: did not establish all {parallel} requested userspace connections before the common setup deadline"))??;
+        let path_class = extract_path_class(&server.status(), &target);
+        measure(
+            streams,
+            "userspace-tsnet",
+            target,
+            duration,
+            direction,
+            parallel,
+            path_class,
+            my_ip,
+        )
         .await
-        .map_err(|_| format!("capacity error: did not establish all {parallel} requested userspace connections before the common setup deadline"))??;
-    let path_class = extract_path_class(&server.status(), &target);
-    let result = measure(
-        streams,
-        "userspace-tsnet",
-        target,
-        duration,
-        direction,
-        parallel,
-        path_class,
-        my_ip,
-    )
-    .await?;
-    close_userspace(&mut server).await?;
-    Ok(result)
+    }
+    .await;
+    let shutdown = close_userspace(&mut server).await;
+    match (operation, shutdown) {
+        (Ok(result), Ok(())) => {
+            eprintln!("BENCH_SHUTDOWN role=client status=clean");
+            Ok(result)
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => {
+            Err(format!("{error}; userspace shutdown also failed: {shutdown_error}").into())
+        }
+    }
 }
 
 pub(crate) async fn close_userspace(server: &mut Server) -> Result<(), Box<dyn Error>> {
@@ -451,7 +475,7 @@ pub(crate) async fn wait_for_peer(
     server: &Server,
     target_ip: std::net::Ipv4Addr,
     timeout: Duration,
-) {
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if server.status().peers.iter().any(|p| {
@@ -459,10 +483,20 @@ pub(crate) async fn wait_for_peer(
                 .iter()
                 .any(|ip| matches!(ip, std::net::IpAddr::V4(v4) if *v4 == target_ip))
         }) {
-            return;
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let peers = server
+        .status()
+        .peers
+        .iter()
+        .map(|peer| format!("{}:{:?}:{:?}", peer.name, peer.ips, peer.path_class))
+        .collect::<Vec<_>>()
+        .join(",");
+    Err(format!(
+        "peer-map readiness timeout: target={target_ip} peers=[{peers}]"
+    ))
 }
 pub(crate) fn extract_path_class(status: &ServerStatus, target: &str) -> String {
     let Some(target_ip) = extract_target_ip(target) else {
@@ -495,6 +529,100 @@ mod tests {
     use super::*;
     use crate::protocol::{read_go, read_header, write_ack};
     use tokio::net::TcpListener;
+
+    async fn synthetic_rsb1_round(parallel: usize) -> ThroughputResult {
+        let mut clients = Vec::with_capacity(parallel);
+        let mut servers = tokio::task::JoinSet::new();
+        for _ in 0..parallel {
+            let (client, mut server) = tokio::io::duplex(1024);
+            clients.push(client);
+            servers.spawn(async move {
+                let header = read_header(&mut server).await.expect("read header");
+                assert_eq!(header.mode, MODE_THROUGHPUT);
+                write_ack(&mut server).await.expect("write ACK");
+                read_go(&mut server).await.expect("read GO");
+                server.shutdown().await.expect("shutdown server stream");
+            });
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            measure(
+                clients,
+                "userspace-tsnet",
+                "100.64.0.1:5201".into(),
+                0,
+                "down",
+                parallel,
+                "direct".into(),
+                "100.64.0.2".into(),
+            ),
+        )
+        .await
+        .expect("round deadline")
+        .expect("complete RSB1 round");
+        while let Some(joined) = servers.join_next().await {
+            joined.expect("server worker");
+        }
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_userspace_p1_p10_p100_rounds_count_every_stream() {
+        for _ in 0..3 {
+            for parallel in [1, 10, 100] {
+                let result = synthetic_rsb1_round(parallel).await;
+                assert_eq!(
+                    (result.established, result.handshaken, result.completed),
+                    (parallel, parallel, parallel)
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incomplete_userspace_handshake_rejects_partial_capacity_and_joins_workers() {
+        const STREAMS: usize = 10;
+        const REJECTED: usize = 4;
+        let mut clients = Vec::with_capacity(STREAMS);
+        let mut servers = tokio::task::JoinSet::new();
+        for index in 0..STREAMS {
+            let (client, mut server) = tokio::io::duplex(1024);
+            clients.push(client);
+            servers.spawn(async move {
+                let _ = read_header(&mut server).await;
+                if index == REJECTED {
+                    return;
+                }
+                let _ = write_ack(&mut server).await;
+                let _ = read_go(&mut server).await;
+            });
+        }
+
+        let error = match measure(
+            clients,
+            "userspace-tsnet",
+            "100.64.0.1:5201".into(),
+            0,
+            "down",
+            STREAMS,
+            "direct".into(),
+            "100.64.0.2".into(),
+        )
+        .await
+        {
+            Ok(_) => panic!("partial handshake must not produce a sample"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(&format!("stream {REJECTED} ACK")), "{error}");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(joined) = servers.join_next().await {
+                joined.expect("server worker");
+            }
+        })
+        .await
+        .expect("failed setup leaked an RSB1 worker");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn kernel_setup_completes_all_one_thousand_streams() {

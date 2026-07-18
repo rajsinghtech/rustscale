@@ -2276,8 +2276,8 @@ PYEOF
 
 # Run one configuration-neutral RSB1 suite after the caller has prepared its
 # transport, endpoint, path gate, process subjects, and teardown function. The
-# sole warmup may retry before sampling; every measured throughput/latency
-# process is invoked exactly once and an incomplete lifecycle fails the cell.
+# warmup and every measured throughput/latency process are each invoked exactly
+# once; an incomplete lifecycle fails the cell with first-attempt evidence.
 # Args: CLI_TRANSPORT REPORTED_TRANSPORT TARGET PRE_GATED_PATH
 rsb1_client_command() {
   local kind="$1" operation="$2" target="$3" value="$4" parallel="$5" state_dir="$6" logfile="$7"
@@ -2304,8 +2304,8 @@ rsb1_client_command() {
 
 # Run one configuration-neutral RSB1 suite after the caller has prepared its
 # transport, endpoint, path gate, process subjects, and teardown function. The
-# sole warmup may retry before sampling; every measured throughput/latency
-# process is invoked exactly once and an incomplete lifecycle fails the cell.
+# warmup and every measured throughput/latency process are each invoked exactly
+# once; an incomplete lifecycle fails the cell with first-attempt evidence.
 # Args: CLIENT_KIND REPORTED_TRANSPORT TARGET PRE_GATED_PATH
 rsb1_measure() {
   local client_kind="$1" reported_transport="$2" target="$3" gated_path="$4"
@@ -2336,16 +2336,8 @@ rsb1_measure() {
   # its prior process-local netmap cache before waiting for a fresh snapshot.
   local client_state_dir=/tmp/rsb1-client-state command
   RS_PARITY_FAILURE_LOG=/tmp/rsb1-warmup.log
-  local warmup_attempt
-  warmup_json=""
-  for warmup_attempt in 1 2 3; do
-    command=$(rsb1_client_command "$client_kind" throughput "$target" 3 1 "$client_state_dir" /tmp/rsb1-warmup.log) || return 2
-    warmup_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") && break
-    echo "[gcp] RSB1 warmup retry $warmup_attempt/3" >&2
-    sleep 5
-    warmup_json=""
-  done
-  [[ -n "$warmup_json" ]] || return 1
+  command=$(rsb1_client_command "$client_kind" throughput "$target" 3 1 "$client_state_dir" /tmp/rsb1-warmup.log) || return 2
+  warmup_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
   path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,tool=sys.argv[1:]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1 and d["established"]==1 and d["handshaken"]==1 and d["completed"]==1; value=float(d["total_mbps"]); assert math.isfinite(value) and value>0; print(d["path_class"])' "$reported_transport" "$expected_client_tool") || return 1
   warmup_evidence=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in ("transport","protocol","direction","duration_secs","parallel","established","handshaken","completed","total_mbps","path_class")}))') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && path_class="$gated_path"
@@ -2421,7 +2413,7 @@ obj={"schema_version":6,"status":"ok","tool":tool,
  "repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],"error":"","log_tail":"",
  "path_class_reported":observed_path,"transport":transport,
  "workload":{"implementation":workload_implementation,"protocol":"RSB1","direction":"down","payload_bytes":1280,
-             "warmup":{"parallel":1,"duration_s":3,"max_attempts":3},
+             "warmup":{"parallel":1,"duration_s":3,"max_attempts":1},
              "client_lifecycle":"new_benchmark_process_per_trial",
              "transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,
              "latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,
@@ -2495,12 +2487,11 @@ rsb1_lifecycle_self_test() {
     && "$command" == *'/tmp/ts-socks-connect'* && "$command" == *'11080'* \
     && "$command" == *'ip link show dev tailscale0'* ]] || return 1
 
-  # The measured suite contains retries only in the pre-sampling warmup. Both
-  # embedded clients use the stable state/hostname contract, while only Rust's
-  # process-local netmap cache is explicitly discarded between processes.
+  # No workload process is retried. Both embedded clients use the stable
+  # state/hostname contract, while only Rust's process-local netmap cache is
+  # explicitly discarded between processes.
   definition="$(declare -f rsb1_measure)$(declare -f rsb1_client_command)$(declare -f go_tsnet_client_command)"
-  [[ $(grep -c 'RSB1 warmup retry' <<<"$definition") -eq 1 \
-    && "$definition" != *'measured retry'* \
+  [[ "$definition" != *'retry'* \
     && "$definition" == *'client_state_dir=/tmp/rsb1-client-state'* \
     && "$definition" == *'netmap-cache.json'* \
     && "$definition" == *'/opt/rustscale/bin/go-tsnet-rsb1 client'* \

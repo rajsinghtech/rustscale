@@ -450,35 +450,38 @@ async fn latency_small_message_round_trip() {
 }
 
 #[tokio::test]
-async fn canceled_pending_dial_releases_socket_and_buffers_promptly() {
+async fn repeated_canceled_dials_release_sockets_and_buffers_promptly() {
     let net = Arc::new(
         Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).expect("create netstack"),
     );
-    let dial_net = Arc::clone(&net);
-    let dial = tokio::spawn(async move {
-        dial_net
-            .dial(SocketAddr::from(([100, 64, 0, 254], 9)))
-            .await
-    });
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while net.dial_stats().pending_dials != 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("pending dial was not registered");
-    assert_eq!(net.dial_stats().pending_buffer_bytes, TCP_BUF * 2);
+    for round in 1..=3 {
+        let dial_net = Arc::clone(&net);
+        let dial = tokio::spawn(async move {
+            dial_net
+                .dial(SocketAddr::from(([100, 64, 0, 254], 9)))
+                .await
+        });
 
-    dial.abort();
-    let _ = dial.await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while net.dial_stats() != DialStats::default() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("canceled dial retained pending socket buffers");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while net.dial_stats().pending_dials != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round} pending dial was not registered"));
+        assert_eq!(net.dial_stats().pending_buffer_bytes, TCP_BUF * 2);
+
+        dial.abort();
+        let _ = dial.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while net.dial_stats() != DialStats::default() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round} retained a canceled dial or its buffers"));
+    }
 }
 
 #[tokio::test(start_paused = true)]

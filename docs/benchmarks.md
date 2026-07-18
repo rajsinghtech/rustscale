@@ -25,8 +25,10 @@ The routine matrix has five distinct cells:
 | `ts-tun` | `tailscaled` plus kernel TUN/TCP | `rustscale-bench` | tailscaled TUN |
 
 `go-tsnet-rsb1` is built from `tailscale.com@v1.100.0`; `go.mod`, `go.sum`,
-the native Go 1.26.4 toolchain archive, and the resulting executable identity
-are pinned or checksum-recorded. It implements the same 14-byte RSB1 header,
+the native `go1.26.4.linux-amd64.tar.gz` toolchain archive
+(`1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f`),
+and the resulting executable identity are pinned or checksum-recorded. It
+implements the same 14-byte RSB1 header,
 ready/GO barrier, 1280-byte download writes, setup deadline, stream lifecycle
 counts, and 8-byte latency exchanges as `rustscale-bench`.
 
@@ -193,15 +195,19 @@ latency. Dynamic exact-name process sets are:
 - `ts-tun`: `tailscaled` and `rustscale-bench` on both endpoints.
 
 A successful result requires each endpoint to contain observed, nonempty RSS
-and CPU data, a monotonic series with an included process, the exact declared
-process-set scope, and executable path/version/SHA-256 identities for every
-subject. The primary transport binary has its own positive on-disk size and
+and CPU data, a monotonic series in which every declared process subject was
+actually observed, the exact declared process-set scope, and executable
+path/version/SHA-256 identities for every subject. The primary transport binary
+has its own positive on-disk size and
 identity binding. Scopes include no descendants by inference and no kernel
 CPU; TUN kernel work is therefore excluded, and shared ncat pages can be
 counted more than once.
 
 Results retain every throughput repeat and stream lifecycle, all latency
-samples, both endpoint timelines, path gates, and verified cleanup. Publication
+samples, both endpoint timelines, path gates, and verified cleanup. Each
+throughput point reports its raw repeat vector, median, min/max, population
+standard deviation, and coefficient of variation; a median alone is not
+presented as repeat stability. Publication
 occurs only after samplers, workloads, helpers, daemons/listeners, state, DNS,
 and TUN interfaces satisfy cell postconditions. Unsafe handoff aborts the
 matrix.
@@ -409,11 +415,15 @@ preserves batching.
 - Both harnesses use ephemeral tailnets that are created and deleted per run.
 - On localhost, the path is typically **direct** (UDP loopback). DERP paths
   require network isolation (separate machines or UDP blocking).
-- The rustscale netstack uses a 1280-byte MTU (Tailscale default) with a 256KB
-  TCP socket buffer. The Go netstack uses similar defaults.
+- The rustscale netstack uses a 1280-byte MTU and fixed 256 KiB TCP send and
+  receive buffers per socket. Pinned Tailscale 1.100.0 uses the pinned gVisor
+  defaults of 1 MiB send and 1 MiB receive, with Tailscale maxima of 8 MiB RX
+  and 6 MiB TX on non-iOS builds. The matrix does not normalize this
+  buffer/window asymmetry: it compares declared product defaults, not
+  buffer-matched stacks.
 - Throughput is limited by per-packet userspace processing overhead (WG
   encapsulation/decapsulation, smoltcp/gVisor TCP processing, magicsock IO).
   Both sides face the same fundamental bottleneck.
-- Localhost throughput varies run-to-run (458–854 Mbps observed) due to
-  ephemeral tailnet setup timing and system load. The best run (854 Mbps)
-  reflects the architecture's capability; the variance is environmental.
+- Historical localhost throughput varied from 458–854 Mbps across unmatched
+  single runs. Those samples did not isolate setup timing from system load and
+  do not support a comparative or architectural-capability claim.

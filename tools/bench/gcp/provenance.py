@@ -23,6 +23,8 @@ SHA = re.compile(r"[0-9a-f]{64}\Z")
 GO_MODULE_VERSION = "v1.100.0"
 GO_MODULE_SUM = "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE="
 GO_TOOLCHAIN = "go1.26.4"
+GO_TOOLCHAIN_ARCHIVE = "go1.26.4.linux-amd64.tar.gz"
+GO_TOOLCHAIN_ARCHIVE_SHA256 = "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f"
 LEGACY_CELL_IDENTITIES = {
     "rs-userspace": {"implementation": "rustscale", "mode": "userspace"},
     "rs-tun": {"implementation": "rustscale", "mode": "tun"},
@@ -126,10 +128,14 @@ def validate_run(run):
     if not isinstance(cloud, dict) or cloud.get("provider") != "gcp" or any(not is_string(cloud.get(k)) for k in required_cloud[1:]) or type(cloud.get("disk_gb")) is not int or cloud["disk_gb"] <= 0: raise ValueError("invalid cloud metadata")
     build = run.get("build")
     if not isinstance(build, dict) or any(type(build.get(k)) is not str for k in ("command", "rustflags", "cargo_profile_release_lto", "cargo_profile_release_codegen_units")): raise ValueError("invalid build metadata")
-    go_keys = {"go_command", "go_toolchain", "go_module", "go_module_version", "go_module_sum"}
+    go_keys = {"go_command", "go_toolchain", "go_toolchain_archive", "go_toolchain_archive_sha256",
+               "go_module", "go_module_version", "go_module_sum"}
     if go_keys & set(build):
         if (not go_keys <= set(build) or any(type(build.get(k)) is not str for k in go_keys)
-                or build["go_toolchain"] != GO_TOOLCHAIN or build["go_module"] != "tailscale.com"
+                or build["go_toolchain"] != GO_TOOLCHAIN
+                or build["go_toolchain_archive"] != GO_TOOLCHAIN_ARCHIVE
+                or build["go_toolchain_archive_sha256"] != GO_TOOLCHAIN_ARCHIVE_SHA256
+                or build["go_module"] != "tailscale.com"
                 or build["go_module_version"] != GO_MODULE_VERSION or build["go_module_sum"] != GO_MODULE_SUM):
             raise ValueError("invalid pinned Go build metadata")
     runtime_metadata(run)
@@ -249,6 +255,8 @@ def command_manifest(args):
            "cloud": {"provider": "gcp", "project": args.project, "requested_image_project": args.image_project, "requested_image_family": args.image_family, "requested_machine_type": args.machine, "network": args.network, "disk_type": args.disk_type, "disk_gb": args.disk_gb},
            "build": {"command": args.build_command, "rustflags": args.rustflags, "cargo_profile_release_lto": args.lto, "cargo_profile_release_codegen_units": args.codegen_units,
                      "go_command": args.go_build_command, "go_toolchain": GO_TOOLCHAIN,
+                     "go_toolchain_archive": GO_TOOLCHAIN_ARCHIVE,
+                     "go_toolchain_archive_sha256": GO_TOOLCHAIN_ARCHIVE_SHA256,
                      "go_module": "tailscale.com", "go_module_version": GO_MODULE_VERSION,
                      "go_module_sum": GO_MODULE_SUM},
            "runtime": {"rs_tun_inbound_pipeline": args.rs_tun_inbound_pipeline == "1",

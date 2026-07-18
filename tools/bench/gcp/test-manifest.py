@@ -27,8 +27,11 @@ def run_identity():
                       "requested_image_family": "ubuntu-2204-lts", "requested_machine_type": "n1-standard-4",
                       "network": "default", "disk_type": "pd-standard", "disk_gb": 200},
             "build": {"command": "cargo build --release", "rustflags": "", "cargo_profile_release_lto": "", "cargo_profile_release_codegen_units": "",
-                      "go_command": "go build", "go_toolchain": "go1.26.4", "go_module": "tailscale.com",
-                      "go_module_version": "v1.100.0", "go_module_sum": "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE="},
+                      "go_command": "go build", "go_toolchain": "go1.26.4",
+                      "go_toolchain_archive": "go1.26.4.linux-amd64.tar.gz",
+                      "go_toolchain_archive_sha256": "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f",
+                      "go_module": "tailscale.com", "go_module_version": "v1.100.0",
+                      "go_module_sum": "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE="},
             "runtime": {"rs_tun_inbound_pipeline": False, "rs_tun_outbound_send_pipeline": False, "linux_udp_batch": True, "linux_udp_gro": True, "linux_udp_gso": True}}
 
 
@@ -155,9 +158,9 @@ def matched_result(root, config, manifest):
                 "rss_peak_kb": 2, "rss_avg_kb": 1, "cpu_peak_pct": 1, "cpu_avg_pct": 0.5,
                 "samples": 2, "missing_samples": 0, "sample_cadence_s": 1, "clock": "monotonic",
                 "series": [{"offset_ms": 0, "rss_kb": 1, "cpu_pct": 0,
-                            "included_processes": [f"1:{subjects[0]}"], "status": "observed"},
+                            "included_processes": [f"{index + 1}:{subject}" for index, subject in enumerate(subjects)], "status": "observed"},
                            {"offset_ms": 1000, "rss_kb": 2, "cpu_pct": 1,
-                            "included_processes": [f"1:{subjects[0]}"], "status": "observed"}],
+                            "included_processes": [f"{index + 1}:{subject}" for index, subject in enumerate(subjects)], "status": "observed"}],
                 "series_truncated": False}
     server = resource("server", subject_map[config][0])
     client = resource("client", subject_map[config][1])
@@ -173,7 +176,10 @@ def matched_result(root, config, manifest):
                                   "handshaken": 1, "completed": 1, "total_mbps": 10.0,
                                   "path_class": warmup_path},
               "throughput": [{"parallel": 1, "mbps": 100.0, "duration_s": 10,
-                              "samples_mbps": [100.0], "statistic": "median"}],
+                              "samples_mbps": [100.0], "statistic": "median",
+                              "min_mbps": 100.0, "max_mbps": 100.0,
+                              "population_stddev_mbps": 0.0,
+                              "coefficient_of_variation_pct": 0.0}],
               "throughput_trials": [{"parallel": 1, "repeat_index": 1, "transport": transport,
                                      "protocol": "RSB1", "direction": "down", "duration_s": 10,
                                      "established": 1, "handshaken": 1, "completed": 1,
@@ -259,6 +265,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "Matched five-cell RSB1 workload" in moved_html and "requested peer load" in moved_html
     assert "RustScale embedded tsnet" in moved_html and "Go embedded tsnet" in moved_html
     assert "tailscaled daemon proxy" in moved_html
+    assert "Repeat dispersion" in moved_html and "coefficient of variation" in moved_html
     ts_user_path = matched_root / "same-zone/direct/ts-userspace.json"
     original_ts_user = json.loads(ts_user_path.read_text())
     for expected_error, mutate in (
@@ -266,6 +273,8 @@ with tempfile.TemporaryDirectory() as tmp:
         ("clean teardown", lambda value: value["cleanup"].__setitem__("status", "failed")),
         ("pre/post path gate", lambda value: value["path_gate"].__setitem__("post", "derp")),
         ("manifest_sha256", lambda value: value.__setitem__("manifest_sha256", "0" * 64)),
+        ("repeat dispersion", lambda value: value["throughput"][0].__setitem__("max_mbps", 99.0)),
+        ("process-set scope", lambda value: [sample.__setitem__("included_processes", []) for sample in value["resources"]["client"]["series"]]),
     ):
         changed = json.loads(json.dumps(original_ts_user)); mutate(changed); ts_user_path.write_text(json.dumps(changed))
         assert expected_error in run("python3", GCP / "aggregate.py", matched_root, ok=False).stderr

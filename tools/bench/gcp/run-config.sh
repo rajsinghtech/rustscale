@@ -1708,7 +1708,7 @@ append_tun_throughput_row() {
   local current="$1" parallel="$2" duration="$3"
   shift 3
   python3 - "$current" "$parallel" "$duration" "$@" <<'PYEOF'
-import json, math, sys
+import json, math, statistics, sys
 rows = json.loads(sys.argv[1])
 parallel, duration = int(sys.argv[2]), int(sys.argv[3])
 samples = [float(value) for value in sys.argv[4:]]
@@ -1717,8 +1717,13 @@ if not samples or any(not math.isfinite(value) or value <= 0 for value in sample
 ordered = sorted(samples)
 middle = len(ordered) // 2
 median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+mean = statistics.fmean(samples)
+stddev = statistics.pstdev(samples)
 rows.append({"parallel": parallel, "mbps": median, "duration_s": duration,
-             "samples_mbps": samples, "statistic": "median"})
+             "samples_mbps": samples, "statistic": "median",
+             "min_mbps": ordered[0], "max_mbps": ordered[-1],
+             "population_stddev_mbps": stddev,
+             "coefficient_of_variation_pct": stddev / mean * 100})
 print(json.dumps(rows))
 PYEOF
 }
@@ -1904,6 +1909,10 @@ import json, sys
 rows = json.loads(sys.argv[1])
 assert [row["samples_mbps"] for row in rows] == [[100.0, 200.0], [300.0, 400.0]]
 assert [row["mbps"] for row in rows] == [150.0, 350.0]
+assert [row["min_mbps"] for row in rows] == [100.0, 300.0]
+assert [row["max_mbps"] for row in rows] == [200.0, 400.0]
+assert [row["population_stddev_mbps"] for row in rows] == [50.0, 50.0]
+assert all(row["coefficient_of_variation_pct"] > 0 for row in rows)
 assert all(row["statistic"] == "median" for row in rows)
 lines = open(sys.argv[2]).read().splitlines()
 warmup = next(i for i, line in enumerate(lines) if "-t 3 -P 1 -R" in line)
@@ -2388,12 +2397,13 @@ import json, math, sys
 config, topo, requested_path, observed_path, transport, size, tp, trials, warmup_evidence, lat, server, client, repeat, server_subjects, client_subjects, primary_subject, primary_path, workload_implementation, *parallels = sys.argv[1:]
 server, client = json.loads(server), json.loads(client)
 subject_sets = [server_subjects.split(","), client_subjects.split(",")]
-for endpoint in (server, client):
+for endpoint, subjects in zip((server, client), subject_sets):
     assert endpoint["samples"] > 0 and endpoint["samples"] > endpoint["missing_samples"]
     assert all(isinstance(endpoint.get(name), (int, float)) and not isinstance(endpoint.get(name), bool) and math.isfinite(endpoint[name]) for name in ("rss_peak_kb", "rss_avg_kb", "cpu_peak_pct", "cpu_avg_pct"))
     assert endpoint["rss_peak_kb"] > 0 and endpoint["rss_avg_kb"] > 0 and endpoint["cpu_peak_pct"] >= 0 and endpoint["cpu_avg_pct"] >= 0
     assert endpoint["series"] and any(sample.get("rss_kb") is not None for sample in endpoint["series"]) and any(sample.get("cpu_pct") is not None for sample in endpoint["series"])
-    assert any(sample.get("included_processes") for sample in endpoint["series"])
+    observed = {item.rsplit(":", 1)[-1] for sample in endpoint["series"] for item in sample.get("included_processes", []) if isinstance(item, str) and ":" in item}
+    assert set(subjects) <= observed
 scope = {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
 implementation = "rustscale" if config.startswith("rs-") else "tailscale"
 mode = {"rs-userspace":"embedded", "rs-tun":"tun", "ts-embedded":"embedded", "ts-userspace":"daemon-proxy", "ts-tun":"tun"}[config]

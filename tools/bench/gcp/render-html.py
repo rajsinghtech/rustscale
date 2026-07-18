@@ -456,6 +456,47 @@ def emit_throughput_charts(runs_idx: dict, parallels: list[int], matrix: dict) -
     return "".join(parts) + "".join(scripts)
 
 
+def emit_repeat_dispersion(runs_idx: dict, matrix: dict) -> str:
+    rows = []
+    for topo in matrix["topologies"]:
+        for path in matrix["paths"]:
+            for config in matrix["configs"]:
+                run = runs_idx.get((topo, path, config)) or {}
+                if run.get("status") != "ok" or run.get("error"):
+                    continue
+                for point in run.get("throughput") or []:
+                    samples = point.get("samples_mbps")
+                    if isinstance(samples, list) and samples:
+                        rows.append((topo, path, config, point))
+    if not rows:
+        return '<div class="empty">No repeat-dispersion data.</div>'
+    out = [
+        '<table class="footprint" id="repeat-dispersion-table">',
+        '<thead><tr><th class="label">topology / path</th><th class="label">cell</th>',
+        '<th>streams</th><th>repeats</th><th>samples Mbps</th><th>median</th>',
+        '<th>min</th><th>max</th><th>population σ</th><th>CV %</th></tr></thead><tbody>',
+    ]
+    for topo, path, config, point in rows:
+        samples = point["samples_mbps"]
+        sample_text = ", ".join(f"{float(value):.1f}" for value in samples)
+        def value(name):
+            item = point.get(name)
+            return "—" if not isinstance(item, (int, float)) else f"{float(item):.2f}"
+        out.append(
+            f'<tr class="dispersion-row" data-topo="{html.escape(topo)}" data-path="{html.escape(path)}" '
+            f'data-config="{html.escape(config)}" data-mode="{config_mode(config)}">'
+            f'<td class="label">{html.escape(topo)} / {html.escape(path)}</td>'
+            f'<td class="label" style="color:{CONFIG_COLORS[config]}">{html.escape(CONFIG_LABELS[config])}</td>'
+            f'<td>{point.get("parallel", "—")}</td><td>{len(samples)}</td>'
+            f'<td>{html.escape(sample_text)}</td><td>{value("mbps")}</td>'
+            f'<td>{value("min_mbps")}</td><td>{value("max_mbps")}</td>'
+            f'<td>{value("population_stddev_mbps")}</td>'
+            f'<td>{value("coefficient_of_variation_pct")}</td></tr>'
+        )
+    out.append('</tbody></table>')
+    return "".join(out)
+
+
 def emit_latency_chart(runs_idx: dict, matrix: dict) -> str:
     data = latency_chart_data(runs_idx, matrix)
     parts = [
@@ -953,7 +994,7 @@ function applyFilters() {
     const okP = f.path === "all" || card.dataset.path === f.path;
     card.classList.toggle("hidden", !(okT && okP));
   });
-  document.querySelectorAll(".footprint-row, .resource-row, .detail-row").forEach(row => {
+  document.querySelectorAll(".dispersion-row, .footprint-row, .resource-row, .detail-row").forEach(row => {
     const okT = f.topo === "all" || row.dataset.topo === f.topo;
     const okP = f.path === "all" || row.dataset.path === f.path;
     const okM = f.mode === "all" || row.dataset.mode === f.mode;
@@ -1020,6 +1061,9 @@ def main() -> int:
     out.append('<section class="block" id="throughput">')
     out.append("<h2>Throughput — per-configuration TCP workload (download)</h2>")
     out.append(emit_throughput_charts(runs_idx, parallels, matrix))
+    out.append("<h2>Repeat dispersion</h2>")
+    out.append('<p class="empty">Every successful current cell retains each repeat and reports min/max, population standard deviation, and coefficient of variation; medians alone are not treated as stability evidence.</p>')
+    out.append(emit_repeat_dispersion(runs_idx, matrix))
     out.append("</section>")
 
     # Latency.

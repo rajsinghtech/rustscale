@@ -761,10 +761,10 @@ def result(root, status):
           "parallelism_requested":[1],"duration_s_requested":10,"sample_cadence_s":1,
           "peer_count_requested":1,"error":"dry-run","log_tail":"","throughput":None,"latency":None,"footprint":None,"path_class_reported":"unknown"}
     if status=="ok":
-        series={"rss_peak_kb":1,"rss_avg_kb":1,"cpu_peak_pct":0,"cpu_avg_pct":0,"samples":1,"missing_samples":0,"sample_cadence_s":1,"clock":"monotonic","series":[{"offset_ms":0,"rss_kb":1,"cpu_pct":0,"included_processes":["1:rustscaled"],"status":"observed"}],"series_truncated":False}
+        series={"rss_peak_kb":1,"rss_avg_kb":1,"cpu_peak_pct":0,"cpu_avg_pct":0,"samples":1,"missing_samples":0,"sample_cadence_s":1,"clock":"monotonic","series":[{"offset_ms":0,"rss_kb":1,"cpu_pct":0,"included_processes":["1:rustscaled","2:rustscale-bench"],"status":"observed"}],"series_truncated":False}
         scope={"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
         samples=list(range(1,51))
-        common.update({"error":"","transport":"kernel-tcp","throughput":[{"parallel":1,"mbps":1.0,"duration_s":10,"samples_mbps":[1.0],"statistic":"median"}],
+        common.update({"error":"","transport":"kernel-tcp","throughput":[{"parallel":1,"mbps":1.0,"duration_s":10,"samples_mbps":[1.0],"statistic":"median","min_mbps":1.0,"max_mbps":1.0,"population_stddev_mbps":0.0,"coefficient_of_variation_pct":0.0}],
           "warmup_evidence":{"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_secs":3,"parallel":1,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"},
           "throughput_trials":[{"parallel":1,"repeat_index":1,"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_s":10,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"}],
           "latency":{"protocol":"RSB1-tcp-pingpong","requested":50,"successful":50,"timed_out":0,"malformed":0,"count":50,"min_ns":1,"mean_ns":25.5,"p50_ns":26,"p95_ns":48,"p99_ns":50,"max_ns":50,"min_us":0.001,"mean_us":0.0255,"p50_us":0.026,"p95_us":0.048,"p99_us":0.05,"max_us":0.05,"samples_ns":samples},
@@ -815,7 +815,7 @@ matrix_manifest_self_test() {
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
   python3 - "$manifest" "$GCP_MACHINE" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_toolchain_archive"] == "go1.26.4.linux-amd64.tar.gz" and build["go_toolchain_archive_sha256"] == "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1

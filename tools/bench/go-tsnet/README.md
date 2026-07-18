@@ -29,6 +29,8 @@ go vet ./...
 ```
 
 The GCP harness additionally records the executable path, `--version`, SHA-256,
-native Go toolchain, module checksum, endpoint process scope, CPU, and RSS.
+the pinned native Go archive name and SHA-256, module checksum, endpoint process
+scope, CPU, and RSS. It also discloses rather than normalizes the Rust 256 KiB
+per-socket buffers versus pinned Go/gVisor's 1 MiB defaults.
 See [`docs/benchmarks.md`](../../../docs/benchmarks.md) for the five-cell
 contract and the separately labeled tailscaled daemon-proxy evidence.

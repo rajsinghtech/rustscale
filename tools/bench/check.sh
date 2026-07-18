@@ -34,6 +34,10 @@ run bash -c 'test -z "$(gofmt -l tools/bench/go-tsnet/*.go)"'
 run bash -c 'cd tools/bench/go-tsnet && go mod verify && go test ./... && go vet ./...'
 run grep -Fx 'require tailscale.com v1.100.0' tools/bench/go-tsnet/go.mod
 run grep -Fx 'tailscale.com v1.100.0 h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=' tools/bench/go-tsnet/go.sum
+run grep -Fq "GO_TOOLCHAIN_ARCHIVE_SHA256 = \"1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f\"" tools/bench/gcp/provenance.py
+run grep -Fq "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f  /tmp/go1.26.4.linux-amd64.tar.gz" tools/bench/gcp/lib.sh
+run grep -Fq 'fixed 256 KiB TCP send and' docs/benchmarks.md
+run grep -Fq 'defaults of 1 MiB send and 1 MiB receive' docs/benchmarks.md
 run grep -Fq 'PARALLELS=(1 10 100)' tools/bench/run-native-baseline.sh
 run grep -Fq 'bench_mint_authkey true' tools/bench/run-native-baseline.sh
 run tools/bench/run-native-baseline.sh --self-test

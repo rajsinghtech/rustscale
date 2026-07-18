@@ -174,8 +174,23 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         samples = row.get("samples_mbps")
         if not isinstance(samples, list) or len(samples) != repeat or not all(finite_positive(sample) for sample in samples):
             errors.append(f"parallel {parallel}: samples_mbps must contain {repeat} finite positive samples")
-        elif not math.isclose(row.get("mbps"), median(samples), rel_tol=MEDIAN_REL_TOL, abs_tol=MEDIAN_ABS_TOL):
-            errors.append(f"parallel {parallel}: mbps must equal median(samples_mbps) within rel={MEDIAN_REL_TOL:g}, abs={MEDIAN_ABS_TOL:g}")
+        else:
+            expected_median = median(samples)
+            if not math.isclose(row.get("mbps"), expected_median, rel_tol=MEDIAN_REL_TOL, abs_tol=MEDIAN_ABS_TOL):
+                errors.append(f"parallel {parallel}: mbps must equal median(samples_mbps) within rel={MEDIAN_REL_TOL:g}, abs={MEDIAN_ABS_TOL:g}")
+            if current:
+                mean = sum(samples) / len(samples)
+                stddev = math.sqrt(sum((sample - mean) ** 2 for sample in samples) / len(samples))
+                expected_dispersion = {
+                    "min_mbps": min(samples), "max_mbps": max(samples),
+                    "population_stddev_mbps": stddev,
+                    "coefficient_of_variation_pct": stddev / mean * 100,
+                }
+                for name, expected_value in expected_dispersion.items():
+                    value = row.get(name)
+                    if (not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value)
+                            or value < 0 or not math.isclose(value, expected_value, rel_tol=MEDIAN_REL_TOL, abs_tol=MEDIAN_ABS_TOL)):
+                        errors.append(f"parallel {parallel}: {name} must match repeat dispersion")
     if len(parallels) != len(set(parallels)) or set(parallels) != set(requested) or len(rows) != len(requested):
         errors.append("throughput must contain each requested parallelism exactly once")
     latency = obj.get("latency")
@@ -389,10 +404,16 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
                     and math.isfinite(measured["cpu_peak_pct"]) and measured["cpu_peak_pct"] >= 0
                     and isinstance(measured.get("cpu_avg_pct"), (int, float)) and not isinstance(measured.get("cpu_avg_pct"), bool)
                     and math.isfinite(measured["cpu_avg_pct"]) and measured["cpu_avg_pct"] >= 0)
+                observed_subjects = {
+                    item.rsplit(":", 1)[-1]
+                    for sample in series if isinstance(series, list) and isinstance(sample, dict)
+                    for item in sample.get("included_processes", []) if isinstance(item, str) and ":" in item
+                }
                 series_valid = (isinstance(series, list) and bool(series)
                     and any(isinstance(sample, dict) and sample.get("rss_kb") is not None for sample in series)
                     and any(isinstance(sample, dict) and sample.get("cpu_pct") is not None for sample in series)
-                    and any(isinstance(sample, dict) and sample.get("included_processes") for sample in series))
+                    and any(isinstance(sample, dict) and sample.get("included_processes") for sample in series)
+                    and set(subjects) <= observed_subjects)
                 if (not isinstance(measured, dict) or measured.get("endpoint") != endpoint
                         or measured.get("subjects") != subjects
                         or scope != {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}

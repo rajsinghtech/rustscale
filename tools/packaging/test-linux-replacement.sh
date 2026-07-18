@@ -588,7 +588,10 @@ wait_backend() {
         return 0
       fi
     fi
-    timeout --signal=KILL 3s systemctl is-active --quiet rustscaled.service || break
+    # Restart=always has an intentional inactive transition between the
+    # logout generation and its fresh NeedsLogin generation. Do not mistake
+    # that bounded handoff for a terminal service failure.
+    timeout --signal=KILL 3s systemctl is-active --quiet rustscaled.service || true
     sleep 0.25
   done
   echo "$LABEL $(timestamp) ERROR: timed out waiting for LocalAPI BackendState=$expected" >&2

@@ -177,3 +177,14 @@ jobs:
         env:
           TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
         run: tools/interop-tun.sh
+
+      # Corrected parity gate: the in-process repro above can pass while the
+      # failure mode only appears with bench-style separate processes. Run
+      # the out-of-process split — independent rustscale TUN server and
+      # client processes under sudo, full logs captured on both sides,
+      # kernel-state assertions plus UDP-cadence and TCP roundtrips across
+      # the process boundary.
+      - name: Run out-of-process TUN repro (split server + client)
+        env:
+          TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
+        run: tools/interop-tun-oops.sh

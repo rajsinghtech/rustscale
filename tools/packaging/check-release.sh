@@ -98,6 +98,8 @@ token_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'Mint Tailscale org token' |
 test -n "$preflight_line"
 test -n "$token_line"
 test "$preflight_line" -lt "$token_line"
+grep -Fq -- 'cargo test -p rustscale-tsnet --lib --no-run' tools/interop-tun.sh
+grep -Fq -- 'tests::interop_tun_rust_dials_go: test' tools/interop-tun.sh
 grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/interop-tun.sh
 grep -Fq -- '--nocapture --test-threads=1' tools/interop-tun.sh
 grep -Fq 'up_tun failed after privileged TUN prerequisites were established' crates/tsnet/src/tests.rs

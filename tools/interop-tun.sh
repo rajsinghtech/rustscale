@@ -209,29 +209,42 @@ sleep 3
 # toolchain. Instead: compile as the current user, find the test binary, and
 # run THAT under sudo with env passed through.
 # ---------------------------------------------------------------------------
-echo "[interop-tun] building test binary (unprivileged)..." >&2
-cargo test -p rustscale-tsnet --no-run 2>&1 || {
+echo "[interop-tun] building library test binary (unprivileged)..." >&2
+cargo test -p rustscale-tsnet --lib --no-run 2>&1 || {
   echo "[interop-tun] ERROR: build failed" >&2
   exit 1
 }
 
-# Find the test binary path.
-TEST_BIN=$(cargo test -p rustscale-tsnet --no-run --message-format=json 2>/dev/null \
+# Find the library unit-test binary. Restricting Cargo to --lib prevents an
+# integration-test executable from being selected merely because it appeared
+# first in Cargo's JSON stream.
+TEST_BIN=$(cargo test -p rustscale-tsnet --lib --no-run --message-format=json 2>/dev/null \
   | python3 -c "
 import json, sys
 for line in sys.stdin:
     try:
         d = json.loads(line)
-        if d.get('profile', {}).get('test'):
+        target = d.get('target', {})
+        if (d.get('profile', {}).get('test')
+                and target.get('name') == 'rustscale_tsnet'
+                and 'lib' in target.get('kind', [])):
             print(d['executable'])
             break
     except: pass
 " 2>/dev/null || echo "")
 if [[ -z "$TEST_BIN" || ! -x "$TEST_BIN" ]]; then
-  echo "[interop-tun] ERROR: could not find test binary" >&2
+  echo "[interop-tun] ERROR: could not find library test binary" >&2
   exit 1
 fi
 echo "[interop-tun] test binary: $TEST_BIN" >&2
+
+# Fail closed if the selected executable does not contain the required ignored
+# test. libtest exits successfully when an exact filter matches zero tests.
+if ! "$TEST_BIN" --ignored --list \
+    | grep -Fxq 'tests::interop_tun_rust_dials_go: test'; then
+  echo "[interop-tun] ERROR: selected binary lacks the exact TUN regression test" >&2
+  exit 1
+fi
 
 # Run one exact, serial regression gate under sudo with env passed through.
 # It asserts the kernel interface/rules/routes and completes an echo roundtrip.

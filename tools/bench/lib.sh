@@ -11,7 +11,7 @@
 #
 # After sourcing, call:
 #   bench_provision_tailnet   — creates tailnet, sets globals, traps cleanup
-#   bench_mint_authkey        — mints a reusable ephemeral authkey, prints to stdout
+#   bench_mint_authkey [BOOL] — mints a reusable authkey (ephemeral by default)
 #   bench_cleanup_tailnet     — explicit cleanup (also called via EXIT trap)
 #
 # Globals set by bench_provision_tailnet:
@@ -114,9 +114,16 @@ bench_provision_tailnet() {
 }
 
 # ---------------------------------------------------------------------------
-# Mint a reusable ephemeral preauthorized authkey. Prints the key to stdout.
+# Mint a reusable preauthorized authkey. The optional argument is the JSON
+# boolean controlling ephemeral device enrollment (default: true). Prints the
+# key to stdout.
 # ---------------------------------------------------------------------------
 bench_mint_authkey() {
+  local ephemeral="${1:-true}"
+  (( $# <= 1 )) && [[ "$ephemeral" == true || "$ephemeral" == false ]] || {
+    echo "[bench] authkey ephemerality must be true or false" >&2
+    return 2
+  }
   # Refresh a child-scoped token from the child OAuth client creds on every
   # call. The access token minted at provision time expires (~1h), so over a
   # ~40-min matrix the later per-config mints 401 with a stale token. The
@@ -127,13 +134,13 @@ bench_mint_authkey() {
       | jq -r .access_token)
   fi
   local key
-  # A full 5-point, 3-repeat userspace cell can exceed 15 minutes because each
-  # ephemeral identity performs control/path setup. Keep the key valid for the
-  # bounded matrix while retaining ephemeral nodes and deleting the tailnet.
+  # A full 5-point, 3-repeat userspace cell can exceed 15 minutes. Keep the
+  # key valid for the bounded matrix; the caller chooses whether control may
+  # reap disconnected devices before the disposable tailnet is deleted.
   key=$(curl -fsS --retry 3 --retry-delay 3 --retry-all-errors \
     -X POST "$BENCH_API/api/v2/tailnet/$BENCH_DNS/keys" \
     -H "Authorization: Bearer $BENCH_CHILD_TOKEN" -H 'Content-Type: application/json' \
-    -d '{"capabilities":{"devices":{"create":{"reusable":true,"ephemeral":true,"preauthorized":true,"tags":["tag:e2e"]}}},"expirySeconds":7200}' \
+    -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":true,\"ephemeral\":$ephemeral,\"preauthorized\":true,\"tags\":[\"tag:e2e\"]}}},\"expirySeconds\":7200}" \
     | jq -r .key)
   [[ -n "$key" && "$key" != null ]] || { echo "[bench] authkey mint failed" >&2; return 1; }
   echo "$key"

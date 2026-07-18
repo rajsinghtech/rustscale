@@ -33,10 +33,13 @@ pub async fn run_userspace(
     control_url: String,
     state_dir: Option<std::path::PathBuf>,
 ) -> Result<LatencyResult, Box<dyn Error>> {
+    // A supplied state directory is a restart-stable transport identity. Do
+    // not ask control to reap it between the throughput and latency processes.
+    let ephemeral = state_dir.is_none();
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(authkey)
-        .ephemeral(true)
+        .ephemeral(ephemeral)
         .disable_portmapping(true)
         .control_url(control_url);
     if let Some(ref d) = state_dir {

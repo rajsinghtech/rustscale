@@ -157,9 +157,12 @@ The warmup may retry up to three times before resource sampling starts.
 Measured throughput and latency processes are never retried inside the resource
 window; one failed or incomplete trial discards the cell. Every trial uses a
 new benchmark process, while all four cells retain one transport identity per
-endpoint for the complete cell; embedded tsnet reopens one persisted client
-state rather than registering a new ephemeral peer before every fan-out. Both
-endpoint samplers run continuously from after warmup through the throughput trials,
+endpoint for the complete cell. Embedded tsnet reopens one non-ephemeral client
+identity under a stable hostname instead of registering a new peer before every
+fan-out; each restart keeps its durable keys but discards the prior process's
+netmap cache so startup waits for a fresh peer snapshot. The enclosing tailnet
+remains disposable and is deleted during run cleanup. Both endpoint samplers
+run continuously from after warmup through the throughput trials,
 three-second inter-trial gaps, and latency. Dynamic exact-name process sets are:
 
 - `rs-userspace`: `rustscale-bench` on both endpoints.

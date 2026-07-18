@@ -162,6 +162,27 @@ matrix_run_config_with_policy() {
   fi
 }
 
+# rs-userspace reopens one state directory from a new process for every trial.
+# Its device must therefore survive the short disconnect between processes;
+# all other configurations keep their transport process online for the cell.
+matrix_authkey_ephemeral_for_config() {
+  case "$1" in
+    rs-userspace) printf '%s' false ;;
+    rs-tun|ts-userspace|ts-tun) printf '%s' true ;;
+    *) return 2 ;;
+  esac
+}
+
+matrix_authkey_policy_self_test() {
+  [[ "$(matrix_authkey_ephemeral_for_config rs-userspace)" == false ]] || return 1
+  local config
+  for config in rs-tun ts-userspace ts-tun; do
+    [[ "$(matrix_authkey_ephemeral_for_config "$config")" == true ]] || return 1
+  done
+  if matrix_authkey_ephemeral_for_config invalid >/dev/null 2>&1; then return 1; fi
+  if bench_mint_authkey invalid >/dev/null 2>&1; then return 1; else [[ $? -eq 2 ]]; fi
+}
+
 matrix_config_failure_policy_self_test() {
   local output status
 
@@ -830,6 +851,7 @@ configure_linux_udp_tx_gso_mode || exit $?
 
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
+matrix_authkey_policy_self_test
 matrix_config_failure_policy_self_test
 matrix_profile_self_test
 matrix_option_parsing_self_test
@@ -1061,8 +1083,11 @@ gcp_bench_on_signal() {
 # ---------------------------------------------------------------------------
 # Provision tailnet (skipped in dry-run to avoid API calls).
 # A FRESH authkey is minted per config invocation inside the main loop to
-# avoid key expiry / invalidation across the ~40-min matrix run.  The
-# org-level child token / DNS / API base are exported so that bench_mint_authkey
+# avoid key expiry / invalidation across the ~40-min matrix run. rs-userspace
+# gets a non-ephemeral device key because its durable client identity is
+# intentionally offline between trial processes; the disposable tailnet still
+# owns final cleanup. The org-level child token / DNS / API base are exported
+# so that bench_mint_authkey
 # (defined in tools/bench/lib.sh) works inside run-config.sh if ever needed.
 # ---------------------------------------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
@@ -1132,13 +1157,13 @@ for TOPO in "${TOPOLOGIES[@]}"; do
       export BENCH_MATRIX="${TOPO}/${PATH_TAG}"
       matrix_select_cell_observed "$TOPO" "$CFG" "$Z_A" "$Z_B"
 
-      # Mint a FRESH authkey per config.  Reusing a single ephemeral key
-      # across all 16 configs causes "invalid key" / "node not found" errors
-      # as the key expires or its ephemeral nodes are reaped mid-run.
+      # Mint a FRESH authkey per config. Reusing one key across a long matrix
+      # risks expiry, while an ephemeral rs-userspace device can be reaped in
+      # the intentional disconnect between measured client processes.
       if [[ $DRY_RUN -eq 1 ]]; then
         AUTHKEY="tskey-dryrun-placeholder"
       else
-        AUTHKEY=$(bench_mint_authkey)
+        AUTHKEY=$(bench_mint_authkey "$(matrix_authkey_ephemeral_for_config "$CFG")")
         echo "[gcp] minted fresh authkey for $CFG" >&2
       fi
 
@@ -1152,7 +1177,7 @@ for TOPO in "${TOPOLOGIES[@]}"; do
       if [[ $DRY_RUN -eq 1 ]]; then
         AUTHKEY="tskey-dryrun-placeholder"
       else
-        AUTHKEY=$(bench_mint_authkey)
+        AUTHKEY=$(bench_mint_authkey true)
         echo "[gcp] minted fresh authkey for rs-tun profile diagnostic" >&2
       fi
       matrix_select_cell_observed "$TOPO" rs-tun "$Z_A" "$Z_B"

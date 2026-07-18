@@ -20,13 +20,13 @@ rustscale-conffile = { path = "../conffile", version = "0.1.4" }
 rustscale-ipn = { path = "../ipn", version = "0.1.4" }
 rustscale-logpolicy = { path = "../logpolicy", version = "0.1.4" }
 rustscale-logtail = { path = "../logtail", version = "0.1.4" }
+rustscale-localclient = { path = "../localclient", version = "0.1.4" }
 rustscale-syspolicy.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 log.workspace = true
 
 [dev-dependencies]
-rustscale-localclient = { path = "../localclient", version = "0.1.4" }
 rustscale-testcontrol = { path = "../testcontrol", version = "0.1.4" }
 serde_json.workspace = true
 tempfile = "3"

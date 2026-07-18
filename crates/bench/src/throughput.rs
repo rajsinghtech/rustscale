@@ -54,10 +54,14 @@ pub async fn run_userspace(
     control_url: String,
     state_dir: Option<std::path::PathBuf>,
 ) -> Result<ThroughputResult, Box<dyn Error>> {
+    // A supplied state directory is a restart-stable transport identity. Do
+    // not ask control to reap that identity while the next benchmark process
+    // is reopening the same durable keys.
+    let ephemeral = state_dir.is_none();
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(authkey)
-        .ephemeral(true)
+        .ephemeral(ephemeral)
         .disable_portmapping(true)
         .control_url(control_url);
     if let Some(ref d) = state_dir {

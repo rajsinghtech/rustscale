@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # tools/bench/gcp/run-matrix.sh — main orchestrator for the GCP bench matrix.
 #
-# Defaults to the routine same-zone/direct four-way matched matrix. --full
-# expands topology/path coverage to the 2x2x4 = 16-cell matrix on dedicated
+# Defaults to the routine same-zone/direct five-cell matched matrix. --full
+# expands topology/path coverage to the 2x2x5 = 20-cell matrix on dedicated
 # GCP VMs, writing per-run JSON + a combined summary.json + a standalone HTML
 # dashboard into bench-results/gcp-<stamp>/.
 #
 # Reuses tools/bench/lib.sh for ephemeral tailnet provisioning.
 #
 # Usage:
-#   tools/bench/gcp/run-matrix.sh            # four-way routine run
+#   tools/bench/gcp/run-matrix.sh            # five-cell routine run
 #   tools/bench/gcp/run-matrix.sh --dry-run  # validate args, no gcloud/API
 #
 # Environment:
@@ -72,6 +72,7 @@ rust_build_command() {
     case "$config" in
       rs-userspace|ts-userspace|ts-tun) requested=(rustscale-bench) ;;
       rs-tun) requested=(rustscale-bench rustscale-cli rustscale-rustscaled) ;;
+      ts-embedded) continue ;;
       *) continue ;;
     esac
     for candidate in "${requested[@]}"; do
@@ -94,8 +95,29 @@ rust_build_command() {
   done
 }
 
+go_build_command() {
+  local config
+  for config in "${CONFIGS[@]}"; do
+    if [[ "$config" == ts-embedded ]]; then
+      printf '%s' 'export GOTOOLCHAIN=local; cd /opt/rustscale/tools/bench/go-tsnet && test "$(go env GOVERSION)" = go1.26.4 && go mod verify && mkdir -p /opt/rustscale/bin && go build -trimpath -buildvcs=false -ldflags=-buildid= -o /opt/rustscale/bin/go-tsnet-rsb1 .'
+      return 0
+    fi
+  done
+}
+
+remote_build_command() {
+  local rust_command go_command
+  rust_command=$(rust_build_command)
+  go_command=$(go_build_command)
+  if [[ -n "$rust_command" && -n "$go_command" ]]; then
+    printf '%s && %s' "$rust_command" "$go_command"
+  else
+    printf '%s%s' "$rust_command" "$go_command"
+  fi
+}
+
 matrix_command_shape_self_test() {
-  local actual
+  local actual go_actual remote_actual
   CONFIGS=(rs-userspace)
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench' ]] || return 1
@@ -108,10 +130,20 @@ matrix_command_shape_self_test() {
   CONFIGS=(ts-userspace ts-tun)
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench' ]] || return 1
-  CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
+  CONFIGS=(rs-userspace rs-tun ts-embedded ts-userspace ts-tun)
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
   [[ "$actual" != *'-p rustscaled'* ]] || return 1
+  go_actual=$(go_build_command)
+  [[ "$go_actual" == *'GOTOOLCHAIN=local'* && "$go_actual" == *'test "$(go env GOVERSION)" = go1.26.4'* \
+    && "$go_actual" == *'go mod verify'* && "$go_actual" == *'-trimpath -buildvcs=false -ldflags=-buildid='* \
+    && "$go_actual" == *'/opt/rustscale/bin/go-tsnet-rsb1'* ]] || return 1
+  remote_actual=$(remote_build_command)
+  [[ "$remote_actual" == "$actual && $go_actual" ]] || return 1
+  CONFIGS=(ts-embedded)
+  [[ -z "$(rust_build_command)" && "$(remote_build_command)" == "$(go_build_command)" ]] || return 1
+  CONFIGS=(rs-userspace)
+  [[ -z "$(go_build_command)" && "$(remote_build_command)" == "$(rust_build_command)" ]] || return 1
   RUSTFLAGS='-C target-cpu=native'; CARGO_PROFILE_RELEASE_LTO=thin; CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
   CONFIGS=(rs-tun); actual=$(rust_build_command)
   [[ "$actual" == *'RUSTFLAGS=-C\ target-cpu=native'* && "$actual" == *'CARGO_PROFILE_RELEASE_LTO=thin'* && "$actual" == *'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1'* ]] || return 1
@@ -160,6 +192,27 @@ matrix_run_config_with_policy() {
     fi
     echo "[gcp] $config: FAILED (continuing)" >&2
   fi
+}
+
+# Embedded clients reopen one state directory from a new process for every
+# trial, so their transport identity must survive each intentional disconnect.
+matrix_authkey_ephemeral_for_config() {
+  case "$1" in
+    rs-userspace|ts-embedded) printf '%s' false ;;
+    rs-tun|ts-userspace|ts-tun) printf '%s' true ;;
+    *) return 2 ;;
+  esac
+}
+
+matrix_authkey_policy_self_test() {
+  [[ "$(matrix_authkey_ephemeral_for_config rs-userspace)" == false ]] || return 1
+  [[ "$(matrix_authkey_ephemeral_for_config ts-embedded)" == false ]] || return 1
+  local config
+  for config in rs-tun ts-userspace ts-tun; do
+    [[ "$(matrix_authkey_ephemeral_for_config "$config")" == true ]] || return 1
+  done
+  if matrix_authkey_ephemeral_for_config invalid >/dev/null 2>&1; then return 1; fi
+  if bench_mint_authkey invalid >/dev/null 2>&1; then return 1; else [[ $? -eq 2 ]]; fi
 }
 
 matrix_config_failure_policy_self_test() {
@@ -461,6 +514,7 @@ for name, explicit in (
     ("rustscale-bench", "/opt/rustscale/target/release/rustscale-bench"),
     ("rustscale", "/opt/rustscale/target/release/rustscale"),
     ("rustscaled", "/opt/rustscale/target/release/rustscaled"),
+    ("go-tsnet-rsb1", "/opt/rustscale/bin/go-tsnet-rsb1"),
 ):
     if os.path.isfile(explicit):
         products.append({"path": explicit, "version": output(["timeout", "15", explicit, "--version"]), "version_source": "executable --version", "sha256": hashlib.sha256(open(explicit,"rb").read()).hexdigest()})
@@ -474,7 +528,7 @@ cpu=output(["lscpu", "-J"])
 try: cpu_model=next(x["data"] for x in json.loads(cpu)["lscpu"] if x["field"].strip()=="Model name:")
 except Exception: raise SystemExit("unable to determine CPU model")
 utilities = [entry for entry in (utility("iperf3", ["--version"]), utility("socat", ["-V"]), utility("ncat", ["--version"]), utility("pidstat", ["-V"]), utility("python3", ["--version"])) if entry]
-print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env),"rustc_verbose":output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env),"product":products,"measurement_tools":utilities}))
+print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env),"rustc_verbose":output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env),"go":output(["/usr/local/go/bin/go","version"]),"product":products,"measurement_tools":utilities}))
 PY
 PYEOF
 }
@@ -485,6 +539,8 @@ matrix_product_observation_self_test() {
   [[ "$program" == *'("rustscale-bench", "/opt/rustscale/target/release/rustscale-bench")'* ]] || return 1
   [[ "$program" == *'("rustscale", "/opt/rustscale/target/release/rustscale")'* ]] || return 1
   [[ "$program" == *'("rustscaled", "/opt/rustscale/target/release/rustscaled")'* ]] || return 1
+  [[ "$program" == *'("go-tsnet-rsb1", "/opt/rustscale/bin/go-tsnet-rsb1")'* ]] || return 1
+  [[ "$program" == *'output(["/usr/local/go/bin/go","version"])'* ]] || return 1
   [[ "$program" == *'output(["timeout", "15", explicit, "--version"])'* ]] || return 1
   [[ "$program" == *'utility("iperf3", ["--version"])'* && "$program" == *'utility("pidstat", ["-V"])'* ]] || return 1
   # On a fresh VM /usr/local/bin/cargo is a rustup shim and the SSH user's
@@ -503,6 +559,9 @@ matrix_product_observation_self_test() {
   grep -Fq 'fn metadata_version()' crates/bench/src/main.rs || return 1
   grep -Fq 'matches!(args[1].as_str(), "--version" | "-V")' crates/cli/src/main.rs || return 1
   grep -Fq 'matches!(arg.as_str(), "--version" | "-V")' crates/rustscaled/src/main.rs || return 1
+  grep -Fq 'toolVersion = "tailscale.com/v1.100.0"' tools/bench/go-tsnet/main.go || return 1
+  grep -Fxq 'require tailscale.com v1.100.0' tools/bench/go-tsnet/go.mod || return 1
+  grep -Fxq 'tailscale.com v1.100.0 h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=' tools/bench/go-tsnet/go.sum || return 1
 }
 
 # Atomically publish command stdout in the result directory. The command is
@@ -591,7 +650,7 @@ matrix_write_manifest() {
     --run-id "$MATRIX_RUN_ID" --started-at-utc "$MATRIX_STARTED_AT_UTC" --commit "$MATRIX_SOURCE_COMMIT" \
     --dirty "$MATRIX_WORKTREE_DIRTY" --project "$MATRIX_PROJECT" --image-project "$GCP_IMAGE_PROJECT" \
     --image-family "$GCP_IMAGE" --machine "$GCP_MACHINE" --network "$GCP_NETWORK" --disk-type pd-standard \
-    --disk-gb "$GCP_DISK_GB" --build-command "${RUST_BUILD_COMMAND:-}" --rustflags "${RUSTFLAGS:-}" \
+    --disk-gb "$GCP_DISK_GB" --build-command "${RUST_BUILD_COMMAND:-}" --go-build-command "${GO_BUILD_COMMAND:-}" --rustflags "${RUSTFLAGS:-}" \
     --lto "${CARGO_PROFILE_RELEASE_LTO:-}" --codegen-units "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}" \
     --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" \
     --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
@@ -696,7 +755,8 @@ def observed(dry_run):
     return {"resolved_image":"fixture-image","server":endpoint("us-central1-a"),"client":endpoint("us-central1-b"),"toolchain":{"server_cargo":"cargo fixture","server_rustc_verbose":"rustc fixture","client_cargo":"cargo fixture","client_rustc_verbose":"rustc fixture"},"product":{"server":products,"client":products}}
 def result(root, status):
     manifest=json.loads((root/"matrix.json").read_text()); run=manifest["run"]
-    common={"schema_version":5,"run":run,"observed":observed(status=="failed"),"status":status,"tool":"rustscale","implementation":"rustscale","mode":"tun",
+    obs=observed(status=="failed")
+    common={"schema_version":6,"run":run,"observed":obs,"status":status,"tool":"rustscale","implementation":"rustscale","mode":"tun",
           "topology":"same-zone","path":"direct","config":"rs-tun","repeat":1,
           "parallelism_requested":[1],"duration_s_requested":10,"sample_cadence_s":1,
           "peer_count_requested":1,"error":"dry-run","log_tail":"","throughput":None,"latency":None,"footprint":None,"path_class_reported":"unknown"}
@@ -707,10 +767,11 @@ def result(root, status):
         common.update({"error":"","transport":"kernel-tcp","throughput":[{"parallel":1,"mbps":1.0,"duration_s":10,"samples_mbps":[1.0],"statistic":"median"}],
           "warmup_evidence":{"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_secs":3,"parallel":1,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"},
           "throughput_trials":[{"parallel":1,"repeat_index":1,"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_s":10,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"}],
-          "latency":{"protocol":"RSB1-tcp-pingpong","requested":50,"successful":50,"timed_out":0,"malformed":0,"count":50,"p50_us":1,"p95_us":2,"p99_us":3,"samples_ns":samples},
-          "footprint":dict(series,binary_size_bytes=1,scope=scope),
+          "latency":{"protocol":"RSB1-tcp-pingpong","requested":50,"successful":50,"timed_out":0,"malformed":0,"count":50,"min_ns":1,"mean_ns":25.5,"p50_ns":26,"p95_ns":48,"p99_ns":50,"max_ns":50,"min_us":0.001,"mean_us":0.0255,"p50_us":0.026,"p95_us":0.048,"p99_us":0.05,"max_us":0.05,"samples_ns":samples},
+          "footprint":dict(series,binary_size_bytes=1,subject="rustscaled",scope=scope),
           "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3,"max_attempts":3},"client_lifecycle":"new_benchmark_process_per_trial","transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,"latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"latency_count":50,"transport_path":"kernel-tcp-via-rustscaled-tun","userspace_portmapping":"not-applicable"},
-          "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,"server":dict(series,endpoint="server",subjects=["rustscaled","rustscale-bench"],scope=scope),"client":dict(series,endpoint="client",subjects=["rustscaled","rustscale-bench"],scope=scope)},
+          "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,"server":dict(series,endpoint="server",subjects=["rustscaled","rustscale-bench"],scope=scope,binary_identities=[obs["product"]["server"][1],obs["product"]["server"][2]]),"client":dict(series,endpoint="client",subjects=["rustscaled","rustscale-bench"],scope=scope,binary_identities=[obs["product"]["client"][1],obs["product"]["client"][2]])},
+          "binary":dict(obs["product"]["server"][1],subject="rustscaled",size_bytes=1),
           "path_class_reported":"direct","path_gate":{"requested":"direct","pre":"direct","post":"direct","matched":True},"cleanup":{"status":"clean","samplers_stopped":True,"workload_stopped":True,"transport_stopped":True,"postconditions_verified":True},
           "identity":{"key":"same-zone/direct/rs-tun","cell_id":"rs-tun","implementation":"rustscale","mode":"tun","topology":"same-zone","path":"direct"},
           "load":{"preset":manifest["load"]["preset"],"parallelism_requested":[1],"repeat":1,"duration_s":10,"peer_load":manifest["load"]["peer_load"]},
@@ -754,7 +815,7 @@ matrix_manifest_self_test() {
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
   python3 - "$manifest" "$GCP_MACHINE" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; assert data["schema_version"] == 3 and data["parallelism"] == [1,10,100] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1
@@ -830,6 +891,7 @@ configure_linux_udp_tx_gso_mode || exit $?
 
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
+matrix_authkey_policy_self_test
 matrix_config_failure_policy_self_test
 matrix_profile_self_test
 matrix_option_parsing_self_test
@@ -860,12 +922,12 @@ fi
 matrix_usage() {
   cat <<EOF
 usage: $0 [--dry-run] [--full] [--profile] [--repeat N] [--parallelism LIST] [--scale-streams] [--duration N] [--peer-count N] [--topology LIST] [--path LIST] [--config LIST]
-Runs same-zone/direct rs-userspace,rs-tun,ts-userspace,ts-tun with one matched RSB1 workload.
+Runs same-zone/direct rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun with one matched RSB1 workload.
   --dry-run  validate args + script structure without gcloud or API calls.
-  --full     expand to both topologies and both paths; all four configs remain selected.
+  --full     expand to both topologies and both paths; all five configs remain selected.
   --topology comma-separated subset: same-zone,cross-region
   --path     comma-separated subset: direct,derp
-  --config   comma-separated subset: rs-userspace,rs-tun,ts-userspace,ts-tun
+  --config   comma-separated subset: rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun
   --repeat N run each throughput point N times (1..=9; default 3)
   --parallelism LIST ordered unique stream counts in 1..=1000 (default 1,10,100)
   --scale-streams opt in to the honest all-cell 1,2,4,8,16,32,64,100,200,500,1000 RSB1 sweep
@@ -893,7 +955,7 @@ declare -A ZONES=(
 )
 ALL_TOPOLOGIES=(same-zone cross-region)
 ALL_PATHS=(direct derp)
-ALL_CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
+ALL_CONFIGS=(rs-userspace rs-tun ts-embedded ts-userspace ts-tun)
 if (( FULL )); then
   TOPOLOGIES=("${ALL_TOPOLOGIES[@]}")
   PATHS=("${ALL_PATHS[@]}")
@@ -941,8 +1003,10 @@ elif (( ! FULL )) && [[ -z "$TOPOLOGY_FILTER$PATH_FILTER$CONFIG_FILTER" ]]; then
 else
   MATRIX_PRESET=custom
 fi
-# Every selected cell uses rustscale-bench RSB1 and the exact requested list.
-# Capacity or lifecycle shortfalls fail the whole cell; the harness never caps,
+# Every selected cell uses the byte-identical RSB1 workload and exact requested
+# list. Rust cells and daemon/TUN evidence use rustscale-bench; ts-embedded uses
+# the pinned Go endpoint. Capacity or lifecycle shortfalls fail the whole cell;
+# the harness never caps,
 # truncates, or substitutes an effective stream count.
 if (( PROFILE )); then
   found=0
@@ -953,8 +1017,10 @@ if (( PROFILE )); then
   }
 fi
 RUST_BUILD_COMMAND=$(rust_build_command)
-if [[ -z "$RUST_BUILD_COMMAND" ]]; then
-  echo "[gcp] skipping Rust source delivery and builds (no Rust configs selected)" >&2
+GO_BUILD_COMMAND=$(go_build_command)
+REMOTE_BUILD_COMMAND=$(remote_build_command)
+if [[ -z "$REMOTE_BUILD_COMMAND" ]]; then
+  echo "[gcp] skipping source delivery and builds (no source-built configs selected)" >&2
 fi
 
 MATRIX_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1061,8 +1127,10 @@ gcp_bench_on_signal() {
 # ---------------------------------------------------------------------------
 # Provision tailnet (skipped in dry-run to avoid API calls).
 # A FRESH authkey is minted per config invocation inside the main loop to
-# avoid key expiry / invalidation across the ~40-min matrix run.  The
-# org-level child token / DNS / API base are exported so that bench_mint_authkey
+# avoid key expiry across the bounded matrix. Embedded clients use durable,
+# non-ephemeral identities between trial processes; continuously running
+# daemon cells remain ephemeral. The org-level child token / DNS / API base
+# are exported so that bench_mint_authkey
 # (defined in tools/bench/lib.sh) works inside run-config.sh if ever needed.
 # ---------------------------------------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
@@ -1098,14 +1166,15 @@ for TOPO in "${TOPOLOGIES[@]}"; do
   # Provision VMs (no-op in dry-run).
   create_vms "$SERVER_VM" "$Z_A" "$CLIENT_VM" "$Z_B"
 
-  if [[ -n "$RUST_BUILD_COMMAND" ]]; then
-    # Deliver source sequentially, then build on both VMs in parallel.
+  if [[ -n "$REMOTE_BUILD_COMMAND" ]]; then
+    # Deliver source sequentially, then build every selected source endpoint on
+    # both VMs in parallel. The Go module and toolchain are independently pinned.
     deliver_source "$SERVER_VM" "$Z_A"
     deliver_source "$CLIENT_VM" "$Z_B"
-    echo "[gcp] building rustscale on both VMs in parallel..." >&2
-    ssh_cmd "$SERVER_VM" "$Z_A" "$RUST_BUILD_COMMAND" &
+    echo "[gcp] building selected source endpoints on both VMs in parallel..." >&2
+    ssh_cmd "$SERVER_VM" "$Z_A" "$REMOTE_BUILD_COMMAND" &
     SERVER_BUILD_PID=$!
-    ssh_cmd "$CLIENT_VM" "$Z_B" "$RUST_BUILD_COMMAND" &
+    ssh_cmd "$CLIENT_VM" "$Z_B" "$REMOTE_BUILD_COMMAND" &
     CLIENT_BUILD_PID=$!
     wait_for_remote_builds "$SERVER_BUILD_PID" "$CLIENT_BUILD_PID"
   fi
@@ -1132,13 +1201,13 @@ for TOPO in "${TOPOLOGIES[@]}"; do
       export BENCH_MATRIX="${TOPO}/${PATH_TAG}"
       matrix_select_cell_observed "$TOPO" "$CFG" "$Z_A" "$Z_B"
 
-      # Mint a FRESH authkey per config.  Reusing a single ephemeral key
-      # across all 16 configs causes "invalid key" / "node not found" errors
-      # as the key expires or its ephemeral nodes are reaped mid-run.
+      # Mint a fresh key per config. Reusing one key across a long matrix risks
+      # expiry, while an ephemeral embedded identity can be reaped during the
+      # intentional disconnect between measured client processes.
       if [[ $DRY_RUN -eq 1 ]]; then
         AUTHKEY="tskey-dryrun-placeholder"
       else
-        AUTHKEY=$(bench_mint_authkey)
+        AUTHKEY=$(bench_mint_authkey "$(matrix_authkey_ephemeral_for_config "$CFG")")
         echo "[gcp] minted fresh authkey for $CFG" >&2
       fi
 
@@ -1152,7 +1221,7 @@ for TOPO in "${TOPOLOGIES[@]}"; do
       if [[ $DRY_RUN -eq 1 ]]; then
         AUTHKEY="tskey-dryrun-placeholder"
       else
-        AUTHKEY=$(bench_mint_authkey)
+        AUTHKEY=$(bench_mint_authkey true)
         echo "[gcp] minted fresh authkey for rs-tun profile diagnostic" >&2
       fi
       matrix_select_cell_observed "$TOPO" rs-tun "$Z_A" "$Z_B"

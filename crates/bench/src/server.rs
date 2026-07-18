@@ -27,10 +27,14 @@ pub async fn run_userspace(
     control_url: String,
     state_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
+    // A supplied state directory denotes a durable endpoint identity. The
+    // disposable tailnet, rather than control-plane ephemeral-node reaping,
+    // owns benchmark cleanup.
+    let ephemeral = state_dir.is_none();
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(authkey)
-        .ephemeral(true)
+        .ephemeral(ephemeral)
         // Benchmark VMs have public endpoints; NAT mapping adds no path value
         // and can make short-lived trial shutdown wait on an uncertain release.
         .disable_portmapping(true)

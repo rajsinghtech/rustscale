@@ -5,7 +5,7 @@
 #   run-config.sh CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE \
 #                 AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME [--profile]
 #
-# CONFIG ∈ {rs-userspace, rs-tun, ts-userspace, ts-tun}
+# CONFIG ∈ {rs-userspace, rs-tun, ts-embedded, ts-userspace, ts-tun}
 # Emits <RESULTS_DIR>/<CONFIG>.json with benchmark results and provenance.
 #
 # Environment:
@@ -32,7 +32,7 @@ usage() {
 usage: $0 CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE \
 AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
 
-CONFIG: rs-userspace | rs-tun | ts-userspace | ts-tun
+CONFIG: rs-userspace | rs-tun | ts-embedded | ts-userspace | ts-tun
 --profile: rs-tun only; collect a Linux perf profile after normal metrics
 --profile-only: rs-tun only; collect a Linux perf diagnostic without writing metrics
 --repeat N: measured samples per parallelism (1..=9; default 3)
@@ -588,6 +588,26 @@ rs_userspace_client_command() {
     "$environment" "$authkey" "$target" "$duration" "$parallel" "$hostname" "$statedir" "$logfile"
 }
 
+go_tsnet_server_start_command() {
+  local authkey="$1" port="$2" hostname="$3" statedir="$4" logfile="$5" pidfile="$6"
+  nohup_background_command "" \
+    "prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey $authkey --port $port --hostname $hostname --state-dir $statedir" \
+    "$logfile" "$pidfile"
+}
+
+go_tsnet_client_command() {
+  local operation="$1" authkey="$2" target="$3" value="$4" parallel="$5" hostname="$6" statedir="$7" logfile="$8"
+  case "$operation" in
+    throughput)
+      printf '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
+        "$authkey" "$target" "$value" "$parallel" "$hostname" "$statedir" "$logfile" ;;
+    latency)
+      printf '/opt/rustscale/bin/go-tsnet-rsb1 latency --authkey %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
+        "$authkey" "$target" "$value" "$hostname" "$statedir" "$logfile" ;;
+    *) return 2 ;;
+  esac
+}
+
 # Start the shared kernel-TCP RSB1 server after a configuration has prepared
 # its transport. ts-userspace binds loopback; TUN cells bind all interfaces.
 # Args: BIND_ADDRESS
@@ -647,6 +667,7 @@ start_ts_userspace_bridge() {
 command_shape_self_test() {
   local ts_direct rs_direct ts_derp rs_derp nofile_gate bridge_calls bridge_definition
   local rs_server_off rs_client_off rs_server_on rs_client_on rs_server_outbound rs_server_scalar rs_server_plain rs_server_gso_off rs_userspace_server rs_userspace_client
+  local go_server go_client go_latency
   ts_direct=$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)
   rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
   ts_derp=$(tun_ping_invocation tailscale /tmp/ts.sock derp 100.64.0.1)
@@ -704,6 +725,13 @@ command_shape_self_test() {
   [[ "$rs_userspace_server" == 'RUSTSCALE_DISABLE_UDP_GSO=1 nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --authkey tskey-auth-selftest --port 7777 --hostname srv --state-dir /tmp/rs-srv > /tmp/rs-srv.log 2>&1 & echo $! > /tmp/rs-srv.pid' ]] || return 1
   rs_userspace_client=$(rs_userspace_client_command 1 1 0 tskey-auth-selftest 100.64.0.1:7777 10 1 cli /tmp/rs-cli /tmp/rs-cli.log)
   [[ "$rs_userspace_client" == 'RUSTSCALE_DISABLE_UDP_GSO=1 /opt/rustscale/target/release/rustscale-bench client --authkey tskey-auth-selftest --target 100.64.0.1:7777 --duration 10 --parallel 1 --hostname cli --state-dir /tmp/rs-cli --json 2>/tmp/rs-cli.log' ]] || return 1
+  go_server=$(go_tsnet_server_start_command tskey-auth-selftest 7777 srv /tmp/go-srv /tmp/go-srv.log /tmp/go-srv.pid)
+  [[ "$go_server" == 'nohup prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey tskey-auth-selftest --port 7777 --hostname srv --state-dir /tmp/go-srv > /tmp/go-srv.log 2>&1 & echo $! > /tmp/go-srv.pid' ]] || return 1
+  go_client=$(go_tsnet_client_command throughput tskey-auth-selftest 100.64.0.1:7777 10 100 cli /tmp/go-cli /tmp/go-client.log)
+  [[ "$go_client" == '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey tskey-auth-selftest --target 100.64.0.1:7777 --duration 10 --parallel 100 --direction down --hostname cli --state-dir /tmp/go-cli --json 2>/tmp/go-client.log' ]] || return 1
+  go_latency=$(go_tsnet_client_command latency tskey-auth-selftest 100.64.0.1:7777 50 1 cli /tmp/go-cli /tmp/go-latency.log)
+  [[ "$go_latency" == '/opt/rustscale/bin/go-tsnet-rsb1 latency --authkey tskey-auth-selftest --target 100.64.0.1:7777 --count 50 --hostname cli --state-dir /tmp/go-cli --json 2>/tmp/go-latency.log' ]] || return 1
+  if go_tsnet_client_command invalid x x 1 1 x x x >/dev/null 2>&1; then return 1; fi
 }
 
 pid_capture_semantics_self_test() {
@@ -1060,16 +1088,17 @@ userspace_cleanup_command() {
 "socket=$socket" "pidfile=$pidfile" \
 'tailscale --socket="$socket" serve reset 2>/dev/null || true' \
 'tailscale --socket="$socket" down 2>/dev/null || true' \
-'for file in /tmp/rs-srv.pid /tmp/rsb1-server.pid "$pidfile" /tmp/ncat.pid /tmp/socat.pid; do pid=$(cat "$file" 2>/dev/null || true); case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac; done' \
+'for file in /tmp/rs-srv.pid /tmp/go-tsnet-srv.pid /tmp/rsb1-server.pid "$pidfile" /tmp/ncat.pid /tmp/socat.pid; do pid=$(cat "$file" 2>/dev/null || true); case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac; done' \
 'pkill -TERM -x rustscale-bench 2>/dev/null || true' \
+'pkill -TERM -x go-tsnet-rsb1 2>/dev/null || true' \
 'pkill -TERM -x ncat 2>/dev/null || true' \
 'pkill -TERM -x socat 2>/dev/null || true' \
 'pkill -TERM -x tailscaled 2>/dev/null || true' \
-'is_clear() { ! pgrep -x rustscale-bench >/dev/null 2>&1 && ! pgrep -x ncat >/dev/null 2>&1 && ! pgrep -x socat >/dev/null 2>&1 && ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300|11080)[[:space:]]"; }' \
+'is_clear() { ! pgrep -x rustscale-bench >/dev/null 2>&1 && ! pgrep -x go-tsnet-rsb1 >/dev/null 2>&1 && ! pgrep -x ncat >/dev/null 2>&1 && ! pgrep -x socat >/dev/null 2>&1 && ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300|11080)[[:space:]]"; }' \
 'elapsed=0; while (( elapsed < 15 )); do is_clear && break; sleep 1; elapsed=$((elapsed + 1)); done' \
-'if ! is_clear; then pkill -KILL -x rustscale-bench 2>/dev/null || true; pkill -KILL -x ncat 2>/dev/null || true; pkill -KILL -x socat 2>/dev/null || true; pkill -KILL -x tailscaled 2>/dev/null || true; fi' \
-'rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/rs-parity-client /tmp/ts-srv /tmp/ts-cli /tmp/rsb1-*' \
-'rm -f /tmp/rs-srv.* /tmp/ts-srv.* /tmp/ts-cli.* /tmp/ncat.* /tmp/socat.* /tmp/ts-socks-connect /tmp/rs-footprint-set.py' \
+'if ! is_clear; then pkill -KILL -x rustscale-bench 2>/dev/null || true; pkill -KILL -x go-tsnet-rsb1 2>/dev/null || true; pkill -KILL -x ncat 2>/dev/null || true; pkill -KILL -x socat 2>/dev/null || true; pkill -KILL -x tailscaled 2>/dev/null || true; fi' \
+'rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/rs-parity-client /tmp/go-tsnet-srv /tmp/ts-srv /tmp/ts-cli /tmp/rsb1-*' \
+'rm -f /tmp/rs-srv.* /tmp/go-tsnet-srv.* /tmp/ts-srv.* /tmp/ts-cli.* /tmp/ncat.* /tmp/socat.* /tmp/ts-socks-connect /tmp/rs-footprint-set.py' \
 'is_clear'
 }
 
@@ -1094,6 +1123,7 @@ cleanup_userspace_endpoints() {
 }
 
 cleanup_rs_userspace() { cleanup_userspace_endpoints; }
+cleanup_ts_embedded() { cleanup_userspace_endpoints; }
 cleanup_ts_userspace() { cleanup_userspace_endpoints; }
 
 # Args: CLEANUP_FUNCTION ERROR_STRING [LOG_TAIL].  This is the sole failure
@@ -1127,11 +1157,13 @@ emit_stub() {
   fi
   local tool mode
   case "$CONFIG" in
-    rs-*) tool=rustscale; mode=userspace ;;
-    ts-*) tool=tailscaled; mode=tun ;;
+    rs-userspace) tool=rustscale; mode=embedded ;;
+    rs-tun) tool=rustscale; mode=tun ;;
+    ts-embedded) tool=go-tsnet-rsb1; mode=embedded ;;
+    ts-userspace) tool=tailscaled; mode=daemon-proxy ;;
+    ts-tun) tool=tailscaled; mode=tun ;;
+    *) return 2 ;;
   esac
-  [[ "$CONFIG" == *-tun ]] && mode=tun
-  [[ "$CONFIG" == *-userspace ]] && mode=userspace
 
   # Use Python so log_tail (which may contain quotes, newlines, etc.) is
   # properly JSON-escaped. Pass log_tail via a temp file to avoid argv limits.
@@ -1149,7 +1181,7 @@ try:
 except OSError:
     log_tail = ""
 obj = {
-    "schema_version": 5,
+    "schema_version": 6,
     "status": "failed",
     "tool": tool,
     "mode": mode,
@@ -1419,7 +1451,7 @@ import json, sys
 path, duration, latency_count, inbound_pipeline, outbound_pipeline, udp_batch, udp_gro, udp_gso, *parallels = sys.argv[1:]
 with open(path) as f:
     result = json.load(f)
-assert result["schema_version"] == 5 and result["status"] == "failed"
+assert result["schema_version"] == 6 and result["status"] == "failed"
 assert result["run"]["source"]["includes_uncommitted_changes"] is False
 assert result["run"]["runtime"] == {"rs_tun_inbound_pipeline": inbound_pipeline == "1", "rs_tun_outbound_send_pipeline": outbound_pipeline == "1", "linux_udp_batch": udp_batch == "1", "linux_udp_gro": udp_gro == "1", "linux_udp_gso": udp_gso == "1"}
 assert result["observed"]["resolved_image"] == "dry-run"
@@ -1820,7 +1852,7 @@ if config == "rs-tun":
 
 print(json.dumps(obj, indent=2))
 PYEOF
-  finalize_result_metadata
+  (( SELF_TEST )) || finalize_result_metadata
   echo "[gcp] $label: wrote $OUT" >&2
 }
 
@@ -2238,31 +2270,74 @@ PYEOF
 # sole warmup may retry before sampling; every measured throughput/latency
 # process is invoked exactly once and an incomplete lifecycle fails the cell.
 # Args: CLI_TRANSPORT REPORTED_TRANSPORT TARGET PRE_GATED_PATH
+rsb1_client_command() {
+  local kind="$1" operation="$2" target="$3" value="$4" parallel="$5" state_dir="$6" logfile="$7"
+  case "$kind/$operation" in
+    rust-userspace/throughput)
+      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport userspace --authkey %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
+        "$AUTHKEY" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
+    rust-userspace/latency)
+      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport userspace --authkey %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
+        "$AUTHKEY" "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
+    rust-kernel/throughput)
+      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport kernel-tcp --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
+        "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
+    rust-kernel/latency)
+      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport kernel-tcp --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
+        "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
+    go-userspace/throughput)
+      printf 'prlimit --nofile=65535:65535 -- %s' "$(go_tsnet_client_command throughput "$AUTHKEY" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile")" ;;
+    go-userspace/latency)
+      printf 'prlimit --nofile=65535:65535 -- %s' "$(go_tsnet_client_command latency "$AUTHKEY" "$target" "$value" 1 "$CHOST" "$state_dir" "$logfile")" ;;
+    *) return 2 ;;
+  esac
+}
+
+# Run one configuration-neutral RSB1 suite after the caller has prepared its
+# transport, endpoint, path gate, process subjects, and teardown function. The
+# sole warmup may retry before sampling; every measured throughput/latency
+# process is invoked exactly once and an incomplete lifecycle fails the cell.
+# Args: CLIENT_KIND REPORTED_TRANSPORT TARGET PRE_GATED_PATH
 rsb1_measure() {
-  local cli_transport="$1" reported_transport="$2" target="$3" gated_path="$4"
-  local auth_args="" path_class warmup_json warmup_evidence tp_json="[]" trial_json="[]" lat_json server_foot client_foot bin_size
-  local server_subjects client_subjects
+  local client_kind="$1" reported_transport="$2" target="$3" gated_path="$4"
+  local path_class warmup_json warmup_evidence tp_json="[]" trial_json="[]" lat_json server_foot client_foot bin_size
+  local server_subjects client_subjects expected_client_tool primary_subject primary_path workload_implementation client_state_prep=""
   RS_PARITY_FAILURE_LOG=/tmp/rsb1-setup.log
   RSB1_MEASURE_PATH_POST=unknown
   (( ${#RSB1_SERVER_SUBJECTS[@]} > 0 && ${#RSB1_CLIENT_SUBJECTS[@]} > 0 )) || return 2
-  [[ "$cli_transport" == userspace ]] && auth_args="--authkey $AUTHKEY"
+  case "$client_kind" in
+    rust-userspace)
+      expected_client_tool=rustscale-bench
+      client_state_prep='find /tmp/rsb1-client-state -type f -name netmap-cache.json -delete 2>/dev/null || true; ' ;;
+    rust-kernel) expected_client_tool=rustscale-bench ;;
+    go-userspace) expected_client_tool=go-tsnet-rsb1 ;;
+    *) return 2 ;;
+  esac
+  case "$CONFIG" in
+    rs-userspace) primary_subject=rustscale-bench; primary_path=/opt/rustscale/target/release/rustscale-bench; workload_implementation=rustscale-bench ;;
+    rs-tun) primary_subject=rustscaled; primary_path=/opt/rustscale/target/release/rustscaled; workload_implementation=rustscale-bench ;;
+    ts-embedded) primary_subject=go-tsnet-rsb1; primary_path=/opt/rustscale/bin/go-tsnet-rsb1; workload_implementation=go-tsnet-rsb1 ;;
+    ts-userspace|ts-tun) primary_subject=tailscaled; primary_path=/usr/sbin/tailscaled; workload_implementation=rustscale-bench ;;
+    *) return 2 ;;
+  esac
 
   # Every cell keeps one transport identity per endpoint while each warmup,
-  # measured trial, and latency trial still gets a new benchmark process. For
-  # embedded tsnet this stable state directory avoids registering a new
-  # ephemeral peer before every measured fan-out; kernel transports ignore it.
-  local client_state_dir=/tmp/rsb1-client-state
+  # measured trial, and latency trial gets a new benchmark process. Embedded
+  # clients reopen durable keys under one stable hostname; Rust also discards
+  # its prior process-local netmap cache before waiting for a fresh snapshot.
+  local client_state_dir=/tmp/rsb1-client-state command
   RS_PARITY_FAILURE_LOG=/tmp/rsb1-warmup.log
   local warmup_attempt
   warmup_json=""
   for warmup_attempt in 1 2 3; do
-    warmup_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $cli_transport $auth_args --target $target --duration 3 --parallel 1 --direction down --hostname $CHOST-warmup-$warmup_attempt --state-dir $client_state_dir --json 2>/tmp/rsb1-warmup.log") && break
+    command=$(rsb1_client_command "$client_kind" throughput "$target" 3 1 "$client_state_dir" /tmp/rsb1-warmup.log) || return 2
+    warmup_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") && break
     echo "[gcp] RSB1 warmup retry $warmup_attempt/3" >&2
     sleep 5
     warmup_json=""
   done
   [[ -n "$warmup_json" ]] || return 1
-  path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport=sys.argv[1]; assert d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1 and d["established"]==1 and d["handshaken"]==1 and d["completed"]==1; value=float(d["total_mbps"]); assert math.isfinite(value) and value>0; print(d["path_class"])' "$reported_transport") || return 1
+  path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,tool=sys.argv[1:]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1 and d["established"]==1 and d["handshaken"]==1 and d["completed"]==1; value=float(d["total_mbps"]); assert math.isfinite(value) and value>0; print(d["path_class"])' "$reported_transport" "$expected_client_tool") || return 1
   warmup_evidence=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in ("transport","protocol","direction","duration_secs","parallel","established","handshaken","completed","total_mbps","path_class")}))') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && path_class="$gated_path"
   [[ "$PATH_TAG" == direct && "$path_class" == direct || "$PATH_TAG" == derp && "$path_class" == derp ]] || {
@@ -2282,8 +2357,9 @@ rsb1_measure() {
     for ((sample_index=1; sample_index<=REPEAT; sample_index++)); do
       echo "[gcp] $CONFIG: RSB1 N=$N sample=$sample_index/$REPEAT" >&2
       RS_PARITY_FAILURE_LOG=/tmp/rsb1-$N-$sample_index.log
-      sample_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport $cli_transport $auth_args --target $target --duration $DURATION --parallel $N --direction down --hostname $CHOST-$N-$sample_index --state-dir $client_state_dir --json 2>/tmp/rsb1-$N-$sample_index.log") || return 1
-      mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$reported_transport" "$N" "$PATH_TAG") || return 1
+      command=$(rsb1_client_command "$client_kind" throughput "$target" "$DURATION" "$N" "$client_state_dir" "/tmp/rsb1-$N-$sample_index.log") || return 2
+      sample_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
+      mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected,tool=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$reported_transport" "$N" "$PATH_TAG" "$expected_client_tool") || return 1
       samples+=("$mbps")
       trial_json=$(printf '%s' "$sample_json" | python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); d=json.load(sys.stdin); rows.append({"parallel":d["parallel"],"repeat_index":int(sys.argv[2]),"transport":d["transport"],"protocol":d["protocol"],"direction":d["direction"],"duration_s":d["duration_secs"],"established":d["established"],"handshaken":d["handshaken"],"completed":d["completed"],"total_mbps":d["total_mbps"],"path_class":d["path_class"]}); print(json.dumps(rows))' "$trial_json" "$sample_index") || return 1
       sample_number=$((sample_number+1))
@@ -2295,40 +2371,46 @@ rsb1_measure() {
   # Latency is the final measured trial and receives the same inter-trial gap.
   sleep 3
   RS_PARITY_FAILURE_LOG=/tmp/rsb1-latency.log
-  lat_json=$(ssh_cmd "$CVM" "$CZONE" "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport $cli_transport $auth_args --target $target --count $LATENCY_COUNT --hostname $CHOST-latency --state-dir $client_state_dir --json 2>/tmp/rsb1-latency.log") || return 1
-  lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); transport,n,expected=sys.argv[1],int(sys.argv[2]),sys.argv[3]; assert d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n and all(type(v) is int and v>0 for v in d["samples_ns"]); assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$reported_transport" "$LATENCY_COUNT" "$PATH_TAG") || return 1
+  command=$(rsb1_client_command "$client_kind" latency "$target" "$LATENCY_COUNT" 1 "$client_state_dir" /tmp/rsb1-latency.log) || return 2
+  lat_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
+  lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,n,expected,tool=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n and all(type(v) is int and v>0 for v in d["samples_ns"]); values=[d[k] for k in ("min_ns","mean_ns","p50_ns","p95_ns","p99_ns","max_ns","min_us","mean_us","p50_us","p95_us","p99_us","max_us")]; assert all(isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and v>0 for v in values) and d["p50_ns"]<=d["p95_ns"]<=d["p99_ns"]; assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$reported_transport" "$LATENCY_COUNT" "$PATH_TAG" "$expected_client_tool") || return 1
   RSB1_MEASURE_PATH_POST=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path_class"])') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && RSB1_MEASURE_PATH_POST="$gated_path"
 
   server_foot=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rsb1-server.footprint) || return 1
   client_foot=$(remote_stop_footprint "$CVM" "$CZONE" /tmp/rsb1-client.footprint) || return 1
-  bin_size=$(ssh_cmd "$SVM" "$SZONE" 'stat -c %s /opt/rustscale/target/release/rustscale-bench') || return 1
+  bin_size=$(ssh_cmd "$SVM" "$SZONE" "stat -c %s $primary_path") || return 1
   server_subjects=$(IFS=,; printf '%s' "${RSB1_SERVER_SUBJECTS[*]}")
   client_subjects=$(IFS=,; printf '%s' "${RSB1_CLIENT_SUBJECTS[*]}")
 
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$reported_transport" "$bin_size" "$tp_json" "$trial_json" "$warmup_evidence" "$lat_json" "$server_foot" "$client_foot" "$REPEAT" "$server_subjects" "$client_subjects" "${PARALLELS[@]}" >"$PENDING_OUT" <<'PYEOF'
-import json, sys
-config, topo, requested_path, observed_path, transport, size, tp, trials, warmup_evidence, lat, server, client, repeat, server_subjects, client_subjects, *parallels = sys.argv[1:]
+  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$reported_transport" "$bin_size" "$tp_json" "$trial_json" "$warmup_evidence" "$lat_json" "$server_foot" "$client_foot" "$REPEAT" "$server_subjects" "$client_subjects" "$primary_subject" "$primary_path" "$workload_implementation" "${PARALLELS[@]}" >"$PENDING_OUT" <<'PYEOF'
+import json, math, sys
+config, topo, requested_path, observed_path, transport, size, tp, trials, warmup_evidence, lat, server, client, repeat, server_subjects, client_subjects, primary_subject, primary_path, workload_implementation, *parallels = sys.argv[1:]
 server, client = json.loads(server), json.loads(client)
 subject_sets = [server_subjects.split(","), client_subjects.split(",")]
 for endpoint in (server, client):
     assert endpoint["samples"] > 0 and endpoint["samples"] > endpoint["missing_samples"]
-    assert endpoint["rss_peak_kb"] > 0 and endpoint["series"]
+    assert all(isinstance(endpoint.get(name), (int, float)) and not isinstance(endpoint.get(name), bool) and math.isfinite(endpoint[name]) for name in ("rss_peak_kb", "rss_avg_kb", "cpu_peak_pct", "cpu_avg_pct"))
+    assert endpoint["rss_peak_kb"] > 0 and endpoint["rss_avg_kb"] > 0 and endpoint["cpu_peak_pct"] >= 0 and endpoint["cpu_avg_pct"] >= 0
+    assert endpoint["series"] and any(sample.get("rss_kb") is not None for sample in endpoint["series"]) and any(sample.get("cpu_pct") is not None for sample in endpoint["series"])
+    assert any(sample.get("included_processes") for sample in endpoint["series"])
 scope = {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
 implementation = "rustscale" if config.startswith("rs-") else "tailscale"
-mode = "userspace" if config.endswith("userspace") else "tun"
+mode = {"rs-userspace":"embedded", "rs-tun":"tun", "ts-embedded":"embedded", "ts-userspace":"daemon-proxy", "ts-tun":"tun"}[config]
 transport_path = {
-    "rs-userspace":"embedded-tsnet",
+    "rs-userspace":"embedded-rust-tsnet",
     "rs-tun":"kernel-tcp-via-rustscaled-tun",
+    "ts-embedded":"embedded-go-tsnet",
     "ts-userspace":"kernel-tcp-via-loopback-ncat-socks5-tailscaled-serve",
     "ts-tun":"kernel-tcp-via-tailscaled-tun",
 }[config]
-portmapping = "disabled" if config == "rs-userspace" else "not-applicable"
-obj={"schema_version":5,"status":"ok","tool":"rustscale" if implementation=="rustscale" else "tailscaled",
+portmapping = {"rs-userspace":"disabled", "ts-embedded":"upstream-default"}.get(config, "not-applicable")
+tool = {"rs-userspace":"rustscale", "rs-tun":"rustscale", "ts-embedded":"go-tsnet-rsb1", "ts-userspace":"tailscaled", "ts-tun":"tailscaled"}[config]
+obj={"schema_version":6,"status":"ok","tool":tool,
  "implementation":implementation,"mode":mode,"topology":topo,"path":requested_path,"config":config,
  "repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],"error":"","log_tail":"",
  "path_class_reported":observed_path,"transport":transport,
- "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,
+ "workload":{"implementation":workload_implementation,"protocol":"RSB1","direction":"down","payload_bytes":1280,
              "warmup":{"parallel":1,"duration_s":3,"max_attempts":3},
              "client_lifecycle":"new_benchmark_process_per_trial",
              "transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,
@@ -2339,12 +2421,11 @@ obj={"schema_version":5,"status":"ok","tool":"rustscale" if implementation=="rus
  "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,
               "server":dict(server,endpoint="server",subjects=subject_sets[0],scope=scope),
               "client":dict(client,endpoint="client",subjects=subject_sets[1],scope=scope)},
- "footprint":dict(server,binary_size_bytes=int(size),subject="rustscale-bench",endpoint="server",scope=scope),
- "binary":{"subject":"rustscale-bench","size_bytes":int(size)}}
+ "footprint":dict(server,binary_size_bytes=int(size),subject=primary_subject,endpoint="server",scope=scope),
+ "binary":{"subject":primary_subject,"path":primary_path,"size_bytes":int(size)}}
 print(json.dumps(obj,indent=2))
 PYEOF
 }
-
 # Publish only after a post-suite path gate and verified clean teardown. The
 # pending file is never considered by aggregate.py's three-level cell scan.
 publish_rsb1_result() {
@@ -2400,15 +2481,20 @@ rsb1_lifecycle_self_test() {
   command=$(userspace_cleanup_command cli) || return 1
   bash -n <<<"$command" || return 1
   [[ "$command" == *'serve reset'* && "$command" == *'pkill -KILL -x ncat'* \
+    && "$command" == *'pkill -KILL -x go-tsnet-rsb1'* \
     && "$command" == *'/tmp/ts-socks-connect'* && "$command" == *'11080'* \
     && "$command" == *'ip link show dev tailscale0'* ]] || return 1
 
-  # The measured suite contains retries only in the pre-sampling warmup.
-  definition=$(declare -f rsb1_measure)
+  # The measured suite contains retries only in the pre-sampling warmup. Both
+  # embedded clients use the stable state/hostname contract, while only Rust's
+  # process-local netmap cache is explicitly discarded between processes.
+  definition="$(declare -f rsb1_measure)$(declare -f rsb1_client_command)$(declare -f go_tsnet_client_command)"
   [[ $(grep -c 'RSB1 warmup retry' <<<"$definition") -eq 1 \
     && "$definition" != *'measured retry'* \
     && "$definition" == *'client_state_dir=/tmp/rsb1-client-state'* \
-    && $(grep -o -- '--state-dir \$client_state_dir' <<<"$definition" | wc -l | tr -d ' ') -eq 3 \
+    && "$definition" == *'netmap-cache.json'* \
+    && "$definition" == *'/opt/rustscale/bin/go-tsnet-rsb1 client'* \
+    && "$definition" == *'"$CHOST" "$state_dir"'* \
     && "$definition" == *'throughput_trials'* ]] || return 1
 
   event=$(mktemp "$RDIR/cell-exit-test.XXXXXX") || return 1
@@ -2462,7 +2548,7 @@ run_rs_userspace() {
 
   RSB1_SERVER_SUBJECTS=(rustscale-bench)
   RSB1_CLIENT_SUBJECTS=(rustscale-bench)
-  if rsb1_measure userspace userspace-tsnet "$server_ip:$PORT" "$PATH_TAG"; then
+  if rsb1_measure rust-userspace userspace-tsnet "$server_ip:$PORT" "$PATH_TAG"; then
     local post_path="$RSB1_MEASURE_PATH_POST"
     if ! cleanup_rs_userspace; then
       emit_stub "rs-userspace-cleanup-failed"
@@ -2542,7 +2628,7 @@ run_rs_tun() {
   fi
   RSB1_SERVER_SUBJECTS=(rustscaled rustscale-bench)
   RSB1_CLIENT_SUBJECTS=(rustscaled rustscale-bench)
-  if rsb1_measure kernel-tcp kernel-tcp "$server_ip:$PORT" "$path_class"; then
+  if rsb1_measure rust-kernel kernel-tcp "$server_ip:$PORT" "$path_class"; then
     local post_path
     post_path=$(tun_path_gate 1 "$CVM" "$CZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/rs-tun-cli.path-post.log) || {
       emit_stub "rs-post-path-gate-failed" "$(capture_log_tail "$CVM" "$CZONE" /tmp/rs-tun-cli.path-post.log)"
@@ -2573,11 +2659,69 @@ run_rs_tun() {
 }
 
 # ===========================================================================
-# Config: ts-userspace — tailscaled userspace-networking + SOCKS5
+# Config: ts-embedded — pinned Go tsnet server + client
+# ===========================================================================
+run_ts_embedded() {
+  arm_cell_cleanup cleanup_ts_embedded
+  echo "[gcp] ts-embedded: starting pinned Go tsnet RSB1 server on $SVM" >&2
+  if ! ssh_cmd "$SVM" "$SZONE" \
+      "rm -rf /tmp/go-tsnet-srv; rm -f /tmp/go-tsnet-srv.{log,pid}; $(go_tsnet_server_start_command "$AUTHKEY" "$PORT" "$SHOST" /tmp/go-tsnet-srv /tmp/go-tsnet-srv.log /tmp/go-tsnet-srv.pid)"; then
+    fail_userspace_config cleanup_ts_embedded "ts-embedded-server-start-failed"
+    return 1
+  fi
+
+  local timeout=180
+  [[ "$PATH_TAG" == derp ]] && timeout=300
+  local elapsed=0
+  while (( elapsed < timeout )); do
+    if ssh_cmd "$SVM" "$SZONE" 'pid=$(cat /tmp/go-tsnet-srv.pid 2>/dev/null); kill -0 "$pid" 2>/dev/null && grep -q "BENCH_READY 1" /tmp/go-tsnet-srv.log' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  if (( elapsed >= timeout )); then
+    fail_userspace_config cleanup_ts_embedded "ts-embedded-server-not-ready" "$(capture_log_tail "$SVM" "$SZONE" /tmp/go-tsnet-srv.log)"
+    return 1
+  fi
+  if ! ssh_cmd "$SVM" "$SZONE" "$(nofile_limit_gate_command /tmp/go-tsnet-srv.pid)"; then
+    fail_userspace_config cleanup_ts_embedded "ts-embedded-nofile-limit-too-low"
+    return 1
+  fi
+
+  local server_ip
+  server_ip=$(ssh_cmd "$SVM" "$SZONE" "grep '^BENCH_IP ' /tmp/go-tsnet-srv.log | awk '{print \$2}'")
+  [[ "$server_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    fail_userspace_config cleanup_ts_embedded "ts-embedded-invalid-server-ip" "$(capture_log_tail "$SVM" "$SZONE" /tmp/go-tsnet-srv.log)"
+    return 1
+  }
+  echo "[gcp] ts-embedded: server IP=$server_ip" >&2
+
+  RSB1_SERVER_SUBJECTS=(go-tsnet-rsb1)
+  RSB1_CLIENT_SUBJECTS=(go-tsnet-rsb1)
+  if rsb1_measure go-userspace userspace-tsnet "$server_ip:$PORT" "$PATH_TAG"; then
+    local post_path="$RSB1_MEASURE_PATH_POST"
+    if ! cleanup_ts_embedded; then
+      emit_stub "ts-embedded-cleanup-failed"
+      return "$FATAL_HANDOFF_STATUS"
+    fi
+    if publish_rsb1_result "$PATH_TAG" "$post_path"; then
+      echo "[gcp] ts-embedded: wrote matched RSB1 result $OUT" >&2
+      return 0
+    fi
+    emit_stub "ts-embedded-result-publish-failed"
+    return 1
+  fi
+  fail_userspace_config cleanup_ts_embedded "ts-embedded-rsb1-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rsb1-setup.log}")"
+  return 1
+}
+
+# ===========================================================================
+# Config: ts-userspace — retained tailscaled SOCKS5/Serve daemon-proxy evidence
 # ===========================================================================
 run_ts_userspace() {
   arm_cell_cleanup cleanup_ts_userspace
-  echo "[gcp] ts-userspace: preparing loopback RSB1 server and tailscaled userspace path" >&2
+  echo "[gcp] ts-userspace: preparing retained tailscaled daemon-proxy path" >&2
 
   # The local RSB1 listener is authoritative readiness gate one and is never
   # exposed on a host interface; tailscale Serve owns the tailnet-side port.
@@ -2654,7 +2798,7 @@ run_ts_userspace() {
 
   RSB1_SERVER_SUBJECTS=(tailscaled rustscale-bench)
   RSB1_CLIENT_SUBJECTS=(tailscaled ncat rustscale-bench)
-  if ! rsb1_measure kernel-tcp kernel-tcp 127.0.0.1:5300 "$path_class"; then
+  if ! rsb1_measure rust-kernel kernel-tcp 127.0.0.1:5300 "$path_class"; then
     fail_userspace_config cleanup_ts_userspace "ts-userspace-rsb1-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rsb1-setup.log}")"
     return 1
   fi
@@ -2778,7 +2922,7 @@ run_ts_tun() {
   fi
   RSB1_SERVER_SUBJECTS=(tailscaled rustscale-bench)
   RSB1_CLIENT_SUBJECTS=(tailscaled rustscale-bench)
-  if ! rsb1_measure kernel-tcp kernel-tcp "$server_ip:$PORT" "$path_class"; then
+  if ! rsb1_measure rust-kernel kernel-tcp "$server_ip:$PORT" "$path_class"; then
     emit_stub "ts-tun-rsb1-measure-failed" "$(capture_log_tail "$CVM" "$CZONE" "${RS_PARITY_FAILURE_LOG:-/tmp/rsb1-setup.log}")"
     cleanup_ts_tun || return "$FATAL_HANDOFF_STATUS"
     return 1
@@ -2817,6 +2961,7 @@ trap 'exit 143' TERM
 case "$CONFIG" in
   rs-userspace)  run_rs_userspace ;;
   rs-tun)        run_rs_tun ;;
+  ts-embedded)   run_ts_embedded ;;
   ts-userspace)  run_ts_userspace ;;
   ts-tun)        run_ts_tun ;;
   *)

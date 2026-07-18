@@ -214,6 +214,13 @@ cp /opt/rust/cargo/bin/cargo /usr/local/bin/cargo
 cp /opt/rust/cargo/bin/rustc /usr/local/bin/rustc
 cp /opt/rust/cargo/bin/rustup /usr/local/bin/rustup
 chmod 755 /usr/local/bin/cargo /usr/local/bin/rustc /usr/local/bin/rustup
+# Build the embedded Go comparator with one checksum-pinned native toolchain.
+curl -fsSLo /tmp/go1.26.4.linux-amd64.tar.gz https://go.dev/dl/go1.26.4.linux-amd64.tar.gz
+echo '1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f  /tmp/go1.26.4.linux-amd64.tar.gz' | sha256sum -c -
+rm -rf /usr/local/go
+tar -C /usr/local -xzf /tmp/go1.26.4.linux-amd64.tar.gz
+ln -sf /usr/local/go/bin/go /usr/local/bin/go
+rm -f /tmp/go1.26.4.linux-amd64.tar.gz
 # World-writable build dir for the non-root SSH user (gcloud ssh runs as GCP account user).
 mkdir -p /opt/rustscale && chmod 777 /opt/rustscale
 # The non-root SSH user runs `cargo build`, which writes the registry cache
@@ -239,6 +246,9 @@ startup_script_self_test() {
   script=$(render_startup_script)
   bash -n <<<"$script" || return 1
   [[ "$script" == *'HN=$(hostname)'* ]] || return 1
+  [[ "$script" == *'go1.26.4.linux-amd64.tar.gz'* \
+    && "$script" == *'1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f'* \
+    && "$script" == *'sha256sum -c -'* ]] || return 1
   [[ "$script" == *'`cargo build`'* ]] || return 1
   [[ "$script" == *'systemctl stop tailscaled.service 2>/dev/null || true'* ]] || return 1
   [[ "$script" == *'systemctl disable tailscaled.service 2>/dev/null || true'* ]] || return 1

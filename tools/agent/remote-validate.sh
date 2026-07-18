@@ -4,6 +4,7 @@
 #   tools/agent/remote-validate.sh preflight
 #   tools/agent/remote-validate.sh check [package]
 #   tools/agent/remote-validate.sh interop
+#   tools/agent/remote-validate.sh baseline [--allow-local-tailnet-credentials]
 #   tools/agent/remote-validate.sh tun --allow-privileged
 #   tools/agent/remote-validate.sh install --allow-privileged --allow-install
 set -euo pipefail
@@ -18,6 +19,7 @@ MODE="${1:-preflight}"
 PACKAGE=""
 ALLOW_PRIVILEGED=0
 ALLOW_INSTALL=0
+ALLOW_LOCAL_TAILNET_CREDENTIALS=0
 
 usage() {
   cat >&2 <<'EOF'
@@ -25,6 +27,7 @@ usage:
   tools/agent/remote-validate.sh preflight
   tools/agent/remote-validate.sh check [package]
   tools/agent/remote-validate.sh interop
+  tools/agent/remote-validate.sh baseline [--allow-local-tailnet-credentials]
   tools/agent/remote-validate.sh tun --allow-privileged
   tools/agent/remote-validate.sh install --allow-privileged --allow-install
 
@@ -52,7 +55,7 @@ esac
 
 case "$MODE" in
   -h|--help|help) usage ;;
-  preflight|interop) ;;
+  preflight|interop|baseline) ;;
   check)
     if [[ $# -gt 0 && "${1:-}" != --* ]]; then
       PACKAGE="$1"
@@ -67,6 +70,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --allow-privileged) ALLOW_PRIVILEGED=1 ;;
     --allow-install) ALLOW_INSTALL=1 ;;
+    --allow-local-tailnet-credentials) ALLOW_LOCAL_TAILNET_CREDENTIALS=1 ;;
     *) usage ;;
   esac
   shift
@@ -90,11 +94,23 @@ fi
 if [[ "$MODE" != install && "$ALLOW_INSTALL" == 1 ]]; then
   fail "--allow-install is valid only for install"
 fi
+if [[ "$ALLOW_LOCAL_TAILNET_CREDENTIALS" == 1 ]]; then
+  [[ "$MODE" == baseline || "$MODE" == interop || "$MODE" == tun ]] \
+    || fail "--allow-local-tailnet-credentials is valid only for baseline, interop, or tun"
+  if [[ -n "${TS_ORG_TOKEN:-}" ]]; then
+    [[ -z "${TS_ORG_CLIENT_ID:-}" && -z "${TS_ORG_CLIENT_SECRET:-}" ]] \
+      || fail "set either TS_ORG_TOKEN or TS_ORG_CLIENT_ID/TS_ORG_CLIENT_SECRET, not both"
+  else
+    [[ -n "${TS_ORG_CLIENT_ID:-}" && -n "${TS_ORG_CLIENT_SECRET:-}" ]] \
+      || fail "--allow-local-tailnet-credentials requires loaded Tailscale org credentials"
+  fi
+fi
 
 case "$MODE" in
   preflight) DEFAULT_TIMEOUT=120 ;;
   check) DEFAULT_TIMEOUT=3600 ;;
   interop|tun) DEFAULT_TIMEOUT=2400 ;;
+  baseline) DEFAULT_TIMEOUT=3600 ;;
   install) DEFAULT_TIMEOUT=1200 ;;
 esac
 DEADLINE="${RUSTSCALE_REMOTE_TIMEOUT:-$DEFAULT_TIMEOUT}"
@@ -152,7 +168,8 @@ write_result() {
   python3 - "$RESULT_FILE" "$RUN_ID" "$MODE" "$status" "$exit_code" "$cleanup" \
     "$TARGET" "$STARTED_AT" "$ended_at" "$DEADLINE" "$LOCAL_COMMIT" \
     "$INDEX_TREE" "$DIFF_SHA256" "$source_tree" "$archive_sha" \
-    "$UNTRACKED_COUNT" "$ALLOW_PRIVILEGED" "$ALLOW_INSTALL" "$output" <<'PYEOF'
+    "$UNTRACKED_COUNT" "$ALLOW_PRIVILEGED" "$ALLOW_INSTALL" \
+    "$ALLOW_LOCAL_TAILNET_CREDENTIALS" "$output" <<'PYEOF'
 import json
 import os
 import sys
@@ -160,7 +177,8 @@ import sys
 (
     path, run_id, mode, status, exit_code, cleanup, target, started_at,
     ended_at, deadline, commit, index_tree, diff_sha256, source_tree,
-    archive_sha256, untracked_count, privileged, install, output_path,
+    archive_sha256, untracked_count, privileged, install,
+    local_tailnet_credentials, output_path,
 ) = sys.argv[1:]
 facts = {}
 missing_required = []
@@ -204,6 +222,7 @@ data = {
     },
     "privileged_opt_in": privileged == "1",
     "install_opt_in": install == "1",
+    "local_tailnet_credentials_opt_in": local_tailnet_credentials == "1",
     "remote_facts": facts,
     "missing_required": missing_required,
     "missing_optional": missing_optional,
@@ -292,6 +311,49 @@ git -C "$ROOT" diff --no-ext-diff --binary --full-index -- . >"$AFTER_DIFF"
 CONTROL="$TMP/control"
 mkdir -p "$CONTROL"
 cp "$SOURCE_TAR" "$CONTROL/source.tar"
+if [[ "$ALLOW_LOCAL_TAILNET_CREDENTIALS" == 1 ]]; then
+  CREDENTIAL_FILE="$CONTROL/tailnet.env"
+  umask 077
+  python3 - "$CREDENTIAL_FILE" <<'PYEOF'
+import base64
+import os
+import pathlib
+import sys
+
+names = ("TS_ORG_TOKEN", "TS_ORG_CLIENT_ID", "TS_ORG_CLIENT_SECRET", "TS_API_BASE_URL")
+lines = []
+for name in names:
+    value = os.environ.get(name, "")
+    if value:
+        if "\0" in value or "\n" in value or "\r" in value:
+            raise SystemExit(f"invalid newline or NUL in {name}")
+        encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        lines.append(f"{name}\t{encoded}\n")
+pathlib.Path(sys.argv[1]).write_text("".join(lines), encoding="ascii")
+PYEOF
+  chmod 600 "$CREDENTIAL_FILE"
+fi
+cat >"$CONTROL/launch.sh" <<'REMOTE_LAUNCHER'
+#!/usr/bin/env bash
+set -euo pipefail
+credential_file="$1"
+shift
+if [[ -n "$credential_file" && -f "$credential_file" ]]; then
+  while IFS=$'\t' read -r name encoded; do
+    case "$name" in
+      TS_ORG_TOKEN|TS_ORG_CLIENT_ID|TS_ORG_CLIENT_SECRET|TS_API_BASE_URL) ;;
+      *) echo "invalid credential envelope" >&2; exit 76 ;;
+    esac
+    value="$(printf '%s' "$encoded" | base64 --decode)"
+    printf -v "$name" '%s' "$value"
+    export "$name"
+    unset value encoded
+  done <"$credential_file"
+  rm -f "$credential_file"
+fi
+exec "$@"
+REMOTE_LAUNCHER
+chmod 700 "$CONTROL/launch.sh"
 cat >"$CONTROL/runner.sh" <<'REMOTE_RUNNER'
 #!/usr/bin/env bash
 set -u
@@ -457,6 +519,11 @@ for command_name in tailscale tailscaled jq ip sudo systemctl; do
 done
 
 case "$MODE" in
+  baseline)
+    for command_name in jq curl python3; do
+      has "$command_name" || add_required "$command_name"
+    done
+    ;;
   interop)
     for command_name in tailscale tailscaled jq curl python3; do
       has "$command_name" || add_required "$command_name"
@@ -558,7 +625,12 @@ case "$MODE" in
     [[ -z "$PACKAGE" ]] || COMMAND+=("$PACKAGE")
     ;;
   interop)
+    COMMON_ENV+=("RUSTSCALE_REMOTE_EVIDENCE=1")
     COMMAND=(bash tools/interop.sh)
+    ;;
+  baseline)
+    COMMON_ENV+=("RUSTSCALE_REMOTE_EVIDENCE=1")
+    COMMAND=(bash tools/bench/run-native-baseline.sh)
     ;;
   tun)
     COMMAND=(bash tools/interop-tun.sh)
@@ -569,20 +641,31 @@ case "$MODE" in
     ;;
 esac
 
-# Credential-free modes get an empty environment apart from build/runtime
-# necessities. Explicit interop modes may consume only remote-side Tailscale
-# credentials already present in sshd's environment; no local values arrive.
-if [[ "$MODE" == interop || "$MODE" == tun ]]; then
-  for name in TS_ORG_TOKEN TS_ORG_CLIENT_ID TS_ORG_CLIENT_SECRET; do
-    if [[ -n "${!name:-}" ]]; then
-      COMMON_ENV+=("$name=${!name}")
-    fi
-  done
+# Credential-capable modes use a mode-0600 envelope. An explicit local
+# envelope takes precedence; otherwise credentials separately provisioned in
+# sshd's environment are copied into a temporary envelope. Values never enter
+# a command line and the launcher removes the envelope before exec.
+CREDENTIAL_FILE=""
+if [[ "$MODE" == interop || "$MODE" == baseline || "$MODE" == tun ]]; then
+  if [[ -f "$ROOT/control/tailnet.env" ]]; then
+    CREDENTIAL_FILE="$ROOT/control/tailnet.env"
+  elif [[ -n "${TS_ORG_TOKEN:-}${TS_ORG_CLIENT_ID:-}${TS_ORG_CLIENT_SECRET:-}" ]]; then
+    CREDENTIAL_FILE="$ROOT/tailnet.env"
+    umask 077
+    python3 - "$CREDENTIAL_FILE" <<'PYEOF'
+import base64, os, pathlib, sys
+names=("TS_ORG_TOKEN","TS_ORG_CLIENT_ID","TS_ORG_CLIENT_SECRET","TS_API_BASE_URL")
+pathlib.Path(sys.argv[1]).write_text("".join(
+    f"{name}\t{base64.b64encode(os.environ[name].encode()).decode()}\n"
+    for name in names if os.environ.get(name)), encoding="ascii")
+PYEOF
+  fi
 fi
+unset TS_ORG_TOKEN TS_ORG_CLIENT_ID TS_ORG_CLIENT_SECRET TS_API_BASE_URL || true
 
 cd "$SOURCE" || exit 1
 set +e
-env -i "${COMMON_ENV[@]}" "${COMMAND[@]}"
+env -i "${COMMON_ENV[@]}" "$ROOT/control/launch.sh" "$CREDENTIAL_FILE" "${COMMAND[@]}"
 command_status=$?
 set -e
 if (( command_status == 0 )); then
@@ -594,7 +677,9 @@ exit "$command_status"
 REMOTE_RUNNER
 chmod 700 "$CONTROL/runner.sh"
 BUNDLE="$TMP/bundle.tar"
-tar --no-xattrs -cf "$BUNDLE" -C "$CONTROL" source.tar runner.sh
+CONTROL_FILES=(source.tar runner.sh launch.sh)
+[[ ! -f "$CONTROL/tailnet.env" ]] || CONTROL_FILES+=(tailnet.env)
+tar --no-xattrs -cf "$BUNDLE" -C "$CONTROL" "${CONTROL_FILES[@]}"
 
 REMOTE_ENTRY=$(cat <<'REMOTE_ENTRY'
 set -u
@@ -711,7 +796,8 @@ set +e
 (
   unset OPENAI_API_KEY ANTHROPIC_API_KEY GH_TOKEN GITHUB_TOKEN PI_API_KEY \
     CODEX_API_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
-    GOOGLE_APPLICATION_CREDENTIALS AZURE_CLIENT_SECRET || true
+    GOOGLE_APPLICATION_CREDENTIALS AZURE_CLIENT_SECRET TS_ORG_TOKEN \
+    TS_ORG_CLIENT_ID TS_ORG_CLIENT_SECRET TS_API_BASE_URL || true
   python3 "$SCRIPT_DIR/run-with-deadline.py" "$LOCAL_DEADLINE" -- \
     ssh "${SSH_OPTIONS[@]}" "$TARGET" "$REMOTE_COMMAND" <"$BUNDLE"
 ) 2>&1 | tee "$OUTPUT"

@@ -104,12 +104,12 @@
         <p>Environment and evidence status are part of every result</p>
       </div>
 
-      <article class="performance-panel" data-benchmark="performance" data-environment="gcp-host-vm" data-mode="userspace-and-kernel-tun" data-evidence-status="measured" data-comparison="matched-evidence-sets" data-run="gcp-20260717-100908-a708151c79" data-rustscale-run="gcp-20260715-085022-076e87bd41" data-tailscaled-run="gcp-20260715-090601-02788a10b4" data-rustscale-profile="opt-in-outbound-pipeline" data-tailscaled-profile="default" data-provenance="docs/performance">
+      <article class="performance-panel" data-benchmark="performance" data-environment="gcp-host-vm" data-mode="userspace-and-kernel-tun" data-evidence-status="measured" data-comparison="separate-evidence-sets" data-run="gcp-20260717-100908-a708151c79" data-rustscale-run="gcp-20260715-085022-076e87bd41" data-tailscaled-run="gcp-20260715-090601-02788a10b4" data-rustscale-profile="opt-in-outbound-pipeline" data-tailscaled-profile="default" data-provenance="docs/performance">
         <div class="panel-heading">
           <h3>Performance · userspace and kernel TUN</h3>
           <span class="status status-measured">Measured evidence</span>
         </div>
-        <p class="scope">One matched GCP run, one RSB1 workload, and one direct comparison from 1 to 1000 streams.</p>
+        <p class="scope">The visible five-point RSB1 run compares two RustScale modes only. The earlier RustScale-versus-tailscaled kernel-TUN comparison below is a separate three-repeat evidence set.</p>
         <details hidden>
           <summary>Earlier kernel-TUN comparison with tailscaled</summary>
           <p class="scope">Direct UDP on matched GCP <code>n1-standard-4</code> hosts, Linux 6.8, three 10-second samples per throughput point. This is a host benchmark; neither daemon ran in a container.</p>
@@ -144,9 +144,9 @@
 
         <div class="panel-heading">
           <h3>Current RSB1 scale run</h3>
-          <span class="status status-measured">Matched userspace ↔ TUN</span>
+          <span class="status status-measured">Matched RustScale modes</span>
         </div>
-        <p class="scope">Direct UDP on matched GCP <code>n2-standard-16</code> endpoints. Each point is the median of three complete 10-second RSB1 reverse-throughput samples. Both transports include 50-sample RSB1 latency distributions and complete 1-second server/client CPU and RSS timelines.</p>
+        <p class="scope">Direct UDP on matched GCP <code>n2-standard-16</code> endpoints. This is RustScale embedded tsnet versus RustScale kernel TUN, not a RustScale-versus-Tailscale result. Each point is the median of three complete 10-second RSB1 reverse-throughput samples. Both transports include 50-sample RSB1 latency distributions and complete 1-second server/client CPU and RSS timelines.</p>
         <div class="chart-grid">
         <div class="chart" role="img" aria-label="Unified RustScale RSB1 median throughput comparison. Userspace versus kernel TUN: P1 1231.1 versus 3169.4, P10 927.0 versus 3130.7, P100 779.5 versus 2395.1, P500 216.3 versus 1316.8, and P1000 439.8 versus 993.5 megabits per second.">
           <h3>Median throughput · Mbps · higher is better</h3>
@@ -192,13 +192,13 @@
             <p><strong>Latency:</strong> p50 180 us · p95 364 us · p99 1752 us · 200 rounds</p>
           </div>
           <div class="fact" data-product="tailscaled" data-userspace-record="historical" data-throughput-mbps="383.71" data-throughput-duration-s="5" data-latency-p50-us="257" data-latency-p95-us="422" data-latency-p99-us="481" data-latency-count="200">
-            <h4>tailscaled · 1.98.8-t05a918293</h4>
+            <h4>tailscaled daemon proxy · 1.98.8-t05a918293</h4>
             <p><strong>Throughput:</strong> 383.71 Mbps · 1 stream · 5s</p>
             <p><strong>Latency:</strong> p50 257 us · p95 422 us · p99 481 us · 200 rounds</p>
           </div>
         </div>
-        <p class="performance-note"><strong>CPU and RSS:</strong> not recorded. RustScale used its then-current tsnet userspace defaults; tailscaled used <code>--tun=userspace-networking</code>. These historical samples do not establish current defaults or an opt-in performance profile.</p>
-        <p class="performance-note">Run a current matched userspace comparison with provenance capture:</p>
+        <p class="performance-note"><strong>CPU and RSS:</strong> not recorded. RustScale used embedded tsnet; the tailscaled path used a separate <code>--tun=userspace-networking</code> daemon plus SOCKS5/Serve proxy boundaries. It is daemon-proxy evidence, not embedded Go tsnet evidence. These historical samples do not establish current defaults or an opt-in performance profile.</p>
+        <p class="performance-note">Run current separately labeled embedded-Rust and tailscaled daemon-proxy cells with provenance capture:</p>
         <pre class="reproduction"><code data-reproduction="userspace">tools/bench/gcp/run-matrix.sh --repeat 3 --topology same-zone --path direct --config rs-userspace,ts-userspace</code></pre>
         <p class="provenance">Provenance IDs: not recorded by the historical harness; labels are <code>phase-10d</code> and <code>tailscaled 1.98.8-t05a918293</code>. See the <a href="https://github.com/rajsinghtech/rustscale/blob/master/docs/benchmarks.md#results">tracked userspace record and caveats</a>.</p>
       </article>

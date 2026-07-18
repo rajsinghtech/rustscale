@@ -26,7 +26,7 @@ PANEL_CONTRACTS = {
         "data-environment": "gcp-host-vm",
         "data-mode": "userspace-and-kernel-tun",
         "data-evidence-status": "measured",
-        "data-comparison": "matched-evidence-sets",
+        "data-comparison": "separate-evidence-sets",
         "data-run": PARITY_RUN_ID,
         "data-rustscale-run": HOST_RUN_IDS["rustscale"],
         "data-tailscaled-run": HOST_RUN_IDS["tailscaled"],
@@ -500,7 +500,7 @@ def validate_userspace_facts(userspace: dict[str, object], document: str) -> Non
     expected = tracked_userspace(document)
     evidence_labels = {
         "rustscale": "RustScale · phase-10d",
-        "tailscaled": "tailscaled · 1.98.8-t05a918293",
+        "tailscaled": "tailscaled daemon proxy · 1.98.8-t05a918293",
     }
     facts = userspace["facts"]
     assert isinstance(facts, list)
@@ -591,7 +591,7 @@ def validate_parity_evidence(parser: PerformanceParser) -> None:
         latency = result.get("latency", {})
         if latency.get("count") != 50 or len(latency.get("samples_ns", [])) != 50:
             raise SystemExit(f"tracked {config} latency distribution is incomplete")
-    require_text(parity, "Matched userspace ↔ TUN", "Requested peer load: 1", "observed peer membership was not instrumented", "raw evidence and methodology")
+    require_text(parity, "Matched RustScale modes", "not a RustScale-versus-Tailscale result", "Requested peer load: 1", "observed peer membership was not instrumented", "raw evidence and methodology")
 
 
 def main() -> None:
@@ -652,8 +652,10 @@ def main() -> None:
         "they are not a matched comparison",
         "No deltas or comparative bars are shown.",
         "CPU and RSS: not recorded.",
-        "then-current tsnet userspace defaults",
+        "RustScale used embedded tsnet",
         "--tun=userspace-networking",
+        "daemon plus SOCKS5/Serve proxy boundaries",
+        "not embedded Go tsnet evidence",
         "do not establish current defaults or an opt-in performance profile",
         "Provenance IDs: not recorded by the historical harness",
     )

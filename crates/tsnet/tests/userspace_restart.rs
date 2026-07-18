@@ -97,10 +97,14 @@ async fn exchange_once(
     outgoing.shutdown().await.expect("shutdown stream");
 }
 
-async fn wait_for_direct(server: &Server, peer: &NodePublic) {
+async fn establish_direct(server: &Server, peer: &NodePublic, peer_ip: Ipv4Addr) {
     let deadline = Instant::now() + STEP_TIMEOUT;
+    let magicsock = server.magicsock().expect("client magicsock");
     while server.peer_path_class(peer) != Some(PathClass::Direct) {
         assert!(Instant::now() < deadline, "peer path did not become direct");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let ping = magicsock.cli_ping(peer, "restart-service", IpAddr::V4(peer_ip), 0);
+        let _ = tokio::time::timeout(remaining, ping).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -138,6 +142,10 @@ async fn durable_identity_rotates_disco_and_reestablishes_direct_after_restart()
         .expect("service startup deadline")
         .expect("service startup");
     let service_key = service.node_key().expect("service node key");
+    control
+        .await_node_in_map_request(&service_key, STEP_TIMEOUT)
+        .await
+        .expect("service streaming map request");
     let service_endpoints = service
         .magicsock()
         .expect("service magicsock")
@@ -162,10 +170,14 @@ async fn durable_identity_rotates_disco_and_reestablishes_direct_after_restart()
     let first_control_node = control.node(&node_key).expect("first control node");
     let first_magicsock = first.magicsock().expect("first magicsock");
     let first_disco = first_magicsock.disco_public();
+    control
+        .await_node_in_map_request(&node_key, STEP_TIMEOUT)
+        .await
+        .expect("first client streaming map request");
     control.set_node_endpoints(&service_key, service_endpoints.clone());
     control.set_node_endpoints(&node_key, first_magicsock.local_endpoints());
     wait_for_peer(&first, &service_key).await;
-    wait_for_direct(&first, &service_key).await;
+    establish_direct(&first, &service_key, service_ip).await;
     exchange_once(&mut first, &mut listener, service_ip, b"first").await;
 
     // Even a streaming response that happens to carry Node, Peers, and Domain
@@ -209,7 +221,7 @@ async fn durable_identity_rotates_disco_and_reestablishes_direct_after_restart()
     control.resume_auto_map(&node_key);
     control.set_node_endpoints(&service_key, service_endpoints.clone());
     wait_for_peer(&first, &service_key).await;
-    wait_for_direct(&first, &service_key).await;
+    establish_direct(&first, &service_key, service_ip).await;
 
     tokio::time::timeout(STEP_TIMEOUT, first.close())
         .await
@@ -264,6 +276,10 @@ async fn durable_identity_rotates_disco_and_reestablishes_direct_after_restart()
     assert_eq!(second_control_node.ID, first_control_node.ID);
     assert_eq!(second_control_node.StableID, first_control_node.StableID);
     assert_eq!(second_control_node.Machine, first_control_node.Machine);
+    control
+        .await_node_in_map_request(&node_key, STEP_TIMEOUT)
+        .await
+        .expect("restarted client streaming map request");
 
     control.set_node_endpoints(&service_key, service_endpoints);
     control.set_node_endpoints(
@@ -274,7 +290,7 @@ async fn durable_identity_rotates_disco_and_reestablishes_direct_after_restart()
             .local_endpoints(),
     );
     wait_for_peer(&second, &service_key).await;
-    wait_for_direct(&second, &service_key).await;
+    establish_direct(&second, &service_key, service_ip).await;
     exchange_once(&mut second, &mut listener, service_ip, b"second").await;
     tokio::time::timeout(STEP_TIMEOUT, second.close())
         .await

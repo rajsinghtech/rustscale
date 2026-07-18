@@ -576,11 +576,9 @@ pub(crate) fn spawn_map_update_task(
     tailnet_identity: String,
     mut peer_snapshot_fresh: bool,
 ) -> JoinHandle<()> {
-    // Create the netmap cache helper once so that save_if_changed can
-    // dedup identical writes via the in-memory SHA-256 hash.
-    let netmap_cache = state_scope
-        .as_ref()
-        .map(|scope| NetMapCache::new_scoped(scope, ""));
+    // Deliberately do not persist raw streaming responses here. Their fields
+    // are independently optional deltas, even when Node, Peers, and Domain all
+    // happen to be present; only bootstrap owns the normalized restart cache.
     // Watchdog for map-response timeout: fires if no MapResponse for >2m5s
     // (matching Go's MapResponseTimeout duration). Fed on each response.
     let map_timeout_watchdog = Watchdog::new(
@@ -1273,16 +1271,6 @@ pub(crate) fn spawn_map_update_task(
                             ClientVersion: serde_json::to_value(cv).ok(),
                             ..Default::default()
                         });
-                    }
-
-                    // Save the updated netmap to disk (best-effort) so a
-                    // restart can skip the blocking first fetch. Dedup via
-                    // SHA-256 skips the write if the content is unchanged
-                    // since the last successful save.
-                    if let Some(ref cache) = netmap_cache {
-                        if let Err(e) = cache.save_if_changed(&node_pub, &resp) {
-                            log::warn!("tsnet: netmap cache save failed (non-fatal): {e}");
-                        }
                     }
                 }
                 Some(Err(e)) => {

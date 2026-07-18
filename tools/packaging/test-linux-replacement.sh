@@ -331,7 +331,7 @@ uninstall_release() {
 # this removes only state attributable to this isolated run. Successful journey
 # assertions happen before this function can be used.
 emergency_kernel_cleanup() {
-  local family preference table ifindex
+  local family preference table ifindex rules
   sudo -n timeout --signal=KILL 5s \
     systemctl kill --kill-whom=all --signal=KILL rustscaled.service \
     >/dev/null 2>&1 || true
@@ -371,6 +371,22 @@ emergency_kernel_cleanup() {
     sudo -n timeout --signal=KILL 3s \
       rm -f "/run/rustscale/rule-owners/$RULE_BASE" || true
   fi
+  # Preflight proved that no protocol-201 rule existed before this journey.
+  # Sweep every such rule so an interrupted restart with a new TUN ifindex
+  # cannot leave either generation's chain or emergency direct-traffic block.
+  for family in -4 -6; do
+    for _ in {1..16}; do
+      rules=$(timeout --signal=KILL 3s ip "$family" -details rule show 2>/dev/null || true)
+      preference=$(printf '%s\n' "$rules" \
+        | awk '/proto 201([[:space:]]|$)/ {sub(":", "", $1); print $1; exit}')
+      [[ "$preference" =~ ^[0-9]+$ ]] || break
+      sudo -n timeout --signal=KILL 3s \
+        ip "$family" rule del pref "$preference" protocol 201 \
+        >/dev/null 2>&1 || break
+    done
+  done
+  sudo -n timeout --signal=KILL 3s \
+    rm -rf /run/rustscale/rule-owners >/dev/null 2>&1 || true
   sudo -n timeout --signal=KILL 3s \
     ip link delete dev "$TUN_NAME" >/dev/null 2>&1 || true
   sudo -n timeout --signal=KILL 3s rm -f "$DEFAULT_SOCKET" || true
@@ -406,6 +422,13 @@ assert_kernel_clean() {
       leaked=1
     fi
   fi
+  for family in -4 -6; do
+    rules=$(timeout --signal=KILL 3s ip "$family" -details rule show 2>/dev/null || true)
+    if printf '%s\n' "$rules" | grep -E 'proto 201([[:space:]]|$)' >/dev/null; then
+      echo "$LABEL cleanup leak: IPv${family#-} protocol-201 rule remains" >&2
+      leaked=1
+    fi
+  done
   routes=$(timeout --signal=KILL 3s ip -4 route show table 52 2>/dev/null || true)
   if printf '%s\n' "$routes" | grep -F "dev $TUN_NAME" >/dev/null; then
     echo "$LABEL cleanup leak: table 52 still routes through $TUN_NAME" >&2

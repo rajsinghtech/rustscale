@@ -6,7 +6,7 @@ exclude = ["crates/bench-tsrs", "vendor/boringtun"]
 [workspace.package]
 edition = "2021"
 rust-version = "1.91"
-version = "0.1.3"
+version = "0.1.4"
 license = "BSD-3-Clause"
 repository = "https://github.com/rajsinghtech/rustscale"
 
@@ -66,24 +66,24 @@ async-trait = "0.1"
 # stage; real LE certs via control come in a later phase).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
-rustscale-tsaddr = { path = "crates/tsaddr", version = "0.1.3" }
-rustscale-packet = { path = "crates/packet", version = "0.1.3" }
-rustscale-netmon = { path = "crates/netmon", version = "0.1.3" }
+rustscale-tsaddr = { path = "crates/tsaddr", version = "0.1.4" }
+rustscale-packet = { path = "crates/packet", version = "0.1.4" }
+rustscale-netmon = { path = "crates/netmon", version = "0.1.4" }
 socket2 = { version = "0.6", features = ["all"] }
-rustscale-netns = { path = "crates/netns", version = "0.1.3" }
-rustscale-dnscache = { path = "crates/dnscache", version = "0.1.3" }
-rustscale-dnsfallback = { path = "crates/dnsfallback", version = "0.1.3" }
-rustscale-safesocket = { path = "crates/safesocket", version = "0.1.3" }
-rustscale-routetable = { path = "crates/routetable", version = "0.1.3" }
-rustscale-routecheck = { path = "crates/routecheck", version = "0.1.3" }
-rustscale-dnsname = { path = "crates/dnsname", version = "0.1.3" }
-rustscale-ringlog = { path = "crates/ringlog", version = "0.1.3" }
-rustscale-speedtest = { path = "crates/speedtest", version = "0.1.3" }
-rustscale-singleflight = { path = "crates/singleflight", version = "0.1.3" }
-rustscale-limiter = { path = "crates/limiter", version = "0.1.3" }
-rustscale-memnet = { path = "crates/memnet", version = "0.1.3" }
-rustscale-art = { path = "crates/art", version = "0.1.3" }
-rustscale-syspolicy = { path = "crates/syspolicy", version = "0.1.3" }
+rustscale-netns = { path = "crates/netns", version = "0.1.4" }
+rustscale-dnscache = { path = "crates/dnscache", version = "0.1.4" }
+rustscale-dnsfallback = { path = "crates/dnsfallback", version = "0.1.4" }
+rustscale-safesocket = { path = "crates/safesocket", version = "0.1.4" }
+rustscale-routetable = { path = "crates/routetable", version = "0.1.4" }
+rustscale-routecheck = { path = "crates/routecheck", version = "0.1.4" }
+rustscale-dnsname = { path = "crates/dnsname", version = "0.1.4" }
+rustscale-ringlog = { path = "crates/ringlog", version = "0.1.4" }
+rustscale-speedtest = { path = "crates/speedtest", version = "0.1.4" }
+rustscale-singleflight = { path = "crates/singleflight", version = "0.1.4" }
+rustscale-limiter = { path = "crates/limiter", version = "0.1.4" }
+rustscale-memnet = { path = "crates/memnet", version = "0.1.4" }
+rustscale-art = { path = "crates/art", version = "0.1.4" }
+rustscale-syspolicy = { path = "crates/syspolicy", version = "0.1.4" }
 
 # Shared lint policy: pedantic where sane, but allow the noisier style lints so
 # that the default `cargo clippy` run stays clean and readable.

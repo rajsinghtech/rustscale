@@ -229,6 +229,112 @@ async fn lock_init_filters_unsigned_recovers_and_disables() {
     recovered.close().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_disable_denylist_survives_restart_and_requires_a_fresh_map() {
+    let mut control = TestControlServer::new();
+    control.start().await.unwrap();
+    control.add_fake_node();
+
+    let state = tempfile::tempdir().unwrap();
+    let sockets = tempfile::tempdir().unwrap();
+    let socket = sockets.path().join("lock-local-disable.sock");
+    let mut server = Server::builder()
+        .disable_portmapping(true)
+        .hostname("lock-local-disable")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket)
+        .build()
+        .unwrap();
+    Box::pin(tokio::time::timeout(Duration::from_secs(60), server.up()))
+        .await
+        .expect("startup deadline")
+        .expect("startup");
+
+    let client = LocalClient::new(&socket);
+    let initial = client.tailnet_lock_status().await.unwrap();
+    let public: NLPublic = initial["PublicKey"].as_str().unwrap().parse().unwrap();
+    let secret = vec![0x64; 32];
+    client
+        .tailnet_lock_init(&serde_json::json!({
+            "Keys": [Key {
+                kind: KeyKind::Key25519,
+                votes: 1,
+                public: public.raw32().to_vec(),
+                meta: None,
+            }],
+            "DisablementValues": [disablement_kdf(&secret)],
+            "DisablementSecrets": [secret],
+            "SupportDisablement": [],
+            "Resume": false,
+        }))
+        .await
+        .unwrap();
+    wait_until(|| server.status().peer_count == 1, "signed peer visible").await;
+
+    client.tailnet_lock_force_local_disable().await.unwrap();
+    let withdrawn = client.tailnet_lock_status().await.unwrap();
+    assert!(withdrawn["LocalDisabled"].as_bool().unwrap());
+    assert!(!withdrawn["StateConsistent"].as_bool().unwrap());
+    assert_eq!(server.status().peer_count, 0);
+
+    // Local disable does not reuse the old filtered generation. A subsequent
+    // authenticated map bootstraps the genesis, matches its denylisted state
+    // ID, and only then publishes an unfiltered local generation.
+    control.add_fake_node();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = client.tailnet_lock_status().await.unwrap();
+        if status["LocalDisabled"].as_bool().unwrap_or(false)
+            && status["StateConsistent"].as_bool().unwrap_or(false)
+            && server.status().peer_count == 2
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh map did not activate the denylisted local-disable state"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(find_file(state.path(), "tailnet-lock-local-disable.json").is_some());
+    if let Some(authority_parent) = find_dir(state.path(), "tailnet-lock") {
+        assert!(std::fs::read_dir(authority_parent)
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    server.close().await.unwrap();
+    if let Some(cache) = find_file(state.path(), "netmap-cache.json") {
+        std::fs::remove_file(cache).unwrap();
+    }
+    let mut restarted = Server::builder()
+        .disable_portmapping(true)
+        .hostname("lock-local-disable")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket)
+        .build()
+        .unwrap();
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(60),
+        restarted.up(),
+    ))
+    .await
+    .expect("restart deadline")
+    .expect("restart");
+    let restarted_status = LocalClient::new(&socket)
+        .tailnet_lock_status()
+        .await
+        .unwrap();
+    assert!(restarted_status["LocalDisabled"].as_bool().unwrap());
+    assert!(restarted_status["StateConsistent"].as_bool().unwrap());
+    assert_eq!(restarted.status().peer_count, 2);
+    restarted.close().await.unwrap();
+}
+
 fn find_dir(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     find_entry(root, name, true)
 }

@@ -306,6 +306,38 @@ impl Server {
         }
     }
 
+    /// Inject a dual-stack, approved exit-node peer and return its exact map
+    /// representation. This keeps CLI/LocalAPI route tests hermetic while
+    /// exercising the same `AllowedIPs` capability predicate as production.
+    pub fn add_fake_exit_node(&self, name: impl Into<String>, online: bool) -> Node {
+        let mut inner = self.inner.lock().unwrap();
+        let nk = NodePrivate::generate().public();
+        let id = inner.next_node_id;
+        inner.next_node_id += 1;
+        let ip4 = format!("100.64.{}.{}", (id >> 8) as u8, id as u8);
+        let ip6 = format!("fd7a:115c:a1e0::{id:x}");
+        let addr4 = format!("{ip4}/32");
+        let addr6 = format!("{ip6}/128");
+        let node = Node {
+            ID: id,
+            StableID: format!("TESTCTRL{id:08x}"),
+            User: id,
+            Machine: MachinePrivate::generate().public(),
+            Key: nk.clone(),
+            DiscoKey: DiscoPrivate::generate().public(),
+            Addresses: vec![addr4.clone(), addr6.clone()],
+            AllowedIPs: vec![addr4, addr6, "0.0.0.0/0".into(), "::/0".into()],
+            Name: name.into(),
+            Online: Some(online),
+            ..Default::default()
+        };
+        inner.nodes.insert(nk, node.clone());
+        for tx in inner.updates.values() {
+            let _ = tx.try_send(UpdateType::PeerChanged);
+        }
+        node
+    }
+
     /// Override the capability map sent to a specific client.
     pub fn set_node_cap_map(&self, node_key: &NodePublic, cap_map: NodeCapMap) {
         let mut inner = self.inner.lock().unwrap();

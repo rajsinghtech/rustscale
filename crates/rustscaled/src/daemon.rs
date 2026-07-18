@@ -177,9 +177,15 @@ async fn retry_close<R: CloseRunner>(runner: &mut R) -> Result<(), R::Error> {
 }
 
 const UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE: &str = "server cleanup is busy or failed; retry close: magicsock cleanup: portmapper cleanup incomplete: protocol error: portmapper cleanup remains uncertain";
+const UNCONFIRMED_LOGOUT_PORTMAP_RELEASE: &str = "logout cleanup requires retry: magicsock cleanup: portmapper cleanup incomplete: protocol error: portmapper cleanup remains uncertain";
 
 fn is_only_unconfirmed_external_portmap_release(error: &TsnetError) -> bool {
-    matches!(error, TsnetError::ShutdownIncomplete(detail) if detail == UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE)
+    matches!(
+        error,
+        TsnetError::ShutdownIncomplete(detail)
+            if detail == UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE
+                || detail == UNCONFIRMED_LOGOUT_PORTMAP_RELEASE
+    )
 }
 
 async fn close_server(server: &mut Server) -> Result<(), TsnetError> {
@@ -215,17 +221,29 @@ impl LogoutRunner for Server {
     }
 }
 
+#[cfg(test)]
+const LOGOUT_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(not(test))]
+const LOGOUT_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+enum LogoutRetryOutcome<E> {
+    Complete,
+    Shutdown,
+    Exhausted(E),
+}
+
 /// Retry a retained logout phase with bounded exponential backoff. Each
 /// attempt is cancellation-safe because Server transfers transaction ownership
 /// before awaiting; shutdown stops daemon retries and Drop continues ownership.
 async fn retry_logout_until_shutdown<R, S>(
     runner: &mut R,
     mut shutdown: std::pin::Pin<&mut S>,
-) -> bool
+) -> LogoutRetryOutcome<R::Error>
 where
     R: LogoutRunner,
     S: std::future::Future<Output = ()> + ?Sized,
 {
+    let deadline = tokio::time::Instant::now() + LOGOUT_RETRY_TIMEOUT;
     let mut delay = std::time::Duration::from_millis(25);
     loop {
         let result = tokio::select! {
@@ -233,18 +251,89 @@ where
             () = shutdown.as_mut() => None,
         };
         match result {
-            Some(Ok(())) => return true,
+            Some(Ok(())) => return LogoutRetryOutcome::Complete,
+            Some(Err(error)) if tokio::time::Instant::now() >= deadline => {
+                return LogoutRetryOutcome::Exhausted(error);
+            }
             Some(Err(error)) => {
                 log::warn!("rustscaled: logout incomplete; retrying: {error}");
             }
-            None => return false,
+            None => return LogoutRetryOutcome::Shutdown,
         }
         tokio::select! {
-            () = tokio::time::sleep(delay) => {}
-            () = shutdown.as_mut() => return false,
+            () = tokio::time::sleep(delay.min(deadline.saturating_duration_since(tokio::time::Instant::now()))) => {}
+            () = shutdown.as_mut() => return LogoutRetryOutcome::Shutdown,
         }
         delay = (delay * 2).min(std::time::Duration::from_secs(5));
     }
+}
+
+enum DaemonLogoutDisposition {
+    Cleaned,
+    StopNow,
+}
+
+async fn finish_server_logout_until_shutdown<S>(
+    server: &mut Server,
+    shutdown: std::pin::Pin<&mut S>,
+) -> Result<DaemonLogoutDisposition, TsnetError>
+where
+    S: std::future::Future<Output = ()> + ?Sized,
+{
+    match retry_logout_until_shutdown(server, shutdown).await {
+        LogoutRetryOutcome::Complete => {
+            server.complete_pending_logout_requests();
+            log::info!("rustscaled: logged out, state cleared → NeedsLogin");
+            Ok(DaemonLogoutDisposition::Cleaned)
+        }
+        LogoutRetryOutcome::Shutdown => {
+            server.fail_pending_logout_requests("daemon shutdown interrupted logout completion");
+            log::info!("rustscaled: shutdown interrupted logout; Drop retained its transaction");
+            Ok(DaemonLogoutDisposition::StopNow)
+        }
+        LogoutRetryOutcome::Exhausted(error)
+            if is_only_unconfirmed_external_portmap_release(&error) =>
+        {
+            // Durable logout state and all local packet ownership committed
+            // before this external NAT lease uncertainty. Process exit closes
+            // the socket; the unconfirmed remote lease can only age out.
+            server.complete_pending_logout_requests();
+            log::warn!(
+                "rustscaled: logout complete with unconfirmed external port mapping release"
+            );
+            Ok(DaemonLogoutDisposition::StopNow)
+        }
+        LogoutRetryOutcome::Exhausted(error) => {
+            server.fail_pending_logout_requests(format!("logout cleanup failed: {error}"));
+            Err(error)
+        }
+    }
+}
+
+/// Commit the daemon lifecycle intent through the live LocalAPI preference
+/// transaction. This updates the in-memory snapshot and atomically replaces
+/// prefs.json without ever including the one-shot enrollment credential.
+async fn persist_direct_auth_running_intent(
+    socket_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut update = rustscale_ipn::MaskedPrefs::default();
+    update.Prefs.WantRunning = true;
+    update.WantRunningSet = true;
+    update.Prefs.LoggedOut = false;
+    update.LoggedOutSet = true;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        rustscale_localclient::LocalClient::new(socket_path).edit_prefs(&update),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out persisting direct auth-key running intent",
+        )
+    })??;
+    Ok(())
 }
 
 async fn run_with_auth_key(
@@ -296,12 +385,19 @@ async fn run_with_auth_key(
             ..Default::default()
         };
         Box::pin(server.up_tun(config)).await?;
-        log::info!("rustscaled: TUN mode up (hostname={hostname})");
     } else {
         Box::pin(server.up()).await?;
-        log::info!("rustscaled: up (hostname={hostname})");
     }
 
+    // Direct TS_AUTHKEY/config enrollment bypasses the CLI StartOptions path
+    // that normally persists WantRunning. Commit that intent only after the
+    // node has enrolled successfully and before reporting the daemon Running.
+    persist_direct_auth_running_intent(socket_path).await?;
+    if tun {
+        log::info!("rustscaled: TUN mode up (hostname={hostname})");
+    } else {
+        log::info!("rustscaled: up (hostname={hostname})");
+    }
     print_status(&server, socket_path);
 
     // Wait for either shutdown or logout. A transient register/disk/cleanup
@@ -322,13 +418,12 @@ async fn run_with_auth_key(
     };
     if logout_requested {
         log::info!("rustscaled: logout requested");
-        if !retry_logout_until_shutdown(&mut server, shutdown.as_mut()).await {
-            server.fail_pending_logout_requests("daemon shutdown interrupted logout completion");
-            log::info!("rustscaled: shutdown interrupted logout; Drop retained its transaction");
+        if matches!(
+            finish_server_logout_until_shutdown(&mut server, shutdown.as_mut()).await?,
+            DaemonLogoutDisposition::StopNow
+        ) {
             return Ok(());
         }
-        server.complete_pending_logout_requests();
-        log::info!("rustscaled: logged out, state cleared → NeedsLogin");
     }
 
     log::info!("rustscaled: shutting down...");
@@ -597,17 +692,12 @@ async fn run_interactive(
                 }
             } => {
                 log::info!("rustscaled: logout requested");
-                if !retry_logout_until_shutdown(&mut server, shutdown.as_mut()).await {
-                    server.fail_pending_logout_requests(
-                        "daemon shutdown interrupted logout completion",
-                    );
-                    log::info!(
-                        "rustscaled: shutdown interrupted logout; Drop retained its transaction"
-                    );
+                if matches!(
+                    finish_server_logout_until_shutdown(&mut server, shutdown.as_mut()).await?,
+                    DaemonLogoutDisposition::StopNow
+                ) {
                     return Ok(());
                 }
-                server.complete_pending_logout_requests();
-                log::info!("rustscaled: logged out, state cleared → NeedsLogin");
                 break;
             }
             Some(cmd) = command_rx.recv() => {
@@ -618,14 +708,16 @@ async fn run_interactive(
                     }
                     DaemonCommand::Logout => {
                         log::info!("rustscaled: logout requested via LocalAPI command");
-                        if !retry_logout_until_shutdown(&mut server, shutdown.as_mut()).await {
-                            server.fail_pending_logout_requests(
-                                "daemon shutdown interrupted logout completion",
-                            );
+                        if matches!(
+                            finish_server_logout_until_shutdown(
+                                &mut server,
+                                shutdown.as_mut(),
+                            )
+                            .await?,
+                            DaemonLogoutDisposition::StopNow
+                        ) {
                             return Ok(());
                         }
-                        server.complete_pending_logout_requests();
-                        log::info!("rustscaled: logged out, state cleared → NeedsLogin");
                         break;
                     }
                     DaemonCommand::ReloadConfig => {
@@ -891,12 +983,88 @@ mod tests {
     use rustscale_tsnet::PreferencePolicy;
 
     #[cfg(unix)]
-    use super::{drive_login_until_running, LoginLoopOutcome};
+    use super::{drive_login_until_running, persist_direct_auth_running_intent, LoginLoopOutcome};
     use super::{
         is_only_unconfirmed_external_portmap_release, retry_close, retry_logout_until_shutdown,
-        should_resume_persisted_node, CloseRunner, InstallUpdatesPolicy, LogoutRunner,
-        UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE,
+        should_resume_persisted_node, CloseRunner, InstallUpdatesPolicy, LogoutRetryOutcome,
+        LogoutRunner, UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE, UNCONFIRMED_LOGOUT_PORTMAP_RELEASE,
     };
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_auth_enrollment_resumes_same_node_without_key() {
+        let mut control = rustscale_testcontrol::Server::new();
+        control.start().await.unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let socket = state_dir.path().join("direct-auth-restart.sock");
+        let secret = "tskey-test-direct-auth-one-shot";
+        let mut enrolled = rustscale_tsnet::Server::builder()
+            .hostname("direct-auth-restart")
+            .auth_key(secret)
+            .control_url(control.base_url())
+            .state_dir(state_dir.path())
+            .localapi_path(&socket)
+            .disable_portmapping(true)
+            .build()
+            .unwrap();
+        let enrolled_status =
+            tokio::time::timeout(Duration::from_secs(15), Box::pin(enrolled.up()))
+                .await
+                .expect("direct auth enrollment timed out")
+                .expect("direct auth enrollment failed");
+        let enrolled_ip = *enrolled_status
+            .tailscale_ips
+            .first()
+            .expect("enrolled node has no tailnet IP");
+
+        persist_direct_auth_running_intent(&socket)
+            .await
+            .expect("persist direct auth lifecycle intent");
+        let prefs = rustscale_ipn::Prefs::load(state_dir.path()).unwrap();
+        assert!(prefs.WantRunning);
+        assert!(!prefs.LoggedOut);
+        assert!(
+            !std::fs::read_to_string(state_dir.path().join("prefs.json"))
+                .unwrap()
+                .contains(secret),
+            "one-shot auth key leaked into persisted preferences"
+        );
+        assert_eq!(control.num_nodes(), 1);
+        let enrolled_node = control.all_nodes()[0].clone();
+
+        tokio::time::timeout(Duration::from_secs(15), enrolled.close())
+            .await
+            .expect("enrolled server close timed out")
+            .expect("enrolled server close failed");
+
+        let mut restarted = rustscale_tsnet::Server::builder()
+            .hostname("direct-auth-restart")
+            .control_url(control.base_url())
+            .state_dir(state_dir.path())
+            .localapi_path(&socket)
+            .disable_portmapping(true)
+            .build()
+            .unwrap();
+        let restarted_status =
+            tokio::time::timeout(Duration::from_secs(15), Box::pin(restarted.up()))
+                .await
+                .expect("credential-free restart timed out")
+                .expect("credential-free restart failed");
+        assert_eq!(restarted_status.tailscale_ips.first(), Some(&enrolled_ip));
+        assert_eq!(control.num_nodes(), 1, "restart registered a new node");
+        assert_eq!(control.all_nodes()[0].Key, enrolled_node.Key);
+        assert_eq!(control.register_auth_presence(), [true, false]);
+        assert_eq!(
+            restarted.ipn_status().await.unwrap().BackendState,
+            "Running"
+        );
+
+        tokio::time::timeout(Duration::from_secs(15), restarted.close())
+            .await
+            .expect("restarted server close timed out")
+            .expect("restarted server close failed");
+    }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -989,6 +1157,12 @@ mod tests {
             UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE.into(),
         );
         assert!(is_only_unconfirmed_external_portmap_release(&accepted));
+        let accepted_logout = rustscale_tsnet::TsnetError::ShutdownIncomplete(
+            UNCONFIRMED_LOGOUT_PORTMAP_RELEASE.into(),
+        );
+        assert!(is_only_unconfirmed_external_portmap_release(
+            &accepted_logout
+        ));
         let rejected =
             rustscale_tsnet::TsnetError::ShutdownIncomplete("router cleanup incomplete".into());
         assert!(!is_only_unconfirmed_external_portmap_release(&rejected));
@@ -1043,13 +1217,32 @@ mod tests {
             calls: Arc::clone(&calls),
         };
         let mut shutdown = Box::pin(std::future::pending::<()>());
-        assert!(tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             Duration::from_secs(1),
             retry_logout_until_shutdown(&mut logout, shutdown.as_mut()),
         )
         .await
-        .expect("logout retries exceeded their bounded backoff"));
+        .expect("logout retries exceeded their bounded backoff");
+        assert!(matches!(outcome, LogoutRetryOutcome::Complete));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn daemon_bounds_persistently_uncertain_logout_cleanup() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut logout = TransientLogout {
+            remaining_failures: usize::MAX,
+            calls: Arc::clone(&calls),
+        };
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            retry_logout_until_shutdown(&mut logout, shutdown.as_mut()),
+        )
+        .await
+        .expect("persistent logout uncertainty was not bounded");
+        assert!(matches!(outcome, LogoutRetryOutcome::Exhausted(_)));
+        assert!(calls.load(Ordering::SeqCst) >= 2);
     }
 
     #[test]

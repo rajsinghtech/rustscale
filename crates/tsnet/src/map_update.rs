@@ -287,6 +287,7 @@ pub(crate) struct PeerAuthorityRuntime {
     peers: Arc<RwLock<Vec<Node>>>,
     wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
     resolver: Arc<RwLock<MagicDnsResolver>>,
+    user_dialer: Arc<rustscale_tsdial::Dialer>,
     prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
     route_table: Arc<RwLock<RouteTable>>,
     router: Option<SharedRouter>,
@@ -308,6 +309,7 @@ impl PeerAuthorityRuntime {
         peers: Arc<RwLock<Vec<Node>>>,
         wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
         resolver: Arc<RwLock<MagicDnsResolver>>,
+        user_dialer: Arc<rustscale_tsdial::Dialer>,
         prefs: Arc<RwLock<rustscale_ipn::Prefs>>,
         route_table: Arc<RwLock<RouteTable>>,
         router: Option<SharedRouter>,
@@ -324,6 +326,7 @@ impl PeerAuthorityRuntime {
             peers,
             wg_tunnels,
             resolver,
+            user_dialer,
             prefs,
             route_table,
             router,
@@ -387,6 +390,15 @@ impl PeerAuthorityRuntime {
         self.pause_before_withdrawal_await(WithdrawalAwait::ResolverWrite)
             .await;
         self.resolver.write().await.set_peers(Vec::new());
+        #[cfg(test)]
+        self.pause_before_withdrawal_await(WithdrawalAwait::UserDialer)
+            .await;
+        self.user_dialer
+            .set_net_map(&MapResponse {
+                Peers: Some(Vec::new()),
+                ..Default::default()
+            })
+            .await;
 
         #[cfg(test)]
         self.pause_before_withdrawal_await(WithdrawalAwait::PrefsRead)
@@ -484,13 +496,14 @@ enum WithdrawalAwait {
     TunnelsWrite,
     MagicsockNetmap,
     ResolverWrite,
+    UserDialer,
     PrefsRead,
     RoutesWrite,
 }
 
 #[cfg(test)]
 impl WithdrawalAwait {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::ExitMapGate,
         Self::PeerMapGate,
         Self::PeerSnapshot,
@@ -500,6 +513,7 @@ impl WithdrawalAwait {
         Self::TunnelsWrite,
         Self::MagicsockNetmap,
         Self::ResolverWrite,
+        Self::UserDialer,
         Self::PrefsRead,
         Self::RoutesWrite,
     ];
@@ -1066,10 +1080,6 @@ pub(crate) fn spawn_map_update_task(
                         .expect("validated verified peer map installs");
                     drop(drive_epoch);
                     drop(map_commit);
-                    // A LocalAPI init/resume/disable may proceed only after
-                    // this exact decision has either revoked or committed all
-                    // peer-derived publication surfaces.
-                    drop(tka_operation);
                     let peers = next_peers;
 
                     // Forward peer deltas to the IPN notify bus so
@@ -1217,6 +1227,13 @@ pub(crate) fn spawn_map_update_task(
                         ..Default::default()
                     };
                     user_dialer.set_net_map(&complete_dial_map).await;
+
+                    // Notifications, router state, resolver state, and tsdial
+                    // are peer-derived publications too. Keep the TKA
+                    // operation generation through this final write so a
+                    // concurrent init/local-disable cannot withdraw and then
+                    // be overwritten by the tail of this older map commit.
+                    drop(tka_operation);
 
                     // Merge UserProfiles delta (add/update; never removed).
                     if !resp.UserProfiles.is_empty() {
@@ -1582,9 +1599,150 @@ mod tests {
     use rustscale_key::{DiscoPrivate, MachinePrivate, NLPrivate, NodePrivate};
     use rustscale_tailcfg::{PeerChange, TKAInfo};
     use rustscale_tka::{disablement_kdf, Key, KeyKind};
+    #[cfg(unix)]
+    use rustscale_tka::{Authority, FsChonk, State};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct BlockRouter(Arc<AtomicUsize>);
+
+    #[cfg(unix)]
+    fn install_test_authority(
+        state_dir: &std::path::Path,
+        signing_key: &NLPrivate,
+        state_ids: (u64, u64),
+    ) {
+        let path = state_dir
+            .join("tailnet-lock")
+            .join(hex::encode(signing_key.public().raw32()));
+        rustscale_atomicfile::ensure_private_dir(path.parent().unwrap()).unwrap();
+        rustscale_atomicfile::ensure_private_dir(&path).unwrap();
+        let storage = FsChonk::open(&path).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&signing_key.raw32());
+        Authority::create(
+            &storage,
+            State {
+                last_aum_hash: None,
+                disablement_values: vec![disablement_kdf(b"local-disable-test")],
+                keys: vec![Key {
+                    kind: KeyKind::Key25519,
+                    votes: 1,
+                    public: signing_key.public().raw32().to_vec(),
+                    meta: None,
+                }],
+                state_id1: state_ids.0,
+                state_id2: state_ids.1,
+            },
+            &signer,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    struct ActivePeerAuthority {
+        runtime: Arc<PeerAuthorityRuntime>,
+        peer_map: Arc<crate::peer_map::Runtime>,
+        peers: Arc<RwLock<Vec<Node>>>,
+        tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+        routes: Arc<RwLock<RouteTable>>,
+        magicsock: Arc<Magicsock>,
+        drive: Arc<crate::drive::Runtime>,
+        user_dialer: Arc<rustscale_tsdial::Dialer>,
+    }
+
+    #[cfg(unix)]
+    async fn active_peer_authority(local_key: &NodePrivate, peer: &Node) -> ActivePeerAuthority {
+        let peer_map = crate::peer_map::Runtime::new(std::slice::from_ref(peer)).unwrap();
+        let peers = Arc::new(RwLock::new(vec![peer.clone()]));
+        let tunnels = Arc::new(RwLock::new(HashMap::from([(
+            peer.Key.clone(),
+            Arc::new(Mutex::new(WgTunn::new(local_key, &peer.Key, 1).unwrap())),
+        )])));
+        let mut initial_routes =
+            RouteTable::from_peers_with_opts(std::slice::from_ref(peer), false);
+        initial_routes.set_exit_node(peer.Key.clone());
+        let routes = Arc::new(RwLock::new(initial_routes));
+        let drive = crate::drive::Runtime::new();
+        {
+            let mut epoch = drive.authorization_write().await;
+            drive.set_sharing_allowed_locked(true, &mut epoch);
+        }
+        let (magicsock, _wg_rx) = Magicsock::new(rustscale_magicsock::MagicsockConfig {
+            private_key: local_key.clone(),
+            disco_key: DiscoPrivate::generate(),
+            derp_client: None,
+            derp_map: None,
+            home_derp_region: 0,
+            udp_bind: None,
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+            sockstats: None,
+            control_knobs: None,
+        })
+        .await
+        .unwrap();
+        let magicsock = Arc::new(magicsock);
+        magicsock.set_netmap(vec![peer.clone()]).await.unwrap();
+        let resolver = Arc::new(RwLock::new(MagicDnsResolver::default()));
+        resolver.write().await.set_peers(vec![peer.clone()]);
+        let user_dialer = Arc::new(rustscale_tsdial::Dialer::new(None));
+        user_dialer
+            .set_net_map(&MapResponse {
+                Domain: "local-disable.invalid".into(),
+                Peers: Some(vec![peer.clone()]),
+                ..Default::default()
+            })
+            .await;
+        let runtime = PeerAuthorityRuntime::new(
+            Arc::new(tokio::sync::Mutex::new(())),
+            peer_map.clone(),
+            drive.clone(),
+            magicsock.clone(),
+            Arc::new(std::sync::Mutex::new(Filter::allow_none())),
+            peers.clone(),
+            tunnels.clone(),
+            resolver,
+            user_dialer.clone(),
+            Arc::new(RwLock::new(Prefs::default())),
+            routes.clone(),
+            None,
+            Vec::new(),
+            "http://127.0.0.1:1".into(),
+            false,
+        );
+        ActivePeerAuthority {
+            runtime,
+            peer_map,
+            peers,
+            tunnels,
+            routes,
+            magicsock,
+            drive,
+            user_dialer,
+        }
+    }
+
+    #[cfg(unix)]
+    fn local_disable_params(
+        state_dir: &std::path::Path,
+        local_key: &NodePrivate,
+        signing_key: &NLPrivate,
+    ) -> crate::tailnet_lock::TailnetLockParams {
+        crate::tailnet_lock::TailnetLockParams {
+            control_url: "http://127.0.0.1:1".into(),
+            machine_key: MachinePrivate::generate(),
+            server_pub_key: MachinePrivate::generate().public(),
+            node_key: local_key.clone(),
+            signing_key: signing_key.clone(),
+            capability_version: 141,
+            protocol_version: 141,
+            state_dir: Some(state_dir.into()),
+            extra_root_certs: None,
+        }
+    }
 
     impl rustscale_router::Router for BlockRouter {
         fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
@@ -1805,6 +1963,7 @@ mod tests {
         let peer = Node {
             ID: 77,
             StableID: "n-tka-peer".into(),
+            Name: "revoked-peer.example.invalid".into(),
             Key: NodePrivate::generate().public(),
             DiscoKey: DiscoPrivate::generate().public(),
             Addresses: vec!["100.64.0.77/32".into()],
@@ -1845,6 +2004,15 @@ mod tests {
         let magicsock = Arc::new(magicsock);
         magicsock.set_netmap(vec![peer.clone()]).await.unwrap();
         let resolver = Arc::new(RwLock::new(MagicDnsResolver::default()));
+        let user_dialer = Arc::new(rustscale_tsdial::Dialer::new(None));
+        user_dialer
+            .set_net_map(&MapResponse {
+                Domain: "example.invalid".into(),
+                Peers: Some(vec![peer.clone()]),
+                ..Default::default()
+            })
+            .await;
+        assert!(user_dialer.user_dial_plan("tcp", "revoked-peer:80").is_ok());
         let prefs = Arc::new(RwLock::new(Prefs::default()));
         let runtime = PeerAuthorityRuntime::new(
             Arc::new(tokio::sync::Mutex::new(())),
@@ -1855,6 +2023,7 @@ mod tests {
             peers.clone(),
             tunnels.clone(),
             resolver,
+            user_dialer.clone(),
             prefs,
             routes.clone(),
             None,
@@ -1885,11 +2054,249 @@ mod tests {
             .is_none());
         assert!(magicsock.authorization_generation(&peer.Key).is_none());
         assert!(!drive.sharing_allowed());
+        assert!(user_dialer
+            .user_dial_plan("tcp", "revoked-peer:80")
+            .is_err());
         let routes = routes.read().await;
         assert_eq!(routes.entries().count(), 0);
         assert!(routes.exit_node_requested());
         assert!(routes.exit_traffic_blocked());
         assert!(routes.lookup("8.8.8.8".parse().unwrap()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_disable_is_retained_linearized_and_denylisted_across_restart() {
+        let state = tempfile::tempdir().unwrap();
+        let local_key = NodePrivate::generate();
+        let signing_key = NLPrivate::generate();
+        install_test_authority(state.path(), &signing_key, (901, 902));
+        let params = local_disable_params(state.path(), &local_key, &signing_key);
+        let lock = crate::tailnet_lock::TailnetLock::open(params.clone()).unwrap();
+        let advertised_head = lock.head();
+        assert!(!advertised_head.is_empty());
+
+        let peer = Node {
+            ID: 901,
+            StableID: "n-local-disable".into(),
+            Name: "local-disable-peer.local-disable.invalid".into(),
+            Key: NodePrivate::generate().public(),
+            DiscoKey: DiscoPrivate::generate().public(),
+            Addresses: vec!["100.64.0.91/32".into()],
+            AllowedIPs: vec!["100.64.0.91/32".into(), "0.0.0.0/0".into()],
+            ..Default::default()
+        };
+        let active = Box::pin(active_peer_authority(&local_key, &peer)).await;
+        assert!(active
+            .user_dialer
+            .user_dial_plan("tcp", "local-disable-peer:80")
+            .is_ok());
+        let pause = active
+            .runtime
+            .pause_withdrawal_at(WithdrawalAwait::PeerMapGate);
+        lock.attach_peer_authority(active.runtime.clone()).unwrap();
+
+        // Simulate an in-flight packet/delivery reader. Local disable must not
+        // return or release its TKA generation until that reader drains.
+        let delivery_reader = active.peer_map.gate.read().await;
+        let disconnected_waiter = lock.start_force_local_disable().await.unwrap();
+        let observing_waiter = lock.start_force_local_disable().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.acquire())
+            .await
+            .expect("local disable did not reach the delivery barrier")
+            .unwrap()
+            .forget();
+        assert!(state
+            .path()
+            .join("tailnet-lock-local-disable.json")
+            .is_file());
+        drop(disconnected_waiter);
+        assert!(lock.local_disable_flight_retained().await);
+
+        let stale_publication = {
+            let lock = lock.clone();
+            let advertised_head = advertised_head.clone();
+            tokio::spawn(async move {
+                let operation = lock.operation().await;
+                operation.control_change_requires_revocation(
+                    Some(&TKAInfo {
+                        Head: advertised_head,
+                        Disabled: false,
+                    }),
+                    false,
+                )
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!stale_publication.is_finished());
+        pause.release.add_permits(1);
+        tokio::task::yield_now().await;
+        assert_eq!(active.peers.read().await.len(), 1);
+        assert!(!stale_publication.is_finished());
+
+        drop(delivery_reader);
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), observing_waiter.wait())
+                .await
+                .expect("local disable did not finish after traffic drained");
+        assert!(result.as_ref().is_ok(), "local disable failed: {result:?}");
+        lock.join_local_disable_flight().await;
+        assert!(!lock.local_disable_flight_retained().await);
+        assert!(stale_publication.await.unwrap());
+
+        assert!(active.peers.read().await.is_empty());
+        assert!(active.tunnels.read().await.is_empty());
+        assert!(active
+            .peer_map
+            .current_owner("100.64.0.91".parse().unwrap())
+            .is_none());
+        assert!(active
+            .magicsock
+            .authorization_generation(&peer.Key)
+            .is_none());
+        assert!(!active.drive.sharing_allowed());
+        assert!(active
+            .user_dialer
+            .user_dial_plan("tcp", "local-disable-peer:80")
+            .is_err());
+        let routes = active.routes.read().await;
+        assert_eq!(routes.entries().count(), 0);
+        assert!(routes.exit_traffic_blocked());
+        drop(routes);
+
+        let status = lock.status_json();
+        assert_eq!(status["Enabled"], false);
+        assert_eq!(status["LocalDisabled"], true);
+        assert_eq!(status["StateConsistent"], false);
+        assert_eq!(status["DisallowedStateIDs"], serde_json::json!(["901:902"]));
+        let authority_path = state
+            .path()
+            .join("tailnet-lock")
+            .join(hex::encode(signing_key.public().raw32()));
+        assert!(!authority_path.exists());
+
+        // Simulate a disk rollback restoring the retired Chonk. Restart must
+        // honor the committed denylist, refuse that authority, and retire it
+        // again before any fresh-map publication.
+        drop(lock);
+        install_test_authority(state.path(), &signing_key, (901, 902));
+        let reopened = crate::tailnet_lock::TailnetLock::open(params).unwrap();
+        let reopened_status = reopened.status_json();
+        assert_eq!(reopened_status["Enabled"], false);
+        assert_eq!(reopened_status["LocalDisabled"], true);
+        assert_eq!(reopened_status["StateConsistent"], false);
+        assert!(!authority_path.exists());
+        let mut rolled_back_peers = vec![peer];
+        reopened.filter_peers(&mut rolled_back_peers);
+        assert!(rolled_back_peers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_disable_persistence_failure_rolls_back_without_withdrawal() {
+        let state = tempfile::tempdir().unwrap();
+        let local_key = NodePrivate::generate();
+        let signing_key = NLPrivate::generate();
+        install_test_authority(state.path(), &signing_key, (911, 912));
+        let lock = crate::tailnet_lock::TailnetLock::open(local_disable_params(
+            state.path(),
+            &local_key,
+            &signing_key,
+        ))
+        .unwrap();
+        let peer = Node {
+            ID: 911,
+            StableID: "n-local-disable-rollback".into(),
+            Name: "rollback-peer.local-disable.invalid".into(),
+            Key: NodePrivate::generate().public(),
+            DiscoKey: DiscoPrivate::generate().public(),
+            Addresses: vec!["100.64.0.92/32".into()],
+            AllowedIPs: vec!["100.64.0.92/32".into()],
+            ..Default::default()
+        };
+        let active = Box::pin(active_peer_authority(&local_key, &peer)).await;
+        lock.attach_peer_authority(active.runtime.clone()).unwrap();
+
+        // A directory at the regular-file denylist path makes the atomic
+        // commit fail before any in-memory or traffic authority is changed.
+        let denylist_path = state.path().join("tailnet-lock-local-disable.json");
+        std::fs::create_dir(&denylist_path).unwrap();
+        let result = lock.start_force_local_disable().await.unwrap().wait().await;
+        assert!(matches!(
+            result.as_ref(),
+            Err(crate::tailnet_lock::TailnetLockError::Persistence(_))
+        ));
+        lock.join_local_disable_flight().await;
+        assert_eq!(active.peers.read().await.as_slice(), &[peer.clone()]);
+        assert!(active
+            .peer_map
+            .current_owner("100.64.0.92".parse().unwrap())
+            .is_some());
+        assert!(active
+            .magicsock
+            .authorization_generation(&peer.Key)
+            .is_some());
+        assert!(active.drive.sharing_allowed());
+        let status = lock.status_json();
+        assert_eq!(status["Enabled"], true);
+        assert_eq!(status["LocalDisabled"], false);
+        assert_eq!(status["StateConsistent"], true);
+        std::fs::remove_dir(denylist_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambiguous_local_disable_cleanup_stays_revoked_and_is_retryable() {
+        let state = tempfile::tempdir().unwrap();
+        let local_key = NodePrivate::generate();
+        let signing_key = NLPrivate::generate();
+        install_test_authority(state.path(), &signing_key, (921, 922));
+        let lock = crate::tailnet_lock::TailnetLock::open(local_disable_params(
+            state.path(),
+            &local_key,
+            &signing_key,
+        ))
+        .unwrap();
+        let peer = Node {
+            ID: 921,
+            StableID: "n-local-disable-ambiguous".into(),
+            Key: NodePrivate::generate().public(),
+            DiscoKey: DiscoPrivate::generate().public(),
+            Addresses: vec!["100.64.0.93/32".into()],
+            AllowedIPs: vec!["100.64.0.93/32".into()],
+            ..Default::default()
+        };
+        let active = Box::pin(active_peer_authority(&local_key, &peer)).await;
+        lock.attach_peer_authority(active.runtime.clone()).unwrap();
+        let authority_path = state
+            .path()
+            .join("tailnet-lock")
+            .join(hex::encode(signing_key.public().raw32()));
+        let tombstone = authority_path.with_extension("deleting");
+        std::fs::write(&tombstone, b"not a directory").unwrap();
+
+        let result = lock.start_force_local_disable().await.unwrap().wait().await;
+        assert!(matches!(
+            result.as_ref(),
+            Err(crate::tailnet_lock::TailnetLockError::LocalDisableCommitted)
+        ));
+        lock.join_local_disable_flight().await;
+        assert!(active.peers.read().await.is_empty());
+        assert!(active.tunnels.read().await.is_empty());
+        assert!(lock.status_json()["LocalDisabled"].as_bool().unwrap());
+        assert!(lock.status_json()["LocalDisableCleanupPending"]
+            .as_bool()
+            .unwrap());
+        assert!(authority_path.is_dir());
+
+        std::fs::remove_file(&tombstone).unwrap();
+        let retry = lock.start_force_local_disable().await.unwrap().wait().await;
+        assert!(retry.as_ref().is_ok());
+        lock.join_local_disable_flight().await;
+        assert!(!authority_path.exists());
+        assert!(!lock.status_json()["LocalDisableCleanupPending"]
+            .as_bool()
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1949,6 +2356,7 @@ mod tests {
             peers.clone(),
             tunnels.clone(),
             Arc::new(RwLock::new(MagicDnsResolver::default())),
+            Arc::new(rustscale_tsdial::Dialer::new(None)),
             Arc::new(RwLock::new(Prefs::default())),
             routes.clone(),
             None,
@@ -2123,6 +2531,7 @@ mod tests {
                 peers.clone(),
                 tunnels.clone(),
                 resolver,
+                Arc::new(rustscale_tsdial::Dialer::new(None)),
                 Arc::new(RwLock::new(Prefs::default())),
                 routes.clone(),
                 None,

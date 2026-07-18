@@ -5,10 +5,10 @@
 //! uses for MagicDNS). It also handles split-DNS routing, ExtraRecords hosts,
 //! `.onion` NXDOMAIN, 4via6 address synthesis, and TC truncation.
 //!
-//! [`DnsResponder`] is a minimal UDP DNS server bound to the MagicDNS VIP
-//! `100.100.100.100:53` that serves those answers, returns `NXDOMAIN` for
-//! unknown names within the tailnet domain, and forwards everything else to
-//! an upstream system resolver.
+//! [`DnsResponder`] serves UDP and length-prefixed TCP DNS on the MagicDNS VIP
+//! `100.100.100.100:53`. It returns `NXDOMAIN` for unknown names within local
+//! suffixes and forwards other queries through the longest matching split-DNS
+//! route.
 
 #![forbid(unsafe_code)]
 
@@ -17,7 +17,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use rustscale_tailcfg::{DNSConfig, Node};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 
 pub mod forwarder;
 pub mod osconfig;
@@ -32,8 +35,9 @@ pub use osconfig::{
 #[cfg(target_os = "macos")]
 pub use osconfig_darwin::DarwinConfigurator;
 pub use wire::{
-    build_a_response, build_aaaa_response, build_nxdomain, build_ptr_response,
-    build_rcode_response, check_response_size_and_set_tc, parse_question, qtype, rcode,
+    build_a_response, build_aaaa_response, build_format_error_response, build_nxdomain,
+    build_ptr_response, build_rcode_response, check_response_size_and_set_tc, parse_question,
+    qtype, rcode,
 };
 
 /// The MagicDNS VIP that OS resolvers point at (`100.100.100.100`).
@@ -489,24 +493,26 @@ impl MagicDnsResolver {
     }
 
     /// Get the upstream resolvers for a given domain name, based on routes.
-    /// Most-specific suffix match wins. Returns empty vec if no match.
+    /// Most-specific suffix match wins. Returns an empty vector for either an
+    /// explicitly local route or no matching route; [`Self::upstream_route_for`]
+    /// preserves that distinction for forwarding callers.
     pub fn upstream_resolvers_for(&self, name: &str) -> Vec<UpstreamResolver> {
+        self.upstream_route_for(name).unwrap_or_default()
+    }
+
+    /// Return the longest matching split-DNS route.
+    ///
+    /// `Some([])` is an explicit local-only route and must not fall through to
+    /// system DNS. `None` means no configured route matched, so the responder
+    /// may use its base/system resolver fallback.
+    pub fn upstream_route_for(&self, name: &str) -> Option<Vec<UpstreamResolver>> {
         let n = name.trim_end_matches('.').to_lowercase();
-        let mut best_match: Option<(&String, &Vec<UpstreamResolver>)> = None;
-
-        for (suffix, resolvers) in &self.config.routes {
-            if suffix == "." || suffix_matches(suffix, &n) {
-                // Most specific = longest suffix.
-                if best_match.is_none_or(|(s, _)| suffix.len() > s.len()) {
-                    best_match = Some((suffix, resolvers));
-                }
-            }
-        }
-
-        match best_match {
-            Some((_, resolvers)) => resolvers.clone(),
-            None => Vec::new(),
-        }
+        self.config
+            .routes
+            .iter()
+            .filter(|(suffix, _)| suffix.as_str() == "." || suffix_matches(suffix, &n))
+            .max_by_key(|(suffix, _)| suffix_specificity(suffix))
+            .map(|(_, resolvers)| resolvers.clone())
     }
 }
 
@@ -518,22 +524,48 @@ fn build_config(dns_config: Option<&DNSConfig>, domain: &str, peers: &[Node]) ->
         cfg.accept_dns = true;
         cfg.search_domains.clone_from(&dc.Domains);
 
-        // Build routes from DNSConfig.Routes.
+        // Build routes from DNSConfig.Routes. As in the pinned Go manager,
+        // an empty resolver set is authoritative/local and is moved into
+        // local_domains rather than being allowed to leak to a fallback.
         for (suffix, resolvers) in &dc.Routes {
-            let up = resolvers
+            let suffix = normalize_suffix(suffix);
+            if resolvers.is_empty() {
+                if !cfg.local_domains.iter().any(|domain| domain == &suffix) {
+                    cfg.local_domains.push(suffix);
+                }
+                continue;
+            }
+            let up: Vec<_> = resolvers
                 .iter()
-                .map(|r| UpstreamResolver::from_addr(&r.Addr))
+                .filter(|resolver| !resolver.Addr.is_empty())
+                .map(|resolver| UpstreamResolver::from_addr(&resolver.Addr))
                 .collect();
-            let suffix = suffix.trim_end_matches('.').to_lowercase();
-            cfg.routes.insert(suffix, up);
+            if up.is_empty() {
+                if !cfg.local_domains.iter().any(|domain| domain == &suffix) {
+                    cfg.local_domains.push(suffix);
+                }
+            } else {
+                cfg.routes.insert(suffix, up);
+            }
         }
 
-        // Add default route from Resolvers if not already present.
-        if !cfg.routes.contains_key(".") {
-            let default: Vec<UpstreamResolver> = dc
-                .Resolvers
+        // Add a default route from Resolvers, then FallbackResolvers, unless
+        // DNSConfig.Routes explicitly supplied the root route (including an
+        // empty local-only root route).
+        let has_root_route = dc
+            .Routes
+            .keys()
+            .any(|suffix| normalize_suffix(suffix) == ".");
+        if !has_root_route && !cfg.routes.contains_key(".") {
+            let source = if dc.Resolvers.is_empty() {
+                &dc.FallbackResolvers
+            } else {
+                &dc.Resolvers
+            };
+            let default: Vec<UpstreamResolver> = source
                 .iter()
-                .map(|r| UpstreamResolver::from_addr(&r.Addr))
+                .filter(|resolver| !resolver.Addr.is_empty())
+                .map(|resolver| UpstreamResolver::from_addr(&resolver.Addr))
                 .collect();
             if !default.is_empty() {
                 cfg.routes.insert(".".to_string(), default);
@@ -550,7 +582,9 @@ fn build_config(dns_config: Option<&DNSConfig>, domain: &str, peers: &[Node]) ->
 
         // Local domains: the tailnet domain + search domains + .arpa zones.
         if !domain.is_empty() {
-            cfg.local_domains.push(domain.to_string());
+            if !cfg.local_domains.iter().any(|local| local == domain) {
+                cfg.local_domains.push(domain.to_string());
+            }
             // Add reverse DNS zones for tailnet ranges.
             cfg.local_domains
                 .push(format!("{}.in-addr.arpa.", rustscale_tsaddr::cgnat_range()));
@@ -559,8 +593,11 @@ fn build_config(dns_config: Option<&DNSConfig>, domain: &str, peers: &[Node]) ->
                 rustscale_tsaddr::tailscale_ula_range()
             ));
         }
-        for d in &dc.Domains {
-            cfg.local_domains.push(d.clone());
+        for domain in &dc.Domains {
+            let domain = normalize_suffix(domain);
+            if !cfg.local_domains.iter().any(|local| local == &domain) {
+                cfg.local_domains.push(domain);
+            }
         }
     }
 
@@ -661,6 +698,26 @@ fn node_ips(peer: &Node) -> Vec<IpAddr> {
         .iter()
         .filter_map(|s| s.split('/').next().and_then(|ip| ip.parse::<IpAddr>().ok()))
         .collect()
+}
+
+/// Normalize a route/local suffix while preserving `.` as the DNS root.
+fn normalize_suffix(suffix: &str) -> String {
+    let suffix = suffix.trim_end_matches('.').to_lowercase();
+    if suffix.is_empty() {
+        ".".to_string()
+    } else {
+        suffix
+    }
+}
+
+/// Rank a matching suffix by label count, as the pinned Go resolver does.
+fn suffix_specificity(suffix: &str) -> usize {
+    let suffix = suffix.trim_end_matches('.');
+    if suffix.is_empty() {
+        0
+    } else {
+        suffix.split('.').count()
+    }
 }
 
 /// Check if `name` ends with `suffix` (case-insensitive, dot-aware).
@@ -846,13 +903,22 @@ pub fn upstream_nameservers(dns_config: Option<&DNSConfig>) -> Vec<SocketAddr> {
 /// dynamically advertise routes.
 pub type DnsResponseObserver = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
-/// A minimal UDP DNS responder serving MagicDNS answers and forwarding the
-/// rest upstream.
+/// Maximum inbound DNS-over-TCP query size, matching
+/// `tailscale.com@v1.100.0/net/dns/manager.go`.
+pub const MAX_TCP_REQUEST_SIZE: usize = 4096;
+
+/// Upper bound on one local resolver query, matching Go's `dnsQueryTimeout`.
+const DNS_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Idle bound for each TCP frame read or write, matching Go's manager.
+const TCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// A UDP and DNS-over-TCP responder serving MagicDNS answers and forwarding
+/// non-local names through the longest matching suffix route.
 pub struct DnsResponder {
     resolver: Arc<RwLock<MagicDnsResolver>>,
-    upstream: Vec<SocketAddr>,
     bind: SocketAddr,
-    forwarder: Option<Arc<Forwarder>>,
+    forwarder: Arc<Forwarder>,
     observer: Option<DnsResponseObserver>,
 }
 
@@ -863,11 +929,14 @@ impl DnsResponder {
         upstream: Vec<SocketAddr>,
         bind: SocketAddr,
     ) -> Self {
+        let defaults = upstream
+            .iter()
+            .map(|server| UpstreamResolver::from_addr(&server.to_string()))
+            .collect();
         Self {
             resolver,
-            upstream,
             bind,
-            forwarder: None,
+            forwarder: Arc::new(Forwarder::new(defaults)),
             observer: None,
         }
     }
@@ -880,9 +949,8 @@ impl DnsResponder {
     ) -> Self {
         Self {
             resolver,
-            upstream: Vec::new(),
             bind,
-            forwarder: Some(forwarder),
+            forwarder,
             observer: None,
         }
     }
@@ -896,61 +964,240 @@ impl DnsResponder {
         self
     }
 
-    /// Bind the UDP socket and spawn the query loop.
-    pub async fn spawn(self) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let addrs = &[
-            self.bind,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-        ];
-        let mut bind_idx = 0;
-        let sock = loop {
-            if bind_idx >= addrs.len() {
-                return Err(std::io::Error::other("all DNS bind addresses failed"));
-            }
-            let addr = addrs[bind_idx];
-            match tokio::net::UdpSocket::bind(addr).await {
-                Ok(s) => {
-                    if bind_idx > 0 {
-                        eprintln!("DNS responder: bound to {addr} instead of {}", self.bind);
-                    }
-                    break Arc::new(s);
-                }
-                Err(_e) if bind_idx + 1 < addrs.len() => {
-                    bind_idx += 1;
-                    continue;
-                }
-                Err(e) => return Err(e),
+    /// Bind UDP and TCP to the same address and spawn the supervised query
+    /// loops. Dropping or shutting down the returned handle cancels active
+    /// queries and releases both listeners.
+    pub async fn spawn(self) -> std::io::Result<DnsResponderHandle> {
+        let (udp, tcp, local_addr) = bind_dns_sockets(self.bind).await?;
+        if local_addr != self.bind {
+            eprintln!(
+                "DNS responder: bound to {local_addr} instead of {}",
+                self.bind
+            );
+        }
+
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let context = ResponderContext {
+            resolver: self.resolver,
+            forwarder: self.forwarder,
+            observer: self.observer,
+        };
+        let task = tokio::spawn(async move {
+            run_responder(udp, tcp, context, task_cancel).await;
+        });
+        Ok(DnsResponderHandle {
+            local_addr,
+            cancel,
+            task: Some(task),
+        })
+    }
+}
+
+/// Lifecycle handle for a running [`DnsResponder`].
+pub struct DnsResponderHandle {
+    local_addr: SocketAddr,
+    cancel: CancellationToken,
+    task: Option<JoinHandle<()>>,
+}
+
+impl DnsResponderHandle {
+    /// The shared UDP/TCP address selected by the responder.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Request cancellation, join all listener/session work, and release the
+    /// shared UDP/TCP port before returning.
+    pub async fn shutdown(mut self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+
+    /// Transfer task ownership to an outer supervisor. Aborting the returned
+    /// task drops both listeners and aborts every child query/session.
+    pub fn into_join_handle(mut self) -> JoinHandle<()> {
+        self.task
+            .take()
+            .expect("DNS responder task already transferred")
+    }
+}
+
+impl Drop for DnsResponderHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResponderContext {
+    resolver: Arc<RwLock<MagicDnsResolver>>,
+    forwarder: Arc<Forwarder>,
+    observer: Option<DnsResponseObserver>,
+}
+
+async fn bind_dns_sockets(
+    requested: SocketAddr,
+) -> std::io::Result<(tokio::net::UdpSocket, tokio::net::TcpListener, SocketAddr)> {
+    let mut candidates = vec![
+        requested,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    ];
+    candidates.dedup();
+
+    let mut last_error = None;
+    for candidate in candidates {
+        let tcp = match tokio::net::TcpListener::bind(candidate).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
             }
         };
-        let upstream = self.upstream;
-        let resolver = self.resolver;
-        let forwarder = self.forwarder;
-        let observer = self.observer;
-        Ok(tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            loop {
-                let Ok((n, src)) = sock.recv_from(&mut buf).await else {
-                    continue;
+        let local_addr = tcp.local_addr()?;
+        match tokio::net::UdpSocket::bind(local_addr).await {
+            Ok(udp) => return Ok((udp, tcp, local_addr)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("all DNS bind addresses failed")))
+}
+
+async fn run_responder(
+    udp: tokio::net::UdpSocket,
+    tcp: tokio::net::TcpListener,
+    context: ResponderContext,
+    cancel: CancellationToken,
+) {
+    let udp = Arc::new(udp);
+    let mut children = JoinSet::new();
+    let mut buf = vec![0u8; MAX_TCP_REQUEST_SIZE];
+
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            received = udp.recv_from(&mut buf) => {
+                let Ok((length, source)) = received else {
+                    break;
                 };
-                let query = buf[..n].to_vec();
-                let resolver = resolver.clone();
-                let upstream = upstream.clone();
-                let forwarder = forwarder.clone();
-                let sock = sock.clone();
-                let observer = observer.clone();
-                tokio::spawn(async move {
-                    if let Some(resp) =
-                        handle_query(&query, &resolver, &upstream, forwarder.as_deref()).await
+                let query = buf[..length].to_vec();
+                let socket = Arc::clone(&udp);
+                let child_context = context.clone();
+                let child_cancel = cancel.clone();
+                children.spawn(async move {
+                    if let Some(response) = resolve_query(
+                        &query,
+                        &child_context,
+                        "udp",
+                        &child_cancel,
+                    )
+                    .await
                     {
-                        if let Some(obs) = &observer {
-                            obs(&resp);
-                        }
-                        let _ = sock.send_to(&resp, src).await;
+                        observe_response(&child_context, &response);
+                        let _ = socket.send_to(&response, source).await;
                     }
                 });
             }
-        }))
+            accepted = tcp.accept() => {
+                let Ok((stream, _source)) = accepted else {
+                    break;
+                };
+                let child_context = context.clone();
+                let child_cancel = cancel.clone();
+                children.spawn(async move {
+                    serve_tcp_connection(stream, child_context, child_cancel).await;
+                });
+            }
+            Some(_) = children.join_next(), if !children.is_empty() => {}
+        }
+    }
+
+    children.abort_all();
+    while children.join_next().await.is_some() {}
+}
+
+async fn serve_tcp_connection(
+    mut stream: tokio::net::TcpStream,
+    context: ResponderContext,
+    cancel: CancellationToken,
+) {
+    let _ = stream.set_nodelay(true);
+    loop {
+        let mut length_bytes = [0u8; 2];
+        let read_length = tokio::select! {
+            () = cancel.cancelled() => return,
+            result = tokio::time::timeout(
+                TCP_IDLE_TIMEOUT,
+                stream.read_exact(&mut length_bytes),
+            ) => result,
+        };
+        if !matches!(read_length, Ok(Ok(_))) {
+            return;
+        }
+
+        let request_len = usize::from(u16::from_be_bytes(length_bytes));
+        if request_len > MAX_TCP_REQUEST_SIZE {
+            return;
+        }
+        let mut query = vec![0u8; request_len];
+        let read_query = tokio::select! {
+            () = cancel.cancelled() => return,
+            result = tokio::time::timeout(
+                TCP_IDLE_TIMEOUT,
+                stream.read_exact(&mut query),
+            ) => result,
+        };
+        if !matches!(read_query, Ok(Ok(_))) {
+            return;
+        }
+
+        let Some(response) = resolve_query(&query, &context, "tcp", &cancel).await else {
+            return;
+        };
+        let Ok(response_len) = u16::try_from(response.len()) else {
+            return;
+        };
+        observe_response(&context, &response);
+        let write_response = async {
+            stream.write_all(&response_len.to_be_bytes()).await?;
+            stream.write_all(&response).await
+        };
+        let written = tokio::select! {
+            () = cancel.cancelled() => return,
+            result = tokio::time::timeout(TCP_IDLE_TIMEOUT, write_response) => result,
+        };
+        if !matches!(written, Ok(Ok(()))) {
+            return;
+        }
+    }
+}
+
+async fn resolve_query(
+    query: &[u8],
+    context: &ResponderContext,
+    family: &str,
+    cancel: &CancellationToken,
+) -> Option<Vec<u8>> {
+    tokio::select! {
+        () = cancel.cancelled() => None,
+        result = tokio::time::timeout(
+            DNS_QUERY_TIMEOUT,
+            handle_query(query, &context.resolver, &context.forwarder, family),
+        ) => result.ok().flatten(),
+    }
+}
+
+fn observe_response(context: &ResponderContext, response: &[u8]) {
+    if let Some(observer) = &context.observer {
+        observer(response);
     }
 }
 
@@ -959,10 +1206,12 @@ impl DnsResponder {
 async fn handle_query(
     query: &[u8],
     resolver: &RwLock<MagicDnsResolver>,
-    upstream: &[SocketAddr],
-    forwarder: Option<&Forwarder>,
+    forwarder: &Forwarder,
+    family: &str,
 ) -> Option<Vec<u8>> {
-    let (name, qtype, _qclass) = parse_question(query)?;
+    let Some((name, qtype, _qclass)) = parse_question(query) else {
+        return Some(build_format_error_response(query));
+    };
 
     let r = resolver.read().await;
 
@@ -970,20 +1219,24 @@ async fn handle_query(
     if qtype == qtype::PTR {
         // Check for Bonjour prefix — skip and forward.
         if has_rdns_bonjour_prefix(&name) {
+            let route = r.upstream_route_for(&name);
             drop(r);
-            return forward(query, &name, forwarder, upstream).await;
+            return forward(query, forwarder, family, route.as_deref()).await;
         }
 
         let (fqdn, code) = r.resolve_local_reverse(&name);
         if code == rcode::REFUSED {
             // Not our name; forward upstream.
+            let route = r.upstream_route_for(&name);
             drop(r);
-            return forward(query, &name, forwarder, upstream).await;
+            return forward(query, forwarder, family, route.as_deref()).await;
         }
-        if code == rcode::SUCCESS && !fqdn.is_empty() {
-            return build_ptr_response(query, &fqdn);
-        }
-        return build_rcode_response(query, code);
+        let response = if code == rcode::SUCCESS && !fqdn.is_empty() {
+            build_ptr_response(query, &fqdn)
+        } else {
+            build_rcode_response(query, code)
+        }?;
+        return Some(finish_local_response(response, query, family));
     }
 
     // .onion rejection (RFC 7686).
@@ -992,80 +1245,60 @@ async fn handle_query(
         .to_lowercase()
         .ends_with(".onion")
     {
-        return build_rcode_response(query, rcode::NAME_ERROR);
+        let response = build_rcode_response(query, rcode::NAME_ERROR)?;
+        return Some(finish_local_response(response, query, family));
     }
 
     // Check if this is a local name (hosts, peers, 4via6, symbolic).
     let (ip, code) = r.resolve_local(&name, qtype);
 
     if code == rcode::REFUSED {
-        // Not authoritative; forward upstream.
+        // Not authoritative; route against the same resolver snapshot used for
+        // the local decision, then release the lock before network I/O.
+        let route = r.upstream_route_for(&name);
         drop(r);
-        return forward(query, &name, forwarder, upstream).await;
+        return forward(query, forwarder, family, route.as_deref()).await;
     }
 
     if code != rcode::SUCCESS {
-        return build_rcode_response(query, code);
+        let response = build_rcode_response(query, code)?;
+        return Some(finish_local_response(response, query, family));
     }
 
     // Build the response based on the resolved IP.
-    match ip {
+    let response = match ip {
         Some(IpAddr::V4(v4)) if qtype == qtype::A || qtype == qtype::ALL => {
-            let mut resp = build_a_response(query, &[v4])?;
-            check_response_size_and_set_tc(&mut resp, query, "udp");
-            Some(resp)
+            build_a_response(query, &[v4])?
         }
         Some(IpAddr::V6(v6)) if qtype == qtype::AAAA || qtype == qtype::ALL => {
-            let mut resp = build_aaaa_response(query, &[v6])?;
-            check_response_size_and_set_tc(&mut resp, query, "udp");
-            Some(resp)
+            build_aaaa_response(query, &[v6])?
         }
         Some(IpAddr::V4(_)) if qtype == qtype::AAAA => {
             // Name exists but no AAAA record.
-            build_rcode_response(query, rcode::SUCCESS)
+            build_rcode_response(query, rcode::SUCCESS)?
         }
-        Some(IpAddr::V6(_)) if qtype == qtype::A => build_rcode_response(query, rcode::SUCCESS),
+        Some(IpAddr::V6(_)) if qtype == qtype::A => build_rcode_response(query, rcode::SUCCESS)?,
         _ => {
             // NOERROR with 0 answers (name exists, no records of this type).
-            build_rcode_response(query, rcode::SUCCESS)
+            build_rcode_response(query, rcode::SUCCESS)?
         }
-    }
+    };
+    Some(finish_local_response(response, query, family))
 }
 
-/// Forward a query to the appropriate upstream resolver.
+fn finish_local_response(mut response: Vec<u8>, query: &[u8], family: &str) -> Vec<u8> {
+    check_response_size_and_set_tc(&mut response, query, family);
+    response
+}
+
+/// Forward a query through an already-selected live route.
 async fn forward(
     query: &[u8],
-    name: &str,
-    forwarder: Option<&Forwarder>,
-    fallback_upstream: &[SocketAddr],
+    forwarder: &Forwarder,
+    family: &str,
+    route: Option<&[UpstreamResolver]>,
 ) -> Option<Vec<u8>> {
-    if let Some(fwd) = forwarder {
-        return fwd.forward(query, name, "udp").await;
-    }
-    forward_upstream(query, fallback_upstream).await
-}
-
-/// Forward a raw DNS query to the first reachable upstream resolver and
-/// return its response verbatim.
-async fn forward_upstream(query: &[u8], upstream: &[SocketAddr]) -> Option<Vec<u8>> {
-    for server in upstream {
-        let sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if rustscale_netns::configure_udp_socket(&sock).is_err() {
-            continue;
-        }
-        if sock.send_to(query, server).await.is_err() {
-            continue;
-        }
-        let mut buf = vec![0u8; 4096];
-        let fut = tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv(&mut buf));
-        if let Ok(Ok(n)) = fut.await {
-            return Some(buf[..n].to_vec());
-        }
-    }
-    None
+    forwarder.forward_with_resolvers(query, family, route).await
 }
 
 /// Build a config from a DNSConfig for use with `set_config`.

@@ -125,12 +125,17 @@ pub fn check_response_size_and_set_tc(response: &mut [u8], request: &[u8], famil
 /// name *in the original message* (i.e. after the terminating 0 byte, or
 /// after a 2-byte pointer when one is encountered).
 fn parse_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
+    const MAX_POINTER_HOPS: usize = 64;
+    const MAX_LABEL_BYTES: usize = 63;
+    const MAX_NAME_BYTES: usize = 255;
+
     let mut labels: Vec<String> = Vec::new();
     let mut after = None; // position after the name in the original stream
     let mut jumped = false;
     let mut hops = 0;
+    let mut expanded_len = 1usize; // terminating root label
     loop {
-        if pos >= buf.len() || hops > 64 {
+        if pos >= buf.len() || hops > MAX_POINTER_HOPS {
             return None;
         }
         let len = buf[pos];
@@ -150,13 +155,24 @@ fn parse_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
                 after = Some(pos + 2);
             }
             let offset = ((len as usize & 0x3F) << 8) | buf[pos + 1] as usize;
+            if offset >= buf.len() {
+                return None;
+            }
             pos = offset;
             jumped = true;
             hops += 1;
             continue;
         }
+        // 01xxxxxx and 10xxxxxx are reserved DNS label encodings.
+        if len & 0xC0 != 0 {
+            return None;
+        }
         let label_len = len as usize;
-        if pos + 1 + label_len > buf.len() {
+        if label_len > MAX_LABEL_BYTES || pos + 1 + label_len > buf.len() {
+            return None;
+        }
+        expanded_len = expanded_len.checked_add(label_len + 1)?;
+        if expanded_len > MAX_NAME_BYTES {
             return None;
         }
         let label = std::str::from_utf8(&buf[pos + 1..pos + 1 + label_len]).ok()?;
@@ -188,7 +204,8 @@ pub fn parse_question(buf: &[u8]) -> Option<(String, u16, u16)> {
 /// The byte offset where the question section ends (header + QNAME + 4).
 fn question_end(buf: &[u8]) -> Option<usize> {
     let (_, after_name) = parse_name(buf, 12)?;
-    Some(after_name + 4)
+    let end = after_name.checked_add(4)?;
+    (end <= buf.len()).then_some(end)
 }
 
 /// Build the response header from a query: QR=1, copy RD, set RA, given
@@ -331,6 +348,37 @@ pub fn build_rcode_response(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
     resp.extend_from_slice(&response_header(query, rcode, 0));
     resp.extend_from_slice(&query[12..qend]);
     Some(resp)
+}
+
+/// Build a header-only FORMERR response for a malformed query.
+///
+/// Unlike the regular response builders, this accepts even a truncated DNS
+/// header. The transaction ID and the query's opcode/RD bit are retained when
+/// those bytes are present, while QDCOUNT is zero because no question could be
+/// parsed safely.
+pub fn build_format_error_response(query: &[u8]) -> Vec<u8> {
+    let id0 = query.first().copied().unwrap_or(0);
+    let id1 = query.get(1).copied().unwrap_or(0);
+    let request_flags = query
+        .get(2..4)
+        .map_or(0, |flags| u16::from_be_bytes([flags[0], flags[1]]));
+    let opcode = (request_flags >> 11) & 0b1111;
+    let rd = (request_flags >> 8) & 0b1;
+    let flags = 0x8000 | (opcode << 11) | (rd << 8) | 0x0080 | u16::from(rcode::FORMAT_ERROR);
+    vec![
+        id0,
+        id1,
+        (flags >> 8) as u8,
+        flags as u8,
+        0,
+        0, // QDCOUNT: malformed question is not echoed
+        0,
+        0, // ANCOUNT
+        0,
+        0, // NSCOUNT
+        0,
+        0, // ARCOUNT
+    ]
 }
 
 #[cfg(test)]
@@ -476,5 +524,38 @@ mod tests {
         let resp = build_rcode_response(&q, rcode::NOT_IMPLEMENTED).expect("build");
         assert_eq!(resp[3] & 0x0F, rcode::NOT_IMPLEMENTED);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
+    }
+
+    #[test]
+    fn malformed_names_are_bounded_and_return_formerr() {
+        let mut oversized_label = vec![0u8; HEADER_BYTES];
+        oversized_label[4..6].copy_from_slice(&1u16.to_be_bytes());
+        oversized_label.push(64); // DNS labels are at most 63 bytes.
+        oversized_label.extend(std::iter::repeat_n(b'a', 64));
+        oversized_label.push(0);
+        oversized_label.extend_from_slice(&qtype::A.to_be_bytes());
+        oversized_label.extend_from_slice(&1u16.to_be_bytes());
+        assert!(parse_question(&oversized_label).is_none());
+
+        let mut pointer_cycle = vec![0u8; HEADER_BYTES];
+        pointer_cycle[4..6].copy_from_slice(&1u16.to_be_bytes());
+        pointer_cycle.extend_from_slice(&[0xc0, 0x0c]);
+        pointer_cycle.extend_from_slice(&qtype::A.to_be_bytes());
+        pointer_cycle.extend_from_slice(&1u16.to_be_bytes());
+        assert!(parse_question(&pointer_cycle).is_none());
+
+        let malformed = [0x12, 0x34, 0x01];
+        let response = build_format_error_response(&malformed);
+        assert_eq!(&response[..2], &[0x12, 0x34]);
+        assert_eq!(response[3] & 0x0f, rcode::FORMAT_ERROR);
+        assert_eq!(u16::from_be_bytes([response[4], response[5]]), 0);
+    }
+
+    #[test]
+    fn truncated_question_never_builds_by_slicing_past_packet() {
+        let mut query = make_query("host.tailnet.ts.net", qtype::A);
+        query.truncate(query.len() - 1);
+        assert!(build_rcode_response(&query, rcode::SERVER_FAILURE).is_none());
+        assert!(build_a_response(&query, &[Ipv4Addr::LOCALHOST]).is_none());
     }
 }

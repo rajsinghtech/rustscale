@@ -10,7 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-atomicfile = { path = "../atomicfile", version = "0.1.3" }
+rustscale-atomicfile = { path = "../atomicfile", version = "0.1.4" }
 hex.workspace = true
 rand.workspace = true
 serde.workspace = true

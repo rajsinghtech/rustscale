@@ -1748,6 +1748,42 @@ impl SecurityBlockReason {
     }
 }
 
+/// Keeps the kernel TUN descriptor alive through the router's final close.
+/// Linux removes a non-persistent TUN when its last descriptor drops; route
+/// teardown still names that interface, so pump-task ownership alone is too
+/// short-lived during restart and rollback.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct TunLifetimeRouter {
+    inner: Box<dyn rustscale_router::Router>,
+    _tun: Arc<dyn Tun>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl rustscale_router::Router for TunLifetimeRouter {
+    fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+        self.inner.up()
+    }
+
+    fn set(
+        &mut self,
+        config: &rustscale_router::RouterConfig,
+    ) -> Result<(), rustscale_router::RouterError> {
+        self.inner.set(config)
+    }
+
+    fn block_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+        self.inner.block_direct()
+    }
+
+    fn unblock_direct(&mut self) -> Result<(), rustscale_router::RouterError> {
+        self.inner.unblock_direct()
+    }
+
+    fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+        self.inner.close()
+    }
+}
+
 pub(crate) struct ManagedRouter {
     pub(crate) router: Box<dyn rustscale_router::Router>,
     pub(crate) tun_name: String,
@@ -2209,9 +2245,13 @@ pub(crate) async fn create_tun_device(
     exit_node_allow_lan_access: bool,
     state_dir: Option<&std::path::Path>,
 ) -> Result<(Arc<dyn Tun>, Option<SharedRouter>), TsnetError> {
-    let dev = rustscale_tun::create(&config.tun)?;
+    let dev: Arc<dyn Tun> = Arc::new(rustscale_tun::create(&config.tun)?);
     let router = if config.apply_routes {
-        let mut router = rustscale_router::new_with_state_dir(dev.name(), state_dir);
+        let platform_router = rustscale_router::new_with_state_dir(dev.name(), state_dir);
+        let mut router: Box<dyn rustscale_router::Router> = Box::new(TunLifetimeRouter {
+            inner: platform_router,
+            _tun: dev.clone(),
+        });
         if let Err(error) = router.up() {
             let owner = Arc::new(std::sync::Mutex::new(ManagedRouter {
                 router,
@@ -2403,7 +2443,7 @@ pub(crate) async fn create_tun_device(
         b.route_table.write().await.block_localapi_dial();
         None
     };
-    Ok((Arc::new(dev), router))
+    Ok((dev, router))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -2656,6 +2696,57 @@ mod tests {
                 let _ = notify.send(());
             }
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    struct TunLifetimeProbeRouter {
+        tun: std::sync::Weak<dyn Tun>,
+        closed_with_tun: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    impl rustscale_router::Router for TunLifetimeProbeRouter {
+        fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn set(
+            &mut self,
+            _config: &rustscale_router::RouterConfig,
+        ) -> Result<(), rustscale_router::RouterError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), rustscale_router::RouterError> {
+            self.closed_with_tun.store(
+                self.tun.upgrade().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn managed_router_retains_tun_through_route_close() {
+        let (tun, _inject) = rustscale_tun::MockTun::new("tun-lifetime", 1280);
+        let tun: Arc<dyn Tun> = Arc::new(tun);
+        let weak = Arc::downgrade(&tun);
+        let closed_with_tun = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut router = TunLifetimeRouter {
+            inner: Box::new(TunLifetimeProbeRouter {
+                tun: weak.clone(),
+                closed_with_tun: closed_with_tun.clone(),
+            }),
+            _tun: tun.clone(),
+        };
+        drop(tun);
+
+        rustscale_router::Router::close(&mut router).unwrap();
+        assert!(closed_with_tun.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(weak.upgrade().is_some());
+        drop(router);
+        assert!(weak.upgrade().is_none());
     }
 
     fn ordered_managed_router(

@@ -52,6 +52,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::localapi_contract::known_localapi_route;
 use crate::serve::ServeConfig;
 use crate::tls::{AcmeCertFetcher, ControlCertProvider};
 
@@ -2178,6 +2179,46 @@ async fn handle_tka_disable<W: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn handle_tka_force_local_disable<W: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut W,
+    body: &[u8],
+    state: &Arc<LocalApiState>,
+) -> Result<(), std::io::Error> {
+    // Match upstream's required JSON stanza as an extra CSRF boundary, while
+    // rejecting unknown fields so malformed recovery requests fail closed.
+    let valid_body = matches!(
+        serde_json::from_slice::<serde_json::Value>(body),
+        Ok(serde_json::Value::Object(object)) if object.is_empty()
+    );
+    if !valid_body {
+        let body = serde_json::json!({"error": "invalid Tailnet Lock local-disable request"});
+        write_json_response(conn, 400, "Bad Request", &body).await?;
+        return Ok(());
+    }
+    let Some(lock) = state.tailnet_lock.as_ref() else {
+        let body = serde_json::json!({"error": "Tailnet Lock state is unavailable"});
+        write_json_response(conn, 409, "Conflict", &body).await?;
+        return Ok(());
+    };
+    let flight = match lock.start_force_local_disable().await {
+        Ok(flight) => flight,
+        Err(error) => {
+            write_tka_error(conn, &error).await?;
+            return Ok(());
+        }
+    };
+    let mut disconnect = [0u8; 1];
+    let result = tokio::select! {
+        result = flight.wait() => result,
+        _ = conn.read(&mut disconnect) => return Ok(()),
+    };
+    match result.as_ref() {
+        Ok(()) => write_no_content_response(conn, 204, "No Content").await?,
+        Err(error) => write_tka_error(conn, error).await?,
+    }
+    Ok(())
+}
+
 async fn write_tka_error<W: AsyncWrite + Unpin>(
     conn: &mut W,
     error: &crate::tailnet_lock::TailnetLockError,
@@ -2189,6 +2230,11 @@ async fn write_tka_error<W: AsyncWrite + Unpin>(
             409,
             "Conflict",
             "Tailnet Lock initialization outcome is ambiguous; secrets are safe in the durable receipt; check status or resume",
+        ),
+        TailnetLockError::LocalDisableCommitted => (
+            409,
+            "Conflict",
+            "Tailnet Lock is locally disabled and traffic was withdrawn, but retired authority cleanup is incomplete; retry local-disable",
         ),
         TailnetLockError::AlreadyEnabled
         | TailnetLockError::NotEnabled
@@ -2259,57 +2305,6 @@ fn percent_decode_query(value: &str) -> String {
 // ---------------------------------------------------------------------------
 // Connection handling
 // ---------------------------------------------------------------------------
-
-fn known_localapi_route(method: &str, endpoint: &str) -> bool {
-    matches!(
-        (method, endpoint),
-        (
-            "GET",
-            "status"
-                | "whois"
-                | "prefs"
-                | "netmap"
-                | "metrics"
-                | "health"
-                | "watch-ipn-bus"
-                | "serve-config"
-                | "drive/status"
-                | "drive/config"
-                | "profiles"
-                | "file-targets"
-                | "debug"
-                | "dns-query"
-                | "check-ip-forwarding"
-                | "id-token"
-                | "tka/status"
-        ) | ("PATCH", "prefs")
-            | (
-                "POST",
-                "start"
-                    | "login-interactive"
-                    | "logout"
-                    | "routecheck"
-                    | "ping"
-                    | "debug-capture"
-                    | "serve-config"
-                    | "dial"
-                    | "check-prefs"
-                    | "set-expiry-sooner"
-                    | "shutdown"
-                    | "reload-config"
-                    | "debug"
-                    | "tka/init"
-                    | "tka/init/ack"
-                    | "tka/sign"
-                    | "tka/disable"
-            )
-            | ("PUT", "drive/config" | "profiles")
-    ) || (method == "GET" && endpoint.starts_with("cert/"))
-        || (endpoint.starts_with("profiles/") && matches!(method, "GET" | "POST" | "DELETE"))
-        || ((endpoint == "files" || endpoint.starts_with("files/"))
-            && matches!(method, "GET" | "DELETE"))
-        || (endpoint.starts_with("file-put/") && method == "PUT")
-}
 
 pub(crate) fn route_body_limit(head: &HttpRequestHead) -> Option<usize> {
     if head.path == "/" {
@@ -2550,6 +2545,7 @@ fn is_mutating_request(method: &str, endpoint: &str) -> bool {
                     | "tka/init/ack"
                     | "tka/sign"
                     | "tka/disable"
+                    | "tka/force-local-disable"
                     | "debug-capture"
                     | "serve-config"
                     | "set-expiry-sooner"
@@ -2633,6 +2629,7 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                     "/localapi/v0/tka/init/ack",
                     "/localapi/v0/tka/sign",
                     "/localapi/v0/tka/disable",
+                    "/localapi/v0/tka/force-local-disable",
                 ]);
                 write_json_response(conn, 200, "OK", &endpoints).await?;
             } else {
@@ -2761,7 +2758,7 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
             handle_logout(conn, state).await?;
         }
 
-        // --- Tailnet Lock status/init/sign/disable ---
+        // --- Tailnet Lock status/init/sign/disable/local-disable ---
         "tka/status" if method == "GET" => {
             handle_tka_status(conn, state).await?;
         }
@@ -2776,6 +2773,9 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
         }
         "tka/disable" if method == "POST" => {
             handle_tka_disable(conn, &req.body, state).await?;
+        }
+        "tka/force-local-disable" if method == "POST" => {
+            handle_tka_force_local_disable(conn, &req.body, state).await?;
         }
         endpoint if endpoint.starts_with("tka/") => {
             let body = serde_json::json!({"error": "bad Tailnet Lock method or endpoint"});
@@ -7290,6 +7290,7 @@ mod tests {
             ("POST", "tka/init/ack"),
             ("POST", "tka/sign"),
             ("POST", "tka/disable"),
+            ("POST", "tka/force-local-disable"),
             ("POST", "debug-capture"),
             ("GET", "cert/test.ts.net"),
             ("POST", "serve-config"),
@@ -8705,13 +8706,32 @@ mod tests {
     #[tokio::test]
     async fn test_readonly_identity_blocked_from_tailnet_lock_mutation() {
         let state = make_test_state().await;
-        let resp = send_request_with_identity(
-            b"POST /localapi/v0/tka/disable HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+        for request in [
+            &b"POST /localapi/v0/tka/disable HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx"[..],
+            &b"POST /localapi/v0/tka/force-local-disable HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..],
+        ] {
+            let resp = send_request_with_identity(request, &state, test_ro_identity()).await;
+            assert!(resp.contains("403 Forbidden"));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_disable_requires_an_empty_json_stanza() {
+        let state = make_test_state().await;
+        let malformed = send_request_to_state(
+            b"POST /localapi/v0/tka/force-local-disable HTTP/1.1\r\nHost: localhost\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"unexpected\":true}",
             &state,
-            test_ro_identity(),
         )
         .await;
-        assert!(resp.contains("403 Forbidden"));
+        assert!(malformed.contains("400 Bad Request"), "{malformed}");
+
+        let admitted = send_request_to_state(
+            b"POST /localapi/v0/tka/force-local-disable HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            &state,
+        )
+        .await;
+        assert!(admitted.contains("409 Conflict"), "{admitted}");
+        assert!(admitted.contains("state is unavailable"), "{admitted}");
     }
 
     #[tokio::test]

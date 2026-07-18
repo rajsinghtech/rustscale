@@ -719,13 +719,19 @@ async fn listen_and_listen_on_same_port() {
 // UDP tests
 // ────────────────────────────────────────────────────────────────────
 
-/// Two netstacks wired back-to-back: B listens for UDP, A sends a datagram,
-/// B receives it and echoes back. Exercises the full UDP data path through
-/// WireGuard-encapsulated IP packets.
-#[tokio::test]
-async fn udp_recv_and_echo() {
-    use std::net::IpAddr;
-
+/// Start a WireGuard pump driven only by netstack transmit notifications.
+///
+/// There is deliberately no periodic fallback here. The old UDP coverage
+/// polled this outer pump every 10 ms and allowed 10 seconds for delivery, so
+/// it proved eventual delivery but not that an idle application send woke the
+/// inner netstack poll loop instead of waiting for its one-second fallback.
+fn make_notification_only_udp_rig() -> (
+    Arc<Netstack>,
+    Arc<Netstack>,
+    tokio::task::JoinHandle<()>,
+    Ipv4Addr,
+    Ipv4Addr,
+) {
     let a_priv = NodePrivate::generate();
     let b_priv = NodePrivate::generate();
     let a_pub = a_priv.public();
@@ -733,10 +739,8 @@ async fn udp_recv_and_echo() {
 
     let a_addr = Ipv4Addr::new(100, 64, 0, 1);
     let b_addr = Ipv4Addr::new(100, 64, 0, 2);
-
     let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
     let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
-
     let a_tunn = Arc::new(Mutex::new(
         WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
     ));
@@ -744,26 +748,35 @@ async fn udp_recv_and_echo() {
         WgTunn::new(&b_priv, &a_pub, 2).expect("B tunnel"),
     ));
 
-    let a_tunn_p = a_tunn.clone();
-    let b_tunn_p = b_tunn.clone();
-    let a_net_p = a_net.clone();
-    let b_net_p = b_net.clone();
+    let a_net_p = Arc::clone(&a_net);
+    let b_net_p = Arc::clone(&b_net);
     let pump = tokio::spawn(async move {
         let a_tx = a_net_p.tx_notify();
         let b_tx = b_net_p.tx_notify();
         loop {
-            let did_work = pump_cycle(&a_tunn_p, &b_tunn_p, &a_net_p, &b_net_p);
-            if !did_work {
+            if !pump_cycle(&a_tunn, &b_tunn, &a_net_p, &b_net_p) {
                 tokio::select! {
                     () = a_tx.notified() => {}
                     () = b_tx.notified() => {}
-                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                 }
             }
         }
     });
 
-    // B listens for UDP on its tailnet IP, port 12345.
+    (a_net, b_net, pump, a_addr, b_addr)
+}
+
+/// Two netstacks wired back-to-back: B listens for UDP, A sends an idle
+/// datagram, B receives it and echoes back. Both application sends must arrive
+/// well before the poll loop's one-second safety fallback.
+#[tokio::test]
+async fn udp_recv_and_echo() {
+    use std::net::IpAddr;
+
+    const DELIVERY_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+    let (a_net, b_net, pump, a_addr, b_addr) = make_notification_only_udp_rig();
+
     let mut b_udp = b_net
         .listen_packet(IpAddr::V4(b_addr), 12345)
         .await
@@ -773,7 +786,6 @@ async fn udp_recv_and_echo() {
         SocketAddr::new(IpAddr::V4(b_addr), 12345)
     );
 
-    // A listens on an ephemeral port so it can receive the echo reply.
     let mut a_udp = a_net
         .listen_packet(IpAddr::V4(a_addr), 0)
         .await
@@ -785,34 +797,173 @@ async fn udp_recv_and_echo() {
         a_local.port()
     );
 
-    // A sends a datagram to B.
+    // Let both poll loops become idle so a command/listener wake cannot carry
+    // this application packet through accidentally.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let sent_at = std::time::Instant::now();
     a_udp
         .send_to(b"hello udp", SocketAddr::new(IpAddr::V4(b_addr), 12345))
         .await
         .expect("send_to");
-
-    // B receives it.
-    let (data, src) = tokio::time::timeout(std::time::Duration::from_secs(10), b_udp.recv_from())
+    let (data, src) = tokio::time::timeout(DELIVERY_DEADLINE, b_udp.recv_from())
         .await
-        .expect("recv_from timed out")
+        .unwrap_or_else(|_| {
+            panic!(
+                "idle application UDP send was not delivered within {DELIVERY_DEADLINE:?}; \
+                 the netstack poll fallback is one second"
+            )
+        })
         .expect("recv_from failed");
     assert_eq!(&data[..], b"hello udp");
     assert_eq!(src, a_local);
+    assert!(
+        sent_at.elapsed() < DELIVERY_DEADLINE,
+        "idle UDP delivery exceeded {DELIVERY_DEADLINE:?}"
+    );
 
-    // B echoes back to A.
+    let echoed_at = std::time::Instant::now();
     b_udp
         .send_to(b"echo reply", src)
         .await
         .expect("echo send_to");
-
-    // A receives the echo.
-    let (data, _src) = tokio::time::timeout(std::time::Duration::from_secs(10), a_udp.recv_from())
+    let (data, _src) = tokio::time::timeout(DELIVERY_DEADLINE, a_udp.recv_from())
         .await
-        .expect("echo recv timed out")
+        .unwrap_or_else(|_| {
+            panic!(
+                "idle application UDP echo was not delivered within {DELIVERY_DEADLINE:?}; \
+                 the netstack poll fallback is one second"
+            )
+        })
         .expect("echo recv failed");
     assert_eq!(&data[..], b"echo reply");
+    assert!(
+        echoed_at.elapsed() < DELIVERY_DEADLINE,
+        "idle UDP echo exceeded {DELIVERY_DEADLINE:?}"
+    );
 
     pump.abort();
+}
+
+/// A 20 Hz application stream must remain paced rather than accumulating in
+/// the send channel until the poll loop's one-second fallback.
+#[tokio::test]
+async fn udp_application_cadence_is_not_batched() {
+    use std::net::IpAddr;
+
+    const PACKET_COUNT: usize = 16;
+    const CADENCE_MS: u64 = 50;
+    const MAX_ONE_WAY: std::time::Duration = std::time::Duration::from_millis(500);
+    const MIN_ARRIVAL_SPAN: std::time::Duration = std::time::Duration::from_millis(400);
+
+    let (a_net, b_net, pump, a_addr, b_addr) = make_notification_only_udp_rig();
+    let mut b_udp = b_net
+        .listen_packet(IpAddr::V4(b_addr), 12346)
+        .await
+        .expect("B listen_packet");
+    let a_udp = a_net
+        .listen_packet(IpAddr::V4(a_addr), 0)
+        .await
+        .expect("A listen_packet");
+    let a_local = a_udp.local_addr();
+    let destination = SocketAddr::new(IpAddr::V4(b_addr), 12346);
+
+    // Establish WireGuard before measuring application cadence. This warmup is
+    // allowed to hit the old fallback; the measured train starts after the
+    // poll loop has returned to a known idle period.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    a_udp
+        .send_to(b"warmup", destination)
+        .await
+        .expect("warmup send_to");
+    let (warmup, warmup_src) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), b_udp.recv_from())
+            .await
+            .expect("warmup timed out")
+            .expect("warmup receive failed");
+    assert_eq!(&warmup[..], b"warmup");
+    assert_eq!(warmup_src, a_local);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let receiver = tokio::spawn(async move {
+        let mut arrivals = Vec::with_capacity(PACKET_COUNT);
+        for expected in 0..PACKET_COUNT {
+            let (data, src) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), b_udp.recv_from())
+                    .await
+                    .unwrap_or_else(|_| panic!("timed out waiting for UDP sequence {expected}"))
+                    .expect("cadence receive failed");
+            let expected_payload = (expected as u32).to_be_bytes();
+            assert_eq!(&data[..], &expected_payload, "UDP sequence {expected}");
+            assert_eq!(src, a_local, "UDP source for sequence {expected}");
+            arrivals.push(std::time::Instant::now());
+        }
+        arrivals
+    });
+
+    let cadence_start = std::time::Instant::now();
+    let mut sent_at = Vec::with_capacity(PACKET_COUNT);
+    for sequence in 0..PACKET_COUNT {
+        let scheduled =
+            cadence_start + std::time::Duration::from_millis(CADENCE_MS * sequence as u64);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled)).await;
+        sent_at.push(std::time::Instant::now());
+        a_udp
+            .send_to(&(sequence as u32).to_be_bytes(), destination)
+            .await
+            .unwrap_or_else(|error| panic!("send sequence {sequence}: {error}"));
+    }
+
+    let arrivals = tokio::time::timeout(std::time::Duration::from_secs(3), receiver)
+        .await
+        .expect("cadence receiver timed out")
+        .expect("cadence receiver task failed");
+    pump.abort();
+
+    let max_one_way = sent_at
+        .iter()
+        .zip(&arrivals)
+        .map(|(sent, arrived)| arrived.duration_since(*sent))
+        .max()
+        .expect("at least one latency sample");
+    let send_span = sent_at
+        .last()
+        .expect("last send")
+        .duration_since(sent_at[0]);
+    let arrival_span = arrivals
+        .last()
+        .expect("last arrival")
+        .duration_since(arrivals[0]);
+    let samples = sent_at
+        .iter()
+        .zip(&arrivals)
+        .enumerate()
+        .map(|(sequence, (sent, arrived))| {
+            format!(
+                "{sequence}:send={}ms recv={}ms latency={}ms",
+                sent.duration_since(cadence_start).as_millis(),
+                arrived.duration_since(cadence_start).as_millis(),
+                arrived.duration_since(*sent).as_millis()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let diagnostics = format!(
+        "send_span={}ms arrival_span={}ms max_one_way={}ms samples=[{samples}]",
+        send_span.as_millis(),
+        arrival_span.as_millis(),
+        max_one_way.as_millis()
+    );
+    eprintln!("UDP cadence regression: {diagnostics}");
+
+    assert!(
+        max_one_way <= MAX_ONE_WAY,
+        "20 Hz application UDP exceeded the generous {MAX_ONE_WAY:?} one-way bound; {diagnostics}"
+    );
+    assert!(
+        arrival_span >= MIN_ARRIVAL_SPAN,
+        "20 Hz application UDP arrived as a batch instead of a paced stream; {diagnostics}"
+    );
 }
 
 /// Verify that listening on an already-bound (addr, port) fails.

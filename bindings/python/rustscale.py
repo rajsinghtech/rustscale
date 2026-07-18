@@ -41,6 +41,19 @@ from ctypes import (
 )
 from pathlib import Path
 
+__all__ = [
+    "Connection",
+    "Listener",
+    "RS_ERR_BUSY",
+    "RS_ERR_INVAL",
+    "RS_ERR_NOENT",
+    "RS_ERR_TIMEOUT",
+    "RS_ERR_UNKNOWN",
+    "RS_OK",
+    "RustscaleError",
+    "Server",
+]
+
 # ---------------------------------------------------------------------------
 # Load the shared library
 # ---------------------------------------------------------------------------
@@ -136,6 +149,7 @@ RS_OK = 0
 RS_ERR_INVAL = -22
 RS_ERR_NOENT = -2
 RS_ERR_BUSY = -16
+RS_ERR_TIMEOUT = -110
 RS_ERR_UNKNOWN = -1
 
 

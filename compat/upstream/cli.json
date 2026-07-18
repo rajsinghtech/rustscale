@@ -1,0 +1,5588 @@
+{
+  "$schema": "../schema/manifest-v1.schema.json",
+  "comparisons": [
+    {
+      "classification": "exact",
+      "denominator_id": "command:appc-routes",
+      "id": "snapshot:command:appc-routes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:appc-routes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:bugreport",
+      "id": "snapshot:command:bugreport",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:bugreport"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:cert",
+      "id": "snapshot:command:cert",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:cert"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:completion",
+      "id": "snapshot:command:completion",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:completion"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:completion/bash",
+      "id": "snapshot:command:completion/bash",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:completion/bash"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:completion/fish",
+      "id": "snapshot:command:completion/fish",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:completion/fish"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:completion/powershell",
+      "id": "snapshot:command:completion/powershell",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:completion/powershell"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:completion/zsh",
+      "id": "snapshot:command:completion/zsh",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:completion/zsh"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:configure",
+      "id": "snapshot:command:configure",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:configure"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:configure/kubeconfig",
+      "id": "snapshot:command:configure/kubeconfig",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:configure/kubeconfig"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:configure/mac-vpn",
+      "id": "snapshot:command:configure/mac-vpn",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:configure/mac-vpn"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:configure/mac-vpn/install",
+      "id": "snapshot:command:configure/mac-vpn/install",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:configure/mac-vpn/install"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:configure/mac-vpn/uninstall",
+      "id": "snapshot:command:configure/mac-vpn/uninstall",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:configure/mac-vpn/uninstall"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:configure/sysext",
+      "id": "snapshot:command:configure/sysext",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:configure/sysext"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:configure/sysext/activate",
+      "id": "snapshot:command:configure/sysext/activate",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:configure/sysext/activate"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:configure/sysext/deactivate",
+      "id": "snapshot:command:configure/sysext/deactivate",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:configure/sysext/deactivate"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:configure/sysext/status",
+      "id": "snapshot:command:configure/sysext/status",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:configure/sysext/status"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:dns",
+      "id": "snapshot:command:dns",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:dns"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:dns/query",
+      "id": "snapshot:command:dns/query",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:dns/query"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:dns/status",
+      "id": "snapshot:command:dns/status",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:dns/status"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:down",
+      "id": "snapshot:command:down",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:down"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:drive",
+      "id": "snapshot:command:drive",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:drive"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:drive/list",
+      "id": "snapshot:command:drive/list",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:drive/list"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:drive/rename",
+      "id": "snapshot:command:drive/rename",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:drive/rename"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:drive/share",
+      "id": "snapshot:command:drive/share",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:drive/share"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:drive/unshare",
+      "id": "snapshot:command:drive/unshare",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:drive/unshare"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:exit-node",
+      "id": "snapshot:command:exit-node",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:exit-node"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:exit-node/list",
+      "id": "snapshot:command:exit-node/list",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:exit-node/list"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:exit-node/suggest",
+      "id": "snapshot:command:exit-node/suggest",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:exit-node/suggest"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:file",
+      "id": "snapshot:command:file",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:file"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:file/cp",
+      "id": "snapshot:command:file/cp",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:file/cp"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:file/get",
+      "id": "snapshot:command:file/get",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:file/get"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:funnel",
+      "id": "snapshot:command:funnel",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:funnel"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:funnel/reset",
+      "id": "snapshot:command:funnel/reset",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:funnel/reset"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:funnel/status",
+      "id": "snapshot:command:funnel/status",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:funnel/status"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:get",
+      "id": "snapshot:command:get",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:get"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:ip",
+      "id": "snapshot:command:ip",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:ip"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:licenses",
+      "id": "snapshot:command:licenses",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:licenses"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock",
+      "id": "snapshot:command:lock",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/add",
+      "id": "snapshot:command:lock/add",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/add"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/disable",
+      "id": "snapshot:command:lock/disable",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/disable"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/disablement-kdf",
+      "id": "snapshot:command:lock/disablement-kdf",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/disablement-kdf"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/init",
+      "id": "snapshot:command:lock/init",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/init"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/local-disable",
+      "id": "snapshot:command:lock/local-disable",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/local-disable"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/log",
+      "id": "snapshot:command:lock/log",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/log"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/remove",
+      "id": "snapshot:command:lock/remove",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/remove"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/revoke-keys",
+      "id": "snapshot:command:lock/revoke-keys",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/revoke-keys"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/sign",
+      "id": "snapshot:command:lock/sign",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/sign"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:lock/status",
+      "id": "snapshot:command:lock/status",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:lock/status"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:login",
+      "id": "snapshot:command:login",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:login"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:logout",
+      "id": "snapshot:command:logout",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:logout"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:metrics",
+      "id": "snapshot:command:metrics",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:metrics"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:metrics/print",
+      "id": "snapshot:command:metrics/print",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:metrics/print"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:metrics/write",
+      "id": "snapshot:command:metrics/write",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:metrics/write"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:nc",
+      "id": "snapshot:command:nc",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:nc"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:netcheck",
+      "id": "snapshot:command:netcheck",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:netcheck"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:ping",
+      "id": "snapshot:command:ping",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:ping"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:serve",
+      "id": "snapshot:command:serve",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:serve"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:serve/advertise",
+      "id": "snapshot:command:serve/advertise",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:serve/advertise"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:serve/clear",
+      "id": "snapshot:command:serve/clear",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:serve/clear"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:serve/drain",
+      "id": "snapshot:command:serve/drain",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:serve/drain"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:serve/get-config",
+      "id": "snapshot:command:serve/get-config",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:serve/get-config"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:serve/reset",
+      "id": "snapshot:command:serve/reset",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:serve/reset"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:serve/set-config",
+      "id": "snapshot:command:serve/set-config",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:serve/set-config"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:serve/status",
+      "id": "snapshot:command:serve/status",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:serve/status"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:set",
+      "id": "snapshot:command:set",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:set"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:ssh",
+      "id": "snapshot:command:ssh",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:ssh"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:status",
+      "id": "snapshot:command:status",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:status"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:switch",
+      "id": "snapshot:command:switch",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:switch"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:switch/remove",
+      "id": "snapshot:command:switch/remove",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:switch/remove"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:syspolicy",
+      "id": "snapshot:command:syspolicy",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:syspolicy"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:syspolicy/list",
+      "id": "snapshot:command:syspolicy/list",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:syspolicy/list"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:syspolicy/reload",
+      "id": "snapshot:command:syspolicy/reload",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:syspolicy/reload"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:up",
+      "id": "snapshot:command:up",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:up"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:update",
+      "id": "snapshot:command:update",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:update"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:version",
+      "id": "snapshot:command:version",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:version"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:wait",
+      "id": "snapshot:command:wait",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:wait"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:web",
+      "id": "snapshot:command:web",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:web"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:whoami",
+      "id": "snapshot:command:whoami",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:whoami"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "command:whois",
+      "id": "snapshot:command:whois",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "command:whois"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:/:socket",
+      "id": "snapshot:flag:/:socket",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:/:socket"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:appc-routes:all",
+      "id": "snapshot:flag:appc-routes:all",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:appc-routes:all"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:appc-routes:map",
+      "id": "snapshot:flag:appc-routes:map",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:appc-routes:map"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:appc-routes:n",
+      "id": "snapshot:flag:appc-routes:n",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:appc-routes:n"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:bugreport:diagnose",
+      "id": "snapshot:flag:bugreport:diagnose",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:bugreport:diagnose"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:bugreport:record",
+      "id": "snapshot:flag:bugreport:record",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:bugreport:record"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:cert:cert-file",
+      "id": "snapshot:flag:cert:cert-file",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:cert:cert-file"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:cert:key-file",
+      "id": "snapshot:flag:cert:key-file",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:cert:key-file"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:cert:min-validity",
+      "id": "snapshot:flag:cert:min-validity",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:cert:min-validity"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:cert:serve-demo",
+      "id": "snapshot:flag:cert:serve-demo",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:cert:serve-demo"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:completion/bash:descs",
+      "id": "snapshot:flag:completion/bash:descs",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:completion/bash:descs"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:completion/bash:flags",
+      "id": "snapshot:flag:completion/bash:flags",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:completion/bash:flags"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:completion/fish:descs",
+      "id": "snapshot:flag:completion/fish:descs",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:completion/fish:descs"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:completion/fish:flags",
+      "id": "snapshot:flag:completion/fish:flags",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:completion/fish:flags"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:completion/powershell:descs",
+      "id": "snapshot:flag:completion/powershell:descs",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:completion/powershell:descs"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:completion/powershell:flags",
+      "id": "snapshot:flag:completion/powershell:flags",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:completion/powershell:flags"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:completion/zsh:descs",
+      "id": "snapshot:flag:completion/zsh:descs",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:completion/zsh:descs"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:completion/zsh:flags",
+      "id": "snapshot:flag:completion/zsh:flags",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:completion/zsh:flags"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:configure/kubeconfig:http",
+      "id": "snapshot:flag:configure/kubeconfig:http",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:configure/kubeconfig:http"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:dns/query:json",
+      "id": "snapshot:flag:dns/query:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:dns/query:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:dns/status:all",
+      "id": "snapshot:flag:dns/status:all",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:dns/status:all"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:dns/status:json",
+      "id": "snapshot:flag:dns/status:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:dns/status:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:down:accept-risk",
+      "id": "snapshot:flag:down:accept-risk",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:down:accept-risk"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:down:reason",
+      "id": "snapshot:flag:down:reason",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:down:reason"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:exit-node/list:filter",
+      "id": "snapshot:flag:exit-node/list:filter",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:exit-node/list:filter"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:file/cp:name",
+      "id": "snapshot:flag:file/cp:name",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:file/cp:name"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:file/cp:targets",
+      "id": "snapshot:flag:file/cp:targets",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:file/cp:targets"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:file/cp:update-interval",
+      "id": "snapshot:flag:file/cp:update-interval",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:file/cp:update-interval"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:file/cp:verbose",
+      "id": "snapshot:flag:file/cp:verbose",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:file/cp:verbose"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:file/get:conflict",
+      "id": "snapshot:flag:file/get:conflict",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:file/get:conflict"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:file/get:loop",
+      "id": "snapshot:flag:file/get:loop",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:file/get:loop"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:file/get:verbose",
+      "id": "snapshot:flag:file/get:verbose",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:file/get:verbose"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:file/get:wait",
+      "id": "snapshot:flag:file/get:wait",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:file/get:wait"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:funnel/status:json",
+      "id": "snapshot:flag:funnel/status:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:funnel/status:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:funnel:bg",
+      "id": "snapshot:flag:funnel:bg",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:funnel:bg"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:funnel:https",
+      "id": "snapshot:flag:funnel:https",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:funnel:https"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:funnel:proxy-protocol",
+      "id": "snapshot:flag:funnel:proxy-protocol",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:funnel:proxy-protocol"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:funnel:set-path",
+      "id": "snapshot:flag:funnel:set-path",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:funnel:set-path"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:funnel:tcp",
+      "id": "snapshot:flag:funnel:tcp",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:funnel:tcp"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:funnel:tls-terminated-tcp",
+      "id": "snapshot:flag:funnel:tls-terminated-tcp",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:funnel:tls-terminated-tcp"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:funnel:yes",
+      "id": "snapshot:flag:funnel:yes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:funnel:yes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:get:json",
+      "id": "snapshot:flag:get:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:get:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:get:set-flags",
+      "id": "snapshot:flag:get:set-flags",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:get:set-flags"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ip:1",
+      "id": "snapshot:flag:ip:1",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ip:1"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ip:4",
+      "id": "snapshot:flag:ip:4",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ip:4"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ip:6",
+      "id": "snapshot:flag:ip:6",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ip:6"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ip:assert",
+      "id": "snapshot:flag:ip:assert",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ip:assert"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/init:confirm",
+      "id": "snapshot:flag:lock/init:confirm",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/init:confirm"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/init:gen-disablement-for-support",
+      "id": "snapshot:flag:lock/init:gen-disablement-for-support",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/init:gen-disablement-for-support"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/init:gen-disablements",
+      "id": "snapshot:flag:lock/init:gen-disablements",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/init:gen-disablements"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/log:json",
+      "id": "snapshot:flag:lock/log:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/log:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/log:limit",
+      "id": "snapshot:flag:lock/log:limit",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/log:limit"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/remove:re-sign",
+      "id": "snapshot:flag:lock/remove:re-sign",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/remove:re-sign"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/revoke-keys:cosign",
+      "id": "snapshot:flag:lock/revoke-keys:cosign",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/revoke-keys:cosign"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/revoke-keys:finish",
+      "id": "snapshot:flag:lock/revoke-keys:finish",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/revoke-keys:finish"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/revoke-keys:fork-from",
+      "id": "snapshot:flag:lock/revoke-keys:fork-from",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/revoke-keys:fork-from"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:lock/status:json",
+      "id": "snapshot:flag:lock/status:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:lock/status:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:accept-dns",
+      "id": "snapshot:flag:login:accept-dns",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:accept-dns"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:accept-routes",
+      "id": "snapshot:flag:login:accept-routes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:accept-routes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:advertise-connector",
+      "id": "snapshot:flag:login:advertise-connector",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:advertise-connector"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:advertise-exit-node",
+      "id": "snapshot:flag:login:advertise-exit-node",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:advertise-exit-node"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:advertise-routes",
+      "id": "snapshot:flag:login:advertise-routes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:advertise-routes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:advertise-tags",
+      "id": "snapshot:flag:login:advertise-tags",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:advertise-tags"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:audience",
+      "id": "snapshot:flag:login:audience",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:audience"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:auth-key",
+      "id": "snapshot:flag:login:auth-key",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:auth-key"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:client-id",
+      "id": "snapshot:flag:login:client-id",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:client-id"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:client-secret",
+      "id": "snapshot:flag:login:client-secret",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:client-secret"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:exit-node",
+      "id": "snapshot:flag:login:exit-node",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:exit-node"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:exit-node-allow-lan-access",
+      "id": "snapshot:flag:login:exit-node-allow-lan-access",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:exit-node-allow-lan-access"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:hostname",
+      "id": "snapshot:flag:login:hostname",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:hostname"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:id-token",
+      "id": "snapshot:flag:login:id-token",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:id-token"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:login-server",
+      "id": "snapshot:flag:login:login-server",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:login-server"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:nickname",
+      "id": "snapshot:flag:login:nickname",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:nickname"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:operator",
+      "id": "snapshot:flag:login:operator",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:operator"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:qr",
+      "id": "snapshot:flag:login:qr",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:qr"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:qr-format",
+      "id": "snapshot:flag:login:qr-format",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:qr-format"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:report-posture",
+      "id": "snapshot:flag:login:report-posture",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:report-posture"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:shields-up",
+      "id": "snapshot:flag:login:shields-up",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:shields-up"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:ssh",
+      "id": "snapshot:flag:login:ssh",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:ssh"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:login:timeout",
+      "id": "snapshot:flag:login:timeout",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:login:timeout"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:logout:reason",
+      "id": "snapshot:flag:logout:reason",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:logout:reason"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:netcheck:bind-address",
+      "id": "snapshot:flag:netcheck:bind-address",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:netcheck:bind-address"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:netcheck:bind-port",
+      "id": "snapshot:flag:netcheck:bind-port",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:netcheck:bind-port"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:netcheck:every",
+      "id": "snapshot:flag:netcheck:every",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:netcheck:every"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:netcheck:format",
+      "id": "snapshot:flag:netcheck:format",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:netcheck:format"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:netcheck:verbose",
+      "id": "snapshot:flag:netcheck:verbose",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:netcheck:verbose"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ping:c",
+      "id": "snapshot:flag:ping:c",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ping:c"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ping:icmp",
+      "id": "snapshot:flag:ping:icmp",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ping:icmp"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ping:peerapi",
+      "id": "snapshot:flag:ping:peerapi",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ping:peerapi"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ping:size",
+      "id": "snapshot:flag:ping:size",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ping:size"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ping:timeout",
+      "id": "snapshot:flag:ping:timeout",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ping:timeout"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ping:tsmp",
+      "id": "snapshot:flag:ping:tsmp",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ping:tsmp"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ping:until-direct",
+      "id": "snapshot:flag:ping:until-direct",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ping:until-direct"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:ping:verbose",
+      "id": "snapshot:flag:ping:verbose",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:ping:verbose"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve/get-config:all",
+      "id": "snapshot:flag:serve/get-config:all",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve/get-config:all"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve/get-config:service",
+      "id": "snapshot:flag:serve/get-config:service",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve/get-config:service"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve/set-config:all",
+      "id": "snapshot:flag:serve/set-config:all",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve/set-config:all"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve/set-config:service",
+      "id": "snapshot:flag:serve/set-config:service",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve/set-config:service"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve/status:json",
+      "id": "snapshot:flag:serve/status:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve/status:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:accept-app-caps",
+      "id": "snapshot:flag:serve:accept-app-caps",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:accept-app-caps"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:bg",
+      "id": "snapshot:flag:serve:bg",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:bg"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:http",
+      "id": "snapshot:flag:serve:http",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:http"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:https",
+      "id": "snapshot:flag:serve:https",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:https"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:proxy-protocol",
+      "id": "snapshot:flag:serve:proxy-protocol",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:proxy-protocol"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:service",
+      "id": "snapshot:flag:serve:service",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:service"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:set-path",
+      "id": "snapshot:flag:serve:set-path",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:set-path"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:tcp",
+      "id": "snapshot:flag:serve:tcp",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:tcp"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:tls-terminated-tcp",
+      "id": "snapshot:flag:serve:tls-terminated-tcp",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:tls-terminated-tcp"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:tun",
+      "id": "snapshot:flag:serve:tun",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:tun"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:serve:yes",
+      "id": "snapshot:flag:serve:yes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:serve:yes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:accept-dns",
+      "id": "snapshot:flag:set:accept-dns",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:accept-dns"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:accept-risk",
+      "id": "snapshot:flag:set:accept-risk",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:accept-risk"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:accept-routes",
+      "id": "snapshot:flag:set:accept-routes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:accept-routes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:advertise-connector",
+      "id": "snapshot:flag:set:advertise-connector",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:advertise-connector"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:advertise-exit-node",
+      "id": "snapshot:flag:set:advertise-exit-node",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:advertise-exit-node"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:advertise-routes",
+      "id": "snapshot:flag:set:advertise-routes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:advertise-routes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:auto-update",
+      "id": "snapshot:flag:set:auto-update",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:auto-update"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:exit-node",
+      "id": "snapshot:flag:set:exit-node",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:exit-node"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:exit-node-allow-lan-access",
+      "id": "snapshot:flag:set:exit-node-allow-lan-access",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:exit-node-allow-lan-access"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:hostname",
+      "id": "snapshot:flag:set:hostname",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:hostname"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:nickname",
+      "id": "snapshot:flag:set:nickname",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:nickname"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:operator",
+      "id": "snapshot:flag:set:operator",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:operator"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:relay-server-port",
+      "id": "snapshot:flag:set:relay-server-port",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:relay-server-port"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:relay-server-static-endpoints",
+      "id": "snapshot:flag:set:relay-server-static-endpoints",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:relay-server-static-endpoints"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:report-posture",
+      "id": "snapshot:flag:set:report-posture",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:report-posture"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:shields-up",
+      "id": "snapshot:flag:set:shields-up",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:shields-up"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:ssh",
+      "id": "snapshot:flag:set:ssh",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:ssh"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:update-check",
+      "id": "snapshot:flag:set:update-check",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:update-check"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:set:webclient",
+      "id": "snapshot:flag:set:webclient",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:set:webclient"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:status:active",
+      "id": "snapshot:flag:status:active",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:status:active"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:status:browser",
+      "id": "snapshot:flag:status:browser",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:status:browser"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:status:header",
+      "id": "snapshot:flag:status:header",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:status:header"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:status:json",
+      "id": "snapshot:flag:status:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:status:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:status:listen",
+      "id": "snapshot:flag:status:listen",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:status:listen"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:status:peers",
+      "id": "snapshot:flag:status:peers",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:status:peers"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:status:self",
+      "id": "snapshot:flag:status:self",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:status:self"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:status:web",
+      "id": "snapshot:flag:status:web",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:status:web"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:switch:json",
+      "id": "snapshot:flag:switch:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:switch:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:switch:list",
+      "id": "snapshot:flag:switch:list",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:switch:list"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:syspolicy/list:json",
+      "id": "snapshot:flag:syspolicy/list:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:syspolicy/list:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:syspolicy/reload:json",
+      "id": "snapshot:flag:syspolicy/reload:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:syspolicy/reload:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:accept-dns",
+      "id": "snapshot:flag:up:accept-dns",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:accept-dns"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:accept-risk",
+      "id": "snapshot:flag:up:accept-risk",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:accept-risk"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:accept-routes",
+      "id": "snapshot:flag:up:accept-routes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:accept-routes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:advertise-connector",
+      "id": "snapshot:flag:up:advertise-connector",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:advertise-connector"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:advertise-exit-node",
+      "id": "snapshot:flag:up:advertise-exit-node",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:advertise-exit-node"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:advertise-routes",
+      "id": "snapshot:flag:up:advertise-routes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:advertise-routes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:advertise-tags",
+      "id": "snapshot:flag:up:advertise-tags",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:advertise-tags"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:audience",
+      "id": "snapshot:flag:up:audience",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:audience"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:auth-key",
+      "id": "snapshot:flag:up:auth-key",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:auth-key"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:client-id",
+      "id": "snapshot:flag:up:client-id",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:client-id"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:client-secret",
+      "id": "snapshot:flag:up:client-secret",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:client-secret"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:exit-node",
+      "id": "snapshot:flag:up:exit-node",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:exit-node"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:exit-node-allow-lan-access",
+      "id": "snapshot:flag:up:exit-node-allow-lan-access",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:exit-node-allow-lan-access"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:force-reauth",
+      "id": "snapshot:flag:up:force-reauth",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:force-reauth"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:hostname",
+      "id": "snapshot:flag:up:hostname",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:hostname"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:id-token",
+      "id": "snapshot:flag:up:id-token",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:id-token"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:json",
+      "id": "snapshot:flag:up:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:login-server",
+      "id": "snapshot:flag:up:login-server",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:login-server"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:operator",
+      "id": "snapshot:flag:up:operator",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:operator"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:qr",
+      "id": "snapshot:flag:up:qr",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:qr"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:qr-format",
+      "id": "snapshot:flag:up:qr-format",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:qr-format"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:report-posture",
+      "id": "snapshot:flag:up:report-posture",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:report-posture"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:reset",
+      "id": "snapshot:flag:up:reset",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:reset"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:shields-up",
+      "id": "snapshot:flag:up:shields-up",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:shields-up"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:ssh",
+      "id": "snapshot:flag:up:ssh",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:ssh"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:up:timeout",
+      "id": "snapshot:flag:up:timeout",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:up:timeout"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:update:dry-run",
+      "id": "snapshot:flag:update:dry-run",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:update:dry-run"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:update:yes",
+      "id": "snapshot:flag:update:yes",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:update:yes"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:version:daemon",
+      "id": "snapshot:flag:version:daemon",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:version:daemon"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:version:json",
+      "id": "snapshot:flag:version:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:version:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:version:track",
+      "id": "snapshot:flag:version:track",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:version:track"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:version:upstream",
+      "id": "snapshot:flag:version:upstream",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:version:upstream"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:wait:timeout",
+      "id": "snapshot:flag:wait:timeout",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:wait:timeout"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:web:cgi",
+      "id": "snapshot:flag:web:cgi",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:web:cgi"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:web:listen",
+      "id": "snapshot:flag:web:listen",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:web:listen"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:web:origin",
+      "id": "snapshot:flag:web:origin",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:web:origin"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:web:prefix",
+      "id": "snapshot:flag:web:prefix",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:web:prefix"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:web:readonly",
+      "id": "snapshot:flag:web:readonly",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:web:readonly"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:whoami:json",
+      "id": "snapshot:flag:whoami:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:whoami:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:whois:json",
+      "id": "snapshot:flag:whois:json",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:whois:json"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "flag:whois:proto",
+      "id": "snapshot:flag:whois:proto",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "flag:whois:proto"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "behavior:help_long",
+      "id": "snapshot:behavior:help_long",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "behavior:help_long"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "behavior:help_short",
+      "id": "snapshot:behavior:help_short",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "behavior:help_short"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "behavior:help_word",
+      "id": "snapshot:behavior:help_word",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "behavior:help_word"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "behavior:nc_help",
+      "id": "snapshot:behavior:nc_help",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "behavior:nc_help"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "behavior:no_args",
+      "id": "snapshot:behavior:no_args",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "behavior:no_args"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "behavior:status_help",
+      "id": "snapshot:behavior:status_help",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "behavior:status_help"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "behavior:unknown_command",
+      "id": "snapshot:behavior:unknown_command",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "behavior:unknown_command"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "behavior:version",
+      "id": "snapshot:behavior:version",
+      "local_ids": [],
+      "note": "normalized extraction from the pinned upstream source/artifact",
+      "upstream_ids": [
+        "behavior:version"
+      ]
+    }
+  ],
+  "contract_version": 1,
+  "denominator": {
+    "count": 270,
+    "ids": [
+      "behavior:help_long",
+      "behavior:help_short",
+      "behavior:help_word",
+      "behavior:nc_help",
+      "behavior:no_args",
+      "behavior:status_help",
+      "behavior:unknown_command",
+      "behavior:version",
+      "command:appc-routes",
+      "command:bugreport",
+      "command:cert",
+      "command:completion",
+      "command:completion/bash",
+      "command:completion/fish",
+      "command:completion/powershell",
+      "command:completion/zsh",
+      "command:configure",
+      "command:configure/kubeconfig",
+      "command:configure/mac-vpn",
+      "command:configure/mac-vpn/install",
+      "command:configure/mac-vpn/uninstall",
+      "command:configure/sysext",
+      "command:configure/sysext/activate",
+      "command:configure/sysext/deactivate",
+      "command:configure/sysext/status",
+      "command:dns",
+      "command:dns/query",
+      "command:dns/status",
+      "command:down",
+      "command:drive",
+      "command:drive/list",
+      "command:drive/rename",
+      "command:drive/share",
+      "command:drive/unshare",
+      "command:exit-node",
+      "command:exit-node/list",
+      "command:exit-node/suggest",
+      "command:file",
+      "command:file/cp",
+      "command:file/get",
+      "command:funnel",
+      "command:funnel/reset",
+      "command:funnel/status",
+      "command:get",
+      "command:ip",
+      "command:licenses",
+      "command:lock",
+      "command:lock/add",
+      "command:lock/disable",
+      "command:lock/disablement-kdf",
+      "command:lock/init",
+      "command:lock/local-disable",
+      "command:lock/log",
+      "command:lock/remove",
+      "command:lock/revoke-keys",
+      "command:lock/sign",
+      "command:lock/status",
+      "command:login",
+      "command:logout",
+      "command:metrics",
+      "command:metrics/print",
+      "command:metrics/write",
+      "command:nc",
+      "command:netcheck",
+      "command:ping",
+      "command:serve",
+      "command:serve/advertise",
+      "command:serve/clear",
+      "command:serve/drain",
+      "command:serve/get-config",
+      "command:serve/reset",
+      "command:serve/set-config",
+      "command:serve/status",
+      "command:set",
+      "command:ssh",
+      "command:status",
+      "command:switch",
+      "command:switch/remove",
+      "command:syspolicy",
+      "command:syspolicy/list",
+      "command:syspolicy/reload",
+      "command:up",
+      "command:update",
+      "command:version",
+      "command:wait",
+      "command:web",
+      "command:whoami",
+      "command:whois",
+      "flag:/:socket",
+      "flag:appc-routes:all",
+      "flag:appc-routes:map",
+      "flag:appc-routes:n",
+      "flag:bugreport:diagnose",
+      "flag:bugreport:record",
+      "flag:cert:cert-file",
+      "flag:cert:key-file",
+      "flag:cert:min-validity",
+      "flag:cert:serve-demo",
+      "flag:completion/bash:descs",
+      "flag:completion/bash:flags",
+      "flag:completion/fish:descs",
+      "flag:completion/fish:flags",
+      "flag:completion/powershell:descs",
+      "flag:completion/powershell:flags",
+      "flag:completion/zsh:descs",
+      "flag:completion/zsh:flags",
+      "flag:configure/kubeconfig:http",
+      "flag:dns/query:json",
+      "flag:dns/status:all",
+      "flag:dns/status:json",
+      "flag:down:accept-risk",
+      "flag:down:reason",
+      "flag:exit-node/list:filter",
+      "flag:file/cp:name",
+      "flag:file/cp:targets",
+      "flag:file/cp:update-interval",
+      "flag:file/cp:verbose",
+      "flag:file/get:conflict",
+      "flag:file/get:loop",
+      "flag:file/get:verbose",
+      "flag:file/get:wait",
+      "flag:funnel/status:json",
+      "flag:funnel:bg",
+      "flag:funnel:https",
+      "flag:funnel:proxy-protocol",
+      "flag:funnel:set-path",
+      "flag:funnel:tcp",
+      "flag:funnel:tls-terminated-tcp",
+      "flag:funnel:yes",
+      "flag:get:json",
+      "flag:get:set-flags",
+      "flag:ip:1",
+      "flag:ip:4",
+      "flag:ip:6",
+      "flag:ip:assert",
+      "flag:lock/init:confirm",
+      "flag:lock/init:gen-disablement-for-support",
+      "flag:lock/init:gen-disablements",
+      "flag:lock/log:json",
+      "flag:lock/log:limit",
+      "flag:lock/remove:re-sign",
+      "flag:lock/revoke-keys:cosign",
+      "flag:lock/revoke-keys:finish",
+      "flag:lock/revoke-keys:fork-from",
+      "flag:lock/status:json",
+      "flag:login:accept-dns",
+      "flag:login:accept-routes",
+      "flag:login:advertise-connector",
+      "flag:login:advertise-exit-node",
+      "flag:login:advertise-routes",
+      "flag:login:advertise-tags",
+      "flag:login:audience",
+      "flag:login:auth-key",
+      "flag:login:client-id",
+      "flag:login:client-secret",
+      "flag:login:exit-node",
+      "flag:login:exit-node-allow-lan-access",
+      "flag:login:hostname",
+      "flag:login:id-token",
+      "flag:login:login-server",
+      "flag:login:nickname",
+      "flag:login:operator",
+      "flag:login:qr",
+      "flag:login:qr-format",
+      "flag:login:report-posture",
+      "flag:login:shields-up",
+      "flag:login:ssh",
+      "flag:login:timeout",
+      "flag:logout:reason",
+      "flag:netcheck:bind-address",
+      "flag:netcheck:bind-port",
+      "flag:netcheck:every",
+      "flag:netcheck:format",
+      "flag:netcheck:verbose",
+      "flag:ping:c",
+      "flag:ping:icmp",
+      "flag:ping:peerapi",
+      "flag:ping:size",
+      "flag:ping:timeout",
+      "flag:ping:tsmp",
+      "flag:ping:until-direct",
+      "flag:ping:verbose",
+      "flag:serve/get-config:all",
+      "flag:serve/get-config:service",
+      "flag:serve/set-config:all",
+      "flag:serve/set-config:service",
+      "flag:serve/status:json",
+      "flag:serve:accept-app-caps",
+      "flag:serve:bg",
+      "flag:serve:http",
+      "flag:serve:https",
+      "flag:serve:proxy-protocol",
+      "flag:serve:service",
+      "flag:serve:set-path",
+      "flag:serve:tcp",
+      "flag:serve:tls-terminated-tcp",
+      "flag:serve:tun",
+      "flag:serve:yes",
+      "flag:set:accept-dns",
+      "flag:set:accept-risk",
+      "flag:set:accept-routes",
+      "flag:set:advertise-connector",
+      "flag:set:advertise-exit-node",
+      "flag:set:advertise-routes",
+      "flag:set:auto-update",
+      "flag:set:exit-node",
+      "flag:set:exit-node-allow-lan-access",
+      "flag:set:hostname",
+      "flag:set:nickname",
+      "flag:set:operator",
+      "flag:set:relay-server-port",
+      "flag:set:relay-server-static-endpoints",
+      "flag:set:report-posture",
+      "flag:set:shields-up",
+      "flag:set:ssh",
+      "flag:set:update-check",
+      "flag:set:webclient",
+      "flag:status:active",
+      "flag:status:browser",
+      "flag:status:header",
+      "flag:status:json",
+      "flag:status:listen",
+      "flag:status:peers",
+      "flag:status:self",
+      "flag:status:web",
+      "flag:switch:json",
+      "flag:switch:list",
+      "flag:syspolicy/list:json",
+      "flag:syspolicy/reload:json",
+      "flag:up:accept-dns",
+      "flag:up:accept-risk",
+      "flag:up:accept-routes",
+      "flag:up:advertise-connector",
+      "flag:up:advertise-exit-node",
+      "flag:up:advertise-routes",
+      "flag:up:advertise-tags",
+      "flag:up:audience",
+      "flag:up:auth-key",
+      "flag:up:client-id",
+      "flag:up:client-secret",
+      "flag:up:exit-node",
+      "flag:up:exit-node-allow-lan-access",
+      "flag:up:force-reauth",
+      "flag:up:hostname",
+      "flag:up:id-token",
+      "flag:up:json",
+      "flag:up:login-server",
+      "flag:up:operator",
+      "flag:up:qr",
+      "flag:up:qr-format",
+      "flag:up:report-posture",
+      "flag:up:reset",
+      "flag:up:shields-up",
+      "flag:up:ssh",
+      "flag:up:timeout",
+      "flag:update:dry-run",
+      "flag:update:yes",
+      "flag:version:daemon",
+      "flag:version:json",
+      "flag:version:track",
+      "flag:version:upstream",
+      "flag:wait:timeout",
+      "flag:web:cgi",
+      "flag:web:listen",
+      "flag:web:origin",
+      "flag:web:prefix",
+      "flag:web:readonly",
+      "flag:whoami:json",
+      "flag:whois:json",
+      "flag:whois:proto"
+    ],
+    "sha256": "25100a84c7dbe068333af5cb44c7bbe8c03d5d77c32c0eabe81a9f04b8b897b8",
+    "source": "pinned-upstream"
+  },
+  "extraction": {
+    "extractor": "tools/compat/generate.py",
+    "module": "tailscale.com@v1.100.0",
+    "platform": "darwin/arm64",
+    "source": "cmd/tailscale --json-docs plus executable probes",
+    "source_revision": "c811bb19bf3b0c89061ac7b7a073f6cd23b504d0"
+  },
+  "generator_version": 1,
+  "guards": {
+    "upstream": {
+      "count": 270,
+      "ids": [
+        "behavior:help_long",
+        "behavior:help_short",
+        "behavior:help_word",
+        "behavior:nc_help",
+        "behavior:no_args",
+        "behavior:status_help",
+        "behavior:unknown_command",
+        "behavior:version",
+        "command:appc-routes",
+        "command:bugreport",
+        "command:cert",
+        "command:completion",
+        "command:completion/bash",
+        "command:completion/fish",
+        "command:completion/powershell",
+        "command:completion/zsh",
+        "command:configure",
+        "command:configure/kubeconfig",
+        "command:configure/mac-vpn",
+        "command:configure/mac-vpn/install",
+        "command:configure/mac-vpn/uninstall",
+        "command:configure/sysext",
+        "command:configure/sysext/activate",
+        "command:configure/sysext/deactivate",
+        "command:configure/sysext/status",
+        "command:dns",
+        "command:dns/query",
+        "command:dns/status",
+        "command:down",
+        "command:drive",
+        "command:drive/list",
+        "command:drive/rename",
+        "command:drive/share",
+        "command:drive/unshare",
+        "command:exit-node",
+        "command:exit-node/list",
+        "command:exit-node/suggest",
+        "command:file",
+        "command:file/cp",
+        "command:file/get",
+        "command:funnel",
+        "command:funnel/reset",
+        "command:funnel/status",
+        "command:get",
+        "command:ip",
+        "command:licenses",
+        "command:lock",
+        "command:lock/add",
+        "command:lock/disable",
+        "command:lock/disablement-kdf",
+        "command:lock/init",
+        "command:lock/local-disable",
+        "command:lock/log",
+        "command:lock/remove",
+        "command:lock/revoke-keys",
+        "command:lock/sign",
+        "command:lock/status",
+        "command:login",
+        "command:logout",
+        "command:metrics",
+        "command:metrics/print",
+        "command:metrics/write",
+        "command:nc",
+        "command:netcheck",
+        "command:ping",
+        "command:serve",
+        "command:serve/advertise",
+        "command:serve/clear",
+        "command:serve/drain",
+        "command:serve/get-config",
+        "command:serve/reset",
+        "command:serve/set-config",
+        "command:serve/status",
+        "command:set",
+        "command:ssh",
+        "command:status",
+        "command:switch",
+        "command:switch/remove",
+        "command:syspolicy",
+        "command:syspolicy/list",
+        "command:syspolicy/reload",
+        "command:up",
+        "command:update",
+        "command:version",
+        "command:wait",
+        "command:web",
+        "command:whoami",
+        "command:whois",
+        "flag:/:socket",
+        "flag:appc-routes:all",
+        "flag:appc-routes:map",
+        "flag:appc-routes:n",
+        "flag:bugreport:diagnose",
+        "flag:bugreport:record",
+        "flag:cert:cert-file",
+        "flag:cert:key-file",
+        "flag:cert:min-validity",
+        "flag:cert:serve-demo",
+        "flag:completion/bash:descs",
+        "flag:completion/bash:flags",
+        "flag:completion/fish:descs",
+        "flag:completion/fish:flags",
+        "flag:completion/powershell:descs",
+        "flag:completion/powershell:flags",
+        "flag:completion/zsh:descs",
+        "flag:completion/zsh:flags",
+        "flag:configure/kubeconfig:http",
+        "flag:dns/query:json",
+        "flag:dns/status:all",
+        "flag:dns/status:json",
+        "flag:down:accept-risk",
+        "flag:down:reason",
+        "flag:exit-node/list:filter",
+        "flag:file/cp:name",
+        "flag:file/cp:targets",
+        "flag:file/cp:update-interval",
+        "flag:file/cp:verbose",
+        "flag:file/get:conflict",
+        "flag:file/get:loop",
+        "flag:file/get:verbose",
+        "flag:file/get:wait",
+        "flag:funnel/status:json",
+        "flag:funnel:bg",
+        "flag:funnel:https",
+        "flag:funnel:proxy-protocol",
+        "flag:funnel:set-path",
+        "flag:funnel:tcp",
+        "flag:funnel:tls-terminated-tcp",
+        "flag:funnel:yes",
+        "flag:get:json",
+        "flag:get:set-flags",
+        "flag:ip:1",
+        "flag:ip:4",
+        "flag:ip:6",
+        "flag:ip:assert",
+        "flag:lock/init:confirm",
+        "flag:lock/init:gen-disablement-for-support",
+        "flag:lock/init:gen-disablements",
+        "flag:lock/log:json",
+        "flag:lock/log:limit",
+        "flag:lock/remove:re-sign",
+        "flag:lock/revoke-keys:cosign",
+        "flag:lock/revoke-keys:finish",
+        "flag:lock/revoke-keys:fork-from",
+        "flag:lock/status:json",
+        "flag:login:accept-dns",
+        "flag:login:accept-routes",
+        "flag:login:advertise-connector",
+        "flag:login:advertise-exit-node",
+        "flag:login:advertise-routes",
+        "flag:login:advertise-tags",
+        "flag:login:audience",
+        "flag:login:auth-key",
+        "flag:login:client-id",
+        "flag:login:client-secret",
+        "flag:login:exit-node",
+        "flag:login:exit-node-allow-lan-access",
+        "flag:login:hostname",
+        "flag:login:id-token",
+        "flag:login:login-server",
+        "flag:login:nickname",
+        "flag:login:operator",
+        "flag:login:qr",
+        "flag:login:qr-format",
+        "flag:login:report-posture",
+        "flag:login:shields-up",
+        "flag:login:ssh",
+        "flag:login:timeout",
+        "flag:logout:reason",
+        "flag:netcheck:bind-address",
+        "flag:netcheck:bind-port",
+        "flag:netcheck:every",
+        "flag:netcheck:format",
+        "flag:netcheck:verbose",
+        "flag:ping:c",
+        "flag:ping:icmp",
+        "flag:ping:peerapi",
+        "flag:ping:size",
+        "flag:ping:timeout",
+        "flag:ping:tsmp",
+        "flag:ping:until-direct",
+        "flag:ping:verbose",
+        "flag:serve/get-config:all",
+        "flag:serve/get-config:service",
+        "flag:serve/set-config:all",
+        "flag:serve/set-config:service",
+        "flag:serve/status:json",
+        "flag:serve:accept-app-caps",
+        "flag:serve:bg",
+        "flag:serve:http",
+        "flag:serve:https",
+        "flag:serve:proxy-protocol",
+        "flag:serve:service",
+        "flag:serve:set-path",
+        "flag:serve:tcp",
+        "flag:serve:tls-terminated-tcp",
+        "flag:serve:tun",
+        "flag:serve:yes",
+        "flag:set:accept-dns",
+        "flag:set:accept-risk",
+        "flag:set:accept-routes",
+        "flag:set:advertise-connector",
+        "flag:set:advertise-exit-node",
+        "flag:set:advertise-routes",
+        "flag:set:auto-update",
+        "flag:set:exit-node",
+        "flag:set:exit-node-allow-lan-access",
+        "flag:set:hostname",
+        "flag:set:nickname",
+        "flag:set:operator",
+        "flag:set:relay-server-port",
+        "flag:set:relay-server-static-endpoints",
+        "flag:set:report-posture",
+        "flag:set:shields-up",
+        "flag:set:ssh",
+        "flag:set:update-check",
+        "flag:set:webclient",
+        "flag:status:active",
+        "flag:status:browser",
+        "flag:status:header",
+        "flag:status:json",
+        "flag:status:listen",
+        "flag:status:peers",
+        "flag:status:self",
+        "flag:status:web",
+        "flag:switch:json",
+        "flag:switch:list",
+        "flag:syspolicy/list:json",
+        "flag:syspolicy/reload:json",
+        "flag:up:accept-dns",
+        "flag:up:accept-risk",
+        "flag:up:accept-routes",
+        "flag:up:advertise-connector",
+        "flag:up:advertise-exit-node",
+        "flag:up:advertise-routes",
+        "flag:up:advertise-tags",
+        "flag:up:audience",
+        "flag:up:auth-key",
+        "flag:up:client-id",
+        "flag:up:client-secret",
+        "flag:up:exit-node",
+        "flag:up:exit-node-allow-lan-access",
+        "flag:up:force-reauth",
+        "flag:up:hostname",
+        "flag:up:id-token",
+        "flag:up:json",
+        "flag:up:login-server",
+        "flag:up:operator",
+        "flag:up:qr",
+        "flag:up:qr-format",
+        "flag:up:report-posture",
+        "flag:up:reset",
+        "flag:up:shields-up",
+        "flag:up:ssh",
+        "flag:up:timeout",
+        "flag:update:dry-run",
+        "flag:update:yes",
+        "flag:version:daemon",
+        "flag:version:json",
+        "flag:version:track",
+        "flag:version:upstream",
+        "flag:wait:timeout",
+        "flag:web:cgi",
+        "flag:web:listen",
+        "flag:web:origin",
+        "flag:web:prefix",
+        "flag:web:readonly",
+        "flag:whoami:json",
+        "flag:whois:json",
+        "flag:whois:proto"
+      ],
+      "sha256": "25100a84c7dbe068333af5cb44c7bbe8c03d5d77c32c0eabe81a9f04b8b897b8"
+    },
+    "upstream_shape": {
+      "count": 270,
+      "ids": [
+        "behavior:help_long@8d15e35ccdc34c28874a7929162bc48d652c8c51f5facddb43d4339352452a25",
+        "behavior:help_short@5e80bd6e5b48f0d3df261037f259241853d313cbe01ac345e5a63728c73e4283",
+        "behavior:help_word@00230cad432b27f957db875dfe6c1e8ee77650f69f8e453604e6f415c6b06529",
+        "behavior:nc_help@8aead7a2fd4c17a972e268d0fcb6ba44b6e2c3bbcb03ff451e3955d001c77356",
+        "behavior:no_args@d904d75c3950b82028630f875d7a4b135a2efb264fb4cc7b12d8cef5d942255d",
+        "behavior:status_help@a20797f1680b774cfc9ecdbf5e137dbbccf8b2fc79e336edc75d8a3037a871c9",
+        "behavior:unknown_command@3b586f447e8c9b6e0390d13764ba7f5f58be5fd14466216bf9b65f008ab4775b",
+        "behavior:version@50b13ba3fd2ff8e6adc6701e8eb95ccf8eb4d0d871c0669a124653d8e59cefdd",
+        "command:appc-routes@8373dabd1c2203c5fe891144bbdc09b247409d275c1effcf9baf820f4677c095",
+        "command:bugreport@a5debba6338ce64be2e1533b2c3ffc96d01ae91e022aa3a450526f79e4da0952",
+        "command:cert@28543e7ca252d19728326c8b70ed2cce54aa608e05acbf1eb0b024ae9620191d",
+        "command:completion/bash@0b6f5d7677bed369e41169899609effc73d20d13b6821e5db70d9ebc7c482d05",
+        "command:completion/fish@82ddf7c270a0660d8d88077ba151bd1997987c2535ae2ef226298ed95c7fb6f4",
+        "command:completion/powershell@4dcc0ba739aac89226255650e395567545b38b3a89962a3c0718560afb2c3867",
+        "command:completion/zsh@c3c9089c5f41238c362289aee11acbd1b5a3c663e47bcf08df13c85bbcd13a8c",
+        "command:completion@40a36f88e618215c6a271c4571c3b9dd149df2a4803820ea60b499135c38ba10",
+        "command:configure/kubeconfig@c56ffce4dcc56c6cc5db69e8fc516971afd2dc7a47d698cb968f02becdb46150",
+        "command:configure/mac-vpn/install@bb48502af91b2ed835924b30bdbede11be0b860554380eda0269e215d3237c0c",
+        "command:configure/mac-vpn/uninstall@54c2bf3474cb6f1d0e8f79d3364902b43afa501f0134bdc6bf79574de20423c0",
+        "command:configure/mac-vpn@b90c2050d43b9881226bb89c60024c40abf62351d060a67dfc646d7f0d3b937e",
+        "command:configure/sysext/activate@1bd887852b171e94aefb8893b9e2b0af9bf66b392bc3de8eb79895e33261b652",
+        "command:configure/sysext/deactivate@66cbe8b81f27e9b52d384850ffca18873bda60052c64389dd56b7069ff74ef93",
+        "command:configure/sysext/status@fd566369490ce5d8912a511e13aff81abeb0718019c30870736deb45e77f4f7f",
+        "command:configure/sysext@2fc4c3ad6d71f2dabf9bacdf0356a5ea74e3d00971a24108a7314c14eaad5f4e",
+        "command:configure@69e60bb0e4a3dde4b85cd27e6124be42cc3b849194f8485b88d812f54d383b60",
+        "command:dns/query@cef7f1b34f18ad9f1a8a4e0162e1582dd41e97d2f0ebf8d7aefb09c56ef7b67f",
+        "command:dns/status@aefd3654ab7f3319f5d4d3396e5e15b41ebe4d0537cbe5b0d94300ea3667a09f",
+        "command:dns@2ad9b46db4e3990242c3e98f4269d7c5fefeed069b66de840082a90972fb65aa",
+        "command:down@5b1209b7de332fd78a195cea06a11c8562cebefeb7d4daca7f8821f93eedf13e",
+        "command:drive/list@58257d71385aef61341bba506f6da7a66a605d1c12da92d5446c6375d7c7de2d",
+        "command:drive/rename@edcc6d55723cc63d3a6efb606122d110c90cb75da549391ee5e53f4a77a98b1d",
+        "command:drive/share@8670a829a096aa40dc5f984eb5cebd620fc96d64f58dfe1d2afff46b4bc10a33",
+        "command:drive/unshare@5ad18219c0762c7d1889d50b029b03006782baf1c904f91a5babd56d2a3140d0",
+        "command:drive@708577991132323a117e537c5fdf518f93f628af7c921c0f40b8a1470c032f90",
+        "command:exit-node/list@8d54c56e88845cf82a331919b7cb357fdb8d09db7859a85d5876795e83011d91",
+        "command:exit-node/suggest@cf060d7c28c92991c13f44d17c762afff212c4c9ebec4bd4e59687128e0d5bfd",
+        "command:exit-node@db516f2f2ae99915ff47cea0c00ef301436bd68fa818c1555e5e8762a429f1b3",
+        "command:file/cp@96dc9892ff7aa1f98aa201087fddba73485b39216e7b493f60dd0655f206ae21",
+        "command:file/get@edc2316096de46d7997dff1952cbb1907d2ef255c7ff26df14f2f40c4ec99136",
+        "command:file@7cf512599e92c9a187e4163f60eb5cc6ef1a8c4ab0cd6785340cc8969ad3aaf1",
+        "command:funnel/reset@2e4f332c639fa624cd80b4e1e91d99290622d96d2843683fae502750f8038ea4",
+        "command:funnel/status@51dc3faa172b983d9d9cd106b7f6d6ac4f7f3bb66f02b334cc3db34413c24dd1",
+        "command:funnel@2bf36ca5f7ff68c919428f5c03da14d2b752f9f2b755bc8d4e9b386ed25dbbb1",
+        "command:get@66c38e55e38bbe74d2e834d46c312e10c27451214b859c41730f8d8af179c5e1",
+        "command:ip@1228fec29ef431dee050596ce68bc34645dec5f66f258b2af90d17e59e7ebd5f",
+        "command:licenses@b68faf386ddd3772153f96cb31e5857788fac405a27c8aa0f6cf7ca90dbdaf41",
+        "command:lock/add@548a3e2e762fc12da7f8ac1ae07ba3ef965832f302927d45216f5b66fda148fe",
+        "command:lock/disable@e2ff2a94883b87d7404408dee61d2e1b4cec202761a0712e3e376a3297b4af4e",
+        "command:lock/disablement-kdf@eed1ba3281f753b2d48f500a95ba5bec1b18de5a70d9bf367f9260ef82a91bb1",
+        "command:lock/init@c1fb7a62403fc02bae3f5aa45cc40bf6b9bff357109337ec61926de230524721",
+        "command:lock/local-disable@d040d9c2da631003db143161cf3d2830ffd581289c28ae99d6c04361af668a5a",
+        "command:lock/log@b20ed651aa64fa4a79137587bf069064f65bde7a8db000f53484315194d92fd9",
+        "command:lock/remove@9d1441c9c81cae79b3fbb7564f30ae824bf905087c18a6a4417d9a05535434e4",
+        "command:lock/revoke-keys@155e8c2a1cc4e5bbc7ecdf791a03183cb00cfff5a2a31b38415c91008a87aaa0",
+        "command:lock/sign@828c21cb8dcde602222c83ebc84c33f9c8b1cbde0caf2db8d746845e24551dad",
+        "command:lock/status@150e642844d9192f872258802e23bdce8d3102f1dd7dd653522eed14d6ed78dc",
+        "command:lock@e3280beec63425173b393b65bf8f9eb76015ce17f85338eec04684cba99d7299",
+        "command:login@969e5a56ddb3ba9e1375900a3ac4507b19b423683f9c09c76ce832f770e2a5cd",
+        "command:logout@bb6006a3ab32929ad1954ed18d46e8b994d7c6ee243a38b81a59ebb41b4ce2f8",
+        "command:metrics/print@c93d8049ee966d170ae6c40f46da20fcdcdd5e2020e8a74b50bc293b51db2438",
+        "command:metrics/write@59848929585cbe052676d982e8e6a7cf3581d32509159152d3c0b990732ac4b3",
+        "command:metrics@4074374be123683ba88803067a5ed468d36219beb5989a6e35a9b066301fbf23",
+        "command:nc@32ca6354b7199fe2b4743080cb745092bd88a1fdae467b398d3f5fa53eccd989",
+        "command:netcheck@cd6b6a371ed0bb3afcf459ff08fd25759d6affd723268bb884e905a8f68eb540",
+        "command:ping@6ecd8e6882d70ff2a038867309a3f4b37e6a5db558d8f7bc820461ae1df88ba9",
+        "command:serve/advertise@80d79834845f6841433ce6c3c85121838c366cb360a1d9307f4749e69f36c0bd",
+        "command:serve/clear@1f5d30408ae4d028d25d6b17c1ad6b5e5125a84e9136912715b811f73a026b87",
+        "command:serve/drain@9fbbdc001ef3fc460390553de07e4ab58e75fe47c2e5451c87a5e48c065dffd4",
+        "command:serve/get-config@a5ce5fb37d529ac3dbec398482cd5e8a70b7f5858c482ddecbed29664b4de0d8",
+        "command:serve/reset@36d63fbdb7f03c0978fbfd6f658d1934eb3893b5a1c2385fcccac4be1a3aabea",
+        "command:serve/set-config@0c85853843ee0e4d3e97fe148e838c10a0b98bd783aaa15c93a13d351921b747",
+        "command:serve/status@c4ae1bfd546a94800b80299b121ea6a7cb470b1d81ecb5e3731b5a8d22e8d05f",
+        "command:serve@8353d606c7aebfd95c9036ff51d6fe071882192e474923efd789ab1bd410f9f2",
+        "command:set@2900c28fee7a69b6d19cf727d9d8db449cfcfddf8fd31d5552f45e6ab11332e1",
+        "command:ssh@a453828e8e7fbd0ed73ed870ef68b4a9e7320d851b6f81cfea6c5fdad47da654",
+        "command:status@fba3abefafe0f965ef1852e5a0a660060db7f32dae06c9d47b95502ac93c9b03",
+        "command:switch/remove@eb03ac72b1d5c6441503f9e5c4519d732e425d0d86d3d47d97b50bb079d07552",
+        "command:switch@b6175699851c0808428828bb338304d555c8f1f981b5dddad363820d1556d080",
+        "command:syspolicy/list@a0cdf6c8c0db04c3b215fc7e41540a05800715fc3eccb2eea7d018eb2f92893f",
+        "command:syspolicy/reload@e60cecc7c591cf69eee78549f73e69fda37613ae3dada433f6aaccff73a6d9ed",
+        "command:syspolicy@4579df7fb852c295951d8fd9deb7ec3f608f686ace1c95a0fb8e3ef2129bc388",
+        "command:up@20c7be5fda5a740fbd3ff62553a7c460f81043659ab2d0c0e1a8edcd7bc40983",
+        "command:update@fea8455e2bdc058af315fa00cb75b3311f3e0715800f84d252f52873b1e681da",
+        "command:version@a8fedb087842d154258e5fab341b39144a18d0b1757bc1e3508abc32d2a13e62",
+        "command:wait@f3618417ccaa997d857c711c6ac936e37c48b385b3b57b69b86bf5e762f206d1",
+        "command:web@5e34fc4ef688bbf836eeb3708b523457f7ca9ba97e0073168eb104aed7f0de27",
+        "command:whoami@16984baecfccee476a28d85702f43960c92446b0b88360934a7e159d6680fcda",
+        "command:whois@67eb0504eb3c28d6e72d57ea0bddf129b8e66832531bbe7026aa83548e04d42d",
+        "flag:/:socket@b82c050f1099dd3bc37ce75cf3dfff2daf71478e66ae14fb5473e1649948f782",
+        "flag:appc-routes:all@b827bce51310f4e148b0355da0cd32bc31884247ef4cfc6331d7c1f8a9d6a514",
+        "flag:appc-routes:map@7381dcd744ad5ba480079970603d739f258b3b66cceed6706f1c4f0c66a40671",
+        "flag:appc-routes:n@cbe628229e783ef98c01c251400e55cd2223184fa97deceb91ace915db40bd7b",
+        "flag:bugreport:diagnose@6071b8d167a55803a604f9bd90d7e16c5e28e571e19698dd6f40a0a887d3fcbe",
+        "flag:bugreport:record@b697abd05b336a3befd7ceaa01f636fb07ad4dc2cc4a3a4a6572561defd1a4c0",
+        "flag:cert:cert-file@f3d45150ee7ff96c0a2506b4ec44f4b472c5b1a1ece57f9100779e4e01b29938",
+        "flag:cert:key-file@19596ae113c512893b4b0471fbfdc7a2030e4397876544f7f05dd80f24eb6414",
+        "flag:cert:min-validity@deb392320f1459d18c19817f80acf18d119841f2bf58ff935e1de4f66a5663db",
+        "flag:cert:serve-demo@296dd3e83ecdf90830e0bdbf380c7398f05c85e78bc45415b481f86e69ab4db9",
+        "flag:completion/bash:descs@b7ddb0fc0502642740da543c90e41075dc99b8e9287a0c016069bdca8b99195f",
+        "flag:completion/bash:flags@ef881813ede8777cc1db3e92aebfa3b02d9913d1618f57d836faa10f09fb9443",
+        "flag:completion/fish:descs@e567767b5bac6b2d71a9edee944cc90ae498c88dcf22fb772ce18539ab1c994a",
+        "flag:completion/fish:flags@f255509d3ad12ceefe3d46fbdea6b25aac0a0f759fa336c3218b65e282004c22",
+        "flag:completion/powershell:descs@afacd4d0889d3828303fbabafe0c557dc14d6aef3dbbc81c21787bf95f2371e6",
+        "flag:completion/powershell:flags@9301628f447ffd0f5f0ac003b4529a046104a16ad933aa91d044d55802f52d38",
+        "flag:completion/zsh:descs@8efdd4323190bda7e64b1b20bfdf93009b62bfe84c54a379a02755850f84e8f0",
+        "flag:completion/zsh:flags@75e33158e60d986477f061ec799b7c102c7d7db62b7d500e608282a0d8acd9ab",
+        "flag:configure/kubeconfig:http@8b7877d1f65c0360627576b666da74d6113c322d61339ed5a56c704e36846545",
+        "flag:dns/query:json@90aaaf4cd7467be7502b88d26448a08723c35ec68e90c35e581f694a44d954b9",
+        "flag:dns/status:all@f0574691156b3f281146791a23e4b142aa96deafdfc5e74b7fdb3a20730b0c46",
+        "flag:dns/status:json@dd9b50b067ee3e3937a5ea8a45ef4a30cd84764e03b3e2c17a71c3c81e65637e",
+        "flag:down:accept-risk@955ed5e4f1520d1fc9976e431512b0f46435b0c13022a2c0433d2dbf0a6d7951",
+        "flag:down:reason@a6e9c39759bef5b4d3910f9b23ab1f33bf0fb1b8961cd8fd366b102e215429e6",
+        "flag:exit-node/list:filter@b641b7316b7abcf2834f064342dc27379860a0e900a63f4d1e988562ae0e49e7",
+        "flag:file/cp:name@d9effd9c82a67cabe8bc5166d0f102a422553328c2bccba158957b0950dc774e",
+        "flag:file/cp:targets@54a926199d25c93a095c46f53b4c520039eaae416f280ca6d1c35a295dab11ac",
+        "flag:file/cp:update-interval@f68755e9567642787273f1b7e16538e8eca198d6a13bdaca6cf6708960e583ec",
+        "flag:file/cp:verbose@be908344316221dcf6d9a646ca0a5292663a7d9eed459062cb79867da4e4ed89",
+        "flag:file/get:conflict@fce92e4dd1889d8fd5169f7ae5dd9c2ffecb0a8ca93dfeb10108bce414417b5d",
+        "flag:file/get:loop@15ff0417b432f7c5bab5f316d7ba5a7079fa013d1de2904cee2f16c17ba0cd1b",
+        "flag:file/get:verbose@7fabef3b0331814364fa531ffe9c71dd06cac3e3e8d22b522ab1b381866af6ed",
+        "flag:file/get:wait@d400e810851070a0ffacaa7bbf84ca6c9dc781fa5453ba0fa28b3d6049559054",
+        "flag:funnel/status:json@9fc16bac2a0076a807596090c47c0a0dee906d7229bb5ef20751e8b8b27fbce3",
+        "flag:funnel:bg@c96f4b44ce829301c604e560743de371ec733c4063f5c4b02d9aa115aadbfc85",
+        "flag:funnel:https@9c31ecda804e58bb736535614a77290c14ba1ff590141a53cf754f23f23fb413",
+        "flag:funnel:proxy-protocol@efdd54c47f27233ab970a10942a812ccbfd5fffdd9714c74c7b26124bc826dd3",
+        "flag:funnel:set-path@d43df1dfb5e026d69f76d154973301bb48593dab9d870f703fc9613493a718c8",
+        "flag:funnel:tcp@58ecdebb514c23b05b5b5fe4d8f638e07bf256af7710f7d7e6cb827979172eb1",
+        "flag:funnel:tls-terminated-tcp@71bcc7bcfb2ff71b0acd7aea558a99c5c9ded59b4162e17ff5564c1ba6c091fb",
+        "flag:funnel:yes@2c58e7f6db289dfa9b9d61534d3872d1f0d19df68b1f2e8d15e3c233fcc4ed87",
+        "flag:get:json@2efbb48e48488c52d470dc50b5ac7fc84e8b79d8673d527e247a540563e353fe",
+        "flag:get:set-flags@3657c7344d417fcf48377403285793611a51d097012892a288fc4e9e19eb20ba",
+        "flag:ip:1@cb65c24c9a3954c558a9490e29f251c3e5bdb676c668290be38a6fafda9d05a0",
+        "flag:ip:4@65e7263d7d7c4afcc009af6ffe3f65f01ce8d568a1763ee39b5d81eb486e05eb",
+        "flag:ip:6@70bf796c5fa48e6f8d2b2e12b438cefef70bed07b85b2fe3fa084ed8cdf6114b",
+        "flag:ip:assert@58bdf811571e0f5e671735d23f5c8bf0dc8bbc6c3e5f961d1a00b976f635fda4",
+        "flag:lock/init:confirm@6db3a1f6f6eee720a94dae256c17aa87c5cb834e5d1be2b5835e14ec54d3c53f",
+        "flag:lock/init:gen-disablement-for-support@f7225b468676bf7e589820e72ca671e6d2aa746a883a08c6b511ce02bb91470a",
+        "flag:lock/init:gen-disablements@4644104bc87974a627a24b7091a4644ac5ae08e092ab671aac78cd28e197c2b4",
+        "flag:lock/log:json@d6f829ebfa99231d8779349a6d5e32751c65c02fd41fc0bde48f3c2c9667d367",
+        "flag:lock/log:limit@128c03b6fd92bc27f551ac808c775fbc8bfcbeaa6b92ea4424775c274fb8ae0b",
+        "flag:lock/remove:re-sign@f99464df493e792f26774a9352bfa2f5932c7c6b087df6aed83241a8c4b18f8b",
+        "flag:lock/revoke-keys:cosign@5fe6c776e2d26fc0d6ae39e6ceeb917f599e216680674f7c152883ab766ea318",
+        "flag:lock/revoke-keys:finish@af62dadf1cfa06a284ccf81331afeddee95b2fa79ec5d764e7828873a57864b9",
+        "flag:lock/revoke-keys:fork-from@88a6f09134df678989d15584cdb12aa3c27aa38073a4814681a26ecd8217ccc9",
+        "flag:lock/status:json@bae8cf0f36d0aaedcc2c0fade7489b3c14d2b969dcae1bb50777c559c648a977",
+        "flag:login:accept-dns@35a5b2be1219ce3d98f7b16c0742b82530509ace1465cef425a229eb3fb8a1c2",
+        "flag:login:accept-routes@1317ea487cce5148eb95bce2acd8844e53ab7bfebfb10fbe9892e81ad063c855",
+        "flag:login:advertise-connector@d8ba08656dabcd2ed69e705c4463e685d6676f326582db6315a16b2650abf207",
+        "flag:login:advertise-exit-node@49d174a070ce98128a3f24d413aac917c8031d64b13fd993ca1ae3304d9fdcd4",
+        "flag:login:advertise-routes@696a239afb1571c4cc72ac2859135305bae82cea2385f3e99bf3017b705efe70",
+        "flag:login:advertise-tags@2d17c0c5a588f5d54925b152b501ab0016b08d5960d94e649a54ece5c77a4319",
+        "flag:login:audience@6b8e6da802e00614699f0f39509f1607cc2a72e4ba48b8a1f0b6c9e127f3275c",
+        "flag:login:auth-key@41910dddab13077ebc27420ab030455959703e9f651507b7a6592298e8c3a7e8",
+        "flag:login:client-id@6b44e5694d1b96eba7788e634e190e6fd5aea5a73fe3e46f96eb657f368c1b51",
+        "flag:login:client-secret@3b602fe287421c69aaa09e94920f414cb5ef8bda0e8b07496d5debf397380ec5",
+        "flag:login:exit-node-allow-lan-access@cb643390a7c38326a124f1547ccc684e1970d9a920ed9556056c4b6e66f7f2bc",
+        "flag:login:exit-node@be089db5d749f711b90e97377f8aca850f46722e5b746f334713738a8c5aa0de",
+        "flag:login:hostname@7111f4db3072d99b079381f94161a16d0a9ebbbb8de60bc6cca861f5664d7d9d",
+        "flag:login:id-token@6856fce0c2b3d09a9f19c74353edb343f4274b0b38a0c7b7ae4728ac5d687ce0",
+        "flag:login:login-server@9080c6371ca33342d0f55b2a6084c704a8e2e8bfa3d9e23154192f5f08049bb4",
+        "flag:login:nickname@acfaa7269fccdc68fbf86f6a025ff96d244146c726f373e383fcdfc34c956db9",
+        "flag:login:operator@7efb8e06c7fbf7739469320e8f3283026f3db7b0ade904d97cf856f1bcaf2f0c",
+        "flag:login:qr-format@7bc595a2197105f0ef6922eddf61f7ec61d94df02e2f9e828e72da6d222eff8f",
+        "flag:login:qr@227fa01c34138d01b1894c3b7e2ee196258119b38d57ca1675da1357d1125a41",
+        "flag:login:report-posture@351b559545e53daab60bc009d338e4b8d7656fc6f1eb1fc11752c9af6663657b",
+        "flag:login:shields-up@ed0599bc835ee14e34c9f6c641500b19acaa7583c9aeb0cae2df222b6abc8f10",
+        "flag:login:ssh@1f352afdf241dced46cd076dfb9c4ed7c637b4c20a07a06f5b3721a76c103e4f",
+        "flag:login:timeout@be51e769b59200663dcc38b6444f1489e0f47c0f92b08543190d1c560f32f173",
+        "flag:logout:reason@ea3171f285f0fe6bc6e777cf3e834301554d4e3520898706cfc4e6ae767bbd35",
+        "flag:netcheck:bind-address@0e83a9a8366a897c55eaac542e24ae830446d14b48a529c739548ece06fd31bf",
+        "flag:netcheck:bind-port@ebdc0c031cda2cd3e919b8da2aca8a4ee0546f4de9b00ac56b92981e03b15375",
+        "flag:netcheck:every@817e71b341e88b8950e83ebc97a1d1349d2ed85210a21e3858f40075ba8fac78",
+        "flag:netcheck:format@33bd6adcf689da67e1e4f3b1f01c494d60dd7eedeba5cb4e0851add5877b3bdf",
+        "flag:netcheck:verbose@affb328d57720782ddd5d2634201e30d7d88e826d6b278bc128b11ded152e4c4",
+        "flag:ping:c@6bf8fd6a3ab6ce7c932e970bb15f9c5f47412f8331dd69db279c72117d620345",
+        "flag:ping:icmp@f5cc273badd08dd075732521732e5976a97aaa64e9ad3d126419836945c1f5e2",
+        "flag:ping:peerapi@b6c87b2043dd3fce2c2a7b7cf4e891a8cbbc7c5a765b876bfcf6f33f00306401",
+        "flag:ping:size@ed5f58be1b7ed3100c6fc035162abbc773831c165ccc841a6e7d98ad9cb14374",
+        "flag:ping:timeout@7c722daef0eab2b7bd1fe2971efeaf0be7461db429b888df290e5cae91b05399",
+        "flag:ping:tsmp@7cdf8ff199231dcf17b711352897a7d6c27ebc376846736da8d3e4d37d399f8c",
+        "flag:ping:until-direct@91499fa0ed7059cf236d0c6447780cd0236b2586ff89602432ab01415b2cce12",
+        "flag:ping:verbose@915100ea12b5e35ca44c92304b930ea8a3bdf20aeb04c3d85c8698e8cd1229de",
+        "flag:serve/get-config:all@887112288809d657a8da14eae710fbe72dda65afaaf0f4ff6150e1df4cc39cd9",
+        "flag:serve/get-config:service@2f5295cdb10f23ec957a169daae5bb044c9c9170ad9402caabdb4ea1aae903a8",
+        "flag:serve/set-config:all@a29d393e5178062db05276d01cf75dd07dd2bf75da0d4923d5a29a0f6dff6583",
+        "flag:serve/set-config:service@f2f4f833577f70d12f6b9ea1b012712f56d95ec94c5d2d1337b1f4a9d6399c58",
+        "flag:serve/status:json@a13ce79800254d5ec1b71080e31ffdc126ead2cb7b14e8f90d2685909ca93665",
+        "flag:serve:accept-app-caps@0a6f174986a165849c74ce02af2f021502ace12b452662bb262806b4e53f3cc7",
+        "flag:serve:bg@f9c894d4606a00bdd9d41b0c3e7f955ed41531c125d88c75c1593372b8a8c517",
+        "flag:serve:http@4ca5d925b982a718686ed899f7913d9907ae0cb629c1fc3586512c70be02ba06",
+        "flag:serve:https@6c88b43e42f1134d472170d4020e07f95b1271eea1a4f36c822598e06e6a4a81",
+        "flag:serve:proxy-protocol@70d879ab9e78473470b5024d4e80da17a10f7c572838fdab621b9e431913a84b",
+        "flag:serve:service@24ff6e0ad58b244680620ee17d61a5a762b6effbc16ec487b3fabdc688cec53e",
+        "flag:serve:set-path@bb2fcc3e27a4f326f16515555d786e3e589cc47262655b295b8b20e722de6759",
+        "flag:serve:tcp@29045db86d5875604510b310bfa1740d16daee510ca8dd664317d46dbd11f071",
+        "flag:serve:tls-terminated-tcp@2c6fad73d529bb988028bd3d04297048501aa3c848313f6fdf059994a08c517c",
+        "flag:serve:tun@e30d3fec74f3042832f3ce52bb23f21f9ccf9179f8760984eb248b671e730d3d",
+        "flag:serve:yes@ffb4c91d90917d24e21df8805356968bc59ad7f5f9da34a7b42a4a5c3b479f47",
+        "flag:set:accept-dns@8d98d5290daf0325b4ee5098fa3cef7841d27219efc3a6ba4c8ae5a970f8e03b",
+        "flag:set:accept-risk@1a1cb606908a38dc479145bd9c0fd994c8478d304c131205eff4d6f42ba7ac37",
+        "flag:set:accept-routes@1c639f4e9086bde25c995cdd6cea514d1aadbddde812e8cbeea5d37f0e04fc5e",
+        "flag:set:advertise-connector@49a694024d7f283aa0b0f7bd5c5638f8458c4c138967dc38375f46622e0d8003",
+        "flag:set:advertise-exit-node@e3a1ad74178e81b310d9b5a5d9243070cca8761a21a6d99599bec58190bfafe3",
+        "flag:set:advertise-routes@2ba31571ff6e009a26d5877124337bdf09c7abe847085686591fa14ce2249df1",
+        "flag:set:auto-update@08060c137205c08e57c891459d6da638c00daaaa1a778756a1af21216c7e3390",
+        "flag:set:exit-node-allow-lan-access@adf21898c7cfd0c5f1f386d7098e33a59fc6b3784e2bda8ae52e36869dcc28b2",
+        "flag:set:exit-node@0429253223540d034c07d7fefeb22256b2a043f7756721688b16ba772f014163",
+        "flag:set:hostname@0168ffd2327ebf1a5d8157c73c3385614bffefd4984577cbf3ea3098b9e87418",
+        "flag:set:nickname@bc049a761d3973a101c4107cfb92e811ac687a8d49a697a995f51bcf5b46587c",
+        "flag:set:operator@56e82e0f3cf4f5125cc5d39ff177ffc2514e7e6de0c39e87517dedc752fba018",
+        "flag:set:relay-server-port@2e6f8c9c27d949976b16b795e05a614b05b8c16943a7f3ae9c4a29b50c4efaa8",
+        "flag:set:relay-server-static-endpoints@26f98172d48d55ca122f87781474cd5a0907d728b342d6bdb1d3891340e7f922",
+        "flag:set:report-posture@8d5110614bcaf8e63e7ea7c1e30963b5302029d0aa5323d452534455140c6bba",
+        "flag:set:shields-up@64bc2e95590be3eb27a493bc5e716be71ec9b9142ca42b2c405bdbe73adb55a3",
+        "flag:set:ssh@946f4906eb492ae15f6e2b20df5439e017b0972400d9af9c938d01a34b82c859",
+        "flag:set:update-check@a7d14c08faae3beaccb84f10712c193c4c5d50b566986ce856a428655ce7cacb",
+        "flag:set:webclient@45748f6acf7cdbdb091f158bf563dd071ac2183170282d11c98345726f2dd600",
+        "flag:status:active@94927e9a9457a798dcdbaa0f2567c7197e0c7c81120ce91a73ab869dc99cb537",
+        "flag:status:browser@05c27e53e99979e071c8c1b3cf3b5686e4ce1d8be5ce4cd404a913fb1781efe4",
+        "flag:status:header@1af574b697e6082edc6a7933ded4fdbd1fdb3052e26e1a6ab25ddad981ef1364",
+        "flag:status:json@7632f4cd1d6f0404c58995c3cce8f15847e220ef96f0e0d67ef4794f02e05763",
+        "flag:status:listen@c8d4cdd963a0d750f6cff02d0ad6a3eb5f597cecf2bd94ea2cb3326310ea61cc",
+        "flag:status:peers@28f2b1824f64f075bf17d6824eb0d80a6c8ccfbca1813cac736ae4c486e1d5b9",
+        "flag:status:self@e935eddf4f452e4e09bbfe497a891cc6380838f29e6d966d3bb21d1b088d43c6",
+        "flag:status:web@95bff73a358da44173501285a7a1d887207a319eeddd0aa2dcb18c2e49ef1432",
+        "flag:switch:json@925135f330ce1b34538707528a5d24af1227286fc2f6aa1888e45e80b19e82b0",
+        "flag:switch:list@a1499007141437a15d85f0a3a1b826a455fa8c1384bd34861f2bf993ea9d9297",
+        "flag:syspolicy/list:json@28ab26c6ab220d2674f54c5cbd8efa3bc4af6d5c22c4207deb51443646124cc6",
+        "flag:syspolicy/reload:json@3d7877dc40af4d69955b2c4650b5c1801e418a3c9b6ebd00729afb09d728f79d",
+        "flag:up:accept-dns@1b5a7d26395cb1d6025516fe7e9a217a7a66969740306589db46f5ea24a668b5",
+        "flag:up:accept-risk@eb595fa519614831f3e3203fb236c7fdc08b065c65ddb8fa099aec443c224da3",
+        "flag:up:accept-routes@71898994e13cb366b71051c36401a1fc87c40f0372ed3db1eac58442c6ce410e",
+        "flag:up:advertise-connector@6442af2d2026237a96952a0692941da312ed139a5f540d06c1b4bb48c6ec72c1",
+        "flag:up:advertise-exit-node@c425ac4d509c4cfeabe48eed98e24e087df13f6b2787f55a166ffcd65a2aacad",
+        "flag:up:advertise-routes@8fa0a91327baf3a77a6b2556ff4c41483cb1715af02387198272c92a25ea176c",
+        "flag:up:advertise-tags@5c45d018108ff04948ba565f9b32edf4acf6bff4a5314ec12eeca17a6ec08c1b",
+        "flag:up:audience@8034a164e53f11c8d07b83846703917da7b3f89b50be81722ceace9eae1e6815",
+        "flag:up:auth-key@37b589dc233452252526acb0fd3f61a8fbe7482089e74f2b0fc9e0cd8a0bf192",
+        "flag:up:client-id@d397dbce589342308ad0ad7c21ac91f3a413113bdd403fa18dbf1e3ab13f8ec5",
+        "flag:up:client-secret@7f72efbd9f3a98417a219942ebbe19f4974b3ab88ed9c087dcffb74c74b71e81",
+        "flag:up:exit-node-allow-lan-access@e00a941c385819f28505761722b18420a85500402d9c544c15fbd492c4cb765f",
+        "flag:up:exit-node@402943472524fec0614aac1afc064d0ae8e076c8b495d58202706821c5e696ff",
+        "flag:up:force-reauth@b2bd12a5aefceb2b53cd74278ff00b5af74361e38b466c2af87b4bb85b50c259",
+        "flag:up:hostname@da9aa14925f323d40920c4b1abd3d92bddfb325b08ae4747d1504fc2e0827f3a",
+        "flag:up:id-token@bc2d537d061b632d2d854f1c7b707a8795a3053cded486ab1c99431db45f4476",
+        "flag:up:json@93cc2510ee5c1d6e9f242494c1c944cb174c61fce2009e343773eaaba69e8039",
+        "flag:up:login-server@975c497071154f358bfb845bd0e418e5fa9722a357694578d07b1313a18bd65a",
+        "flag:up:operator@8aa059080760a4eb523737266f8eab0aaeecbcea94dc69b27595f122ff653b83",
+        "flag:up:qr-format@fae27b9eab251137deeb4533f6eb4ecdda980a88c8aefaa8a677bfe5d4377ced",
+        "flag:up:qr@d33b49598561ca5bb7ec34099d2257dfd909c34b87196754f9cd0ac7df376b50",
+        "flag:up:report-posture@3608a3c6ce45a49e25cb85a30d4db06f33e3f9130d648f83cc0da894508d8d50",
+        "flag:up:reset@7d047dd468457f40307a5300c984a129b522ff6fe9df908c1b7b1e55765bcfdd",
+        "flag:up:shields-up@e2a39f41e86f1dca1525b8c88cf379a4c8f06843562f3db8925d2613974468f8",
+        "flag:up:ssh@4d2433c4cdd991c37cab16e5a336130cf05c3706657aa6dde25ff427913bc883",
+        "flag:up:timeout@5c11fa1cecb6d951a5436267b977f5a41a80deb853d97cc1686b5683f2aea190",
+        "flag:update:dry-run@8c80bcd410ddd93e6c9bd0b69df9550fdae2026646dfc388edcc6d90495de0b5",
+        "flag:update:yes@1ae9c3441d81834fbac292c999b35eec3514bb9ecfc93b5eb3c19ff109a10f3a",
+        "flag:version:daemon@19d6a888649ec84bbe6aa6202e623480db37586ba6ce1a3eed48e7097daf7dbe",
+        "flag:version:json@e48ea463f58fc79e45a7205e98b9c4cd4e1e4c4890b64d6adddc1132ec3440b4",
+        "flag:version:track@c6f7e2ddfad1ecdff2d6d9f9e15d97ab3ca8fe7df3d7394298e34a03ea346dfe",
+        "flag:version:upstream@426e6af61a30987f2240068623e24ddfc85f6963dacb7cd42ee08510a57150f9",
+        "flag:wait:timeout@74ff31417534092fb0f8236290c94792a9e5f5ae0d60d362d9cc94ccb9e7d45f",
+        "flag:web:cgi@e030700fafee015fb65bb0fdc95b9265eb2d1b43e2fec46ea3381802ae025619",
+        "flag:web:listen@4ebe98a946256ca5d77d3bc0748019791708ee1c48ead3813b3023bfd0cd76b1",
+        "flag:web:origin@e34f4d6f27b1af342c16ccd11bb29f1360721e67c682907805e5d595cfe440a9",
+        "flag:web:prefix@cb9b43d923fb4ab62d356ddabb0a66b5206e06d10717aae60f87ef85013224f6",
+        "flag:web:readonly@85b3f02be3b5174bb2b32aa1718cdacc4ab0bb2671fa5440fc24464bd7d3b29a",
+        "flag:whoami:json@95cda0a284fc705259e705a3e59500eca3cf1f570fbd4c89dc8a811a3e524880",
+        "flag:whois:json@989e477a306a8e4a0bce8d909d97773aa314226269ec9306e9438f7fa61b1a95",
+        "flag:whois:proto@b29e92d15f16a12e3da3cc623521b731ffc8f47bf23fcfbebb97017cddc9caf9"
+      ],
+      "sha256": "2c6572cdd3bef0ad91c3d02925155a94bb61e73484e0ecd14cf6a463d333d0b9"
+    }
+  },
+  "inventory": {
+    "behavior": [
+      {
+        "argv": [
+          "--help"
+        ],
+        "case": "help_long",
+        "exit_code": 0,
+        "id": "behavior:help_long",
+        "stderr": {
+          "markers": [
+            "usage",
+            "subcommands",
+            "flags",
+            "version",
+            "nc_description",
+            "wait_description"
+          ],
+          "nonempty": true
+        },
+        "stdout": {
+          "markers": [],
+          "nonempty": false
+        }
+      },
+      {
+        "argv": [
+          "-h"
+        ],
+        "case": "help_short",
+        "exit_code": 0,
+        "id": "behavior:help_short",
+        "stderr": {
+          "markers": [
+            "usage",
+            "subcommands",
+            "flags",
+            "version",
+            "nc_description",
+            "wait_description"
+          ],
+          "nonempty": true
+        },
+        "stdout": {
+          "markers": [],
+          "nonempty": false
+        }
+      },
+      {
+        "argv": [
+          "help"
+        ],
+        "case": "help_word",
+        "exit_code": 0,
+        "id": "behavior:help_word",
+        "stderr": {
+          "markers": [
+            "usage",
+            "subcommands",
+            "flags",
+            "version",
+            "nc_description",
+            "wait_description"
+          ],
+          "nonempty": true
+        },
+        "stdout": {
+          "markers": [],
+          "nonempty": false
+        }
+      },
+      {
+        "argv": [
+          "nc",
+          "--help"
+        ],
+        "case": "nc_help",
+        "exit_code": 0,
+        "id": "behavior:nc_help",
+        "stderr": {
+          "markers": [
+            "usage",
+            "nc_description"
+          ],
+          "nonempty": true
+        },
+        "stdout": {
+          "markers": [],
+          "nonempty": false
+        }
+      },
+      {
+        "argv": [],
+        "case": "no_args",
+        "exit_code": 0,
+        "id": "behavior:no_args",
+        "stderr": {
+          "markers": [
+            "usage",
+            "subcommands",
+            "flags",
+            "version",
+            "nc_description",
+            "wait_description"
+          ],
+          "nonempty": true
+        },
+        "stdout": {
+          "markers": [],
+          "nonempty": false
+        }
+      },
+      {
+        "argv": [
+          "--socket",
+          "/__rustscale_compat_missing__/daemon.sock",
+          "status",
+          "--help"
+        ],
+        "case": "status_help",
+        "exit_code": 0,
+        "id": "behavior:status_help",
+        "stderr": {
+          "markers": [
+            "usage",
+            "flags",
+            "version"
+          ],
+          "nonempty": true
+        },
+        "stdout": {
+          "markers": [],
+          "nonempty": false
+        }
+      },
+      {
+        "argv": [
+          "definitely-not-a-command"
+        ],
+        "case": "unknown_command",
+        "exit_code": 1,
+        "id": "behavior:unknown_command",
+        "stderr": {
+          "markers": [
+            "unknown_subcommand"
+          ],
+          "nonempty": true
+        },
+        "stdout": {
+          "markers": [],
+          "nonempty": false
+        }
+      },
+      {
+        "argv": [
+          "--version"
+        ],
+        "case": "version",
+        "exit_code": 0,
+        "id": "behavior:version",
+        "stderr": {
+          "markers": [],
+          "nonempty": false
+        },
+        "stdout": {
+          "markers": [
+            "version"
+          ],
+          "nonempty": true
+        }
+      }
+    ],
+    "commands": [
+      {
+        "aliases": [],
+        "id": "command:appc-routes",
+        "path": "appc-routes"
+      },
+      {
+        "aliases": [],
+        "id": "command:bugreport",
+        "path": "bugreport"
+      },
+      {
+        "aliases": [],
+        "id": "command:cert",
+        "path": "cert"
+      },
+      {
+        "aliases": [],
+        "id": "command:completion",
+        "path": "completion"
+      },
+      {
+        "aliases": [],
+        "id": "command:completion/bash",
+        "path": "completion/bash"
+      },
+      {
+        "aliases": [],
+        "id": "command:completion/fish",
+        "path": "completion/fish"
+      },
+      {
+        "aliases": [],
+        "id": "command:completion/powershell",
+        "path": "completion/powershell"
+      },
+      {
+        "aliases": [],
+        "id": "command:completion/zsh",
+        "path": "completion/zsh"
+      },
+      {
+        "aliases": [],
+        "id": "command:configure",
+        "path": "configure"
+      },
+      {
+        "aliases": [],
+        "id": "command:configure/kubeconfig",
+        "path": "configure/kubeconfig"
+      },
+      {
+        "aliases": [],
+        "id": "command:configure/mac-vpn",
+        "path": "configure/mac-vpn"
+      },
+      {
+        "aliases": [],
+        "id": "command:configure/mac-vpn/install",
+        "path": "configure/mac-vpn/install"
+      },
+      {
+        "aliases": [],
+        "id": "command:configure/mac-vpn/uninstall",
+        "path": "configure/mac-vpn/uninstall"
+      },
+      {
+        "aliases": [],
+        "id": "command:configure/sysext",
+        "path": "configure/sysext"
+      },
+      {
+        "aliases": [],
+        "id": "command:configure/sysext/activate",
+        "path": "configure/sysext/activate"
+      },
+      {
+        "aliases": [],
+        "id": "command:configure/sysext/deactivate",
+        "path": "configure/sysext/deactivate"
+      },
+      {
+        "aliases": [],
+        "id": "command:configure/sysext/status",
+        "path": "configure/sysext/status"
+      },
+      {
+        "aliases": [],
+        "id": "command:dns",
+        "path": "dns"
+      },
+      {
+        "aliases": [],
+        "id": "command:dns/query",
+        "path": "dns/query"
+      },
+      {
+        "aliases": [],
+        "id": "command:dns/status",
+        "path": "dns/status"
+      },
+      {
+        "aliases": [],
+        "id": "command:down",
+        "path": "down"
+      },
+      {
+        "aliases": [],
+        "id": "command:drive",
+        "path": "drive"
+      },
+      {
+        "aliases": [],
+        "id": "command:drive/list",
+        "path": "drive/list"
+      },
+      {
+        "aliases": [],
+        "id": "command:drive/rename",
+        "path": "drive/rename"
+      },
+      {
+        "aliases": [],
+        "id": "command:drive/share",
+        "path": "drive/share"
+      },
+      {
+        "aliases": [],
+        "id": "command:drive/unshare",
+        "path": "drive/unshare"
+      },
+      {
+        "aliases": [],
+        "id": "command:exit-node",
+        "path": "exit-node"
+      },
+      {
+        "aliases": [],
+        "id": "command:exit-node/list",
+        "path": "exit-node/list"
+      },
+      {
+        "aliases": [],
+        "id": "command:exit-node/suggest",
+        "path": "exit-node/suggest"
+      },
+      {
+        "aliases": [],
+        "id": "command:file",
+        "path": "file"
+      },
+      {
+        "aliases": [],
+        "id": "command:file/cp",
+        "path": "file/cp"
+      },
+      {
+        "aliases": [],
+        "id": "command:file/get",
+        "path": "file/get"
+      },
+      {
+        "aliases": [],
+        "id": "command:funnel",
+        "path": "funnel"
+      },
+      {
+        "aliases": [],
+        "id": "command:funnel/reset",
+        "path": "funnel/reset"
+      },
+      {
+        "aliases": [],
+        "id": "command:funnel/status",
+        "path": "funnel/status"
+      },
+      {
+        "aliases": [],
+        "id": "command:get",
+        "path": "get"
+      },
+      {
+        "aliases": [],
+        "id": "command:ip",
+        "path": "ip"
+      },
+      {
+        "aliases": [],
+        "id": "command:licenses",
+        "path": "licenses"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock",
+        "path": "lock"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/add",
+        "path": "lock/add"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/disable",
+        "path": "lock/disable"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/disablement-kdf",
+        "path": "lock/disablement-kdf"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/init",
+        "path": "lock/init"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/local-disable",
+        "path": "lock/local-disable"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/log",
+        "path": "lock/log"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/remove",
+        "path": "lock/remove"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/revoke-keys",
+        "path": "lock/revoke-keys"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/sign",
+        "path": "lock/sign"
+      },
+      {
+        "aliases": [],
+        "id": "command:lock/status",
+        "path": "lock/status"
+      },
+      {
+        "aliases": [],
+        "id": "command:login",
+        "path": "login"
+      },
+      {
+        "aliases": [],
+        "id": "command:logout",
+        "path": "logout"
+      },
+      {
+        "aliases": [],
+        "id": "command:metrics",
+        "path": "metrics"
+      },
+      {
+        "aliases": [],
+        "id": "command:metrics/print",
+        "path": "metrics/print"
+      },
+      {
+        "aliases": [],
+        "id": "command:metrics/write",
+        "path": "metrics/write"
+      },
+      {
+        "aliases": [],
+        "id": "command:nc",
+        "path": "nc"
+      },
+      {
+        "aliases": [],
+        "id": "command:netcheck",
+        "path": "netcheck"
+      },
+      {
+        "aliases": [],
+        "id": "command:ping",
+        "path": "ping"
+      },
+      {
+        "aliases": [],
+        "id": "command:serve",
+        "path": "serve"
+      },
+      {
+        "aliases": [],
+        "id": "command:serve/advertise",
+        "path": "serve/advertise"
+      },
+      {
+        "aliases": [],
+        "id": "command:serve/clear",
+        "path": "serve/clear"
+      },
+      {
+        "aliases": [],
+        "id": "command:serve/drain",
+        "path": "serve/drain"
+      },
+      {
+        "aliases": [],
+        "id": "command:serve/get-config",
+        "path": "serve/get-config"
+      },
+      {
+        "aliases": [],
+        "id": "command:serve/reset",
+        "path": "serve/reset"
+      },
+      {
+        "aliases": [],
+        "id": "command:serve/set-config",
+        "path": "serve/set-config"
+      },
+      {
+        "aliases": [],
+        "id": "command:serve/status",
+        "path": "serve/status"
+      },
+      {
+        "aliases": [],
+        "id": "command:set",
+        "path": "set"
+      },
+      {
+        "aliases": [],
+        "id": "command:ssh",
+        "path": "ssh"
+      },
+      {
+        "aliases": [],
+        "id": "command:status",
+        "path": "status"
+      },
+      {
+        "aliases": [],
+        "id": "command:switch",
+        "path": "switch"
+      },
+      {
+        "aliases": [],
+        "id": "command:switch/remove",
+        "path": "switch/remove"
+      },
+      {
+        "aliases": [],
+        "id": "command:syspolicy",
+        "path": "syspolicy"
+      },
+      {
+        "aliases": [],
+        "id": "command:syspolicy/list",
+        "path": "syspolicy/list"
+      },
+      {
+        "aliases": [],
+        "id": "command:syspolicy/reload",
+        "path": "syspolicy/reload"
+      },
+      {
+        "aliases": [],
+        "id": "command:up",
+        "path": "up"
+      },
+      {
+        "aliases": [],
+        "id": "command:update",
+        "path": "update"
+      },
+      {
+        "aliases": [],
+        "id": "command:version",
+        "path": "version"
+      },
+      {
+        "aliases": [],
+        "id": "command:wait",
+        "path": "wait"
+      },
+      {
+        "aliases": [],
+        "id": "command:web",
+        "path": "web"
+      },
+      {
+        "aliases": [],
+        "id": "command:whoami",
+        "path": "whoami"
+      },
+      {
+        "aliases": [],
+        "id": "command:whois",
+        "path": "whois"
+      }
+    ],
+    "flags": [
+      {
+        "aliases": [
+          "-socket"
+        ],
+        "command": "/",
+        "id": "flag:/:socket",
+        "name": "--socket"
+      },
+      {
+        "aliases": [
+          "-all"
+        ],
+        "command": "appc-routes",
+        "id": "flag:appc-routes:all",
+        "name": "--all"
+      },
+      {
+        "aliases": [
+          "-map"
+        ],
+        "command": "appc-routes",
+        "id": "flag:appc-routes:map",
+        "name": "--map"
+      },
+      {
+        "aliases": [
+          "-n"
+        ],
+        "command": "appc-routes",
+        "id": "flag:appc-routes:n",
+        "name": "--n"
+      },
+      {
+        "aliases": [
+          "-diagnose"
+        ],
+        "command": "bugreport",
+        "id": "flag:bugreport:diagnose",
+        "name": "--diagnose"
+      },
+      {
+        "aliases": [
+          "-record"
+        ],
+        "command": "bugreport",
+        "id": "flag:bugreport:record",
+        "name": "--record"
+      },
+      {
+        "aliases": [
+          "-cert-file"
+        ],
+        "command": "cert",
+        "id": "flag:cert:cert-file",
+        "name": "--cert-file"
+      },
+      {
+        "aliases": [
+          "-key-file"
+        ],
+        "command": "cert",
+        "id": "flag:cert:key-file",
+        "name": "--key-file"
+      },
+      {
+        "aliases": [
+          "-min-validity"
+        ],
+        "command": "cert",
+        "id": "flag:cert:min-validity",
+        "name": "--min-validity"
+      },
+      {
+        "aliases": [
+          "-serve-demo"
+        ],
+        "command": "cert",
+        "id": "flag:cert:serve-demo",
+        "name": "--serve-demo"
+      },
+      {
+        "aliases": [
+          "-descs"
+        ],
+        "command": "completion/bash",
+        "id": "flag:completion/bash:descs",
+        "name": "--descs"
+      },
+      {
+        "aliases": [
+          "-flags"
+        ],
+        "command": "completion/bash",
+        "id": "flag:completion/bash:flags",
+        "name": "--flags"
+      },
+      {
+        "aliases": [
+          "-descs"
+        ],
+        "command": "completion/fish",
+        "id": "flag:completion/fish:descs",
+        "name": "--descs"
+      },
+      {
+        "aliases": [
+          "-flags"
+        ],
+        "command": "completion/fish",
+        "id": "flag:completion/fish:flags",
+        "name": "--flags"
+      },
+      {
+        "aliases": [
+          "-descs"
+        ],
+        "command": "completion/powershell",
+        "id": "flag:completion/powershell:descs",
+        "name": "--descs"
+      },
+      {
+        "aliases": [
+          "-flags"
+        ],
+        "command": "completion/powershell",
+        "id": "flag:completion/powershell:flags",
+        "name": "--flags"
+      },
+      {
+        "aliases": [
+          "-descs"
+        ],
+        "command": "completion/zsh",
+        "id": "flag:completion/zsh:descs",
+        "name": "--descs"
+      },
+      {
+        "aliases": [
+          "-flags"
+        ],
+        "command": "completion/zsh",
+        "id": "flag:completion/zsh:flags",
+        "name": "--flags"
+      },
+      {
+        "aliases": [
+          "-http"
+        ],
+        "command": "configure/kubeconfig",
+        "id": "flag:configure/kubeconfig:http",
+        "name": "--http"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "dns/query",
+        "id": "flag:dns/query:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-all"
+        ],
+        "command": "dns/status",
+        "id": "flag:dns/status:all",
+        "name": "--all"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "dns/status",
+        "id": "flag:dns/status:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-accept-risk"
+        ],
+        "command": "down",
+        "id": "flag:down:accept-risk",
+        "name": "--accept-risk"
+      },
+      {
+        "aliases": [
+          "-reason"
+        ],
+        "command": "down",
+        "id": "flag:down:reason",
+        "name": "--reason"
+      },
+      {
+        "aliases": [
+          "-filter"
+        ],
+        "command": "exit-node/list",
+        "id": "flag:exit-node/list:filter",
+        "name": "--filter"
+      },
+      {
+        "aliases": [
+          "-name"
+        ],
+        "command": "file/cp",
+        "id": "flag:file/cp:name",
+        "name": "--name"
+      },
+      {
+        "aliases": [
+          "-targets"
+        ],
+        "command": "file/cp",
+        "id": "flag:file/cp:targets",
+        "name": "--targets"
+      },
+      {
+        "aliases": [
+          "-update-interval"
+        ],
+        "command": "file/cp",
+        "id": "flag:file/cp:update-interval",
+        "name": "--update-interval"
+      },
+      {
+        "aliases": [
+          "-verbose"
+        ],
+        "command": "file/cp",
+        "id": "flag:file/cp:verbose",
+        "name": "--verbose"
+      },
+      {
+        "aliases": [
+          "-conflict"
+        ],
+        "command": "file/get",
+        "id": "flag:file/get:conflict",
+        "name": "--conflict"
+      },
+      {
+        "aliases": [
+          "-loop"
+        ],
+        "command": "file/get",
+        "id": "flag:file/get:loop",
+        "name": "--loop"
+      },
+      {
+        "aliases": [
+          "-verbose"
+        ],
+        "command": "file/get",
+        "id": "flag:file/get:verbose",
+        "name": "--verbose"
+      },
+      {
+        "aliases": [
+          "-wait"
+        ],
+        "command": "file/get",
+        "id": "flag:file/get:wait",
+        "name": "--wait"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "funnel/status",
+        "id": "flag:funnel/status:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-bg"
+        ],
+        "command": "funnel",
+        "id": "flag:funnel:bg",
+        "name": "--bg"
+      },
+      {
+        "aliases": [
+          "-https"
+        ],
+        "command": "funnel",
+        "id": "flag:funnel:https",
+        "name": "--https"
+      },
+      {
+        "aliases": [
+          "-proxy-protocol"
+        ],
+        "command": "funnel",
+        "id": "flag:funnel:proxy-protocol",
+        "name": "--proxy-protocol"
+      },
+      {
+        "aliases": [
+          "-set-path"
+        ],
+        "command": "funnel",
+        "id": "flag:funnel:set-path",
+        "name": "--set-path"
+      },
+      {
+        "aliases": [
+          "-tcp"
+        ],
+        "command": "funnel",
+        "id": "flag:funnel:tcp",
+        "name": "--tcp"
+      },
+      {
+        "aliases": [
+          "-tls-terminated-tcp"
+        ],
+        "command": "funnel",
+        "id": "flag:funnel:tls-terminated-tcp",
+        "name": "--tls-terminated-tcp"
+      },
+      {
+        "aliases": [
+          "-yes"
+        ],
+        "command": "funnel",
+        "id": "flag:funnel:yes",
+        "name": "--yes"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "get",
+        "id": "flag:get:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-set-flags"
+        ],
+        "command": "get",
+        "id": "flag:get:set-flags",
+        "name": "--set-flags"
+      },
+      {
+        "aliases": [
+          "-1"
+        ],
+        "command": "ip",
+        "id": "flag:ip:1",
+        "name": "--1"
+      },
+      {
+        "aliases": [
+          "-4"
+        ],
+        "command": "ip",
+        "id": "flag:ip:4",
+        "name": "--4"
+      },
+      {
+        "aliases": [
+          "-6"
+        ],
+        "command": "ip",
+        "id": "flag:ip:6",
+        "name": "--6"
+      },
+      {
+        "aliases": [
+          "-assert"
+        ],
+        "command": "ip",
+        "id": "flag:ip:assert",
+        "name": "--assert"
+      },
+      {
+        "aliases": [
+          "-confirm"
+        ],
+        "command": "lock/init",
+        "id": "flag:lock/init:confirm",
+        "name": "--confirm"
+      },
+      {
+        "aliases": [
+          "-gen-disablement-for-support"
+        ],
+        "command": "lock/init",
+        "id": "flag:lock/init:gen-disablement-for-support",
+        "name": "--gen-disablement-for-support"
+      },
+      {
+        "aliases": [
+          "-gen-disablements"
+        ],
+        "command": "lock/init",
+        "id": "flag:lock/init:gen-disablements",
+        "name": "--gen-disablements"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "lock/log",
+        "id": "flag:lock/log:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-limit"
+        ],
+        "command": "lock/log",
+        "id": "flag:lock/log:limit",
+        "name": "--limit"
+      },
+      {
+        "aliases": [
+          "-re-sign"
+        ],
+        "command": "lock/remove",
+        "id": "flag:lock/remove:re-sign",
+        "name": "--re-sign"
+      },
+      {
+        "aliases": [
+          "-cosign"
+        ],
+        "command": "lock/revoke-keys",
+        "id": "flag:lock/revoke-keys:cosign",
+        "name": "--cosign"
+      },
+      {
+        "aliases": [
+          "-finish"
+        ],
+        "command": "lock/revoke-keys",
+        "id": "flag:lock/revoke-keys:finish",
+        "name": "--finish"
+      },
+      {
+        "aliases": [
+          "-fork-from"
+        ],
+        "command": "lock/revoke-keys",
+        "id": "flag:lock/revoke-keys:fork-from",
+        "name": "--fork-from"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "lock/status",
+        "id": "flag:lock/status:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-accept-dns"
+        ],
+        "command": "login",
+        "id": "flag:login:accept-dns",
+        "name": "--accept-dns"
+      },
+      {
+        "aliases": [
+          "-accept-routes"
+        ],
+        "command": "login",
+        "id": "flag:login:accept-routes",
+        "name": "--accept-routes"
+      },
+      {
+        "aliases": [
+          "-advertise-connector"
+        ],
+        "command": "login",
+        "id": "flag:login:advertise-connector",
+        "name": "--advertise-connector"
+      },
+      {
+        "aliases": [
+          "-advertise-exit-node"
+        ],
+        "command": "login",
+        "id": "flag:login:advertise-exit-node",
+        "name": "--advertise-exit-node"
+      },
+      {
+        "aliases": [
+          "-advertise-routes"
+        ],
+        "command": "login",
+        "id": "flag:login:advertise-routes",
+        "name": "--advertise-routes"
+      },
+      {
+        "aliases": [
+          "-advertise-tags"
+        ],
+        "command": "login",
+        "id": "flag:login:advertise-tags",
+        "name": "--advertise-tags"
+      },
+      {
+        "aliases": [
+          "-audience"
+        ],
+        "command": "login",
+        "id": "flag:login:audience",
+        "name": "--audience"
+      },
+      {
+        "aliases": [
+          "-auth-key"
+        ],
+        "command": "login",
+        "id": "flag:login:auth-key",
+        "name": "--auth-key"
+      },
+      {
+        "aliases": [
+          "-client-id"
+        ],
+        "command": "login",
+        "id": "flag:login:client-id",
+        "name": "--client-id"
+      },
+      {
+        "aliases": [
+          "-client-secret"
+        ],
+        "command": "login",
+        "id": "flag:login:client-secret",
+        "name": "--client-secret"
+      },
+      {
+        "aliases": [
+          "-exit-node"
+        ],
+        "command": "login",
+        "id": "flag:login:exit-node",
+        "name": "--exit-node"
+      },
+      {
+        "aliases": [
+          "-exit-node-allow-lan-access"
+        ],
+        "command": "login",
+        "id": "flag:login:exit-node-allow-lan-access",
+        "name": "--exit-node-allow-lan-access"
+      },
+      {
+        "aliases": [
+          "-hostname"
+        ],
+        "command": "login",
+        "id": "flag:login:hostname",
+        "name": "--hostname"
+      },
+      {
+        "aliases": [
+          "-id-token"
+        ],
+        "command": "login",
+        "id": "flag:login:id-token",
+        "name": "--id-token"
+      },
+      {
+        "aliases": [
+          "-login-server"
+        ],
+        "command": "login",
+        "id": "flag:login:login-server",
+        "name": "--login-server"
+      },
+      {
+        "aliases": [
+          "-nickname"
+        ],
+        "command": "login",
+        "id": "flag:login:nickname",
+        "name": "--nickname"
+      },
+      {
+        "aliases": [
+          "-operator"
+        ],
+        "command": "login",
+        "id": "flag:login:operator",
+        "name": "--operator"
+      },
+      {
+        "aliases": [
+          "-qr"
+        ],
+        "command": "login",
+        "id": "flag:login:qr",
+        "name": "--qr"
+      },
+      {
+        "aliases": [
+          "-qr-format"
+        ],
+        "command": "login",
+        "id": "flag:login:qr-format",
+        "name": "--qr-format"
+      },
+      {
+        "aliases": [
+          "-report-posture"
+        ],
+        "command": "login",
+        "id": "flag:login:report-posture",
+        "name": "--report-posture"
+      },
+      {
+        "aliases": [
+          "-shields-up"
+        ],
+        "command": "login",
+        "id": "flag:login:shields-up",
+        "name": "--shields-up"
+      },
+      {
+        "aliases": [
+          "-ssh"
+        ],
+        "command": "login",
+        "id": "flag:login:ssh",
+        "name": "--ssh"
+      },
+      {
+        "aliases": [
+          "-timeout"
+        ],
+        "command": "login",
+        "id": "flag:login:timeout",
+        "name": "--timeout"
+      },
+      {
+        "aliases": [
+          "-reason"
+        ],
+        "command": "logout",
+        "id": "flag:logout:reason",
+        "name": "--reason"
+      },
+      {
+        "aliases": [
+          "-bind-address"
+        ],
+        "command": "netcheck",
+        "id": "flag:netcheck:bind-address",
+        "name": "--bind-address"
+      },
+      {
+        "aliases": [
+          "-bind-port"
+        ],
+        "command": "netcheck",
+        "id": "flag:netcheck:bind-port",
+        "name": "--bind-port"
+      },
+      {
+        "aliases": [
+          "-every"
+        ],
+        "command": "netcheck",
+        "id": "flag:netcheck:every",
+        "name": "--every"
+      },
+      {
+        "aliases": [
+          "-format"
+        ],
+        "command": "netcheck",
+        "id": "flag:netcheck:format",
+        "name": "--format"
+      },
+      {
+        "aliases": [
+          "-verbose"
+        ],
+        "command": "netcheck",
+        "id": "flag:netcheck:verbose",
+        "name": "--verbose"
+      },
+      {
+        "aliases": [
+          "-c"
+        ],
+        "command": "ping",
+        "id": "flag:ping:c",
+        "name": "--c"
+      },
+      {
+        "aliases": [
+          "-icmp"
+        ],
+        "command": "ping",
+        "id": "flag:ping:icmp",
+        "name": "--icmp"
+      },
+      {
+        "aliases": [
+          "-peerapi"
+        ],
+        "command": "ping",
+        "id": "flag:ping:peerapi",
+        "name": "--peerapi"
+      },
+      {
+        "aliases": [
+          "-size"
+        ],
+        "command": "ping",
+        "id": "flag:ping:size",
+        "name": "--size"
+      },
+      {
+        "aliases": [
+          "-timeout"
+        ],
+        "command": "ping",
+        "id": "flag:ping:timeout",
+        "name": "--timeout"
+      },
+      {
+        "aliases": [
+          "-tsmp"
+        ],
+        "command": "ping",
+        "id": "flag:ping:tsmp",
+        "name": "--tsmp"
+      },
+      {
+        "aliases": [
+          "-until-direct"
+        ],
+        "command": "ping",
+        "id": "flag:ping:until-direct",
+        "name": "--until-direct"
+      },
+      {
+        "aliases": [
+          "-verbose"
+        ],
+        "command": "ping",
+        "id": "flag:ping:verbose",
+        "name": "--verbose"
+      },
+      {
+        "aliases": [
+          "-all"
+        ],
+        "command": "serve/get-config",
+        "id": "flag:serve/get-config:all",
+        "name": "--all"
+      },
+      {
+        "aliases": [
+          "-service"
+        ],
+        "command": "serve/get-config",
+        "id": "flag:serve/get-config:service",
+        "name": "--service"
+      },
+      {
+        "aliases": [
+          "-all"
+        ],
+        "command": "serve/set-config",
+        "id": "flag:serve/set-config:all",
+        "name": "--all"
+      },
+      {
+        "aliases": [
+          "-service"
+        ],
+        "command": "serve/set-config",
+        "id": "flag:serve/set-config:service",
+        "name": "--service"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "serve/status",
+        "id": "flag:serve/status:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-accept-app-caps"
+        ],
+        "command": "serve",
+        "id": "flag:serve:accept-app-caps",
+        "name": "--accept-app-caps"
+      },
+      {
+        "aliases": [
+          "-bg"
+        ],
+        "command": "serve",
+        "id": "flag:serve:bg",
+        "name": "--bg"
+      },
+      {
+        "aliases": [
+          "-http"
+        ],
+        "command": "serve",
+        "id": "flag:serve:http",
+        "name": "--http"
+      },
+      {
+        "aliases": [
+          "-https"
+        ],
+        "command": "serve",
+        "id": "flag:serve:https",
+        "name": "--https"
+      },
+      {
+        "aliases": [
+          "-proxy-protocol"
+        ],
+        "command": "serve",
+        "id": "flag:serve:proxy-protocol",
+        "name": "--proxy-protocol"
+      },
+      {
+        "aliases": [
+          "-service"
+        ],
+        "command": "serve",
+        "id": "flag:serve:service",
+        "name": "--service"
+      },
+      {
+        "aliases": [
+          "-set-path"
+        ],
+        "command": "serve",
+        "id": "flag:serve:set-path",
+        "name": "--set-path"
+      },
+      {
+        "aliases": [
+          "-tcp"
+        ],
+        "command": "serve",
+        "id": "flag:serve:tcp",
+        "name": "--tcp"
+      },
+      {
+        "aliases": [
+          "-tls-terminated-tcp"
+        ],
+        "command": "serve",
+        "id": "flag:serve:tls-terminated-tcp",
+        "name": "--tls-terminated-tcp"
+      },
+      {
+        "aliases": [
+          "-tun"
+        ],
+        "command": "serve",
+        "id": "flag:serve:tun",
+        "name": "--tun"
+      },
+      {
+        "aliases": [
+          "-yes"
+        ],
+        "command": "serve",
+        "id": "flag:serve:yes",
+        "name": "--yes"
+      },
+      {
+        "aliases": [
+          "-accept-dns"
+        ],
+        "command": "set",
+        "id": "flag:set:accept-dns",
+        "name": "--accept-dns"
+      },
+      {
+        "aliases": [
+          "-accept-risk"
+        ],
+        "command": "set",
+        "id": "flag:set:accept-risk",
+        "name": "--accept-risk"
+      },
+      {
+        "aliases": [
+          "-accept-routes"
+        ],
+        "command": "set",
+        "id": "flag:set:accept-routes",
+        "name": "--accept-routes"
+      },
+      {
+        "aliases": [
+          "-advertise-connector"
+        ],
+        "command": "set",
+        "id": "flag:set:advertise-connector",
+        "name": "--advertise-connector"
+      },
+      {
+        "aliases": [
+          "-advertise-exit-node"
+        ],
+        "command": "set",
+        "id": "flag:set:advertise-exit-node",
+        "name": "--advertise-exit-node"
+      },
+      {
+        "aliases": [
+          "-advertise-routes"
+        ],
+        "command": "set",
+        "id": "flag:set:advertise-routes",
+        "name": "--advertise-routes"
+      },
+      {
+        "aliases": [
+          "-auto-update"
+        ],
+        "command": "set",
+        "id": "flag:set:auto-update",
+        "name": "--auto-update"
+      },
+      {
+        "aliases": [
+          "-exit-node"
+        ],
+        "command": "set",
+        "id": "flag:set:exit-node",
+        "name": "--exit-node"
+      },
+      {
+        "aliases": [
+          "-exit-node-allow-lan-access"
+        ],
+        "command": "set",
+        "id": "flag:set:exit-node-allow-lan-access",
+        "name": "--exit-node-allow-lan-access"
+      },
+      {
+        "aliases": [
+          "-hostname"
+        ],
+        "command": "set",
+        "id": "flag:set:hostname",
+        "name": "--hostname"
+      },
+      {
+        "aliases": [
+          "-nickname"
+        ],
+        "command": "set",
+        "id": "flag:set:nickname",
+        "name": "--nickname"
+      },
+      {
+        "aliases": [
+          "-operator"
+        ],
+        "command": "set",
+        "id": "flag:set:operator",
+        "name": "--operator"
+      },
+      {
+        "aliases": [
+          "-relay-server-port"
+        ],
+        "command": "set",
+        "id": "flag:set:relay-server-port",
+        "name": "--relay-server-port"
+      },
+      {
+        "aliases": [
+          "-relay-server-static-endpoints"
+        ],
+        "command": "set",
+        "id": "flag:set:relay-server-static-endpoints",
+        "name": "--relay-server-static-endpoints"
+      },
+      {
+        "aliases": [
+          "-report-posture"
+        ],
+        "command": "set",
+        "id": "flag:set:report-posture",
+        "name": "--report-posture"
+      },
+      {
+        "aliases": [
+          "-shields-up"
+        ],
+        "command": "set",
+        "id": "flag:set:shields-up",
+        "name": "--shields-up"
+      },
+      {
+        "aliases": [
+          "-ssh"
+        ],
+        "command": "set",
+        "id": "flag:set:ssh",
+        "name": "--ssh"
+      },
+      {
+        "aliases": [
+          "-update-check"
+        ],
+        "command": "set",
+        "id": "flag:set:update-check",
+        "name": "--update-check"
+      },
+      {
+        "aliases": [
+          "-webclient"
+        ],
+        "command": "set",
+        "id": "flag:set:webclient",
+        "name": "--webclient"
+      },
+      {
+        "aliases": [
+          "-active"
+        ],
+        "command": "status",
+        "id": "flag:status:active",
+        "name": "--active"
+      },
+      {
+        "aliases": [
+          "-browser"
+        ],
+        "command": "status",
+        "id": "flag:status:browser",
+        "name": "--browser"
+      },
+      {
+        "aliases": [
+          "-header"
+        ],
+        "command": "status",
+        "id": "flag:status:header",
+        "name": "--header"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "status",
+        "id": "flag:status:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-listen"
+        ],
+        "command": "status",
+        "id": "flag:status:listen",
+        "name": "--listen"
+      },
+      {
+        "aliases": [
+          "-peers"
+        ],
+        "command": "status",
+        "id": "flag:status:peers",
+        "name": "--peers"
+      },
+      {
+        "aliases": [
+          "-self"
+        ],
+        "command": "status",
+        "id": "flag:status:self",
+        "name": "--self"
+      },
+      {
+        "aliases": [
+          "-web"
+        ],
+        "command": "status",
+        "id": "flag:status:web",
+        "name": "--web"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "switch",
+        "id": "flag:switch:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-list"
+        ],
+        "command": "switch",
+        "id": "flag:switch:list",
+        "name": "--list"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "syspolicy/list",
+        "id": "flag:syspolicy/list:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "syspolicy/reload",
+        "id": "flag:syspolicy/reload:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-accept-dns"
+        ],
+        "command": "up",
+        "id": "flag:up:accept-dns",
+        "name": "--accept-dns"
+      },
+      {
+        "aliases": [
+          "-accept-risk"
+        ],
+        "command": "up",
+        "id": "flag:up:accept-risk",
+        "name": "--accept-risk"
+      },
+      {
+        "aliases": [
+          "-accept-routes"
+        ],
+        "command": "up",
+        "id": "flag:up:accept-routes",
+        "name": "--accept-routes"
+      },
+      {
+        "aliases": [
+          "-advertise-connector"
+        ],
+        "command": "up",
+        "id": "flag:up:advertise-connector",
+        "name": "--advertise-connector"
+      },
+      {
+        "aliases": [
+          "-advertise-exit-node"
+        ],
+        "command": "up",
+        "id": "flag:up:advertise-exit-node",
+        "name": "--advertise-exit-node"
+      },
+      {
+        "aliases": [
+          "-advertise-routes"
+        ],
+        "command": "up",
+        "id": "flag:up:advertise-routes",
+        "name": "--advertise-routes"
+      },
+      {
+        "aliases": [
+          "-advertise-tags"
+        ],
+        "command": "up",
+        "id": "flag:up:advertise-tags",
+        "name": "--advertise-tags"
+      },
+      {
+        "aliases": [
+          "-audience"
+        ],
+        "command": "up",
+        "id": "flag:up:audience",
+        "name": "--audience"
+      },
+      {
+        "aliases": [
+          "-auth-key"
+        ],
+        "command": "up",
+        "id": "flag:up:auth-key",
+        "name": "--auth-key"
+      },
+      {
+        "aliases": [
+          "-client-id"
+        ],
+        "command": "up",
+        "id": "flag:up:client-id",
+        "name": "--client-id"
+      },
+      {
+        "aliases": [
+          "-client-secret"
+        ],
+        "command": "up",
+        "id": "flag:up:client-secret",
+        "name": "--client-secret"
+      },
+      {
+        "aliases": [
+          "-exit-node"
+        ],
+        "command": "up",
+        "id": "flag:up:exit-node",
+        "name": "--exit-node"
+      },
+      {
+        "aliases": [
+          "-exit-node-allow-lan-access"
+        ],
+        "command": "up",
+        "id": "flag:up:exit-node-allow-lan-access",
+        "name": "--exit-node-allow-lan-access"
+      },
+      {
+        "aliases": [
+          "-force-reauth"
+        ],
+        "command": "up",
+        "id": "flag:up:force-reauth",
+        "name": "--force-reauth"
+      },
+      {
+        "aliases": [
+          "-hostname"
+        ],
+        "command": "up",
+        "id": "flag:up:hostname",
+        "name": "--hostname"
+      },
+      {
+        "aliases": [
+          "-id-token"
+        ],
+        "command": "up",
+        "id": "flag:up:id-token",
+        "name": "--id-token"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "up",
+        "id": "flag:up:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-login-server"
+        ],
+        "command": "up",
+        "id": "flag:up:login-server",
+        "name": "--login-server"
+      },
+      {
+        "aliases": [
+          "-operator"
+        ],
+        "command": "up",
+        "id": "flag:up:operator",
+        "name": "--operator"
+      },
+      {
+        "aliases": [
+          "-qr"
+        ],
+        "command": "up",
+        "id": "flag:up:qr",
+        "name": "--qr"
+      },
+      {
+        "aliases": [
+          "-qr-format"
+        ],
+        "command": "up",
+        "id": "flag:up:qr-format",
+        "name": "--qr-format"
+      },
+      {
+        "aliases": [
+          "-report-posture"
+        ],
+        "command": "up",
+        "id": "flag:up:report-posture",
+        "name": "--report-posture"
+      },
+      {
+        "aliases": [
+          "-reset"
+        ],
+        "command": "up",
+        "id": "flag:up:reset",
+        "name": "--reset"
+      },
+      {
+        "aliases": [
+          "-shields-up"
+        ],
+        "command": "up",
+        "id": "flag:up:shields-up",
+        "name": "--shields-up"
+      },
+      {
+        "aliases": [
+          "-ssh"
+        ],
+        "command": "up",
+        "id": "flag:up:ssh",
+        "name": "--ssh"
+      },
+      {
+        "aliases": [
+          "-timeout"
+        ],
+        "command": "up",
+        "id": "flag:up:timeout",
+        "name": "--timeout"
+      },
+      {
+        "aliases": [
+          "-dry-run"
+        ],
+        "command": "update",
+        "id": "flag:update:dry-run",
+        "name": "--dry-run"
+      },
+      {
+        "aliases": [
+          "-yes"
+        ],
+        "command": "update",
+        "id": "flag:update:yes",
+        "name": "--yes"
+      },
+      {
+        "aliases": [
+          "-daemon"
+        ],
+        "command": "version",
+        "id": "flag:version:daemon",
+        "name": "--daemon"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "version",
+        "id": "flag:version:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-track"
+        ],
+        "command": "version",
+        "id": "flag:version:track",
+        "name": "--track"
+      },
+      {
+        "aliases": [
+          "-upstream"
+        ],
+        "command": "version",
+        "id": "flag:version:upstream",
+        "name": "--upstream"
+      },
+      {
+        "aliases": [
+          "-timeout"
+        ],
+        "command": "wait",
+        "id": "flag:wait:timeout",
+        "name": "--timeout"
+      },
+      {
+        "aliases": [
+          "-cgi"
+        ],
+        "command": "web",
+        "id": "flag:web:cgi",
+        "name": "--cgi"
+      },
+      {
+        "aliases": [
+          "-listen"
+        ],
+        "command": "web",
+        "id": "flag:web:listen",
+        "name": "--listen"
+      },
+      {
+        "aliases": [
+          "-origin"
+        ],
+        "command": "web",
+        "id": "flag:web:origin",
+        "name": "--origin"
+      },
+      {
+        "aliases": [
+          "-prefix"
+        ],
+        "command": "web",
+        "id": "flag:web:prefix",
+        "name": "--prefix"
+      },
+      {
+        "aliases": [
+          "-readonly"
+        ],
+        "command": "web",
+        "id": "flag:web:readonly",
+        "name": "--readonly"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "whoami",
+        "id": "flag:whoami:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-json"
+        ],
+        "command": "whois",
+        "id": "flag:whois:json",
+        "name": "--json"
+      },
+      {
+        "aliases": [
+          "-proto"
+        ],
+        "command": "whois",
+        "id": "flag:whois:proto",
+        "name": "--proto"
+      }
+    ]
+  },
+  "kind": "upstream-cli",
+  "schema_version": 1,
+  "upstream": {
+    "go_mod_sum": "h1:DQ9YBy85DpNlSyeU2XRIWzbAu3RsGp/frv+Khg57meE=",
+    "module": "tailscale.com",
+    "repository": "https://github.com/tailscale/tailscale",
+    "revision": "c811bb19bf3b0c89061ac7b7a073f6cd23b504d0",
+    "sum": "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=",
+    "version": "v1.100.0"
+  }
+}

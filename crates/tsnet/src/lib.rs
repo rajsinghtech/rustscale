@@ -40,6 +40,7 @@ mod hostinfo;
 mod lifecycle;
 mod link_monitor;
 pub mod localapi;
+mod localapi_contract;
 mod loopback;
 mod map_update;
 mod netstack_pump;

@@ -8,6 +8,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_contains() { [[ "$1" == *"$2"* ]] || fail "missing '$2'"; }
+assert_not_contains() { [[ "$1" != *"$2"* ]] || fail "unexpected '$2'"; }
 expect_failure() {
   local output
   if output=$("$@" 2>&1); then
@@ -18,6 +19,7 @@ expect_failure() {
 expect_success() {
   local output
   if ! output=$("$@" 2>&1); then
+    printf '%s\n' "$output" >&2
     fail "command unexpectedly failed: $*"
   fi
   printf '%s' "$output"
@@ -35,7 +37,9 @@ new_repo() {
   mkdir -p "$REPO/tools/agent"
   cp "$ROOT/tools/agent/codex-task.sh" "$ROOT/tools/agent/pi-research.sh" \
     "$ROOT/tools/agent/worktree-merge.sh" "$ROOT/tools/agent/agent-review.sh" \
-    "$ROOT/tools/agent/run-with-deadline.py" "$ROOT/tools/agent/check.sh" "$REPO/tools/agent/"
+    "$ROOT/tools/agent/reconcile-report.sh" "$ROOT/tools/agent/remote-validate.sh" \
+    "$ROOT/tools/agent/run-with-deadline.py" "$ROOT/tools/agent/check.sh" \
+    "$REPO/tools/agent/"
   cp "$ROOT/tools/worktree-status.sh" "$REPO/tools/"
   chmod +x "$REPO/tools/agent/"*.sh "$REPO/tools/worktree-status.sh"
   printf '%s\n' '#!/usr/bin/env bash' \
@@ -56,7 +60,7 @@ new_repo() {
 
 test_production_wrappers_are_executable() {
   local wrapper
-  for wrapper in codex-task.sh pi-research.sh agent-review.sh check.sh; do
+  for wrapper in codex-task.sh pi-research.sh agent-review.sh reconcile-report.sh remote-validate.sh check.sh; do
     [[ -x "$ROOT/tools/agent/$wrapper" ]] || fail "production wrapper is not executable: $wrapper"
   done
 }
@@ -79,6 +83,271 @@ test_check_failure_runs_once() {
   count="$(wc -c <"$check_repo/count" | tr -d ' ')"
   [[ "$count" == 1 ]] || fail "check reran failed cargo command ($count executions)"
   assert_contains "$output" 'intentional failure'
+}
+
+# Build a Linux-shaped fake transport. The fake ssh executes the supplied
+# remote command locally, while tar and timeout wrappers record every use.
+make_remote_fakes() {
+  local real_tar real_shasum
+  real_tar="$(command -v tar)"
+  real_shasum="$(command -v shasum)"
+  FAKE_LOCAL_BIN="$TMP/remote-local-bin"
+  FAKE_REMOTE_BIN="$TMP/remote-command-bin"
+  FAKE_REMOTE_HOME="$TMP/remote-home"
+  FAKE_REMOTE_TMP="$TMP/remote-tmp"
+  mkdir -p "$FAKE_LOCAL_BIN" "$FAKE_REMOTE_BIN" "$FAKE_REMOTE_HOME" "$FAKE_REMOTE_TMP"
+
+  # shellcheck disable=SC2016 # Fake commands expand their test environment at runtime.
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'printf "%s\\n" "$*" >>"$FAKE_TAR_LOG"' \
+    'exec "$REAL_TAR" "$@"' >"$FAKE_LOCAL_BIN/tar"
+  cp "$FAKE_LOCAL_BIN/tar" "$FAKE_REMOTE_BIN/tar"
+
+  # shellcheck disable=SC2016 # Fake commands expand their test environment at runtime.
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'printf "%s\\n" "$*" >>"$FAKE_TIMEOUT_LOG"' \
+    'while [[ "${1:-}" == --* ]]; do shift; done' \
+    '[[ "${1:-}" =~ ^[0-9]+s$ ]] || exit 92' \
+    'shift' \
+    'if [[ -n "${FAKE_TIMEOUT_EXIT:-}" ]]; then exit "$FAKE_TIMEOUT_EXIT"; fi' \
+    'exec "$@"' >"$FAKE_REMOTE_BIN/timeout"
+
+  # macOS does not ship setsid; use a tiny equivalent so process-group cleanup
+  # in the production remote entrypoint is exercised rather than bypassed.
+  cat >"$FAKE_REMOTE_BIN/setsid" <<'EOF'
+#!/usr/bin/env python3
+import os
+import sys
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])
+EOF
+  cat >"$FAKE_REMOTE_BIN/uname" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -s) echo Linux ;;
+  -m) echo aarch64 ;;
+  -r) echo 6.8.0-fake ;;
+  *) echo Linux fake 6.8.0-fake aarch64 ;;
+esac
+EOF
+  cat >"$FAKE_REMOTE_BIN/lsb_release" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -is) echo Ubuntu ;;
+  -rs) echo 24.04 ;;
+  *) exit 1 ;;
+esac
+EOF
+  cat >"$FAKE_REMOTE_BIN/free" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '              total        used        free' 'Mem:       33554432           1    33554431'
+EOF
+  cat >"$FAKE_REMOTE_BIN/df" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' \
+  'fake       100000000    1  99999999       1% /tmp'
+EOF
+  # shellcheck disable=SC2016 # Fake command expands REAL_SHASUM at runtime.
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'exec "$REAL_SHASUM" -a 256 "$@"' >"$FAKE_REMOTE_BIN/sha256sum"
+
+  # shellcheck disable=SC2016 # Fake ssh must preserve and execute its final argument.
+  cat >"$FAKE_LOCAL_BIN/ssh" <<'EOF'
+#!/usr/bin/env bash
+count=$#
+(( count > 0 )) || exit 90
+remote_command=${!count}
+: >"$FAKE_SSH_ARGS"
+for ((index = 1; index < count; index++)); do
+  printf '%s\n' "${!index}" >>"$FAKE_SSH_ARGS"
+done
+cat >"$FAKE_SSH_BUNDLE"
+env PATH="$FAKE_REMOTE_BIN:/usr/bin:/bin" HOME="$FAKE_REMOTE_HOME" \
+  TMPDIR="$FAKE_REMOTE_TMP" USER=builder LOGNAME=builder \
+  FAKE_TAR_LOG="$FAKE_TAR_LOG" FAKE_TIMEOUT_LOG="$FAKE_TIMEOUT_LOG" \
+  FAKE_TIMEOUT_EXIT="${FAKE_TIMEOUT_EXIT:-}" REAL_TAR="$REAL_TAR" \
+  REAL_SHASUM="$REAL_SHASUM" bash -c "$remote_command" <"$FAKE_SSH_BUNDLE"
+EOF
+  chmod +x "$FAKE_LOCAL_BIN/ssh" "$FAKE_LOCAL_BIN/tar" "$FAKE_REMOTE_BIN/"*
+  export REAL_TAR="$real_tar" REAL_SHASUM="$real_shasum"
+}
+
+test_remote_validation_is_hermetic_and_fail_closed() {
+  local output result extract listing
+  new_repo remote-validation
+  make_remote_fakes
+  FAKE_SSH_ARGS="$REPO/args"
+  FAKE_SSH_BUNDLE="$REPO/expected"
+  FAKE_TAR_LOG="$REPO/tar.log"
+  FAKE_TIMEOUT_LOG="$REPO/timeout.log"
+  : >"$FAKE_TAR_LOG"
+  : >"$FAKE_TIMEOUT_LOG"
+
+  printf 'dirty tracked\n' >"$REPO/shared.txt"
+  printf 'reviewed index\n' >"$REPO/reviewed.txt"
+  git -C "$REPO" add reviewed.txt
+  printf 'never transfer this token\n' >"$REPO/private-untracked.txt"
+  mkdir -p "$REPO/.secrets" "$REPO/target" "$REPO/.worktrees/local"
+  printf 'secret material\n' >"$REPO/.secrets/token"
+  printf 'build output\n' >"$REPO/target/output"
+
+  output=$(expect_failure env PATH="$FAKE_LOCAL_BIN:$PATH" \
+    RUSTSCALE_REMOTE_TARGET=builder@fake-host \
+    RUSTSCALE_REMOTE_MIN_MEMORY_MIB=1 RUSTSCALE_REMOTE_MIN_DISK_MIB=1 \
+    FAKE_SSH_ARGS="$FAKE_SSH_ARGS" FAKE_SSH_BUNDLE="$FAKE_SSH_BUNDLE" \
+    FAKE_TAR_LOG="$FAKE_TAR_LOG" FAKE_TIMEOUT_LOG="$FAKE_TIMEOUT_LOG" \
+    FAKE_LOCAL_BIN="$FAKE_LOCAL_BIN" FAKE_REMOTE_BIN="$FAKE_REMOTE_BIN" \
+    FAKE_REMOTE_HOME="$FAKE_REMOTE_HOME" FAKE_REMOTE_TMP="$FAKE_REMOTE_TMP" \
+    REAL_TAR="$REAL_TAR" REAL_SHASUM="$REAL_SHASUM" \
+    "$REPO/tools/agent/remote-validate.sh" preflight)
+  assert_contains "$output" 'remote prerequisites are incomplete'
+  assert_contains "$output" $'RUSTSCALE_REMOTE\tmissing.required\tcargo'
+  assert_contains "$output" 'rustup component add clippy rustfmt'
+  assert_not_contains "$output" 'never transfer this token'
+  assert_contains "$(cat "$FAKE_SSH_ARGS")" 'BatchMode=yes'
+  assert_contains "$(cat "$FAKE_SSH_ARGS")" 'StrictHostKeyChecking=yes'
+  assert_contains "$(cat "$FAKE_SSH_ARGS")" 'ForwardAgent=no'
+  assert_contains "$(cat "$FAKE_SSH_ARGS")" 'ClearAllForwardings=yes'
+  [[ -s "$FAKE_TAR_LOG" ]] || fail 'remote validation did not use the fake tar command'
+  [[ -s "$FAKE_TIMEOUT_LOG" ]] || fail 'remote validation did not use the fake timeout command'
+
+  extract="$TMP/remote-extract"
+  mkdir -p "$extract/control" "$extract/source"
+  "$REAL_TAR" -xf "$FAKE_SSH_BUNDLE" -C "$extract/control"
+  "$REAL_TAR" -xf "$extract/control/source.tar" -C "$extract/source"
+  [[ "$(cat "$extract/source/shared.txt")" == 'dirty tracked' ]] \
+    || fail 'remote archive omitted the explicit working-tree diff'
+  [[ "$(cat "$extract/source/reviewed.txt")" == 'reviewed index' ]] \
+    || fail 'remote archive omitted the reviewed index addition'
+  listing=$(find "$extract/source" -print)
+  assert_not_contains "$listing" 'private-untracked.txt'
+  if find "$extract/source" \( -name .git -o -name target -o -name .agent-runs \
+      -o -name .worktrees -o -name .secrets -o -name secrets \) -print -quit \
+      | grep -q .; then
+    fail 'remote source contained a prohibited path'
+  fi
+  if find "$FAKE_REMOTE_TMP" -maxdepth 1 -name 'rustscale-remote.*' | grep -q .; then
+    fail 'remote temporary directory survived preflight'
+  fi
+
+  result=$(find "$REPO/.agent-runs/remote-validation" -type f -name '*.json' -print | sed -n '1p')
+  [[ -n "$result" ]] || fail 'remote validation did not write provenance'
+  assert_contains "$(cat "$result")" '"status": "blocked"'
+  assert_contains "$(cat "$result")" '"cleanup": "confirmed"'
+  assert_contains "$(cat "$result")" '"archive_integrity": "verified"'
+  assert_contains "$(cat "$result")" '"untracked_files_excluded"'
+  assert_not_contains "$(cat "$result")" "$REPO"
+  assert_not_contains "$(cat "$result")" 'secret material'
+}
+
+test_remote_validation_runs_focused_check() {
+  local output result
+  new_repo remote-focused-check
+  make_remote_fakes
+  FAKE_SSH_ARGS="$REPO/args"
+  FAKE_SSH_BUNDLE="$REPO/expected"
+  FAKE_TAR_LOG="$REPO/tar.log"
+  FAKE_TIMEOUT_LOG="$REPO/timeout.log"
+  : >"$FAKE_TAR_LOG"
+  : >"$FAKE_TIMEOUT_LOG"
+
+  cat >"$FAKE_REMOTE_BIN/cargo" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) echo 'cargo 1.91.0 (fake)' ;;
+  clippy) echo 'clippy 0.1.91 (fake)' ;;
+  fmt) echo 'rustfmt 1.91.0 (fake)' ;;
+  *) exit 0 ;;
+esac
+EOF
+  cat >"$FAKE_REMOTE_BIN/rustc" <<'EOF'
+#!/usr/bin/env bash
+echo 'rustc 1.91.0 (fake)'
+EOF
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' \
+    >"$FAKE_REMOTE_BIN/pkg-config"
+  cp "$FAKE_REMOTE_BIN/pkg-config" "$FAKE_REMOTE_BIN/cmake"
+  chmod +x "$FAKE_REMOTE_BIN/cargo" "$FAKE_REMOTE_BIN/rustc" \
+    "$FAKE_REMOTE_BIN/pkg-config" "$FAKE_REMOTE_BIN/cmake"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "remote check args:$*"' 'exit 0' >"$REPO/tools/check.sh"
+  chmod +x "$REPO/tools/check.sh"
+
+  output=$(expect_success env PATH="$FAKE_LOCAL_BIN:$PATH" \
+    RUSTSCALE_REMOTE_TARGET=builder@fake-host \
+    RUSTSCALE_REMOTE_MIN_MEMORY_MIB=1 RUSTSCALE_REMOTE_MIN_DISK_MIB=1 \
+    FAKE_SSH_ARGS="$FAKE_SSH_ARGS" FAKE_SSH_BUNDLE="$FAKE_SSH_BUNDLE" \
+    FAKE_TAR_LOG="$FAKE_TAR_LOG" FAKE_TIMEOUT_LOG="$FAKE_TIMEOUT_LOG" \
+    FAKE_LOCAL_BIN="$FAKE_LOCAL_BIN" FAKE_REMOTE_BIN="$FAKE_REMOTE_BIN" \
+    FAKE_REMOTE_HOME="$FAKE_REMOTE_HOME" FAKE_REMOTE_TMP="$FAKE_REMOTE_TMP" \
+    REAL_TAR="$REAL_TAR" REAL_SHASUM="$REAL_SHASUM" \
+    "$REPO/tools/agent/remote-validate.sh" check rustscale-key)
+  assert_contains "$output" 'remote check args:rustscale-key'
+  assert_contains "$output" $'RUSTSCALE_REMOTE\tfact.open_files_soft\t'
+  assert_contains "$output" $'RUSTSCALE_REMOTE\tfact.open_files_hard\t'
+  assert_contains "$output" $'RUSTSCALE_REMOTE\tstatus\tpassed'
+  result=$(find "$REPO/.agent-runs/remote-validation" -type f -name '*.json' -print | sed -n '1p')
+  assert_contains "$(cat "$result")" '"status": "passed"'
+  assert_contains "$(cat "$result")" '"cleanup": "confirmed"'
+  assert_contains "$(cat "$result")" '"open_files_soft"'
+  assert_contains "$(cat "$result")" '"open_files_hard"'
+}
+
+test_remote_validation_disable_privilege_and_timeout_guards() {
+  local output result
+  new_repo remote-guards
+  make_remote_fakes
+  FAKE_SSH_ARGS="$REPO/args"
+  FAKE_SSH_BUNDLE="$REPO/expected"
+  FAKE_TAR_LOG="$REPO/tar.log"
+  FAKE_TIMEOUT_LOG="$REPO/timeout.log"
+  : >"$FAKE_TAR_LOG"
+  : >"$FAKE_TIMEOUT_LOG"
+
+  output=$(expect_success env PATH="$FAKE_LOCAL_BIN:$PATH" RUSTSCALE_REMOTE_DISABLE=1 \
+    FAKE_SSH_ARGS="$FAKE_SSH_ARGS" FAKE_SSH_BUNDLE="$FAKE_SSH_BUNDLE" \
+    FAKE_TAR_LOG="$FAKE_TAR_LOG" FAKE_TIMEOUT_LOG="$FAKE_TIMEOUT_LOG" \
+    "$REPO/tools/agent/remote-validate.sh" preflight)
+  assert_contains "$output" 'explicitly disabled'
+  [[ ! -e "$FAKE_SSH_ARGS" ]] || fail 'disabled remote validation invoked ssh'
+  [[ ! -s "$FAKE_TAR_LOG" ]] || fail 'disabled remote validation invoked tar'
+  result=$(find "$REPO/.agent-runs/remote-validation" -type f -name '*.json' -print | sed -n '1p')
+  assert_contains "$(cat "$result")" '"status": "disabled"'
+
+  output=$(expect_failure "$REPO/tools/agent/remote-validate.sh" tun)
+  assert_contains "$output" 'requires the explicit --allow-privileged flag'
+  output=$(expect_failure "$REPO/tools/agent/remote-validate.sh" install --allow-privileged)
+  assert_contains "$output" 'requires the additional --allow-install flag'
+
+  rm -rf "$REPO/.agent-runs/remote-validation"
+  output=$(expect_failure env PATH="$FAKE_LOCAL_BIN:$PATH" \
+    RUSTSCALE_REMOTE_TARGET=builder@fake-host RUSTSCALE_REMOTE_TIMEOUT=1 \
+    RUSTSCALE_REMOTE_MIN_MEMORY_MIB=1 RUSTSCALE_REMOTE_MIN_DISK_MIB=1 \
+    FAKE_TIMEOUT_EXIT=124 FAKE_SSH_ARGS="$FAKE_SSH_ARGS" \
+    FAKE_SSH_BUNDLE="$FAKE_SSH_BUNDLE" FAKE_TAR_LOG="$FAKE_TAR_LOG" \
+    FAKE_TIMEOUT_LOG="$FAKE_TIMEOUT_LOG" FAKE_LOCAL_BIN="$FAKE_LOCAL_BIN" \
+    FAKE_REMOTE_BIN="$FAKE_REMOTE_BIN" FAKE_REMOTE_HOME="$FAKE_REMOTE_HOME" \
+    FAKE_REMOTE_TMP="$FAKE_REMOTE_TMP" REAL_TAR="$REAL_TAR" \
+    REAL_SHASUM="$REAL_SHASUM" "$REPO/tools/agent/remote-validate.sh" preflight)
+  assert_contains "$output" 'status: timed_out'
+  result=$(find "$REPO/.agent-runs/remote-validation" -type f -name '*.json' -print | sed -n '1p')
+  assert_contains "$(cat "$result")" '"status": "timed_out"'
+  assert_contains "$(cat "$result")" '"cleanup": "confirmed"'
+  if find "$FAKE_REMOTE_TMP" -maxdepth 1 -name 'rustscale-remote.*' | grep -q .; then
+    fail 'remote temporary directory survived timeout'
+  fi
+}
+
+test_remote_validation_rejects_tracked_secrets() {
+  local output
+  new_repo remote-secret-rejection
+  mkdir -p "$REPO/.secrets"
+  printf 'tracked secret\n' >"$REPO/.secrets/token"
+  git -C "$REPO" add .secrets/token
+  output=$(expect_failure env RUSTSCALE_REMOTE_TARGET=builder@fake-host \
+    "$REPO/tools/agent/remote-validate.sh" preflight)
+  assert_contains "$output" 'prohibited candidate path'
+  assert_contains "$output" 'prohibited secret or generated path'
 }
 
 test_pi_arguments_and_model_override() {
@@ -264,7 +533,7 @@ test_codex_wrapper_signal_updates_metadata() {
 }
 
 test_deadline_process_group_cleanup() {
-  local linger pidfile runner status output
+  local grace_script linger marker pidfile runner status output
   linger="$TMP/linger.py"
   printf '%s\n' \
     'import subprocess, sys, time' \
@@ -285,6 +554,27 @@ test_deadline_process_group_cleanup() {
   done
   ! kill -0 "$(cat "$pidfile")" 2>/dev/null || fail 'grandchild survived deadline cleanup'
   assert_contains "$output" 'deadline reached'
+
+  grace_script="$TMP/deadline-grace.py"
+  marker="$TMP/deadline-grace.marker"
+  printf '%s\n' \
+    'import signal, sys, time' \
+    'def terminate(_signum, _frame):' \
+    '    with open(sys.argv[1], "a", encoding="ascii") as handle: handle.write("term\\n")' \
+    '    time.sleep(0.5)' \
+    '    with open(sys.argv[1], "a", encoding="ascii") as handle: handle.write("done\\n")' \
+    '    raise SystemExit(143)' \
+    'signal.signal(signal.SIGTERM, terminate)' \
+    'time.sleep(30)' >"$grace_script"
+  set +e
+  output="$(env RUSTSCALE_DEADLINE_GRACE_SECONDS=2 \
+    python3 "$ROOT/tools/agent/run-with-deadline.py" 1 -- \
+      python3 "$grace_script" "$marker" 2>&1)"
+  status=$?
+  set -e
+  [[ "$status" == 124 ]] || fail "deadline helper grace exit was $status, expected 124"
+  [[ -f "$marker" ]] || fail 'deadline helper did not deliver TERM during configurable grace'
+  assert_contains "$(cat "$marker")" 'done'
 
   pidfile="$TMP/term-child.pid"
   python3 "$ROOT/tools/agent/run-with-deadline.py" 30 -- python3 "$linger" "$pidfile" >"$TMP/term.log" 2>&1 &
@@ -458,6 +748,70 @@ test_merged_clean_status_is_not_attention() {
   assert_contains "$output" $'MERGED_CLEAN\t'
 }
 
+test_squash_integrated_statuses_are_evidence_backed() {
+  local output
+  new_repo status-squash-tree
+  git -C "$REPO" worktree add -q -b agent/squash-tree "$REPO/.worktrees/squash-tree" master
+  printf 'squashed\n' >"$REPO/.worktrees/squash-tree/squashed.txt"
+  git -C "$REPO/.worktrees/squash-tree" add squashed.txt
+  git -C "$REPO/.worktrees/squash-tree" commit -qm squash-source
+  git -C "$REPO" merge -q --squash agent/squash-tree
+  git -C "$REPO" commit -qm squash-destination
+  output=$(expect_success "$REPO/tools/worktree-status.sh" --porcelain)
+  assert_contains "$output" $'SQUASH_INTEGRATED\t'
+  assert_contains "$output" $'\ttree:'
+  assert_not_contains "$output" $'AHEAD_UNMERGED\t'
+
+  new_repo status-squash-patch
+  git -C "$REPO" worktree add -q -b agent/squash-patch "$REPO/.worktrees/squash-patch" master
+  printf 'feature\n' >"$REPO/.worktrees/squash-patch/feature.txt"
+  git -C "$REPO/.worktrees/squash-patch" add feature.txt
+  git -C "$REPO/.worktrees/squash-patch" commit -qm patch-source
+  printf 'unrelated\n' >"$REPO/unrelated.txt"
+  git -C "$REPO" add unrelated.txt
+  git -C "$REPO" commit -qm unrelated-master-change
+  git -C "$REPO" merge -q --squash agent/squash-patch
+  git -C "$REPO" commit -qm patch-destination
+  [[ "$(git -C "$REPO" rev-parse 'master^{tree}')" != \
+    "$(git -C "$REPO/.worktrees/squash-patch" rev-parse 'HEAD^{tree}')" ]] \
+    || fail 'patch fixture unexpectedly had tree equivalence'
+  output=$(expect_success "$REPO/tools/worktree-status.sh" --porcelain)
+  assert_contains "$output" $'SQUASH_INTEGRATED\t'
+  assert_contains "$output" $'\tpatch:'
+  assert_not_contains "$output" $'AHEAD_UNMERGED\t'
+}
+
+test_reconciliation_report_links_sessions_by_metadata() {
+  local output
+  new_repo reconciliation-report
+  git -C "$REPO" worktree add -q -b agent/matched "$REPO/.worktrees/matched" master
+  git -C "$REPO" branch agent/stale-session master
+  mkdir -p "$REPO/.agent-runs/codex/matched" "$REPO/.agent-runs/codex/stale" \
+    "$REPO/.agent-runs/codex/orphan" "$REPO/.agent-runs/pi-impl/legacy"
+  python3 - "$REPO" <<'PYEOF'
+import json
+import os
+import sys
+root = sys.argv[1]
+records = {
+    "matched": ("agent/matched", os.path.join(root, ".worktrees", "matched"), "DONE"),
+    "stale": ("agent/stale-session", os.path.join(root, ".worktrees", "missing"), "DONE"),
+    "orphan": ("agent/missing-session", os.path.join(root, ".worktrees", "missing"), "RUNNING"),
+}
+for name, (branch, worktree, status) in records.items():
+    path = os.path.join(root, ".agent-runs", "codex", name, "metadata.json")
+    with open(path, "w", encoding="ascii") as handle:
+        json.dump({"branch": branch, "worktree": worktree, "status": status}, handle)
+PYEOF
+  output=$(expect_success "$REPO/tools/agent/reconcile-report.sh" -)
+  assert_contains "$output" $'WORKTREE\tEMPTY_STALE\tmatched\tagent/matched'
+  assert_contains "$output" $'SESSION\tMATCHED_SESSION\tcodex/matched\tagent/matched'
+  assert_contains "$output" $'SESSION\tSTALE_SESSION\tcodex/stale\tagent/stale-session'
+  assert_contains "$output" $'SESSION\tORPHAN_SESSION\tcodex/orphan\tagent/missing-session\tRUNNING'
+  assert_contains "$output" $'SESSION\tORPHAN_SESSION\tpi-impl/legacy\t-\t-'
+  assert_not_contains "$output" "$REPO"
+}
+
 test_attention_statuses_fail() {
   new_repo status-dirty
   git -C "$REPO" worktree add -q -b agent/dirty "$REPO/.worktrees/dirty" master
@@ -527,6 +881,10 @@ test_final_gate_preserves_worktree() {
 
 test_production_wrappers_are_executable
 test_check_failure_runs_once
+test_remote_validation_is_hermetic_and_fail_closed
+test_remote_validation_runs_focused_check
+test_remote_validation_disable_privilege_and_timeout_guards
+test_remote_validation_rejects_tracked_secrets
 test_pi_arguments_and_model_override
 test_codex_arguments_and_dirty_main
 test_codex_resume_and_deadline
@@ -545,6 +903,8 @@ test_review_stale_branch_refusal
 test_review_remote_staleness_refusal
 test_review_master_movement_refusal
 test_merged_clean_status_is_not_attention
+test_squash_integrated_statuses_are_evidence_backed
+test_reconciliation_report_links_sessions_by_metadata
 test_attention_statuses_fail
 test_uncommitted_work_refusal
 test_conflict_refusal

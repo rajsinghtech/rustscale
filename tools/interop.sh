@@ -4,8 +4,10 @@
 # Provisions an ephemeral tailnet, starts ONE Go tailscaled in userspace-
 # networking mode, exposes a `tailscale serve --tcp` echo forwarder, approves
 # a subnet route the Go node advertises, exports TS_INTEROP_* + TS_E2E_* env
-# vars, then runs the `interop_` test suite against it. Tears everything down
-# via trap (kill tailscaled by pidfile, delete tailnet, remove state dirs).
+# vars, then runs the `interop_` test suite against it. That suite also keeps
+# a two-Rust-node, one-way `listen_packet` cadence gate because the TCP/Go
+# paths do not exercise idle application UDP sends. Tears everything down via
+# trap (kill tailscaled by pidfile, delete tailnet, remove state dirs).
 #
 # Auth (either):
 #   TS_ORG_TOKEN                            — pre-minted org token (CI/WID path)
@@ -253,10 +255,16 @@ echo "[interop]   TS_INTEROP_GO_SUBNET=$GO_SUBNET" >&2
 sleep 3
 
 # ---------------------------------------------------------------------------
-# Run the interop test suite.
+# Run the interop test suite. Keep the cadence gate isolated from the
+# continuously active TCP scenarios so its one-way timing evidence is useful.
 # ---------------------------------------------------------------------------
-echo "[interop] running cargo test -p rustscale-tsnet -- --ignored interop_" >&2
-cargo test -p rustscale-tsnet -- --ignored interop_
+echo "[interop] running isolated application UDP cadence gate" >&2
+cargo test -p rustscale-tsnet tests::interop_application_udp_cadence -- \
+  --ignored --exact --nocapture --test-threads=1
+
+echo "[interop] running remaining cargo test -p rustscale-tsnet -- --ignored interop_" >&2
+cargo test -p rustscale-tsnet -- --ignored interop_ \
+  --skip tests::interop_application_udp_cadence
 TEST_RC=$?
 
 echo "[interop] test suite exited with code $TEST_RC" >&2

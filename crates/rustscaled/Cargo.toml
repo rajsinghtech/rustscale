@@ -14,19 +14,19 @@ name = "rustscaled"
 path = "src/main.rs"
 
 [dependencies]
-rustscale-tsnet = { path = "../tsnet", version = "0.1.3", features = ["identity-federation"] }
-rustscale-safesocket = { path = "../safesocket", version = "0.1.3" }
-rustscale-conffile = { path = "../conffile", version = "0.1.3" }
-rustscale-ipn = { path = "../ipn", version = "0.1.3" }
-rustscale-logpolicy = { path = "../logpolicy", version = "0.1.3" }
-rustscale-logtail = { path = "../logtail", version = "0.1.3" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.4", features = ["identity-federation"] }
+rustscale-safesocket = { path = "../safesocket", version = "0.1.4" }
+rustscale-conffile = { path = "../conffile", version = "0.1.4" }
+rustscale-ipn = { path = "../ipn", version = "0.1.4" }
+rustscale-logpolicy = { path = "../logpolicy", version = "0.1.4" }
+rustscale-logtail = { path = "../logtail", version = "0.1.4" }
+rustscale-localclient = { path = "../localclient", version = "0.1.4" }
 rustscale-syspolicy.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 log.workspace = true
 
 [dev-dependencies]
-rustscale-localclient = { path = "../localclient", version = "0.1.3" }
-rustscale-testcontrol = { path = "../testcontrol", version = "0.1.3" }
+rustscale-testcontrol = { path = "../testcontrol", version = "0.1.4" }
 serde_json.workspace = true
 tempfile = "3"

@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "upstream_version": "v1.100.0",
+  "mappings": {
+    "field:Server.Dir": {
+      "local_ids": ["method:ServerBuilder.state_dir"],
+      "classification": "semantic",
+      "note": "Rust configures the identity/state directory through the builder"
+    },
+    "field:Server.Logf": {
+      "local_ids": ["method:ServerBuilder.logger"],
+      "classification": "semantic",
+      "note": "Rust uses one typed builder callback for server logging"
+    },
+    "field:Server.UserLogf": {
+      "local_ids": ["method:ServerBuilder.logger"],
+      "classification": "semantic",
+      "note": "Rust routes user-facing and server log text through the builder logger"
+    },
+    "field:ServiceListener.FQDN": {
+      "local_ids": ["method:ServiceListener.fqdn"],
+      "classification": "semantic",
+      "note": "Rust exposes the service FQDN through an accessor"
+    },
+    "field:ServiceModeHTTP.HTTPS": {
+      "local_ids": ["method:ServiceMode.https"],
+      "classification": "semantic",
+      "note": "Rust represents HTTPS as a ServiceMode constructor"
+    },
+    "field:ServiceModeHTTP.PROXYProtocol": {
+      "local_ids": ["method:ServiceMode.with_proxy_protocol"],
+      "classification": "semantic",
+      "note": "Rust enables the supported PROXY protocol through a mode builder"
+    },
+    "field:ServiceModeHTTP.Port": {
+      "local_ids": ["method:ServiceMode.port"],
+      "classification": "semantic",
+      "note": "Rust exposes a common service-mode port accessor"
+    },
+    "field:ServiceModeTCP.PROXYProtocolVersion": {
+      "local_ids": ["method:ServiceMode.with_proxy_protocol"],
+      "classification": "semantic",
+      "note": "Rust supports the implemented PROXY protocol through a boolean mode builder"
+    },
+    "field:ServiceModeTCP.Port": {
+      "local_ids": ["method:ServiceMode.port"],
+      "classification": "semantic",
+      "note": "Rust exposes a common service-mode port accessor"
+    },
+    "field:ServiceModeTCP.TerminateTLS": {
+      "local_ids": ["method:ServiceMode.https"],
+      "classification": "semantic",
+      "note": "Rust represents TLS termination as HTTPS service mode"
+    },
+    "method:Server.Start": {
+      "local_ids": ["method:Server.ensure_up"],
+      "classification": "semantic",
+      "note": "ensure_up is the idempotent async start operation"
+    },
+    "method:Server.Sys": {
+      "local_ids": ["method:Server.system"],
+      "classification": "semantic",
+      "note": "Rust spells the typed dependency container accessor system"
+    },
+    "method:Server.TailscaleIPs": {
+      "local_ids": ["method:Server.status"],
+      "classification": "semantic",
+      "note": "Rust returns assigned addresses in the ServerStatus snapshot"
+    },
+    "type:ServiceModeHTTP": {
+      "local_ids": ["enum:ServiceMode"],
+      "classification": "semantic",
+      "note": "Rust uses one enum for TCP, HTTP, and HTTPS service modes"
+    },
+    "type:ServiceModeTCP": {
+      "local_ids": ["enum:ServiceMode"],
+      "classification": "semantic",
+      "note": "Rust uses one enum for TCP, HTTP, and HTTPS service modes"
+    }
+  }
+}

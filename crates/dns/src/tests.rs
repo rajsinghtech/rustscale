@@ -1,7 +1,124 @@
 use super::*;
 use rustscale_key::{DiscoPrivate, MachinePrivate, NodePrivate};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+
+fn make_query(id: u16, name: &str, query_type: u16) -> Vec<u8> {
+    let mut query = Vec::new();
+    query.extend_from_slice(&id.to_be_bytes());
+    query.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    query.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    query.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    query.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    query.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    for label in name.trim_end_matches('.').split('.') {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&query_type.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes()); // IN
+    query
+}
+
+fn response_v4(response: &[u8]) -> Ipv4Addr {
+    let bytes: [u8; 4] = response[response.len() - 4..]
+        .try_into()
+        .expect("A response rdata");
+    Ipv4Addr::from(bytes)
+}
+
+async fn udp_round_trip(server: SocketAddr, query: &[u8]) -> Vec<u8> {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP client");
+    socket.send_to(query, server).await.expect("send UDP query");
+    let mut response = vec![0u8; 8192];
+    let (length, source) =
+        tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut response))
+            .await
+            .expect("UDP response timeout")
+            .expect("receive UDP response");
+    assert_eq!(source, server);
+    response.truncate(length);
+    response
+}
+
+async fn write_tcp_frame(stream: &mut tokio::net::TcpStream, query: &[u8]) {
+    let length = u16::try_from(query.len()).expect("test query fits DNS/TCP frame");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        stream.write_all(&length.to_be_bytes()).await?;
+        stream.write_all(query).await
+    })
+    .await
+    .expect("TCP query write timeout")
+    .expect("write TCP query");
+}
+
+async fn read_tcp_frame(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length).await?;
+        let mut response = vec![0u8; usize::from(u16::from_be_bytes(length))];
+        stream.read_exact(&mut response).await?;
+        std::io::Result::Ok(response)
+    })
+    .await
+    .expect("TCP response timeout")
+    .expect("read TCP response")
+}
+
+async fn spawn_udp_answer(
+    answer: Ipv4Addr,
+    wrong_transaction_id: bool,
+) -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<String>,
+    tokio::task::JoinHandle<()>,
+) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let address = socket.local_addr().expect("fake upstream address");
+    let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let Ok((length, source)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            let query = &buf[..length];
+            let Some((name, _, _)) = parse_question(query) else {
+                continue;
+            };
+            let _ = seen_tx.send(name);
+            let Some(mut response) = build_a_response(query, &[answer]) else {
+                continue;
+            };
+            if wrong_transaction_id {
+                response[1] ^= 0xff;
+            }
+            let _ = socket.send_to(&response, source).await;
+        }
+    });
+    (address, seen_rx, task)
+}
+
+fn local_resolver(name: &str, address: Ipv4Addr) -> Arc<RwLock<MagicDnsResolver>> {
+    let mut config = Config::default();
+    config
+        .hosts
+        .insert(name.to_string(), vec![IpAddr::V4(address)]);
+    let mut resolver = MagicDnsResolver::default();
+    resolver.set_config(config);
+    Arc::new(RwLock::new(resolver))
+}
 
 fn peer(name: &str, v4: &str, v6: &str) -> Node {
     Node {
@@ -500,6 +617,49 @@ fn config_from_dns_builds_routes() {
 }
 
 #[test]
+fn config_from_dns_preserves_root_and_local_routes() {
+    use rustscale_tailcfg::Resolver;
+
+    let explicit_root = DNSConfig {
+        Resolvers: vec![Resolver {
+            Addr: "1.1.1.1".into(),
+        }],
+        Routes: HashMap::from([(
+            ".".to_string(),
+            vec![Resolver {
+                Addr: "9.9.9.9".into(),
+            }],
+        )]),
+        ..Default::default()
+    };
+    let config = config_from_dns(&explicit_root, "", &[]);
+    assert_eq!(config.routes.len(), 1);
+    assert_eq!(config.routes["."][0].addr, "9.9.9.9");
+
+    let local = DNSConfig {
+        Resolvers: vec![Resolver {
+            Addr: "1.1.1.1".into(),
+        }],
+        Routes: HashMap::from([("private.example.".to_string(), vec![])]),
+        ..Default::default()
+    };
+    let config = config_from_dns(&local, "", &[]);
+    assert!(!config.routes.contains_key("private.example"));
+    assert!(config
+        .local_domains
+        .contains(&"private.example".to_string()));
+
+    let fallback = DNSConfig {
+        FallbackResolvers: vec![Resolver {
+            Addr: "8.8.4.4".into(),
+        }],
+        ..Default::default()
+    };
+    let config = config_from_dns(&fallback, "", &[]);
+    assert_eq!(config.routes["."][0].addr, "8.8.4.4");
+}
+
+#[test]
 fn bonjour_prefix_detection() {
     assert!(has_rdns_bonjour_prefix("b._dns-sd._udp.example.com."));
     assert!(has_rdns_bonjour_prefix("db._dns-sd._udp.example.com."));
@@ -562,4 +722,463 @@ fn suffix_matches_domain() {
     assert!(suffix_matches("ts.net", "ts.net"));
     assert!(!suffix_matches("ts.net", "google.com"));
     assert!(!suffix_matches("ts.net", "notts.net"));
+}
+
+/// End-to-end route vectors derived from the route ordering/fallback contracts
+/// in tailscale.com@v1.100.0 net/dns/resolver/forwarder.go.
+#[tokio::test]
+async fn responder_uses_longest_suffix_failover_and_live_reconfiguration() {
+    use rustscale_tailcfg::Resolver;
+
+    let (wrong_addr, mut wrong_seen, wrong_task) =
+        spawn_udp_answer(Ipv4Addr::new(192, 0, 2, 1), true).await;
+    let (corp_addr, mut corp_seen, corp_task) =
+        spawn_udp_answer(Ipv4Addr::new(10, 0, 0, 53), false).await;
+    let (internal_addr, mut internal_seen, internal_task) =
+        spawn_udp_answer(Ipv4Addr::new(10, 0, 0, 54), false).await;
+    let (default_addr, mut default_seen, default_task) =
+        spawn_udp_answer(Ipv4Addr::new(8, 8, 8, 8), false).await;
+
+    let dns_config = DNSConfig {
+        Resolvers: vec![Resolver {
+            Addr: default_addr.to_string(),
+        }],
+        Routes: HashMap::from([
+            (
+                "corp.example.".to_string(),
+                vec![
+                    Resolver {
+                        Addr: wrong_addr.to_string(),
+                    },
+                    Resolver {
+                        Addr: corp_addr.to_string(),
+                    },
+                ],
+            ),
+            (
+                "internal.corp.example.".to_string(),
+                vec![Resolver {
+                    Addr: internal_addr.to_string(),
+                }],
+            ),
+            ("blocked.example.".to_string(), vec![]),
+        ]),
+        Proxied: true,
+        ..Default::default()
+    };
+    let resolver = Arc::new(RwLock::new(MagicDnsResolver::new(
+        vec![],
+        "tailnet.ts.net",
+        Some(&dns_config),
+    )));
+    let responder = DnsResponder::with_forwarder(
+        Arc::clone(&resolver),
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(Forwarder::from_dns_config(Some(&dns_config))),
+    )
+    .spawn()
+    .await
+    .expect("start DNS responder");
+    let responder_addr = responder.local_addr();
+
+    let internal_query = make_query(0x1001, "host.internal.corp.example", qtype::A);
+    let internal_response = udp_round_trip(responder_addr, &internal_query).await;
+    assert_eq!(response_v4(&internal_response), Ipv4Addr::new(10, 0, 0, 54));
+    assert_eq!(
+        internal_seen.recv().await.as_deref(),
+        Some("host.internal.corp.example")
+    );
+    assert!(wrong_seen.try_recv().is_err());
+    assert!(corp_seen.try_recv().is_err());
+
+    // The first resolver returns a mismatched transaction ID, so the same
+    // matched route fails over to its second resolver without using root DNS.
+    let corp_query = make_query(0x1002, "host.corp.example", qtype::A);
+    let corp_response = udp_round_trip(responder_addr, &corp_query).await;
+    assert_eq!(response_v4(&corp_response), Ipv4Addr::new(10, 0, 0, 53));
+    assert_eq!(
+        wrong_seen.recv().await.as_deref(),
+        Some("host.corp.example")
+    );
+    assert_eq!(corp_seen.recv().await.as_deref(), Some("host.corp.example"));
+
+    let default_query = make_query(0x1003, "public.example.net", qtype::A);
+    let default_response = udp_round_trip(responder_addr, &default_query).await;
+    assert_eq!(response_v4(&default_response), Ipv4Addr::new(8, 8, 8, 8));
+    assert_eq!(
+        default_seen.recv().await.as_deref(),
+        Some("public.example.net")
+    );
+
+    // An empty route is local/authoritative and must not leak to root DNS.
+    let blocked_query = make_query(0x1004, "host.blocked.example", qtype::A);
+    let blocked_response = udp_round_trip(responder_addr, &blocked_query).await;
+    assert_eq!(blocked_response[3] & 0x0f, rcode::NAME_ERROR);
+    tokio::task::yield_now().await;
+    assert!(default_seen.try_recv().is_err());
+
+    // Reconfigure the same live responder and prove that its next query uses
+    // the new route rather than Forwarder's startup snapshot.
+    let updated_dns = DNSConfig {
+        Routes: HashMap::from([(
+            "corp.example.".to_string(),
+            vec![Resolver {
+                Addr: internal_addr.to_string(),
+            }],
+        )]),
+        Proxied: true,
+        ..Default::default()
+    };
+    resolver
+        .write()
+        .await
+        .set_config(config_from_dns(&updated_dns, "tailnet.ts.net", &[]));
+    let reconfigured_query = make_query(0x1005, "host.corp.example", qtype::A);
+    let reconfigured_response = udp_round_trip(responder_addr, &reconfigured_query).await;
+    assert_eq!(
+        response_v4(&reconfigured_response),
+        Ipv4Addr::new(10, 0, 0, 54)
+    );
+    assert_eq!(
+        internal_seen.recv().await.as_deref(),
+        Some("host.corp.example")
+    );
+
+    responder.shutdown().await;
+    wrong_task.abort();
+    corp_task.abort();
+    internal_task.abort();
+    default_task.abort();
+}
+
+/// Framing and same-session reconfiguration vectors ported from
+/// tailscale.com@v1.100.0 net/dns/manager_tcp_test.go::TestDNSOverTCP.
+#[tokio::test]
+async fn inbound_tcp_frames_multiple_queries_and_reconfigures() {
+    let resolver = local_resolver("one.test", Ipv4Addr::new(100, 64, 0, 1));
+    {
+        let mut config = resolver.read().await.config().clone();
+        config.hosts.insert(
+            "two.test".to_string(),
+            vec![IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))],
+        );
+        resolver.write().await.set_config(config);
+    }
+    let responder = DnsResponder::with_forwarder(
+        Arc::clone(&resolver),
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(Forwarder::new(vec![])),
+    )
+    .spawn()
+    .await
+    .expect("start DNS responder");
+
+    let mut stream = tokio::net::TcpStream::connect(responder.local_addr())
+        .await
+        .expect("connect DNS/TCP");
+    let query_one = make_query(0x2001, "one.test", qtype::A);
+    let query_two = make_query(0x2002, "two.test", qtype::A);
+    // Write both frames before reading either response, exercising persistent
+    // connection framing and query pipelining.
+    write_tcp_frame(&mut stream, &query_one).await;
+    write_tcp_frame(&mut stream, &query_two).await;
+    let response_one = read_tcp_frame(&mut stream).await;
+    let response_two = read_tcp_frame(&mut stream).await;
+    assert_eq!(&response_one[..2], &0x2001u16.to_be_bytes());
+    assert_eq!(&response_two[..2], &0x2002u16.to_be_bytes());
+    assert_eq!(response_v4(&response_one), Ipv4Addr::new(100, 64, 0, 1));
+    assert_eq!(response_v4(&response_two), Ipv4Addr::new(100, 64, 0, 2));
+    assert!(!wire::truncated_flag_set(&response_one));
+    assert!(!wire::truncated_flag_set(&response_two));
+
+    let mut replacement = Config::default();
+    replacement.hosts.insert(
+        "one.test".to_string(),
+        vec![IpAddr::V4(Ipv4Addr::new(100, 64, 0, 99))],
+    );
+    resolver.write().await.set_config(replacement);
+    let reconfigured = make_query(0x2003, "one.test", qtype::A);
+    write_tcp_frame(&mut stream, &reconfigured).await;
+    let response = read_tcp_frame(&mut stream).await;
+    assert_eq!(response_v4(&response), Ipv4Addr::new(100, 64, 0, 99));
+
+    responder.shutdown().await;
+}
+
+async fn spawn_truncating_dual_upstream() -> (
+    SocketAddr,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream TCP");
+    let address = tcp.local_addr().unwrap();
+    let udp = tokio::net::UdpSocket::bind(address)
+        .await
+        .expect("bind fake upstream UDP");
+    let udp_count = Arc::new(AtomicUsize::new(0));
+    let tcp_count = Arc::new(AtomicUsize::new(0));
+
+    let udp_counter = Arc::clone(&udp_count);
+    let udp_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let Ok((length, source)) = udp.recv_from(&mut buf).await else {
+                return;
+            };
+            udp_counter.fetch_add(1, Ordering::SeqCst);
+            let query = &buf[..length];
+            let addresses = vec![Ipv4Addr::LOCALHOST; 40];
+            let Some(mut response) = build_a_response(query, &addresses) else {
+                continue;
+            };
+            wire::set_tc_flag(&mut response);
+            let _ = udp.send_to(&response, source).await;
+        }
+    });
+
+    let tcp_counter = Arc::clone(&tcp_count);
+    let tcp_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = tcp.accept().await else {
+                return;
+            };
+            tcp_counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut length = [0u8; 2];
+                if stream.read_exact(&mut length).await.is_err() {
+                    return;
+                }
+                let mut query = vec![0u8; usize::from(u16::from_be_bytes(length))];
+                if stream.read_exact(&mut query).await.is_err() {
+                    return;
+                }
+                let addresses = vec![Ipv4Addr::LOCALHOST; 40];
+                let Some(response) = build_a_response(&query, &addresses) else {
+                    return;
+                };
+                let Ok(response_len) = u16::try_from(response.len()) else {
+                    return;
+                };
+                let _ = stream.write_all(&response_len.to_be_bytes()).await;
+                let _ = stream.write_all(&response).await;
+            });
+        }
+    });
+
+    (address, udp_count, tcp_count, udp_task, tcp_task)
+}
+
+/// TCP retry and TC vectors derived from
+/// tailscale.com@v1.100.0 net/dns/resolver/forwarder_test.go::TestForwarderTCPFallback.
+#[tokio::test]
+async fn inbound_transport_preserves_udp_tc_and_returns_full_tcp_response() {
+    let (upstream, udp_count, tcp_count, udp_task, tcp_task) =
+        spawn_truncating_dual_upstream().await;
+    let mut config = Config::default();
+    config.routes.insert(
+        ".".to_string(),
+        vec![UpstreamResolver::from_addr(&upstream.to_string())],
+    );
+    let mut magic = MagicDnsResolver::default();
+    magic.set_config(config);
+    let resolver = Arc::new(RwLock::new(magic));
+    let responder = DnsResponder::with_forwarder(
+        resolver,
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(Forwarder::new(vec![])),
+    )
+    .spawn()
+    .await
+    .expect("start DNS responder");
+    let query = make_query(0x3001, "large.example", qtype::A);
+
+    let udp_response = udp_round_trip(responder.local_addr(), &query).await;
+    assert!(wire::truncated_flag_set(&udp_response));
+    assert_eq!(tcp_count.load(Ordering::SeqCst), 0);
+
+    let mut stream = tokio::net::TcpStream::connect(responder.local_addr())
+        .await
+        .expect("connect DNS/TCP");
+    write_tcp_frame(&mut stream, &query).await;
+    let tcp_response = read_tcp_frame(&mut stream).await;
+    assert!(tcp_response.len() > 512);
+    assert!(!wire::truncated_flag_set(&tcp_response));
+    assert!(udp_count.load(Ordering::SeqCst) >= 1);
+    assert!(tcp_count.load(Ordering::SeqCst) >= 1);
+
+    responder.shutdown().await;
+    udp_task.abort();
+    tcp_task.abort();
+}
+
+async fn spawn_hanging_dual_upstream() -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<()>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hanging upstream TCP");
+    let address = tcp.local_addr().unwrap();
+    let udp = tokio::net::UdpSocket::bind(address)
+        .await
+        .expect("bind hanging upstream UDP");
+    let (started_tx, started_rx) = mpsc::unbounded_channel();
+    let udp_started = started_tx.clone();
+    let udp_task = tokio::spawn(async move {
+        let mut query = vec![0u8; 4096];
+        if udp.recv(&mut query).await.is_ok() {
+            let _ = udp_started.send(());
+            std::future::pending::<()>().await;
+        }
+    });
+    let tcp_task = tokio::spawn(async move {
+        let Ok((mut stream, _)) = tcp.accept().await else {
+            return;
+        };
+        let mut length = [0u8; 2];
+        if stream.read_exact(&mut length).await.is_err() {
+            return;
+        }
+        let mut query = vec![0u8; usize::from(u16::from_be_bytes(length))];
+        if stream.read_exact(&mut query).await.is_ok() {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }
+    });
+    (address, started_rx, udp_task, tcp_task)
+}
+
+#[tokio::test]
+async fn shutdown_cancels_inflight_forwarding() {
+    let (upstream, mut started, udp_task, tcp_task) = spawn_hanging_dual_upstream().await;
+    let mut config = Config::default();
+    config.routes.insert(
+        ".".to_string(),
+        vec![UpstreamResolver::from_addr(&upstream.to_string())],
+    );
+    let mut magic = MagicDnsResolver::default();
+    magic.set_config(config);
+    let responder = DnsResponder::with_forwarder(
+        Arc::new(RwLock::new(magic)),
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(Forwarder::new(vec![])),
+    )
+    .spawn()
+    .await
+    .expect("start DNS responder");
+    let mut stream = tokio::net::TcpStream::connect(responder.local_addr())
+        .await
+        .expect("connect DNS/TCP");
+    write_tcp_frame(
+        &mut stream,
+        &make_query(0x3fff, "hanging.example", qtype::A),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), started.recv())
+        .await
+        .expect("forwarding did not start")
+        .expect("hanging upstream stopped");
+
+    tokio::time::timeout(Duration::from_secs(2), responder.shutdown())
+        .await
+        .expect("in-flight forwarding ignored cancellation");
+    assert_tcp_closed(&mut stream).await;
+    udp_task.abort();
+    tcp_task.abort();
+}
+
+async fn assert_tcp_closed(stream: &mut tokio::net::TcpStream) {
+    let mut byte = [0u8; 1];
+    match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await {
+        Ok(Ok(0) | Err(_)) => {}
+        Ok(Ok(length)) => panic!("unexpected {length} response byte(s) before close"),
+        Err(error) => panic!("DNS/TCP connection did not close: {error}"),
+    }
+}
+
+/// Malformed-size and shutdown/restart vectors ported from
+/// tailscale.com@v1.100.0 net/dns/manager_tcp_test.go::TestDNSOverTCP_TooLarge.
+#[tokio::test]
+async fn inbound_tcp_limits_cancellation_and_restart_release_port() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let first = DnsResponder::with_forwarder(
+        local_resolver("restart.test", Ipv4Addr::new(100, 64, 0, 7)),
+        bind,
+        Arc::new(Forwarder::new(vec![])),
+    )
+    .spawn()
+    .await
+    .expect("start first responder");
+    let address = first.local_addr();
+
+    // Cancellation must wake a session blocked in a partial length prefix.
+    let mut partial = tokio::net::TcpStream::connect(address).await.unwrap();
+    partial.write_all(&[0]).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), first.shutdown())
+        .await
+        .expect("responder shutdown blocked");
+    assert_tcp_closed(&mut partial).await;
+
+    // Both protocols must be immediately restartable on the exact old port.
+    let second = DnsResponder::with_forwarder(
+        local_resolver("restart.test", Ipv4Addr::new(100, 64, 0, 8)),
+        address,
+        Arc::new(Forwarder::new(vec![])),
+    )
+    .spawn()
+    .await
+    .expect("restart responder on released UDP/TCP port");
+    assert_eq!(second.local_addr(), address);
+    let query = make_query(0x4001, "restart.test", qtype::A);
+    assert_eq!(
+        response_v4(&udp_round_trip(address, &query).await),
+        Ipv4Addr::new(100, 64, 0, 8)
+    );
+
+    // The exact pinned boundary is accepted.
+    let mut maximum = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut maximum_query = query.clone();
+    maximum_query.resize(MAX_TCP_REQUEST_SIZE, 0);
+    write_tcp_frame(&mut maximum, &maximum_query).await;
+    let maximum_response = read_tcp_frame(&mut maximum).await;
+    assert_eq!(response_v4(&maximum_response), Ipv4Addr::new(100, 64, 0, 8));
+
+    // A frame above the pinned 4096-byte cap closes only that connection.
+    let mut oversized = tokio::net::TcpStream::connect(address).await.unwrap();
+    oversized
+        .write_all(
+            &u16::try_from(MAX_TCP_REQUEST_SIZE + 1)
+                .unwrap()
+                .to_be_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_tcp_closed(&mut oversized).await;
+
+    // Zero-length and structurally malformed frames receive bounded FORMERR
+    // responses, and the persistent session remains usable afterward.
+    let mut malformed = tokio::net::TcpStream::connect(address).await.unwrap();
+    write_tcp_frame(&mut malformed, &[]).await;
+    let empty_response = read_tcp_frame(&mut malformed).await;
+    assert_eq!(empty_response[3] & 0x0f, rcode::FORMAT_ERROR);
+
+    let mut bad_question_count = vec![0u8; 12];
+    bad_question_count[..2].copy_from_slice(&0x4002u16.to_be_bytes());
+    bad_question_count[4..6].copy_from_slice(&2u16.to_be_bytes());
+    write_tcp_frame(&mut malformed, &bad_question_count).await;
+    let malformed_response = read_tcp_frame(&mut malformed).await;
+    assert_eq!(&malformed_response[..2], &0x4002u16.to_be_bytes());
+    assert_eq!(malformed_response[3] & 0x0f, rcode::FORMAT_ERROR);
+
+    write_tcp_frame(&mut malformed, &query).await;
+    let valid_response = read_tcp_frame(&mut malformed).await;
+    assert_eq!(response_v4(&valid_response), Ipv4Addr::new(100, 64, 0, 8));
+
+    second.shutdown().await;
 }

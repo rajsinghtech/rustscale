@@ -73,6 +73,9 @@ jobs:
         if: ${{ matrix.os == 'windows-latest' }}
         shell: pwsh
         run: tools/packaging/test-install.ps1
+      - name: Compatibility contract drift
+        if: ${{ matrix.os == 'ubuntu-22.04' }}
+        run: tools/compat/check.sh
       - name: Dirty-tree guard (tracked files)
         if: ${{ matrix.os == 'ubuntu-22.04' }}
         run: git diff --no-ext-diff --name-only --exit-code || (echo "Build/test modified tracked files above."; exit 1)
@@ -166,6 +169,57 @@ jobs:
       - name: Run interop tests
         run: cargo test -p rustscale-interop-testcontrol --locked -- --nocapture --test-threads=1
 
+  linux-replacement:
+    name: Installed Linux replacement journey
+    runs-on: ubuntu-22.04
+    timeout-minutes: 50
+    env:
+      # This is a functional install/TUN gate. release.yml separately builds
+      # and smokes the production thin-LTO artifacts.
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: linux-replacement
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26'
+      - name: Build functional replacement artifacts
+        run: |
+          echo "[linux-replacement] $(date -u '+%Y-%m-%dT%H:%M:%SZ') build start (deadline=1200s)"
+          python3 tools/agent/run-with-deadline.py 1200 -- \
+            cargo build --release --locked \
+              -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
+          echo "[linux-replacement] $(date -u '+%Y-%m-%dT%H:%M:%SZ') build complete"
+      - name: Run bounded installed replacement journey
+        env:
+          RUSTSCALE_REQUIRE_LINUX_REPLACEMENT: '1'
+          RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT: '900'
+          RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT: '90'
+          RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE: ${{ runner.temp }}/linux-replacement.phase
+        run: |
+          # The script runs as the runner uid inside a root-manager-owned
+          # transient cgroup. Its 900-second execution limit plus 90-second
+          # diagnostic/teardown grace can kill root descendants and closes
+          # well before this job's 50-minute outer limit.
+          set -o pipefail
+          tools/packaging/test-linux-replacement.sh 2>&1 \
+            | tee "$RUNNER_TEMP/linux-replacement.log"
+      - name: Replay replacement failure diagnostics
+        if: failure()
+        run: |
+          phase=$(cat "$RUNNER_TEMP/linux-replacement.phase" 2>/dev/null || echo not-started)
+          echo "::error title=Linux replacement failed::last phase=$phase"
+          if [[ -f "$RUNNER_TEMP/linux-replacement.log" ]]; then
+            echo "[linux-replacement] final bounded log replay (phase=$phase)"
+            tail -n 400 "$RUNNER_TEMP/linux-replacement.log"
+          fi
+
   ignore-guard:
     name: #[ignore] count guard (L6)
     runs-on: ubuntu-latest
@@ -178,7 +232,7 @@ jobs:
   alls-green:
     name: All green
     if: always()
-    needs: [check, cross, msrv, testcontrol, ignore-guard]
+    needs: [check, cross, msrv, testcontrol, linux-replacement, ignore-guard]
     runs-on: ubuntu-latest
     steps:
       - name: Decide if change is okay to merge

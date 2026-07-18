@@ -1,0 +1,2865 @@
+{
+  "$schema": "../schema/manifest-v1.schema.json",
+  "comparisons": [
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:alpha-set-device-attrs",
+      "id": "compare:route:alpha-set-device-attrs",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:alpha-set-device-attrs"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:appc-route-info",
+      "id": "compare:route:appc-route-info",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:appc-route-info"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:bugreport",
+      "id": "compare:route:bugreport",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:bugreport"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:cert-domains",
+      "id": "compare:route:cert-domains",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:cert-domains"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:cert/<suffix>",
+      "id": "compare:route:cert/<suffix>",
+      "local_ids": [
+        "route:GET:/localapi/v0/cert/<domain>"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:cert/<suffix>"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:check-ip-forwarding",
+      "id": "compare:route:check-ip-forwarding",
+      "local_ids": [
+        "route:GET:/localapi/v0/check-ip-forwarding"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:check-ip-forwarding"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:check-prefs",
+      "id": "compare:route:check-prefs",
+      "local_ids": [
+        "route:POST:/localapi/v0/check-prefs"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:check-prefs"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:check-so-mark-in-use",
+      "id": "compare:route:check-so-mark-in-use",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:check-so-mark-in-use"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:check-udp-gro-forwarding",
+      "id": "compare:route:check-udp-gro-forwarding",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:check-udp-gro-forwarding"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:component-debug-logging",
+      "id": "compare:route:component-debug-logging",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:component-debug-logging"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:debug",
+      "id": "compare:route:debug",
+      "local_ids": [
+        "route:POST:/localapi/v0/debug"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:debug"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-bus-events",
+      "id": "compare:route:debug-bus-events",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-bus-events"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-bus-graph",
+      "id": "compare:route:debug-bus-graph",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-bus-graph"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-bus-queues",
+      "id": "compare:route:debug-bus-queues",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-bus-queues"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-derp-region",
+      "id": "compare:route:debug-derp-region",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-derp-region"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-dial-types",
+      "id": "compare:route:debug-dial-types",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-dial-types"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-log",
+      "id": "compare:route:debug-log",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-log"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-optional-features",
+      "id": "compare:route:debug-optional-features",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-optional-features"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-packet-filter-matches",
+      "id": "compare:route:debug-packet-filter-matches",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-packet-filter-matches"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-packet-filter-rules",
+      "id": "compare:route:debug-packet-filter-rules",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-packet-filter-rules"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-peer-endpoint-changes",
+      "id": "compare:route:debug-peer-endpoint-changes",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-peer-endpoint-changes"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:debug-rotate-disco-key",
+      "id": "compare:route:debug-rotate-disco-key",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:debug-rotate-disco-key"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:derpmap",
+      "id": "compare:route:derpmap",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:derpmap"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:dev-set-state-store",
+      "id": "compare:route:dev-set-state-store",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:dev-set-state-store"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:dial",
+      "id": "compare:route:dial",
+      "local_ids": [
+        "route:POST:/localapi/v0/dial"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:dial"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:disconnect-control",
+      "id": "compare:route:disconnect-control",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:disconnect-control"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:dns-config",
+      "id": "compare:route:dns-config",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:dns-config"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:dns-osconfig",
+      "id": "compare:route:dns-osconfig",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:dns-osconfig"
+      ]
+    },
+    {
+      "classification": "exact",
+      "denominator_id": "route:dns-query",
+      "id": "compare:route:dns-query",
+      "local_ids": [
+        "route:GET:/localapi/v0/dns-query"
+      ],
+      "note": "path, method set, and an extracted schema identifier match",
+      "upstream_ids": [
+        "route:dns-query"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:drive/fileserver-address",
+      "id": "compare:route:drive/fileserver-address",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:drive/fileserver-address"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:drive/shares",
+      "id": "compare:route:drive/shares",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:drive/shares"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:goroutines",
+      "id": "compare:route:goroutines",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:goroutines"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:handle-push-message",
+      "id": "compare:route:handle-push-message",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:handle-push-message"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:id-token",
+      "id": "compare:route:id-token",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:id-token"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:login-interactive",
+      "id": "compare:route:login-interactive",
+      "local_ids": [
+        "route:POST:/localapi/v0/login-interactive"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:login-interactive"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:logout",
+      "id": "compare:route:logout",
+      "local_ids": [
+        "route:POST:/localapi/v0/logout"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:logout"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:logtap",
+      "id": "compare:route:logtap",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:logtap"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:metrics",
+      "id": "compare:route:metrics",
+      "local_ids": [
+        "route:GET:/localapi/v0/metrics"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:metrics"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:peer-by-id",
+      "id": "compare:route:peer-by-id",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:peer-by-id"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:ping",
+      "id": "compare:route:ping",
+      "local_ids": [
+        "route:POST:/localapi/v0/ping"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:ping"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:policy/<suffix>",
+      "id": "compare:route:policy/<suffix>",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:policy/<suffix>"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:pprof",
+      "id": "compare:route:pprof",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:pprof"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:prefs",
+      "id": "compare:route:prefs",
+      "local_ids": [
+        "route:GET:/localapi/v0/prefs",
+        "route:PATCH:/localapi/v0/prefs"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:prefs"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:profiles/<suffix>",
+      "id": "compare:route:profiles/<suffix>",
+      "local_ids": [
+        "route:DELETE:/localapi/v0/profiles/<id>",
+        "route:GET:/localapi/v0/profiles/<id>",
+        "route:POST:/localapi/v0/profiles/<id>"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:profiles/<suffix>"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:query-feature",
+      "id": "compare:route:query-feature",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:query-feature"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:reload-config",
+      "id": "compare:route:reload-config",
+      "local_ids": [
+        "route:POST:/localapi/v0/reload-config"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:reload-config"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:reset-auth",
+      "id": "compare:route:reset-auth",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:reset-auth"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:serve-config",
+      "id": "compare:route:serve-config",
+      "local_ids": [
+        "route:GET:/localapi/v0/serve-config",
+        "route:POST:/localapi/v0/serve-config"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:serve-config"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:services",
+      "id": "compare:route:services",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:services"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:set-dns",
+      "id": "compare:route:set-dns",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:set-dns"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:set-expiry-sooner",
+      "id": "compare:route:set-expiry-sooner",
+      "local_ids": [
+        "route:POST:/localapi/v0/set-expiry-sooner"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:set-expiry-sooner"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:set-gui-visible",
+      "id": "compare:route:set-gui-visible",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:set-gui-visible"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:set-push-device-token",
+      "id": "compare:route:set-push-device-token",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:set-push-device-token"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:set-udp-gro-forwarding",
+      "id": "compare:route:set-udp-gro-forwarding",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:set-udp-gro-forwarding"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:set-use-exit-node-enabled",
+      "id": "compare:route:set-use-exit-node-enabled",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:set-use-exit-node-enabled"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:shutdown",
+      "id": "compare:route:shutdown",
+      "local_ids": [
+        "route:POST:/localapi/v0/shutdown"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:shutdown"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:start",
+      "id": "compare:route:start",
+      "local_ids": [
+        "route:POST:/localapi/v0/start"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:start"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:status",
+      "id": "compare:route:status",
+      "local_ids": [
+        "route:GET:/localapi/v0/status"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:status"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:suggest-exit-node",
+      "id": "compare:route:suggest-exit-node",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:suggest-exit-node"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:tka/affected-sigs",
+      "id": "compare:route:tka/affected-sigs",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:tka/affected-sigs"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:tka/cosign-recovery-aum",
+      "id": "compare:route:tka/cosign-recovery-aum",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:tka/cosign-recovery-aum"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:tka/disable",
+      "id": "compare:route:tka/disable",
+      "local_ids": [
+        "route:POST:/localapi/v0/tka/disable"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:tka/disable"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:tka/force-local-disable",
+      "id": "compare:route:tka/force-local-disable",
+      "local_ids": [
+        "route:POST:/localapi/v0/tka/force-local-disable"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:tka/force-local-disable"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:tka/generate-recovery-aum",
+      "id": "compare:route:tka/generate-recovery-aum",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:tka/generate-recovery-aum"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:tka/init",
+      "id": "compare:route:tka/init",
+      "local_ids": [
+        "route:POST:/localapi/v0/tka/init"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:tka/init"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:tka/log",
+      "id": "compare:route:tka/log",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:tka/log"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:tka/modify",
+      "id": "compare:route:tka/modify",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:tka/modify"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:tka/sign",
+      "id": "compare:route:tka/sign",
+      "local_ids": [
+        "route:POST:/localapi/v0/tka/sign"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:tka/sign"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:tka/status",
+      "id": "compare:route:tka/status",
+      "local_ids": [
+        "route:GET:/localapi/v0/tka/status"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:tka/status"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:tka/submit-recovery-aum",
+      "id": "compare:route:tka/submit-recovery-aum",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:tka/submit-recovery-aum"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:tka/verify-deeplink",
+      "id": "compare:route:tka/verify-deeplink",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:tka/verify-deeplink"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:tka/wrap-preauth-key",
+      "id": "compare:route:tka/wrap-preauth-key",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:tka/wrap-preauth-key"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:update/check",
+      "id": "compare:route:update/check",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:update/check"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:upload-client-metrics",
+      "id": "compare:route:upload-client-metrics",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:upload-client-metrics"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:user-profile",
+      "id": "compare:route:user-profile",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:user-profile"
+      ]
+    },
+    {
+      "classification": "unsupported",
+      "denominator_id": "route:usermetrics",
+      "id": "compare:route:usermetrics",
+      "local_ids": [],
+      "note": "no local route with a compatible method",
+      "upstream_ids": [
+        "route:usermetrics"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:watch-ipn-bus",
+      "id": "compare:route:watch-ipn-bus",
+      "local_ids": [
+        "route:GET:/localapi/v0/watch-ipn-bus"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:watch-ipn-bus"
+      ]
+    },
+    {
+      "classification": "semantic",
+      "denominator_id": "route:whois",
+      "id": "compare:route:whois",
+      "local_ids": [
+        "route:GET:/localapi/v0/whois"
+      ],
+      "note": "route intent matches with a method/schema adaptation",
+      "upstream_ids": [
+        "route:whois"
+      ]
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:DELETE:/localapi/v0/files[/<name>]",
+      "local_ids": [
+        "route:DELETE:/localapi/v0/files[/<name>]"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/",
+      "local_ids": [
+        "route:GET:/"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/localapi/v0/debug",
+      "local_ids": [
+        "route:GET:/localapi/v0/debug"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/localapi/v0/drive/config",
+      "local_ids": [
+        "route:GET:/localapi/v0/drive/config"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/localapi/v0/drive/status",
+      "local_ids": [
+        "route:GET:/localapi/v0/drive/status"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/localapi/v0/file-targets",
+      "local_ids": [
+        "route:GET:/localapi/v0/file-targets"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/localapi/v0/files[/<name>]",
+      "local_ids": [
+        "route:GET:/localapi/v0/files[/<name>]"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/localapi/v0/health",
+      "local_ids": [
+        "route:GET:/localapi/v0/health"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/localapi/v0/id-token",
+      "local_ids": [
+        "route:GET:/localapi/v0/id-token"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/localapi/v0/netmap",
+      "local_ids": [
+        "route:GET:/localapi/v0/netmap"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:GET:/localapi/v0/profiles",
+      "local_ids": [
+        "route:GET:/localapi/v0/profiles"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:POST:/localapi/v0/debug-capture",
+      "local_ids": [
+        "route:POST:/localapi/v0/debug-capture"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:POST:/localapi/v0/routecheck",
+      "local_ids": [
+        "route:POST:/localapi/v0/routecheck"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:POST:/localapi/v0/tka/init/ack",
+      "local_ids": [
+        "route:POST:/localapi/v0/tka/init/ack"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:PUT:/localapi/v0/drive/config",
+      "local_ids": [
+        "route:PUT:/localapi/v0/drive/config"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:PUT:/localapi/v0/file-put/<stable-id>/<filename>",
+      "local_ids": [
+        "route:PUT:/localapi/v0/file-put/<stable-id>/<filename>"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": null,
+      "id": "local-only:route:PUT:/localapi/v0/profiles",
+      "local_ids": [
+        "route:PUT:/localapi/v0/profiles"
+      ],
+      "note": "rustscale-specific route or method extension",
+      "upstream_ids": []
+    }
+  ],
+  "contract_version": 1,
+  "denominator": {
+    "count": 78,
+    "ids": [
+      "route:alpha-set-device-attrs",
+      "route:appc-route-info",
+      "route:bugreport",
+      "route:cert-domains",
+      "route:cert/<suffix>",
+      "route:check-ip-forwarding",
+      "route:check-prefs",
+      "route:check-so-mark-in-use",
+      "route:check-udp-gro-forwarding",
+      "route:component-debug-logging",
+      "route:debug",
+      "route:debug-bus-events",
+      "route:debug-bus-graph",
+      "route:debug-bus-queues",
+      "route:debug-derp-region",
+      "route:debug-dial-types",
+      "route:debug-log",
+      "route:debug-optional-features",
+      "route:debug-packet-filter-matches",
+      "route:debug-packet-filter-rules",
+      "route:debug-peer-endpoint-changes",
+      "route:debug-rotate-disco-key",
+      "route:derpmap",
+      "route:dev-set-state-store",
+      "route:dial",
+      "route:disconnect-control",
+      "route:dns-config",
+      "route:dns-osconfig",
+      "route:dns-query",
+      "route:drive/fileserver-address",
+      "route:drive/shares",
+      "route:goroutines",
+      "route:handle-push-message",
+      "route:id-token",
+      "route:login-interactive",
+      "route:logout",
+      "route:logtap",
+      "route:metrics",
+      "route:peer-by-id",
+      "route:ping",
+      "route:policy/<suffix>",
+      "route:pprof",
+      "route:prefs",
+      "route:profiles/<suffix>",
+      "route:query-feature",
+      "route:reload-config",
+      "route:reset-auth",
+      "route:serve-config",
+      "route:services",
+      "route:set-dns",
+      "route:set-expiry-sooner",
+      "route:set-gui-visible",
+      "route:set-push-device-token",
+      "route:set-udp-gro-forwarding",
+      "route:set-use-exit-node-enabled",
+      "route:shutdown",
+      "route:start",
+      "route:status",
+      "route:suggest-exit-node",
+      "route:tka/affected-sigs",
+      "route:tka/cosign-recovery-aum",
+      "route:tka/disable",
+      "route:tka/force-local-disable",
+      "route:tka/generate-recovery-aum",
+      "route:tka/init",
+      "route:tka/log",
+      "route:tka/modify",
+      "route:tka/sign",
+      "route:tka/status",
+      "route:tka/submit-recovery-aum",
+      "route:tka/verify-deeplink",
+      "route:tka/wrap-preauth-key",
+      "route:update/check",
+      "route:upload-client-metrics",
+      "route:user-profile",
+      "route:usermetrics",
+      "route:watch-ipn-bus",
+      "route:whois"
+    ],
+    "sha256": "9032f577647631865931867ae55724ce5dc9459aae7f583d29c6230e4c8f10da",
+    "source": "pinned-upstream-localapi"
+  },
+  "generator_version": 1,
+  "guards": {
+    "local": {
+      "count": 46,
+      "ids": [
+        "route:DELETE:/localapi/v0/files[/<name>]",
+        "route:DELETE:/localapi/v0/profiles/<id>",
+        "route:GET:/",
+        "route:GET:/localapi/v0/cert/<domain>",
+        "route:GET:/localapi/v0/check-ip-forwarding",
+        "route:GET:/localapi/v0/debug",
+        "route:GET:/localapi/v0/dns-query",
+        "route:GET:/localapi/v0/drive/config",
+        "route:GET:/localapi/v0/drive/status",
+        "route:GET:/localapi/v0/file-targets",
+        "route:GET:/localapi/v0/files[/<name>]",
+        "route:GET:/localapi/v0/health",
+        "route:GET:/localapi/v0/id-token",
+        "route:GET:/localapi/v0/metrics",
+        "route:GET:/localapi/v0/netmap",
+        "route:GET:/localapi/v0/prefs",
+        "route:GET:/localapi/v0/profiles",
+        "route:GET:/localapi/v0/profiles/<id>",
+        "route:GET:/localapi/v0/serve-config",
+        "route:GET:/localapi/v0/status",
+        "route:GET:/localapi/v0/tka/status",
+        "route:GET:/localapi/v0/watch-ipn-bus",
+        "route:GET:/localapi/v0/whois",
+        "route:PATCH:/localapi/v0/prefs",
+        "route:POST:/localapi/v0/check-prefs",
+        "route:POST:/localapi/v0/debug",
+        "route:POST:/localapi/v0/debug-capture",
+        "route:POST:/localapi/v0/dial",
+        "route:POST:/localapi/v0/login-interactive",
+        "route:POST:/localapi/v0/logout",
+        "route:POST:/localapi/v0/ping",
+        "route:POST:/localapi/v0/profiles/<id>",
+        "route:POST:/localapi/v0/reload-config",
+        "route:POST:/localapi/v0/routecheck",
+        "route:POST:/localapi/v0/serve-config",
+        "route:POST:/localapi/v0/set-expiry-sooner",
+        "route:POST:/localapi/v0/shutdown",
+        "route:POST:/localapi/v0/start",
+        "route:POST:/localapi/v0/tka/disable",
+        "route:POST:/localapi/v0/tka/force-local-disable",
+        "route:POST:/localapi/v0/tka/init",
+        "route:POST:/localapi/v0/tka/init/ack",
+        "route:POST:/localapi/v0/tka/sign",
+        "route:PUT:/localapi/v0/drive/config",
+        "route:PUT:/localapi/v0/file-put/<stable-id>/<filename>",
+        "route:PUT:/localapi/v0/profiles"
+      ],
+      "sha256": "59d6c75a31aeae4b279aad00df57f2830a8251b237045d3ad3647eff93494747"
+    },
+    "local_shape": {
+      "count": 46,
+      "ids": [
+        "route:DELETE:/localapi/v0/files[/<name>]@6b442c555fc66b5be60f19f3b6df092966bb62677b3090abb7bba2aee9d616c8",
+        "route:DELETE:/localapi/v0/profiles/<id>@43ac1e450aef543a7832193790c7deb1041a346366b95ec02e7491ba0d9a368d",
+        "route:GET:/@18843f6f10e28fc014b3b92049889d2e4eab9b4532adcda5f3bb2b37a79eca6b",
+        "route:GET:/localapi/v0/cert/<domain>@b27d8ed3704287f9bf64c1cc7c4a72ff0259a212c772b3091d900886b16a2366",
+        "route:GET:/localapi/v0/check-ip-forwarding@70ad6c6852fa712271e99048052a820e4551103333892037a7f8286f96a1ae63",
+        "route:GET:/localapi/v0/debug@888f52fad6526bb028867b4a924c3a9b5b4db54d4f356524f2f50f14d4437ecc",
+        "route:GET:/localapi/v0/dns-query@04f42d83fb46f7e8dec4c36a9723a0f784b7b7e2679a4772565011ad75325ba4",
+        "route:GET:/localapi/v0/drive/config@a266c787adc3073325e491f3038e7b98960e0c8aa79ecbc69e4814bd94e7bc6e",
+        "route:GET:/localapi/v0/drive/status@3458db0259bd291f5e579e1a0523b5462d006941b6d89d13a175ef86cf34df03",
+        "route:GET:/localapi/v0/file-targets@9f2d8e5525fb088b0cc47cba2cff2ffd2973425f08040c2ad5aa1a389802c137",
+        "route:GET:/localapi/v0/files[/<name>]@d6780f36f08fb4a326a9a3edd8ff8a00313d5673a0ac03b77ab1fdd8fea30302",
+        "route:GET:/localapi/v0/health@5fbc2bd7dd02d04111eec0f5295084a7718913c0a335288e1f74c7fd73e0aa25",
+        "route:GET:/localapi/v0/id-token@33d82baa5d1360e392d92a9f2dd30fbecec572ade6960d10210cfcc2c0439d54",
+        "route:GET:/localapi/v0/metrics@d26e6108cc9e0ce1c69c8f8ca9ab1fd41959ce74d8044fd698db9da41656d660",
+        "route:GET:/localapi/v0/netmap@68c98da0e094390585ea54344be1972e4d2d80e05554a8a12c4e7fa9b6bbe59a",
+        "route:GET:/localapi/v0/prefs@240708b924f925ceb667dbbcef90ff183aea61092ef6cc0f63e71a93d4f11e6b",
+        "route:GET:/localapi/v0/profiles/<id>@b64af0ed544f1ef700abd1efdb05556a571b785f8d8e32037721b947eecf9a8a",
+        "route:GET:/localapi/v0/profiles@dc9c8cb426bb4af510202f7256105fdcbd4b6adeb8bfda0ab77708eaacda0e68",
+        "route:GET:/localapi/v0/serve-config@8d51fb0e244837c618652fca36bf6a150447bf356251c69f38ed7c45af27b98b",
+        "route:GET:/localapi/v0/status@058553a988deac1469a7298b3540099d6ee352f61fdca6a5b614a30f635c5257",
+        "route:GET:/localapi/v0/tka/status@32b3501682b63262fe76ec369337f38bd6f633dc8f32b4c01627e244fe78a52e",
+        "route:GET:/localapi/v0/watch-ipn-bus@2d96f9bb248f06742e80effbf74ef5bc7c9ef4d54eff3d6294766a8e3ab9d40d",
+        "route:GET:/localapi/v0/whois@c17f66d9bfd7633dfba23a0e16caa5112a61e56798f6f76b6bfef9121f6d142b",
+        "route:PATCH:/localapi/v0/prefs@29e15187957808b7a914d6e51de836144030c5c9348edf3cd20e259a4f4ecb7c",
+        "route:POST:/localapi/v0/check-prefs@480a5a45b356daed4180a8b9db241abc4e9d322d544e4b142c25a7a7f9f79bc9",
+        "route:POST:/localapi/v0/debug-capture@21f2ae6bdb072ac98ca7041dfc4de790fe7f8fc72c9efd5f149a24242f2d20ed",
+        "route:POST:/localapi/v0/debug@49af6dd281b36c7d7c5ff71875b50225a121bf78cae4d54f30edab9618fd4e88",
+        "route:POST:/localapi/v0/dial@99cc20fe3e4c40eb5fa0e38b1b6674d1cd7ee8b7252bd43a1e0318266e3ccb29",
+        "route:POST:/localapi/v0/login-interactive@fab96f60c52d665d9f7d905bf246007b06560fd140175f4d8c5fdc41dbbf7ee3",
+        "route:POST:/localapi/v0/logout@4e57931ceb3c775c470a7fb5e071d02925a0a6ee85d7719f3ba26f1f5774fa22",
+        "route:POST:/localapi/v0/ping@36e9213e0d5586d5c3a25fcecbc2e382c41ffbde6119d982be468e3cd7fe2840",
+        "route:POST:/localapi/v0/profiles/<id>@ca0dd012ea2ea19111f1f95397d12ab94b33a355169c648e687f9f636e1ffe74",
+        "route:POST:/localapi/v0/reload-config@f0ad98c12e78aea3705e2f225853369e97538568fb9324476442117b894c8ceb",
+        "route:POST:/localapi/v0/routecheck@7124112084729e1397f287fe16f6953290f921cb176f68902f0b6b52987b7f7c",
+        "route:POST:/localapi/v0/serve-config@590d0bff4eb02d810f30d15ce3d6351ef28af636f0d74c0555faf74c679ea07b",
+        "route:POST:/localapi/v0/set-expiry-sooner@ded205f9d3c51b47c26c6bb360b5a1d6021491333c3c291f2b5d1582e1f74e0b",
+        "route:POST:/localapi/v0/shutdown@3d4866e139d666bac27fd0a605569f53dfe56246dec8a519e8da19db91f6da05",
+        "route:POST:/localapi/v0/start@aed4ef15acf1a18acf5bcb3db15a52173deb5ba1e5230aecbbd559ae016ec5e6",
+        "route:POST:/localapi/v0/tka/disable@0c207848ce8f552a9bd6426a1923a385774541b940b1e0ab78dd8ce3e0932e5a",
+        "route:POST:/localapi/v0/tka/force-local-disable@c849e01301f7d3200554d03ea771bb853465246a1da2af6fac0706c3090c2910",
+        "route:POST:/localapi/v0/tka/init/ack@7d8aff5668d7f144deb51e27aeaf0cb80d046f8b0c3ab619bc645a292332e30d",
+        "route:POST:/localapi/v0/tka/init@8c6a6cb0cfef2c9ac88e8dee4a5d1e31299a8c14d189642847e2d5f6d91a5dea",
+        "route:POST:/localapi/v0/tka/sign@0f98235d0bb5294a20c370c2fe8ec0117b00fd6414c7715217f1df7f8ef5e9d2",
+        "route:PUT:/localapi/v0/drive/config@b21a95689e487c048c867251832f96584f7ec420ab89b02a5ed06e0a7763f102",
+        "route:PUT:/localapi/v0/file-put/<stable-id>/<filename>@7d3326ad6073fde94be6e845e10d702f47bcca4bffeda282473ace07104d54c8",
+        "route:PUT:/localapi/v0/profiles@e84f265aa411d2d7288db036eb80c784e16dd89e96099bc81357f10c555a6440"
+      ],
+      "sha256": "e7f2799d3fcae8cc061d42773d8c4d709fae764c78d8898fbc7c614adcde6298"
+    },
+    "upstream": {
+      "count": 78,
+      "ids": [
+        "route:alpha-set-device-attrs",
+        "route:appc-route-info",
+        "route:bugreport",
+        "route:cert-domains",
+        "route:cert/<suffix>",
+        "route:check-ip-forwarding",
+        "route:check-prefs",
+        "route:check-so-mark-in-use",
+        "route:check-udp-gro-forwarding",
+        "route:component-debug-logging",
+        "route:debug",
+        "route:debug-bus-events",
+        "route:debug-bus-graph",
+        "route:debug-bus-queues",
+        "route:debug-derp-region",
+        "route:debug-dial-types",
+        "route:debug-log",
+        "route:debug-optional-features",
+        "route:debug-packet-filter-matches",
+        "route:debug-packet-filter-rules",
+        "route:debug-peer-endpoint-changes",
+        "route:debug-rotate-disco-key",
+        "route:derpmap",
+        "route:dev-set-state-store",
+        "route:dial",
+        "route:disconnect-control",
+        "route:dns-config",
+        "route:dns-osconfig",
+        "route:dns-query",
+        "route:drive/fileserver-address",
+        "route:drive/shares",
+        "route:goroutines",
+        "route:handle-push-message",
+        "route:id-token",
+        "route:login-interactive",
+        "route:logout",
+        "route:logtap",
+        "route:metrics",
+        "route:peer-by-id",
+        "route:ping",
+        "route:policy/<suffix>",
+        "route:pprof",
+        "route:prefs",
+        "route:profiles/<suffix>",
+        "route:query-feature",
+        "route:reload-config",
+        "route:reset-auth",
+        "route:serve-config",
+        "route:services",
+        "route:set-dns",
+        "route:set-expiry-sooner",
+        "route:set-gui-visible",
+        "route:set-push-device-token",
+        "route:set-udp-gro-forwarding",
+        "route:set-use-exit-node-enabled",
+        "route:shutdown",
+        "route:start",
+        "route:status",
+        "route:suggest-exit-node",
+        "route:tka/affected-sigs",
+        "route:tka/cosign-recovery-aum",
+        "route:tka/disable",
+        "route:tka/force-local-disable",
+        "route:tka/generate-recovery-aum",
+        "route:tka/init",
+        "route:tka/log",
+        "route:tka/modify",
+        "route:tka/sign",
+        "route:tka/status",
+        "route:tka/submit-recovery-aum",
+        "route:tka/verify-deeplink",
+        "route:tka/wrap-preauth-key",
+        "route:update/check",
+        "route:upload-client-metrics",
+        "route:user-profile",
+        "route:usermetrics",
+        "route:watch-ipn-bus",
+        "route:whois"
+      ],
+      "sha256": "9032f577647631865931867ae55724ce5dc9459aae7f583d29c6230e4c8f10da"
+    },
+    "upstream_shape": {
+      "count": 78,
+      "ids": [
+        "route:alpha-set-device-attrs@121a8e1b94593ba223031ed6b4553ddab4dfde09af03d31aab4fbfc500655a88",
+        "route:appc-route-info@b28105f04674ae808116424e80cd0a2f30100e29e9f17ea72910e5a163ac2aa2",
+        "route:bugreport@51b6e44cbcf68e66a59bddcaaaf24532c89eddb5e83425ed4eb584f48f5c5a9f",
+        "route:cert-domains@84b63f3cc986d3996d62f1c40f8a66f2655fb76e81b7e4bcc2a8b22560d67439",
+        "route:cert/<suffix>@2cece611f26f2a119662fdf07027d5a10634be4a68b63e18975f3109d4085a80",
+        "route:check-ip-forwarding@79cd12728ec4e64ab935de8c8331fd1976c64790ad0172e4d6cd9297c6d4da99",
+        "route:check-prefs@e47304460f6e867a276a138c09dad6c46f3be750a8d68d6da19ab58dc92dd7f2",
+        "route:check-so-mark-in-use@6aaafbb1e5f99095ec6f87b282def5bbf8b722066a71c0aa70156efd1f063e86",
+        "route:check-udp-gro-forwarding@7cd2fba38291d11cec5180795a349b897a15d3a6d20038efcd1a6ee3ac740e9b",
+        "route:component-debug-logging@ba3fcd480f8e2ec6d36994b6b6abbe4708af772f7b623a88d1a68e9832bb6e4a",
+        "route:debug-bus-events@bbde9f8a82d49ac5ad29101639f9a95eaf2770565d1932e5c04a596321a0b2da",
+        "route:debug-bus-graph@591d8b3c3e4e2a18f4c3c953b0ebc84978410299c746f5e4fa3cd1cbb03b843d",
+        "route:debug-bus-queues@e1b0b8e777256febb8559b1f4cde9efb995222594a66e7ce8d2085bccbf27203",
+        "route:debug-derp-region@ade8ba7a51fdc90c48497edaef2d9e05a1e14fdb5657ebcfed1f737ef6d6e98e",
+        "route:debug-dial-types@c8279e4a1aa3f5a04ba72c43aa0ea354327488f33831a72644cb24790046892e",
+        "route:debug-log@4c793f7b68ec9de099764b8c577d382af8d7f9fcb4466ef7872f5a110f7f4be6",
+        "route:debug-optional-features@e55614a2603cd747c4cb6c4a7afb9e8ffb5fb9d7938dfe7b2d4ac300c3cf3729",
+        "route:debug-packet-filter-matches@8db4ff724f98bfd06ef075465da2cd5d7a9e80e4ad8cfaa80f48c60ae1e508b4",
+        "route:debug-packet-filter-rules@af899853efce838f355dc89e0c2ea302da83d8bc4d46263e131dfdb3b98f787d",
+        "route:debug-peer-endpoint-changes@0c77808121694215fd04197452196f9d4057870b3afd0f1d9ea6b5813cff9f5d",
+        "route:debug-rotate-disco-key@6173f79fb58a85db90bf78cbd8b1fbe4b1b76b69c115c05669ccb9db0dc702c5",
+        "route:debug@ade9b0ad6fad13054ae8cf104c35126b1ef0971f2c69c6009cdd28820f29673c",
+        "route:derpmap@77fb655ad06e23f63e143e9c474de955154b7f9e465ba31601659544e73078cc",
+        "route:dev-set-state-store@b17d6f3341d6cedec82dd61b2f002e5da59a2022ef4e528dbb807b2aceeee3a2",
+        "route:dial@013f53017ff89444742737c6175f3ee609c8ec640d042ebd7054635a58b262ce",
+        "route:disconnect-control@f62375b4a97a7fe8133fab064c9dd457fa21b2902abf458ed049192950d9dab3",
+        "route:dns-config@26932f375da66f466039f94e6dd4a16875b7fdb0a4624a9d0a428d1aed5dd178",
+        "route:dns-osconfig@bdfc5683a3879ff1d57836a7d63ab2278b4221fb4d8981df075064d668598967",
+        "route:dns-query@b67eaafefc88a3e6f516545b0229a75d6796f07f9b3bff3fd16ef2fdf6da2e90",
+        "route:drive/fileserver-address@c5f32043abd705f84b0973c3b7febbb2e2b99b3ed2acd99e7be958fbf3e0ecdc",
+        "route:drive/shares@65aff9805708c66113d5a18a86d71a07b8d240dd1eb14500e39be865ab220909",
+        "route:goroutines@18458761442b474d5881e8fc85aa38ece383fdb900c37f4947cf1cf1d9ab6d11",
+        "route:handle-push-message@61698b596c59cd615db82e3e51288dc825bc74a4222d187f2d9b8f9fbba02f0e",
+        "route:id-token@9fc82a1186b43d6ab4d279d3cd82aa771b463b8ecf1c84b193901c2b71b7c761",
+        "route:login-interactive@7d953a077e36d3a050f4f841d823f307b9fd63269ae0c7658fc053c5ee3aa186",
+        "route:logout@94ba0fa89c0bd9a0093e0fb296a5e5da22cac6b21443d29e0690d6ca587ef01e",
+        "route:logtap@9b94dc16bdbffb701c8d1d363724264b26f406da1f284f3241ce80da499b094e",
+        "route:metrics@afda9281f7cdb70a9abeba2cb8ad12de596b4d96399da6a3c657b1d03e6afd21",
+        "route:peer-by-id@ed4c4c38e5de37d159a974a6d6d5142a630f06e427f8b4a2d95a198e0a8be118",
+        "route:ping@7e8a614736a414ae015023a2866aa1e8d329b47204e2fd1b8545a12f14db5745",
+        "route:policy/<suffix>@67980e8151af8b86783c6ac0d3b4abe65ad0ce82a5a66cf95750f6a71ac08edc",
+        "route:pprof@46cf5b475689d90a57d0c1b27d47ca46d42e504415a939177074b22615e7edbd",
+        "route:prefs@174cb5d6c5898306e6208ddece701a346f277080e66133f196f5923de85be5d9",
+        "route:profiles/<suffix>@5efd67499850edda40d46c889b235822c212b4d9d36107f3753bba1abea14f5f",
+        "route:query-feature@dee41033cf496bf7a6ee48c357dc00b37590876e4f47f9a435e34f0e07cbbf32",
+        "route:reload-config@b3e36ba86d469866f6e6a1f4d08e8e0bc3d6847e11bf923d974b9920af882a43",
+        "route:reset-auth@144092e7fe2b4f123e9bbc452b7230f70f588c952923014e85a027a5f008a3c5",
+        "route:serve-config@51e86ee847e3188137631de63a9ae0eda3716bde716c47b4ab7f09351e08583e",
+        "route:services@fca3799e28321e3d664bf403dfed9ce729c92c83cd85507853ee135e88fa1407",
+        "route:set-dns@e97aec735904b68b1959dcf3b536153ae23c05ae83cfc021f75fa967a72113e2",
+        "route:set-expiry-sooner@d33feb2deae510ae420c34e551bbe04eddb348a825e5fad337fd32ce2648ab84",
+        "route:set-gui-visible@1cb76cbe742506eeb74c342c70aad75f1467f2c49271aaf3210109ac42adc8e9",
+        "route:set-push-device-token@63c2f1421e81f6c81e2b709a25b5348f7ad0e91dd9ce78abbbeef971a426028d",
+        "route:set-udp-gro-forwarding@f7c5a663a2d46cba3fc1e200d5f5992b8a4993a7949e0c02b4ad72f9686926f9",
+        "route:set-use-exit-node-enabled@ab3d7eda7a7ef0092dbddae70a8a0c8f3f76afee7a4634028caf91eb99780c9b",
+        "route:shutdown@b3449096ca15bf989194515aa7db9032a473bb2213e6de39feb9458419002091",
+        "route:start@c6e4c19d54f3667cdce6cb6b93a0467539ab01560b13abf3c8a43a8d0023313f",
+        "route:status@6e9bd24bea0e290b6d3aca42ded8746247708f1bdefb762ce47ce3d85bb1cb16",
+        "route:suggest-exit-node@c7c4bcda6c5894cce39eb620d00f179a9e466f42f544bba52355257cb3be4acb",
+        "route:tka/affected-sigs@2b2f79bed575c77fb9c0b7b03c84daa449446863942fe695992633d8cd47d13c",
+        "route:tka/cosign-recovery-aum@064740f85d123aca1937bfd5137d6a6a8252d48cbc72b660e0ae189de762e9e9",
+        "route:tka/disable@f116e77a21e6bd7fc9405b0bb50fd64716577ed7836f4301f89efe68fcad6774",
+        "route:tka/force-local-disable@1d6cf36108f4040968b2818766d4bfc38cef5de4828491914930ead0759d1930",
+        "route:tka/generate-recovery-aum@7e2312853da14132d3f8e94ab109e1ac067ad28dbebe1d1e4642dfa54b7a775f",
+        "route:tka/init@d8329f1b2ddf827776384b2bf6ca519962e67b92e51f924e0c6ff8442b742092",
+        "route:tka/log@762ef3533866314206a12cbc284cd5758463bb9acf3ffe6574fe34f510435534",
+        "route:tka/modify@33a7865b75e6102b3a3a0da38a80aca8707c0a10e9d6464e256f829e2bae1071",
+        "route:tka/sign@38a2eb4ef2638429fd8911ecf01616712514dcfc47c5698bc929dae910a2f995",
+        "route:tka/status@feae48fb5b4936e92fc75c05bb3f8a46fd177545289f92abfff4eb47f8afd8b6",
+        "route:tka/submit-recovery-aum@10253549f7ac7b045bccd0a2ea0a1b9e4297ec89b945b83a5b1530df9c997b6a",
+        "route:tka/verify-deeplink@67b6c57f3f5b41bd3af938229ac35e2ba1c159e3b34e4841727d56f793aed766",
+        "route:tka/wrap-preauth-key@fb49e6ede3224623179d0ea375db99b6339cee921f1f48bd1083e886aaa599ae",
+        "route:update/check@dc12a5242c8187824f3b480c8d3c2b0b63253c638a4c325f2ef9c5786e5a47e6",
+        "route:upload-client-metrics@7ab78c2c072090b38119774b619d2b01d2afe3d4cd85ef4230ca3c4c8cd83b0d",
+        "route:user-profile@6cbf9e9ffc33cd3b19349a2a8ba4486c9289877ec6d93b10f0170c026e7d1e09",
+        "route:usermetrics@4968cae2cc83eda1571c3abfe41b19d6b30f67e9a8ff7a5dff04987115f372f7",
+        "route:watch-ipn-bus@47fb9adfaa01f5f56b350f52be1dfd6696701b98a023ece10b93125dc1ab9bca",
+        "route:whois@c0aa5767104396478d66c12cac0ff67553b035ca7e10659597e54c2b03b9397f"
+      ],
+      "sha256": "2e7b349e1d2fd2632d503f9fbc246803dbbfdce025a18c3a0dc544dde7ac8d87"
+    }
+  },
+  "inventory": {
+    "local": [
+      {
+        "id": "route:DELETE:/localapi/v0/files[/<name>]",
+        "method": "DELETE",
+        "path": "/localapi/v0/files[/<name>]",
+        "request_schema": "none",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:DELETE:/localapi/v0/profiles/<id>",
+        "method": "DELETE",
+        "path": "/localapi/v0/profiles/<id>",
+        "request_schema": "none",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/",
+        "method": "GET",
+        "path": "/",
+        "request_schema": "none",
+        "response_schema": "localapi.RouteIndex",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/cert/<domain>",
+        "method": "GET",
+        "path": "/localapi/v0/cert/<domain>",
+        "request_schema": "localapi.CertQuery",
+        "response_schema": "pem.KeyPair",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/check-ip-forwarding",
+        "method": "GET",
+        "path": "/localapi/v0/check-ip-forwarding",
+        "request_schema": "none",
+        "response_schema": "apitype.CheckIPForwardingResponse",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/debug",
+        "method": "GET",
+        "path": "/localapi/v0/debug",
+        "request_schema": "localapi.DebugQuery",
+        "response_schema": "json.Value",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/dns-query",
+        "method": "GET",
+        "path": "/localapi/v0/dns-query",
+        "request_schema": "apitype.DNSQueryRequest",
+        "response_schema": "apitype.DNSQueryResponse",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/drive/config",
+        "method": "GET",
+        "path": "/localapi/v0/drive/config",
+        "request_schema": "none",
+        "response_schema": "drive.DriveConfig",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/drive/status",
+        "method": "GET",
+        "path": "/localapi/v0/drive/status",
+        "request_schema": "none",
+        "response_schema": "drive.DriveStatus",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/file-targets",
+        "method": "GET",
+        "path": "/localapi/v0/file-targets",
+        "request_schema": "none",
+        "response_schema": "tsnet.FileTarget[]",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/files[/<name>]",
+        "method": "GET",
+        "path": "/localapi/v0/files[/<name>]",
+        "request_schema": "localapi.FilesQuery",
+        "response_schema": "ipn.WaitingFile[]|bytes",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/health",
+        "method": "GET",
+        "path": "/localapi/v0/health",
+        "request_schema": "none",
+        "response_schema": "health.Warning[]",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/id-token",
+        "method": "GET",
+        "path": "/localapi/v0/id-token",
+        "request_schema": "apitype.IDTokenRequest",
+        "response_schema": "apitype.IDTokenResponse",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/metrics",
+        "method": "GET",
+        "path": "/localapi/v0/metrics",
+        "request_schema": "none",
+        "response_schema": "prometheus.Text",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/netmap",
+        "method": "GET",
+        "path": "/localapi/v0/netmap",
+        "request_schema": "none",
+        "response_schema": "tailcfg.NetMap",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/prefs",
+        "method": "GET",
+        "path": "/localapi/v0/prefs",
+        "request_schema": "none",
+        "response_schema": "ipn.Prefs",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/profiles",
+        "method": "GET",
+        "path": "/localapi/v0/profiles",
+        "request_schema": "none",
+        "response_schema": "ipn.LoginProfile[]",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/profiles/<id>",
+        "method": "GET",
+        "path": "/localapi/v0/profiles/<id>",
+        "request_schema": "none",
+        "response_schema": "ipn.LoginProfile",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/serve-config",
+        "method": "GET",
+        "path": "/localapi/v0/serve-config",
+        "request_schema": "none",
+        "response_schema": "ipn.ServeConfig",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/status",
+        "method": "GET",
+        "path": "/localapi/v0/status",
+        "request_schema": "none",
+        "response_schema": "ipnstate.Status",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/tka/status",
+        "method": "GET",
+        "path": "/localapi/v0/tka/status",
+        "request_schema": "none",
+        "response_schema": "tka.Status",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/watch-ipn-bus",
+        "method": "GET",
+        "path": "/localapi/v0/watch-ipn-bus",
+        "request_schema": "localapi.WatchQuery",
+        "response_schema": "ipn.NotifyStream",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:GET:/localapi/v0/whois",
+        "method": "GET",
+        "path": "/localapi/v0/whois",
+        "request_schema": "localapi.WhoIsQuery",
+        "response_schema": "apitype.WhoIsResponse",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:PATCH:/localapi/v0/prefs",
+        "method": "PATCH",
+        "path": "/localapi/v0/prefs",
+        "request_schema": "ipn.MaskedPrefs",
+        "response_schema": "ipn.Prefs",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/check-prefs",
+        "method": "POST",
+        "path": "/localapi/v0/check-prefs",
+        "request_schema": "ipn.MaskedPrefs",
+        "response_schema": "localapi.CheckPrefsResponse",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/debug",
+        "method": "POST",
+        "path": "/localapi/v0/debug",
+        "request_schema": "localapi.DebugAction",
+        "response_schema": "json.Value",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/debug-capture",
+        "method": "POST",
+        "path": "/localapi/v0/debug-capture",
+        "request_schema": "none",
+        "response_schema": "capture.PcapStream",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/dial",
+        "method": "POST",
+        "path": "/localapi/v0/dial",
+        "request_schema": "tsdial.Request",
+        "response_schema": "tsdial.Stream",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/login-interactive",
+        "method": "POST",
+        "path": "/localapi/v0/login-interactive",
+        "request_schema": "none",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/logout",
+        "method": "POST",
+        "path": "/localapi/v0/logout",
+        "request_schema": "none",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/ping",
+        "method": "POST",
+        "path": "/localapi/v0/ping",
+        "request_schema": "localapi.PingQuery",
+        "response_schema": "tailcfg.PingResult",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/profiles/<id>",
+        "method": "POST",
+        "path": "/localapi/v0/profiles/<id>",
+        "request_schema": "none",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/reload-config",
+        "method": "POST",
+        "path": "/localapi/v0/reload-config",
+        "request_schema": "none",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/routecheck",
+        "method": "POST",
+        "path": "/localapi/v0/routecheck",
+        "request_schema": "routecheck.Query",
+        "response_schema": "routecheck.Report",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/serve-config",
+        "method": "POST",
+        "path": "/localapi/v0/serve-config",
+        "request_schema": "ipn.ServeConfig",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/set-expiry-sooner",
+        "method": "POST",
+        "path": "/localapi/v0/set-expiry-sooner",
+        "request_schema": "apitype.SetExpirySoonerRequest",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/shutdown",
+        "method": "POST",
+        "path": "/localapi/v0/shutdown",
+        "request_schema": "none",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/start",
+        "method": "POST",
+        "path": "/localapi/v0/start",
+        "request_schema": "ipn.Options",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/tka/disable",
+        "method": "POST",
+        "path": "/localapi/v0/tka/disable",
+        "request_schema": "tka.DisableRequest",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/tka/force-local-disable",
+        "method": "POST",
+        "path": "/localapi/v0/tka/force-local-disable",
+        "request_schema": "tka.ForceLocalDisableRequest",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/tka/init",
+        "method": "POST",
+        "path": "/localapi/v0/tka/init",
+        "request_schema": "tka.InitRequest",
+        "response_schema": "tka.InitResponse",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/tka/init/ack",
+        "method": "POST",
+        "path": "/localapi/v0/tka/init/ack",
+        "request_schema": "tka.InitAckRequest",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:POST:/localapi/v0/tka/sign",
+        "method": "POST",
+        "path": "/localapi/v0/tka/sign",
+        "request_schema": "tka.SignRequest",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:PUT:/localapi/v0/drive/config",
+        "method": "PUT",
+        "path": "/localapi/v0/drive/config",
+        "request_schema": "drive.DriveConfig",
+        "response_schema": "drive.DriveStatus",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:PUT:/localapi/v0/file-put/<stable-id>/<filename>",
+        "method": "PUT",
+        "path": "/localapi/v0/file-put/<stable-id>/<filename>",
+        "request_schema": "bytes",
+        "response_schema": "none",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      },
+      {
+        "id": "route:PUT:/localapi/v0/profiles",
+        "method": "PUT",
+        "path": "/localapi/v0/profiles",
+        "request_schema": "none",
+        "response_schema": "ipn.LoginProfile",
+        "source": "crates/tsnet/src/localapi_contract.rs"
+      }
+    ],
+    "upstream": [
+      {
+        "handler": "serveSetDeviceAttrs",
+        "id": "route:alpha-set-device-attrs",
+        "methods": [
+          "PATCH"
+        ],
+        "path": "alpha-set-device-attrs",
+        "schema_ids": [
+          "handler.serveSetDeviceAttrs"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveGetAppcRouteInfo",
+        "id": "route:appc-route-info",
+        "methods": [
+          "GET"
+        ],
+        "path": "appc-route-info",
+        "schema_ids": [
+          "handler.serveGetAppcRouteInfo"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveBugReport",
+        "id": "route:bugreport",
+        "methods": [
+          "POST"
+        ],
+        "path": "bugreport",
+        "schema_ids": [
+          "handler.serveBugReport"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveCertDomains",
+        "id": "route:cert-domains",
+        "methods": [
+          "ANY"
+        ],
+        "path": "cert-domains",
+        "schema_ids": [
+          "handler.serveCertDomains"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveCert",
+        "id": "route:cert/<suffix>",
+        "methods": [
+          "ANY"
+        ],
+        "path": "cert/<suffix>",
+        "schema_ids": [
+          "handler.serveCert"
+        ],
+        "source": [
+          "ipn/localapi/cert.go"
+        ]
+      },
+      {
+        "handler": "serveCheckIPForwarding",
+        "id": "route:check-ip-forwarding",
+        "methods": [
+          "ANY"
+        ],
+        "path": "check-ip-forwarding",
+        "schema_ids": [
+          "handler.serveCheckIPForwarding"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveCheckPrefs",
+        "id": "route:check-prefs",
+        "methods": [
+          "POST"
+        ],
+        "path": "check-prefs",
+        "schema_ids": [
+          "handler.serveCheckPrefs"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveCheckSOMarkInUse",
+        "id": "route:check-so-mark-in-use",
+        "methods": [
+          "ANY"
+        ],
+        "path": "check-so-mark-in-use",
+        "schema_ids": [
+          "handler.serveCheckSOMarkInUse"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveCheckUDPGROForwarding",
+        "id": "route:check-udp-gro-forwarding",
+        "methods": [
+          "ANY"
+        ],
+        "path": "check-udp-gro-forwarding",
+        "schema_ids": [
+          "handler.serveCheckUDPGROForwarding"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveComponentDebugLogging",
+        "id": "route:component-debug-logging",
+        "methods": [
+          "ANY"
+        ],
+        "path": "component-debug-logging",
+        "schema_ids": [
+          "handler.serveComponentDebugLogging"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebug",
+        "id": "route:debug",
+        "methods": [
+          "POST"
+        ],
+        "path": "debug",
+        "schema_ids": [
+          "handler.serveDebug"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugBusEvents",
+        "id": "route:debug-bus-events",
+        "methods": [
+          "GET"
+        ],
+        "path": "debug-bus-events",
+        "schema_ids": [
+          "handler.serveDebugBusEvents"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveEventBusGraph",
+        "id": "route:debug-bus-graph",
+        "methods": [
+          "GET"
+        ],
+        "path": "debug-bus-graph",
+        "schema_ids": [
+          "handler.serveEventBusGraph"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugBusQueues",
+        "id": "route:debug-bus-queues",
+        "methods": [
+          "GET"
+        ],
+        "path": "debug-bus-queues",
+        "schema_ids": [
+          "handler.serveDebugBusQueues"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugDERPRegion",
+        "id": "route:debug-derp-region",
+        "methods": [
+          "GET",
+          "POST"
+        ],
+        "path": "debug-derp-region",
+        "schema_ids": [
+          "handler.serveDebugDERPRegion"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugDialTypes",
+        "id": "route:debug-dial-types",
+        "methods": [
+          "POST"
+        ],
+        "path": "debug-dial-types",
+        "schema_ids": [
+          "handler.serveDebugDialTypes"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugLog",
+        "id": "route:debug-log",
+        "methods": [
+          "POST"
+        ],
+        "path": "debug-log",
+        "schema_ids": [
+          "handler.serveDebugLog"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugOptionalFeatures",
+        "id": "route:debug-optional-features",
+        "methods": [
+          "ANY"
+        ],
+        "path": "debug-optional-features",
+        "schema_ids": [
+          "handler.serveDebugOptionalFeatures"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugPacketFilterMatches",
+        "id": "route:debug-packet-filter-matches",
+        "methods": [
+          "ANY"
+        ],
+        "path": "debug-packet-filter-matches",
+        "schema_ids": [
+          "handler.serveDebugPacketFilterMatches"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugPacketFilterRules",
+        "id": "route:debug-packet-filter-rules",
+        "methods": [
+          "ANY"
+        ],
+        "path": "debug-packet-filter-rules",
+        "schema_ids": [
+          "handler.serveDebugPacketFilterRules"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugPeerEndpointChanges",
+        "id": "route:debug-peer-endpoint-changes",
+        "methods": [
+          "ANY"
+        ],
+        "path": "debug-peer-endpoint-changes",
+        "schema_ids": [
+          "handler.serveDebugPeerEndpointChanges"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDebugRotateDiscoKey",
+        "id": "route:debug-rotate-disco-key",
+        "methods": [
+          "POST"
+        ],
+        "path": "debug-rotate-disco-key",
+        "schema_ids": [
+          "handler.serveDebugRotateDiscoKey"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDERPMap",
+        "id": "route:derpmap",
+        "methods": [
+          "GET"
+        ],
+        "path": "derpmap",
+        "schema_ids": [
+          "handler.serveDERPMap"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveDevSetStateStore",
+        "id": "route:dev-set-state-store",
+        "methods": [
+          "POST"
+        ],
+        "path": "dev-set-state-store",
+        "schema_ids": [
+          "handler.serveDevSetStateStore"
+        ],
+        "source": [
+          "ipn/localapi/debug.go"
+        ]
+      },
+      {
+        "handler": "serveDial",
+        "id": "route:dial",
+        "methods": [
+          "POST"
+        ],
+        "path": "dial",
+        "schema_ids": [
+          "handler.serveDial"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "disconnectControl",
+        "id": "route:disconnect-control",
+        "methods": [
+          "POST"
+        ],
+        "path": "disconnect-control",
+        "schema_ids": [
+          "handler.disconnectControl"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveDNSConfig",
+        "id": "route:dns-config",
+        "methods": [
+          "ANY"
+        ],
+        "path": "dns-config",
+        "schema_ids": [
+          "handler.serveDNSConfig"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveDNSOSConfig",
+        "id": "route:dns-osconfig",
+        "methods": [
+          "GET"
+        ],
+        "path": "dns-osconfig",
+        "schema_ids": [
+          "apitype.DNSOSConfig",
+          "handler.serveDNSOSConfig"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveDNSQuery",
+        "id": "route:dns-query",
+        "methods": [
+          "GET"
+        ],
+        "path": "dns-query",
+        "schema_ids": [
+          "apitype.DNSQueryResponse",
+          "handler.serveDNSQuery"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveDriveServerAddr",
+        "id": "route:drive/fileserver-address",
+        "methods": [
+          "PUT"
+        ],
+        "path": "drive/fileserver-address",
+        "schema_ids": [
+          "handler.serveDriveServerAddr"
+        ],
+        "source": [
+          "ipn/localapi/localapi_drive.go"
+        ]
+      },
+      {
+        "handler": "serveShares",
+        "id": "route:drive/shares",
+        "methods": [
+          "DELETE",
+          "GET",
+          "POST",
+          "PUT"
+        ],
+        "path": "drive/shares",
+        "schema_ids": [
+          "handler.serveShares"
+        ],
+        "source": [
+          "ipn/localapi/localapi_drive.go"
+        ]
+      },
+      {
+        "handler": "serveGoroutines",
+        "id": "route:goroutines",
+        "methods": [
+          "ANY"
+        ],
+        "path": "goroutines",
+        "schema_ids": [
+          "handler.serveGoroutines"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveHandlePushMessage",
+        "id": "route:handle-push-message",
+        "methods": [
+          "POST"
+        ],
+        "path": "handle-push-message",
+        "schema_ids": [
+          "handler.serveHandlePushMessage"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveIDToken",
+        "id": "route:id-token",
+        "methods": [
+          "POST"
+        ],
+        "path": "id-token",
+        "schema_ids": [
+          "handler.serveIDToken",
+          "tailcfg.TokenRequest"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveLoginInteractive",
+        "id": "route:login-interactive",
+        "methods": [
+          "POST"
+        ],
+        "path": "login-interactive",
+        "schema_ids": [
+          "handler.serveLoginInteractive"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveLogout",
+        "id": "route:logout",
+        "methods": [
+          "POST"
+        ],
+        "path": "logout",
+        "schema_ids": [
+          "handler.serveLogout"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveLogTap",
+        "id": "route:logtap",
+        "methods": [
+          "GET"
+        ],
+        "path": "logtap",
+        "schema_ids": [
+          "handler.serveLogTap"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveMetrics",
+        "id": "route:metrics",
+        "methods": [
+          "ANY"
+        ],
+        "path": "metrics",
+        "schema_ids": [
+          "handler.serveMetrics"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "servePeerByID",
+        "id": "route:peer-by-id",
+        "methods": [
+          "ANY"
+        ],
+        "path": "peer-by-id",
+        "schema_ids": [
+          "handler.servePeerByID"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "servePing",
+        "id": "route:ping",
+        "methods": [
+          "POST"
+        ],
+        "path": "ping",
+        "schema_ids": [
+          "handler.servePing"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "servePolicy",
+        "id": "route:policy/<suffix>",
+        "methods": [
+          "GET",
+          "POST"
+        ],
+        "path": "policy/<suffix>",
+        "schema_ids": [
+          "handler.servePolicy"
+        ],
+        "source": [
+          "ipn/localapi/syspolicy_api.go"
+        ]
+      },
+      {
+        "handler": "servePprof",
+        "id": "route:pprof",
+        "methods": [
+          "GET",
+          "HEAD",
+          "OPTIONS"
+        ],
+        "path": "pprof",
+        "schema_ids": [
+          "handler.servePprof"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "servePrefs",
+        "id": "route:prefs",
+        "methods": [
+          "GET",
+          "HEAD",
+          "PATCH"
+        ],
+        "path": "prefs",
+        "schema_ids": [
+          "handler.servePrefs"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveProfiles",
+        "id": "route:profiles/<suffix>",
+        "methods": [
+          "DELETE",
+          "GET",
+          "POST",
+          "PUT"
+        ],
+        "path": "profiles/<suffix>",
+        "schema_ids": [
+          "handler.serveProfiles"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveQueryFeature",
+        "id": "route:query-feature",
+        "methods": [
+          "POST"
+        ],
+        "path": "query-feature",
+        "schema_ids": [
+          "handler.serveQueryFeature",
+          "tailcfg.QueryFeatureRequest"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "reloadConfig",
+        "id": "route:reload-config",
+        "methods": [
+          "POST"
+        ],
+        "path": "reload-config",
+        "schema_ids": [
+          "handler.reloadConfig"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveResetAuth",
+        "id": "route:reset-auth",
+        "methods": [
+          "POST"
+        ],
+        "path": "reset-auth",
+        "schema_ids": [
+          "handler.serveResetAuth"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveServeConfig",
+        "id": "route:serve-config",
+        "methods": [
+          "GET",
+          "POST"
+        ],
+        "path": "serve-config",
+        "schema_ids": [
+          "handler.serveServeConfig"
+        ],
+        "source": [
+          "ipn/localapi/serve.go"
+        ]
+      },
+      {
+        "handler": "serveServices",
+        "id": "route:services",
+        "methods": [
+          "GET"
+        ],
+        "path": "services",
+        "schema_ids": [
+          "handler.serveServices"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveSetDNS",
+        "id": "route:set-dns",
+        "methods": [
+          "POST"
+        ],
+        "path": "set-dns",
+        "schema_ids": [
+          "handler.serveSetDNS"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveSetExpirySooner",
+        "id": "route:set-expiry-sooner",
+        "methods": [
+          "POST"
+        ],
+        "path": "set-expiry-sooner",
+        "schema_ids": [
+          "handler.serveSetExpirySooner"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveSetGUIVisible",
+        "id": "route:set-gui-visible",
+        "methods": [
+          "POST"
+        ],
+        "path": "set-gui-visible",
+        "schema_ids": [
+          "handler.serveSetGUIVisible"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveSetPushDeviceToken",
+        "id": "route:set-push-device-token",
+        "methods": [
+          "POST"
+        ],
+        "path": "set-push-device-token",
+        "schema_ids": [
+          "handler.serveSetPushDeviceToken"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveSetUDPGROForwarding",
+        "id": "route:set-udp-gro-forwarding",
+        "methods": [
+          "ANY"
+        ],
+        "path": "set-udp-gro-forwarding",
+        "schema_ids": [
+          "handler.serveSetUDPGROForwarding"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveSetUseExitNodeEnabled",
+        "id": "route:set-use-exit-node-enabled",
+        "methods": [
+          "POST"
+        ],
+        "path": "set-use-exit-node-enabled",
+        "schema_ids": [
+          "handler.serveSetUseExitNodeEnabled"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveShutdown",
+        "id": "route:shutdown",
+        "methods": [
+          "POST"
+        ],
+        "path": "shutdown",
+        "schema_ids": [
+          "handler.serveShutdown"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveStart",
+        "id": "route:start",
+        "methods": [
+          "POST"
+        ],
+        "path": "start",
+        "schema_ids": [
+          "handler.serveStart"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveStatus",
+        "id": "route:status",
+        "methods": [
+          "ANY"
+        ],
+        "path": "status",
+        "schema_ids": [
+          "handler.serveStatus"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveSuggestExitNode",
+        "id": "route:suggest-exit-node",
+        "methods": [
+          "GET"
+        ],
+        "path": "suggest-exit-node",
+        "schema_ids": [
+          "handler.serveSuggestExitNode"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveTKAAffectedSigs",
+        "id": "route:tka/affected-sigs",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/affected-sigs",
+        "schema_ids": [
+          "handler.serveTKAAffectedSigs"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKACosignRecoveryAUM",
+        "id": "route:tka/cosign-recovery-aum",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/cosign-recovery-aum",
+        "schema_ids": [
+          "handler.serveTKACosignRecoveryAUM"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKADisable",
+        "id": "route:tka/disable",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/disable",
+        "schema_ids": [
+          "handler.serveTKADisable"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKALocalDisable",
+        "id": "route:tka/force-local-disable",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/force-local-disable",
+        "schema_ids": [
+          "handler.serveTKALocalDisable"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKAGenerateRecoveryAUM",
+        "id": "route:tka/generate-recovery-aum",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/generate-recovery-aum",
+        "schema_ids": [
+          "handler.serveTKAGenerateRecoveryAUM"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKAInit",
+        "id": "route:tka/init",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/init",
+        "schema_ids": [
+          "handler.serveTKAInit"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKALog",
+        "id": "route:tka/log",
+        "methods": [
+          "GET"
+        ],
+        "path": "tka/log",
+        "schema_ids": [
+          "handler.serveTKALog"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKAModify",
+        "id": "route:tka/modify",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/modify",
+        "schema_ids": [
+          "handler.serveTKAModify"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKASign",
+        "id": "route:tka/sign",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/sign",
+        "schema_ids": [
+          "handler.serveTKASign"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKAStatus",
+        "id": "route:tka/status",
+        "methods": [
+          "GET"
+        ],
+        "path": "tka/status",
+        "schema_ids": [
+          "handler.serveTKAStatus"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKASubmitRecoveryAUM",
+        "id": "route:tka/submit-recovery-aum",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/submit-recovery-aum",
+        "schema_ids": [
+          "handler.serveTKASubmitRecoveryAUM"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKAVerifySigningDeeplink",
+        "id": "route:tka/verify-deeplink",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/verify-deeplink",
+        "schema_ids": [
+          "handler.serveTKAVerifySigningDeeplink"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveTKAWrapPreauthKey",
+        "id": "route:tka/wrap-preauth-key",
+        "methods": [
+          "POST"
+        ],
+        "path": "tka/wrap-preauth-key",
+        "schema_ids": [
+          "handler.serveTKAWrapPreauthKey"
+        ],
+        "source": [
+          "ipn/localapi/tailnetlock.go"
+        ]
+      },
+      {
+        "handler": "serveUpdateCheck",
+        "id": "route:update/check",
+        "methods": [
+          "GET"
+        ],
+        "path": "update/check",
+        "schema_ids": [
+          "handler.serveUpdateCheck"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveUploadClientMetrics",
+        "id": "route:upload-client-metrics",
+        "methods": [
+          "POST"
+        ],
+        "path": "upload-client-metrics",
+        "schema_ids": [
+          "handler.serveUploadClientMetrics"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveUserProfile",
+        "id": "route:user-profile",
+        "methods": [
+          "ANY"
+        ],
+        "path": "user-profile",
+        "schema_ids": [
+          "handler.serveUserProfile"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveUserMetrics",
+        "id": "route:usermetrics",
+        "methods": [
+          "ANY"
+        ],
+        "path": "usermetrics",
+        "schema_ids": [
+          "handler.serveUserMetrics"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveWatchIPNBus",
+        "id": "route:watch-ipn-bus",
+        "methods": [
+          "ANY"
+        ],
+        "path": "watch-ipn-bus",
+        "schema_ids": [
+          "handler.serveWatchIPNBus"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      },
+      {
+        "handler": "serveWhoIs",
+        "id": "route:whois",
+        "methods": [
+          "ANY"
+        ],
+        "path": "whois",
+        "schema_ids": [
+          "apitype.WhoIsResponse",
+          "handler.serveWhoIs"
+        ],
+        "source": [
+          "ipn/localapi/localapi.go"
+        ]
+      }
+    ]
+  },
+  "kind": "localapi",
+  "schema_version": 1,
+  "scope": "registered upstream routes versus Rust admission routes, methods, and stable schema identifiers",
+  "upstream": {
+    "go_mod_sum": "h1:DQ9YBy85DpNlSyeU2XRIWzbAu3RsGp/frv+Khg57meE=",
+    "module": "tailscale.com",
+    "repository": "https://github.com/tailscale/tailscale",
+    "revision": "c811bb19bf3b0c89061ac7b7a073f6cd23b504d0",
+    "sum": "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=",
+    "version": "v1.100.0"
+  }
+}

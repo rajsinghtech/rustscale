@@ -204,6 +204,14 @@ impl LocalClient {
         Ok(())
     }
 
+    /// POST /localapi/v0/tka/force-local-disable — disable enforcement only
+    /// for this profile/control namespace and durably denylist its authority.
+    pub async fn tailnet_lock_force_local_disable(&self) -> Result<(), LocalClientError> {
+        self.send_request_with_body("POST", "/localapi/v0/tka/force-local-disable", b"{}")
+            .await?;
+        Ok(())
+    }
+
     /// GET /localapi/v0/drive/status — return bounded owner-only status.
     pub async fn drive_status(&self) -> Result<DriveStatus, LocalClientError> {
         let raw = drive_request_timeout(self.send_request_raw_with_limit(

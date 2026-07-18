@@ -4122,6 +4122,202 @@ async fn echo_roundtrip(
     assert_eq!(&got, payload, "echo mismatch ({label})");
 }
 
+/// Interop coverage for application-level one-way UDP cadence.
+///
+/// The existing harness traffic is TCP/bulk or continuously active. This
+/// scenario uses `Server::listen_packet` on two real tailnet nodes, warms the
+/// WireGuard path once, then leaves the receiver strictly one-way so no reply
+/// traffic can hide a missing application-send wakeup.
+#[tokio::test]
+#[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]
+async fn interop_application_udp_cadence() {
+    const PORT: u16 = 4546;
+    const PACKET_COUNT: usize = 16;
+    const CADENCE_MS: u64 = 50;
+    const MAX_ONE_WAY: std::time::Duration = std::time::Duration::from_millis(650);
+    const MIN_ARRIVAL_SPAN: std::time::Duration = std::time::Duration::from_millis(350);
+
+    let Some(ienv) = interop_env() else {
+        log::debug!("interop_application_udp_cadence: skipping (interop env not set)");
+        return;
+    };
+
+    let mut sender_server = interop_server(&ienv.authkey, "udp-sender");
+    let mut receiver_server = interop_server(&ienv.authkey, "udp-receiver");
+    Box::pin(sender_server.up()).await.expect("sender up");
+    Box::pin(receiver_server.up()).await.expect("receiver up");
+
+    let sender_ip = sender_server
+        .status()
+        .tailscale_ips
+        .iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(ip) => Some(*ip),
+            IpAddr::V6(_) => None,
+        })
+        .expect("sender should have an IPv4 address");
+    let receiver_ip = receiver_server
+        .status()
+        .tailscale_ips
+        .iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(ip) => Some(*ip),
+            IpAddr::V6(_) => None,
+        })
+        .expect("receiver should have an IPv4 address");
+
+    wait_for_peer(
+        &sender_server,
+        IpAddr::V4(receiver_ip),
+        "interop_application_udp_cadence sender",
+    )
+    .await;
+    wait_for_peer(
+        &receiver_server,
+        IpAddr::V4(sender_ip),
+        "interop_application_udp_cadence receiver",
+    )
+    .await;
+
+    let mut receiver = receiver_server
+        .listen_packet(&format!("{receiver_ip}:{PORT}"))
+        .await
+        .expect("receiver listen_packet");
+    let sender = sender_server
+        .listen_packet(":0")
+        .await
+        .expect("sender listen_packet");
+    let sender_addr = sender.local_addr();
+    let destination = SocketAddr::new(IpAddr::V4(receiver_ip), PORT);
+
+    // Warm the encrypted path outside the measurement. On the buggy code this
+    // may take the full one-second netstack fallback, which anchors the next
+    // measured train just after that fallback rather than at an arbitrary phase.
+    sender
+        .send_to(b"udp-cadence-warmup", destination)
+        .await
+        .expect("warmup send_to");
+    let (warmup, warmup_src) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv_from())
+            .await
+            .expect("UDP cadence warmup timed out")
+            .expect("UDP cadence warmup receive failed");
+    assert_eq!(&warmup[..], b"udp-cadence-warmup");
+    assert_eq!(warmup_src, sender_addr);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let receive_task = tokio::spawn(async move {
+        let mut arrivals = Vec::with_capacity(PACKET_COUNT);
+        for expected in 0..PACKET_COUNT {
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(3), receiver.recv_from())
+                    .await
+                    .map_err(|_| {
+                        format!(
+                    "timed out waiting for UDP sequence {expected}; received {} of {PACKET_COUNT}",
+                    arrivals.len()
+                )
+                    })?
+                    .map_err(|error| format!("receive sequence {expected}: {error}"))?;
+            let arrived = std::time::Instant::now();
+            let expected_payload = (expected as u32).to_be_bytes();
+            if &received.0[..] != expected_payload.as_slice() {
+                return Err(format!(
+                    "UDP sequence mismatch at {expected}: payload={:?}",
+                    &received.0[..]
+                ));
+            }
+            if received.1 != sender_addr {
+                return Err(format!(
+                    "UDP source mismatch at {expected}: got={} want={sender_addr}",
+                    received.1
+                ));
+            }
+            arrivals.push(arrived);
+        }
+        Ok::<_, String>(arrivals)
+    });
+
+    let cadence_start = std::time::Instant::now();
+    let mut sent_at = Vec::with_capacity(PACKET_COUNT);
+    for sequence in 0..PACKET_COUNT {
+        let scheduled =
+            cadence_start + std::time::Duration::from_millis(CADENCE_MS * sequence as u64);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled)).await;
+        sent_at.push(std::time::Instant::now());
+        sender
+            .send_to(&(sequence as u32).to_be_bytes(), destination)
+            .await
+            .unwrap_or_else(|error| panic!("send sequence {sequence}: {error}"));
+    }
+
+    let arrivals = tokio::time::timeout(std::time::Duration::from_secs(5), receive_task)
+        .await
+        .expect("UDP cadence receiver task timed out")
+        .expect("UDP cadence receiver task panicked")
+        .unwrap_or_else(|error| panic!("UDP cadence receive failed: {error}"));
+    let max_one_way = sent_at
+        .iter()
+        .zip(&arrivals)
+        .map(|(sent, arrived)| arrived.duration_since(*sent))
+        .max()
+        .expect("at least one UDP latency sample");
+    let send_span = sent_at
+        .last()
+        .expect("last send")
+        .duration_since(sent_at[0]);
+    let arrival_span = arrivals
+        .last()
+        .expect("last arrival")
+        .duration_since(arrivals[0]);
+    let path = sender_server
+        .status()
+        .peers
+        .iter()
+        .find(|peer| peer.ips.contains(&IpAddr::V4(receiver_ip)))
+        .map_or_else(
+            || "missing".to_string(),
+            |peer| format!("{:?}", peer.path_class),
+        );
+    let samples = sent_at
+        .iter()
+        .zip(&arrivals)
+        .enumerate()
+        .map(|(sequence, (sent, arrived))| {
+            format!(
+                "{sequence}:send={}ms recv={}ms latency={}ms",
+                sent.duration_since(cadence_start).as_millis(),
+                arrived.duration_since(cadence_start).as_millis(),
+                arrived.duration_since(*sent).as_millis()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let diagnostics = format!(
+        "path={path} cadence={CADENCE_MS}ms count={PACKET_COUNT} send_span={}ms \
+         arrival_span={}ms max_one_way={}ms samples=[{samples}]",
+        send_span.as_millis(),
+        arrival_span.as_millis(),
+        max_one_way.as_millis()
+    );
+    log::debug!("interop_application_udp_cadence: {diagnostics}");
+
+    drop(sender);
+    let sender_close = sender_server.close().await;
+    let receiver_close = receiver_server.close().await;
+
+    assert!(
+        max_one_way <= MAX_ONE_WAY,
+        "one-way application UDP exceeded the generous {MAX_ONE_WAY:?} bound; {diagnostics}"
+    );
+    assert!(
+        arrival_span >= MIN_ARRIVAL_SPAN,
+        "one-way 20 Hz application UDP arrived in a fallback-sized batch; {diagnostics}"
+    );
+    sender_close.expect("close UDP sender server");
+    receiver_close.expect("close UDP receiver server");
+}
+
 /// Interop: rustscale dials the Go node's serve echo port.
 #[tokio::test]
 #[ignore = "requires TS_INTEROP_GO_IP (run via tools/interop.sh)"]

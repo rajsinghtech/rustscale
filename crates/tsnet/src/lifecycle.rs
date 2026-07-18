@@ -800,10 +800,11 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     };
     drain_generation_tasks(tasks).await;
     inner.map_tasks.join().await;
-    // LocalAPI cancellation does not cancel an admitted Tailnet Lock init.
-    // Join the retained flight before durable identity or route ownership can
-    // be rotated or released.
+    // LocalAPI cancellation does not cancel an admitted Tailnet Lock init or
+    // local-disable transaction. Join both retained owners before durable
+    // identity or peer/route authority can be rotated or released.
     inner.tailnet_lock.join_init_flight().await;
+    inner.tailnet_lock.join_local_disable_flight().await;
     inner
         .task_aborts
         .lock()
@@ -1341,6 +1342,7 @@ impl Server {
                 b.peers.clone(),
                 b.wg_tunnels.clone(),
                 b.resolver.clone(),
+                b.user_dialer.clone(),
                 prefs.clone(),
                 b.route_table.clone(),
                 None,
@@ -1396,7 +1398,7 @@ impl Server {
         );
         rollback.track(map_update);
 
-        // MagicDNS responder: best-effort UDP server at 100.100.100.100:53.
+        // MagicDNS responder: best-effort UDP and TCP server at 100.100.100.100:53.
         // Binding to :53 typically requires root and the MagicDNS VIP to be
         // assigned to an interface; failure is non-fatal (dial still resolves
         // via the shared resolver). The responder serves A/AAAA/PTR for peer
@@ -1412,7 +1414,7 @@ impl Server {
         );
         match responder.spawn().await {
             Ok(handle) => {
-                rollback.track(handle);
+                rollback.track(handle.into_join_handle());
             }
             Err(e) => log::warn!(
                 "tsnet: MagicDNS responder not started ({e}); dial still resolves via netmap"
@@ -2053,6 +2055,7 @@ impl Server {
                 b.peers.clone(),
                 b.wg_tunnels.clone(),
                 b.resolver.clone(),
+                b.user_dialer.clone(),
                 prefs.clone(),
                 b.route_table.clone(),
                 router.clone(),

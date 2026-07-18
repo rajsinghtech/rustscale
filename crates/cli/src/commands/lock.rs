@@ -18,8 +18,9 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         "init" => init(&client, rest, json).await,
         "sign" => sign(&client, rest).await,
         "disable" => disable(&client, rest).await,
+        "local-disable" => local_disable(&client, rest).await,
         other => Err(CliError(format!(
-            "lock: unsupported subcommand '{other}' (supported: status, init, sign, disable)"
+            "lock: unsupported subcommand '{other}' (supported: status, init, sign, disable, local-disable)"
         ))),
     }
 }
@@ -37,10 +38,31 @@ async fn status(client: &LocalClient, args: &[String], json: bool) -> Result<(),
         return Ok(());
     }
     let enabled = status["Enabled"].as_bool().unwrap_or(false);
-    println!(
-        "Tailnet Lock is {}.",
-        if enabled { "ENABLED" } else { "NOT enabled" }
-    );
+    let local_disabled = status["LocalDisabled"].as_bool().unwrap_or(false);
+    let local_disable_pending = status["LocalDisablePending"].as_bool().unwrap_or(false);
+    if local_disabled || local_disable_pending {
+        if local_disabled {
+            println!("Tailnet Lock enforcement is LOCALLY DISABLED for this node.");
+        } else {
+            println!("Tailnet Lock local-disable state is awaiting fresh control confirmation.");
+        }
+        if !status["StateConsistent"].as_bool().unwrap_or(false) {
+            println!("Peer access is withdrawn until a fresh authenticated map confirms the denylisted authority.");
+        }
+        if status["LocalDisableCleanupPending"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            println!(
+                "Retired authority cleanup is incomplete; retry `rustscale lock local-disable`."
+            );
+        }
+    } else {
+        println!(
+            "Tailnet Lock is {}.",
+            if enabled { "ENABLED" } else { "NOT enabled" }
+        );
+    }
     if enabled && !status["StateConsistent"].as_bool().unwrap_or(false) {
         println!("Authority state is not synchronized; peer access is failing closed.");
     }
@@ -323,6 +345,18 @@ async fn disable(client: &LocalClient, args: &[String]) -> Result<(), CliError> 
     println!(
         "Disablement accepted; local enforcement remains until control confirms it in a netmap."
     );
+    Ok(())
+}
+
+async fn local_disable(client: &LocalClient, args: &[String]) -> Result<(), CliError> {
+    if !args.is_empty() {
+        return Err(CliError("usage: rustscale lock local-disable".into()));
+    }
+    client.tailnet_lock_force_local_disable().await?;
+    println!(
+        "Tailnet Lock enforcement is locally disabled for this node only; the authority state ID is durably denylisted."
+    );
+    println!("This does not disable Tailnet Lock for any other node in the tailnet.");
     Ok(())
 }
 

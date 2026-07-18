@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.4
+
+Patch release for idle application UDP latency and release-readiness hardening.
+
+- Fixed issue #75 by waking the netstack poll loop after a successful
+  `UdpListener::send_to` enqueue, preventing idle sends from waiting for the
+  one-second safety fallback and arriving in bursts.
+- Added notification-only netstack regression coverage and an isolated 20 Hz,
+  one-way tsnet interoperability cadence gate.
+- Added pinned, generated compatibility inventories for the CLI, Rust API, C
+  ABI, Python exports, LocalAPI, and conceptual tsnet surface. These inventories
+  classify differences; they do not claim blanket runtime parity.
+- Made Tailscale-compatible installer aliases fail closed and added a required
+  installed Linux systemd/TUN replacement journey against pinned Go tooling.
+- Added evidence-backed agent worktree/session reconciliation.
+- Added the node-local Tailnet Lock recovery escape hatch with profile-scoped,
+  bounded state-ID denylisting, retained traffic withdrawal, crash recovery,
+  and `rustscale lock local-disable`; full TKA parity remains incomplete.
+
 ## 0.1.3
 
 Linux artifact compatibility hotfix. GNU/Linux release binaries are built on

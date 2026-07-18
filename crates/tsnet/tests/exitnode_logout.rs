@@ -5,6 +5,7 @@
 //! Uses an in-process testcontrol fake control server — no external
 //! network access required.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -94,8 +95,9 @@ async fn exit_node_prefs_apply_routing() {
     let _addr = tc.start().await.expect("testcontrol start");
     let control_url = tc.base_url();
 
-    // Add a fake exit-node-capable peer.
-    tc.add_fake_node();
+    // Add an online peer with both approved default routes. The returned key
+    // is the route owner the LocalAPI mutation must install.
+    let exit_peer = tc.add_fake_exit_node("route-exit.fake-control.example.net.", true);
 
     let state_tmp = tempfile::tempdir().expect("state tempdir");
     let sock_tmp = tempfile::tempdir().expect("socket tempdir");
@@ -134,11 +136,8 @@ async fn exit_node_prefs_apply_routing() {
     };
     eprintln!("peer IP: {peer_ip}");
 
-    // The fake peer from add_fake_node is NOT exit-node-capable (it does not
-    // advertise both IPv4 and IPv6 defaults). We test prefs handling instead.
-    // PATCH prefs with ExitNodeIP — the route table should be updated
-    // (resolve_exit_node_peer returns None for non-exit peers, so the
-    // route is cleared — but the prefs are still saved).
+    // PATCH prefs with ExitNodeIP. The LocalAPI transaction must persist the
+    // selector and install the peer as both IPv4 and IPv6 catch-all owner.
     let patch_body = serde_json::json!({
         "ExitNodeIPSet": true,
         "ExitNodeIP": peer_ip.to_string()
@@ -156,6 +155,13 @@ async fn exit_node_prefs_apply_routing() {
         Some(peer_ip.to_string().as_str()),
         "ExitNodeIP should be saved in prefs"
     );
+    for public_ip in ["8.8.8.8", "2001:4860:4860::8888"] {
+        assert_eq!(
+            server.route_lookup(public_ip.parse::<IpAddr>().unwrap()),
+            Some(exit_peer.Key.clone()),
+            "{public_ip} should route through the selected exit node"
+        );
+    }
 
     // Clear the exit node pref.
     let clear_body = serde_json::json!({
@@ -172,6 +178,12 @@ async fn exit_node_prefs_apply_routing() {
     assert!(
         prefs.get("ExitNodeIP").is_none() || prefs["ExitNodeIP"].as_str() == Some(""),
         "ExitNodeIP should be cleared"
+    );
+    assert!(
+        server
+            .route_lookup("8.8.8.8".parse::<IpAddr>().unwrap())
+            .is_none(),
+        "clearing prefs should remove the daemon catch-all route"
     );
 
     server.close().await.unwrap();

@@ -187,11 +187,12 @@ jobs:
         env:
           RUSTSCALE_REQUIRE_LINUX_REPLACEMENT: '1'
           RUSTSCALE_LINUX_REPLACEMENT_TIMEOUT: '900'
+          RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE: ${{ runner.temp }}/linux-replacement.phase
           # This is a functional install/TUN gate. release.yml separately builds
           # and smokes the production thin-LTO artifacts.
           CARGO_PROFILE_RELEASE_LTO: 'off'
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
-          CARGO_PROFILE_RELEASE_OPT_LEVEL: '1'
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
         run: |
           # Keep privileged descendant descriptors off the runner log pipe so
           # the process-group deadline can return even during forced teardown.
@@ -200,9 +201,15 @@ jobs:
           tools/packaging/test-linux-replacement.sh >"$log" 2>&1 &
           journey_pid=$!
           (
+            last_phase=
             while kill -0 "$journey_pid" 2>/dev/null; do
+              phase=$(cat "$RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE" 2>/dev/null || echo starting)
+              if [[ "$phase" != "$last_phase" ]]; then
+                echo "::notice title=Linux replacement::phase=$phase"
+                last_phase=$phase
+              fi
+              echo "[linux-replacement] bounded journey still running (phase=$phase)"
               sleep 60
-              echo "[linux-replacement] bounded journey still running"
             done
           ) &
           heartbeat_pid=$!

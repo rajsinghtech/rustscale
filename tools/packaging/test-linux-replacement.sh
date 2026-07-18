@@ -20,6 +20,14 @@ skip() {
   exit 0
 }
 
+record_phase() {
+  local phase=$1
+  echo "$LABEL phase: $phase" >&2
+  if [[ -n "${RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE:-}" ]]; then
+    printf '%s\n' "$phase" >"$RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE"
+  fi
+}
+
 case "$REQUIRE" in
   0|1) ;;
   *) echo "$LABEL ERROR: RUSTSCALE_REQUIRE_LINUX_REPLACEMENT must be 0 or 1" >&2; exit 2 ;;
@@ -54,6 +62,7 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
         bash "$ROOT/tools/packaging/test-linux-replacement.sh"
 fi
 
+record_phase preflight
 for command_name in awk cargo curl find getconf go grep id install ip mktemp \
   python3 readlink sed sha256sum sudo systemctl tar tee timeout tr wc; do
   command -v "$command_name" >/dev/null 2>&1 \
@@ -429,10 +438,12 @@ PY
 }
 
 # Build every artifact before touching system state.
+record_phase rust-release-build
 echo "$LABEL building real release binaries and libraries" >&2
 cargo build --release --locked \
   -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
 
+record_phase pinned-go-build
 TESTCONTROL_BIN="$TMP/testcontrol"
 GO_CLIENT_DIR="$TMP/go-client"
 TESTCONTROL_OUTPUT="$TESTCONTROL_BIN" TESTCONTROL_GO_CLIENT_DIR="$GO_CLIENT_DIR" \
@@ -465,6 +476,7 @@ printf '%s  %s\n' "$(sha256sum "$RELEASE_DIR/$ARCHIVE" | awk '{print $1}')" "$AR
 
 # Start the standalone pinned-Go control plane and retain all logs for a failed
 # run without writing generated binaries into the checkout.
+record_phase control-start
 "$TESTCONTROL_BIN" >"$TMP/testcontrol.url" 2>"$TMP/testcontrol.log" &
 CONTROL_PID=$!
 CONTROL_URL=
@@ -514,6 +526,7 @@ sudo -n install -d -m 755 "$DROPIN_DIR"
 sudo -n install -m 644 "$TMP/rustscaled-install-journey.conf" \
   "$DROPIN_DIR/10-rustscale-install-journey.conf"
 
+record_phase install-and-first-start
 echo "$LABEL installing archive with explicit aliases and shipped systemd service" >&2
 INSTALL_SERVICE=1 PREFIX="$PREFIX" RUSTSCALE_RELEASE_BASE="file://$TMP/releases" \
   RUSTSCALE_HTTP_CLIENT=curl RUSTSCALE_UNAME_S=Linux \
@@ -547,6 +560,7 @@ verify_official_sentinels
 write_config yes "$TMP/config-with-key.json"
 sudo -n install -m 600 "$TMP/config-with-key.json" "$CONFIG_PATH"
 sudo -n systemctl restart rustscaled.service
+record_phase rust-node-enrollment
 running_status=$(wait_backend Running 320)
 RUST_IP=$(printf '%s' "$running_status" | status_ip)
 [[ "$RUST_IP" == 100.* ]] \
@@ -624,6 +638,7 @@ done
 BACKEND_PORT=$(<"$TMP/echo.port")
 [[ "$BACKEND_PORT" =~ ^[1-9][0-9]*$ ]]
 
+record_phase go-peer-start
 GO_STATE="$TMP/go-state"
 GO_SOCKET="$TMP/go-tailscaled.sock"
 mkdir -p "$GO_STATE"
@@ -653,6 +668,7 @@ PEER_PORT=18082
 "$GO_CLI" --socket="$GO_SOCKET" serve --bg --tcp="$PEER_PORT" \
   "tcp://127.0.0.1:$BACKEND_PORT" >>"$TMP/go-tailscaled.log" 2>&1
 
+record_phase kernel-roundtrip
 python3 - "$GO_IP" "$PEER_PORT" <<'PY'
 import socket
 import sys
@@ -683,6 +699,7 @@ PY
 
 # Remove the bootstrap key, then prove the persisted profile and address survive
 # an actual systemd restart without another registration credential.
+record_phase restart-persistence
 write_config no "$TMP/config-without-key.json"
 sudo -n install -m 600 "$TMP/config-without-key.json" "$CONFIG_PATH"
 PID_BEFORE=$(systemctl show -p MainPID --value rustscaled.service)
@@ -722,6 +739,7 @@ PY
 
 # Logout is durable before the LocalAPI call returns. Restart=always then starts
 # a fresh NeedsLogin generation; that generation must not retain TUN state.
+record_phase logout
 PID_BEFORE_LOGOUT=$(systemctl show -p MainPID --value rustscaled.service)
 /usr/local/bin/tailscale logout
 logged_out_status=$(wait_backend NeedsLogin 320)
@@ -736,6 +754,7 @@ verify_official_sentinels
 # Exercise the public uninstaller rather than cleaning files directly. Stateful
 # identity is intentionally retained by uninstall; this isolated test removes
 # it only after checking service, route/rule, socket, and artifact cleanup.
+record_phase uninstall
 echo "$LABEL uninstalling through scripts/install.sh" >&2
 uninstall_release | tee "$TMP/uninstall.log"
 if systemctl is-active --quiet rustscaled.service; then
@@ -769,5 +788,6 @@ sudo -n rm -rf /var/lib/rustscale /var/cache/rustscale /run/rustscale
 INSTALL_STARTED=0
 
 JOURNEY_FINISHED=1
+record_phase complete
 echo "$LABEL PASS: installed archive + explicit aliases + systemd + LocalAPI + restart/logout/uninstall" >&2
 echo "$LABEL PASS: real Linux tun0 packet roundtrip to pinned Go peer $GO_VERSION ($GO_IP:$PEER_PORT)" >&2

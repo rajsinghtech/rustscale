@@ -1752,11 +1752,13 @@ impl SecurityBlockReason {
 /// Linux removes a non-persistent TUN when its last descriptor drops; route
 /// teardown still names that interface, so pump-task ownership alone is too
 /// short-lived during restart and rollback.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct TunLifetimeRouter {
     inner: Box<dyn rustscale_router::Router>,
     _tun: Arc<dyn Tun>,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl rustscale_router::Router for TunLifetimeRouter {
     fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
         self.inner.up()
@@ -2696,11 +2698,13 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     struct TunLifetimeProbeRouter {
         tun: std::sync::Weak<dyn Tun>,
         closed_with_tun: Arc<std::sync::atomic::AtomicBool>,
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl rustscale_router::Router for TunLifetimeProbeRouter {
         fn up(&mut self) -> Result<(), rustscale_router::RouterError> {
             Ok(())
@@ -2722,6 +2726,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn managed_router_retains_tun_through_route_close() {
         let (tun, _inject) = rustscale_tun::MockTun::new("tun-lifetime", 1280);

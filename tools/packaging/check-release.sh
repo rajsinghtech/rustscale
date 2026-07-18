@@ -99,6 +99,9 @@ test -n "$preflight_line"
 test -n "$token_line"
 test "$preflight_line" -lt "$token_line"
 grep -Fq -- 'cargo test -p rustscale-tsnet --lib --no-run' tools/interop-tun.sh
+grep -Fq -- "target.get('name') == 'rustscale_tsnet'" tools/interop-tun.sh
+grep -Fq -- "'lib' in target.get('kind', [])" tools/interop-tun.sh
+grep -Fq -- "if ! \"\$TEST_BIN\" --ignored --list" tools/interop-tun.sh
 grep -Fq -- 'tests::interop_tun_rust_dials_go: test' tools/interop-tun.sh
 grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/interop-tun.sh
 grep -Fq -- '--nocapture --test-threads=1' tools/interop-tun.sh

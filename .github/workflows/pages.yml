@@ -24,18 +24,6 @@ on:
       - 'LICENSE'
       - '.github/workflows/pages.yml'
   pull_request:
-    paths:
-      - 'scripts/install.sh'
-      - 'scripts/install.ps1'
-      - 'site/**'
-      - 'assets/rustscale-logo.svg'
-      - 'PERFORMANCE.md'
-      - 'docs/benchmarks.md'
-      - 'docs/performance/**'
-      - 'tools/packaging/check-pages-performance.py'
-      - 'tools/packaging/test-install.sh'
-      - 'LICENSE'
-      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:

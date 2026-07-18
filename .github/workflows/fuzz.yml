@@ -1,17 +1,10 @@
 name: Fuzz
 
-# Short fuzz runs on PRs touching parser crates; daily longer run on cron.
+# Short fuzz runs on every PR; daily longer run on cron.
 # Crashes are uploaded as artifacts for triage.
 
 on:
   pull_request:
-    paths:
-      - 'crates/disco/**'
-      - 'crates/derp/**'
-      - 'crates/netcheck/**'
-      - 'crates/portmapper/**'
-      - 'fuzz/**'
-      - '.github/workflows/fuzz.yml'
   schedule:
     - cron: '0 4 * * *' # daily 04:00 UTC
   workflow_dispatch:

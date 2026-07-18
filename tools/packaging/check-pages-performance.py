@@ -473,7 +473,7 @@ def markdown_row(document: str, label: str, second_column: str) -> list[str]:
 def tracked_userspace(document: str) -> dict[str, dict[str, str]]:
     definitions = {
         "rustscale": "rustscale (after 10d)",
-        "tailscaled": "tailscaled",
+        "tailscaled": "tailscaled daemon proxy",
     }
     result: dict[str, dict[str, str]] = {}
     for product, label in definitions.items():

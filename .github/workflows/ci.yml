@@ -204,8 +204,23 @@ jobs:
           # the process-group deadline can return even during forced teardown.
           log="$RUNNER_TEMP/linux-replacement.log"
           set +e
+          timeout_marker="$RUNNER_TEMP/linux-replacement.timed-out"
           tools/packaging/test-linux-replacement.sh >"$log" 2>&1 &
           journey_pid=$!
+          python3 - "$journey_pid" "$timeout_marker" <<'PY' &
+          import os
+          import signal
+          import sys
+          import time
+
+          time.sleep(970)
+          open(sys.argv[2], "w", encoding="ascii").close()
+          try:
+              os.kill(int(sys.argv[1]), signal.SIGKILL)
+          except ProcessLookupError:
+              pass
+          PY
+          watchdog_pid=$!
           (
             last_phase=
             while kill -0 "$journey_pid" 2>/dev/null; do
@@ -221,8 +236,11 @@ jobs:
           heartbeat_pid=$!
           wait "$journey_pid"
           status=$?
-          kill "$heartbeat_pid" 2>/dev/null || true
-          wait "$heartbeat_pid" 2>/dev/null || true
+          kill "$heartbeat_pid" "$watchdog_pid" 2>/dev/null || true
+          wait "$heartbeat_pid" "$watchdog_pid" 2>/dev/null || true
+          if [[ -e "$timeout_marker" ]]; then
+            status=124
+          fi
           cat "$log"
           exit "$status"
 

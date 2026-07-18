@@ -338,6 +338,19 @@ impl Server {
         node
     }
 
+    /// Replace a node's advertised transport endpoints and notify every live
+    /// map stream. Tests use this to model a control-plane endpoint update
+    /// without depending on host STUN or DERP connectivity.
+    pub fn set_node_endpoints(&self, node_key: &NodePublic, endpoints: Vec<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(node) = inner.nodes.get_mut(node_key) {
+            node.Endpoints = endpoints;
+        }
+        for tx in inner.updates.values() {
+            let _ = tx.try_send(UpdateType::PeerChanged);
+        }
+    }
+
     /// Override the capability map sent to a specific client.
     pub fn set_node_cap_map(&self, node_key: &NodePublic, cap_map: NodeCapMap) {
         let mut inner = self.inner.lock().unwrap();

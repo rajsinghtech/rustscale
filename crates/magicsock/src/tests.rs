@@ -750,6 +750,105 @@ async fn netmap_key_rotation_removes_every_old_send_path() {
 }
 
 #[tokio::test]
+async fn rotated_disco_invalidates_stale_direct_path_after_peer_restart() {
+    let private_key = NodePrivate::generate();
+    let peer_key = NodePrivate::generate().public();
+    let first_disco = DiscoPrivate::generate().public();
+    let rotated_disco = DiscoPrivate::generate().public();
+    let old_addr: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+    let new_addr: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key,
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .expect("magicsock");
+
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            first_disco.clone(),
+            vec![old_addr.to_string()],
+            0,
+        )])
+        .await
+        .unwrap();
+    magicsock
+        .inner
+        .endpoints
+        .write()
+        .unwrap()
+        .get_mut(&peer_key)
+        .unwrap()
+        .confirm_direct(old_addr, std::time::Instant::now());
+    assert_eq!(magicsock.peer_path_class(&peer_key), PathClass::Direct);
+
+    // An ordinary endpoint refresh within one process keeps a recently
+    // confirmed path trusted, even if control has not yet delivered every
+    // candidate. A process restart must therefore be signaled by disco-key
+    // rotation rather than inferred from endpoint churn.
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            first_disco,
+            vec![new_addr.to_string()],
+            0,
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        magicsock
+            .inner
+            .endpoints
+            .read()
+            .unwrap()
+            .get(&peer_key)
+            .unwrap()
+            .best_path(std::time::Instant::now())
+            .addr(),
+        Some(old_addr)
+    );
+
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            rotated_disco,
+            vec![new_addr.to_string()],
+            0,
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        magicsock.peer_path_class(&peer_key),
+        PathClass::None,
+        "rotated discovery identity must discard trust in the prior UDP socket"
+    );
+    assert_eq!(
+        magicsock
+            .inner
+            .endpoints
+            .read()
+            .unwrap()
+            .get(&peer_key)
+            .unwrap()
+            .candidates(),
+        vec![new_addr]
+    );
+}
+
+#[tokio::test]
 async fn netmap_refreshes_peer_disco_key_and_reverse_map() {
     let private_key = NodePrivate::generate();
     let peer_key = NodePrivate::generate().public();

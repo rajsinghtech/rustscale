@@ -103,6 +103,7 @@ grep -Fq -- "target.get('name') == 'rustscale_tsnet'" tools/interop-tun.sh
 grep -Fq -- "'lib' in target.get('kind', [])" tools/interop-tun.sh
 grep -Fq -- "if ! \"\$TEST_BIN\" --ignored --list" tools/interop-tun.sh
 grep -Fq -- 'tests::interop_tun_rust_dials_go: test' tools/interop-tun.sh
+grep -Fq -- 'sudo did not preserve the required interop environment' tools/interop-tun.sh
 grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/interop-tun.sh
 grep -Fq -- '--nocapture --test-threads=1' tools/interop-tun.sh
 grep -Fq 'up_tun failed after privileged TUN prerequisites were established' crates/tsnet/src/tests.rs

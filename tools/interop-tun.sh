@@ -246,6 +246,19 @@ if ! "$TEST_BIN" --ignored --list \
   exit 1
 fi
 
+# Confirm sudo preserved every variable required by interop_env(). Otherwise the
+# ignored test would return early and libtest would still report one passing test.
+if ! sudo -E sh -c "
+  test -n \"\${TS_E2E_AUTHKEY:-}\" &&
+  test -n \"\${TS_INTEROP_GO_IP:-}\" &&
+  test -n \"\${TS_INTEROP_GO_NAME:-}\" &&
+  test -n \"\${TS_INTEROP_GO_ECHO_PORT:-}\" &&
+  test -n \"\${TS_INTEROP_SOCKS:-}\"
+"; then
+  echo "[interop-tun] ERROR: sudo did not preserve the required interop environment" >&2
+  exit 1
+fi
+
 # Run one exact, serial regression gate under sudo with env passed through.
 # It asserts the kernel interface/rules/routes and completes an echo roundtrip.
 echo "[interop-tun] running focused TUN regression gate under sudo..." >&2

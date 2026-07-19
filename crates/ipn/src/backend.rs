@@ -107,6 +107,9 @@ pub struct BackendInputs {
     pub num_live: i32,
     /// Number of active DERP relay connections.
     pub live_derps: i32,
+    /// Set only by the lifecycle owner after it has committed the complete
+    /// startup generation. Map and engine observations cannot set it.
+    pub startup_ready: bool,
 }
 
 struct BackendInner {
@@ -120,6 +123,25 @@ struct BackendInner {
     /// `LocalBackend.loggedOut`, derived from `Prefs.LoggedOut`. Set via
     /// [`IpnBackend::set_logged_out`].
     logged_out: bool,
+    /// Monotonically increasing lifecycle admission token. Only this token's
+    /// final commit can make the backend publicly Running.
+    startup_generation: u64,
+}
+
+fn state_machine_inputs(inner: &BackendInner) -> StateMachineInputs {
+    StateMachineInputs {
+        want_running: inner.inputs.want_running,
+        logged_out: inner.logged_out,
+        blocked: inner.blocked,
+        has_node_key: inner.inputs.has_node_key,
+        netmap_present: inner.inputs.netmap_present,
+        auth_cant_continue: inner.inputs.auth_cant_continue,
+        key_expired: inner.inputs.key_expired,
+        machine_authorized: inner.inputs.machine_authorized,
+        num_live: inner.inputs.num_live,
+        live_derps: inner.inputs.live_derps,
+        startup_ready: inner.inputs.startup_ready,
+    }
 }
 
 /// The IPN backend: current state + inputs + notification bus.
@@ -149,6 +171,7 @@ impl IpnBackend {
                 inputs: BackendInputs::default(),
                 blocked: false,
                 logged_out: false,
+                startup_generation: 0,
             }),
             bus: NotifyBus::new(),
             state_change_callbacks: Hooks::new(),
@@ -418,20 +441,7 @@ impl IpnBackend {
         let mut inner = self.inner.lock().unwrap();
         update(&mut inner.inputs);
 
-        let sm_inputs = StateMachineInputs {
-            want_running: inner.inputs.want_running,
-            logged_out: inner.logged_out,
-            blocked: inner.blocked,
-            has_node_key: inner.inputs.has_node_key,
-            netmap_present: inner.inputs.netmap_present,
-            auth_cant_continue: inner.inputs.auth_cant_continue,
-            key_expired: inner.inputs.key_expired,
-            machine_authorized: inner.inputs.machine_authorized,
-            num_live: inner.inputs.num_live,
-            live_derps: inner.inputs.live_derps,
-        };
-
-        let new_state = next_state(&sm_inputs, inner.state);
+        let new_state = next_state(&state_machine_inputs(&inner), inner.state);
         if new_state != inner.state {
             inner.state = new_state;
             let notification = self.queue_notification(PendingNotification::State(new_state));
@@ -439,6 +449,67 @@ impl IpnBackend {
             self.dispatch_notification(notification);
         }
         new_state
+    }
+
+    /// Admit a lifecycle-owned startup generation and revoke all prior
+    /// readiness evidence before control or engine tasks can report it.
+    pub fn begin_startup_generation(&self) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner.startup_generation = inner.startup_generation.wrapping_add(1).max(1);
+        inner.inputs.want_running = true;
+        inner.inputs.netmap_present = false;
+        inner.inputs.num_live = 0;
+        inner.inputs.live_derps = 0;
+        inner.inputs.startup_ready = false;
+        inner.blocked = true;
+        let generation = inner.startup_generation;
+        let new_state = next_state(&state_machine_inputs(&inner), inner.state);
+        if new_state != inner.state {
+            inner.state = new_state;
+            let notification = self.queue_notification(PendingNotification::State(new_state));
+            drop(inner);
+            self.dispatch_notification(notification);
+        }
+        generation
+    }
+
+    /// Publish Running for `generation` only after the lifecycle owner has
+    /// transferred all startup resources and its LocalAPI handoff to the live
+    /// runtime. A stale generation is rejected without changing state.
+    pub fn commit_startup_generation(&self, generation: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.startup_generation != generation {
+            return false;
+        }
+        inner.inputs.startup_ready = true;
+        inner.blocked = false;
+        let new_state = next_state(&state_machine_inputs(&inner), inner.state);
+        if new_state != inner.state {
+            inner.state = new_state;
+            let notification = self.queue_notification(PendingNotification::State(new_state));
+            drop(inner);
+            self.dispatch_notification(notification);
+        }
+        true
+    }
+
+    /// Revoke a generation during cancellation or failed startup. Late map
+    /// and engine events remain telemetry and cannot restore Running.
+    pub fn cancel_startup_generation(&self, generation: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.startup_generation != generation {
+            return false;
+        }
+        inner.inputs.startup_ready = false;
+        inner.blocked = true;
+        let new_state = next_state(&state_machine_inputs(&inner), inner.state);
+        if new_state != inner.state {
+            inner.state = new_state;
+            let notification = self.queue_notification(PendingNotification::State(new_state));
+            drop(inner);
+            self.dispatch_notification(notification);
+        }
+        true
     }
 
     /// Set `want_running` to true and re-evaluate.
@@ -472,11 +543,26 @@ impl IpnBackend {
     }
 
     /// Set engine status (num_live, live_derps) and re-evaluate.
+    ///
+    /// A backend that was never admitted by a lifecycle owner retains the
+    /// historic embedding behavior: live engine telemetry establishes its
+    /// initial readiness. Once a generation has been admitted, telemetry is
+    /// never allowed to publish Running; only `commit_startup_generation` can.
     pub fn set_engine_status(&self, num_live: i32, live_derps: i32) -> State {
-        self.update_inputs(|i| {
-            i.num_live = num_live;
-            i.live_derps = live_derps;
-        })
+        let mut inner = self.inner.lock().unwrap();
+        inner.inputs.num_live = num_live;
+        inner.inputs.live_derps = live_derps;
+        if inner.startup_generation == 0 && (num_live > 0 || live_derps > 0) {
+            inner.inputs.startup_ready = true;
+        }
+        let new_state = next_state(&state_machine_inputs(&inner), inner.state);
+        if new_state != inner.state {
+            inner.state = new_state;
+            let notification = self.queue_notification(PendingNotification::State(new_state));
+            drop(inner);
+            self.dispatch_notification(notification);
+        }
+        new_state
     }
 
     /// Set the `blocked` flag and re-evaluate the state machine.
@@ -489,19 +575,7 @@ impl IpnBackend {
     pub fn set_blocked(&self, blocked: bool) -> State {
         let mut inner = self.inner.lock().unwrap();
         inner.blocked = blocked;
-        let sm_inputs = StateMachineInputs {
-            want_running: inner.inputs.want_running,
-            logged_out: inner.logged_out,
-            blocked: inner.blocked,
-            has_node_key: inner.inputs.has_node_key,
-            netmap_present: inner.inputs.netmap_present,
-            auth_cant_continue: inner.inputs.auth_cant_continue,
-            key_expired: inner.inputs.key_expired,
-            machine_authorized: inner.inputs.machine_authorized,
-            num_live: inner.inputs.num_live,
-            live_derps: inner.inputs.live_derps,
-        };
-        let new_state = next_state(&sm_inputs, inner.state);
+        let new_state = next_state(&state_machine_inputs(&inner), inner.state);
         if new_state == inner.state {
             drop(inner);
         } else {
@@ -522,19 +596,7 @@ impl IpnBackend {
     pub fn set_logged_out(&self, logged_out: bool) -> State {
         let mut inner = self.inner.lock().unwrap();
         inner.logged_out = logged_out;
-        let sm_inputs = StateMachineInputs {
-            want_running: inner.inputs.want_running,
-            logged_out: inner.logged_out,
-            blocked: inner.blocked,
-            has_node_key: inner.inputs.has_node_key,
-            netmap_present: inner.inputs.netmap_present,
-            auth_cant_continue: inner.inputs.auth_cant_continue,
-            key_expired: inner.inputs.key_expired,
-            machine_authorized: inner.inputs.machine_authorized,
-            num_live: inner.inputs.num_live,
-            live_derps: inner.inputs.live_derps,
-        };
-        let new_state = next_state(&sm_inputs, inner.state);
+        let new_state = next_state(&state_machine_inputs(&inner), inner.state);
         if new_state == inner.state {
             drop(inner);
         } else {
@@ -786,6 +848,33 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("callback deadlocked on its child notification");
         assert_eq!(backend.state(), State::NeedsLogin);
+    }
+
+    #[test]
+    fn lifecycle_generation_rejects_stale_telemetry_and_commit() {
+        let backend = IpnBackend::new("test");
+        let first = backend.begin_startup_generation();
+        backend.set_has_node_key(true);
+        backend.set_machine_authorized(true);
+        backend.set_netmap_present(true);
+        backend.set_engine_status(4, 1);
+        assert_eq!(backend.state(), State::Starting);
+
+        // A down/up admission revokes every observation from the first
+        // generation. Neither its late engine event nor its final commit may
+        // publish Running for the replacement generation.
+        let second = backend.begin_startup_generation();
+        assert_ne!(first, second);
+        backend.set_has_node_key(true);
+        backend.set_machine_authorized(true);
+        backend.set_netmap_present(true);
+        backend.set_engine_status(99, 99);
+        assert_eq!(backend.state(), State::Starting);
+        assert!(!backend.commit_startup_generation(first));
+        assert_eq!(backend.state(), State::Starting);
+
+        assert!(backend.commit_startup_generation(second));
+        assert_eq!(backend.state(), State::Running);
     }
 
     #[tokio::test]

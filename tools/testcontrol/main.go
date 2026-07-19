@@ -67,6 +67,7 @@ func main() {
 	mux.HandleFunc("/testapi/nodes", handleNodes(control))
 	mux.HandleFunc("/testapi/raw-map-response", handleRawMapResponse(control))
 	mux.HandleFunc("/testapi/health", handleHealth)
+	mux.HandleFunc("/testapi/audit-log", handleAuditLogStats(control))
 
 	// 5. Start the plain-HTTP test control server on 127.0.0.1:0.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -332,7 +333,38 @@ func handleRawMapResponse(control *testcontrol.Server) http.HandlerFunc {
 	}
 }
 
+type auditLogStatsResponse struct {
+	Accepted     uint64 `json:"accepted"`
+	Rejected     uint64 `json:"rejected"`
+	Action       string `json:"action"`
+	DetailsLen   int    `json:"detailsLen"`
+	TimestampSet bool   `json:"timestampSet"`
+	BodySHA256   string `json:"bodySHA256"`
+	LastError    string `json:"lastError"`
+}
+
+func handleAuditLogStats(control *testcontrol.Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		stats := control.AuditLogStats()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(auditLogStatsResponse{
+			Accepted: stats.Accepted, Rejected: stats.Rejected,
+			Action: string(stats.Action), DetailsLen: stats.DetailsLen,
+			TimestampSet: stats.TimestampSet, BodySHA256: stats.LastBodySHA256,
+			LastError: stats.LastError,
+		})
+	}
+}
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"ok":true}`)
 }

@@ -195,7 +195,7 @@ async fn dispatch(
         "logout" => commands::logout::run(args, &socket_path).await,
         "down" => commands::down::run(args, &socket_path).await,
         "set" => commands::set::run(args, &socket_path).await,
-        "get" => commands::get::run(args, &socket_path).await,
+        "get" => commands::get::run(args, &socket_path, json).await,
         "serve" => commands::serve::run(args, &socket_path, json).await,
         "funnel" => commands::serve::run_funnel(args, &socket_path, json).await,
         "switch" => commands::switch::run(args, &socket_path, json).await,

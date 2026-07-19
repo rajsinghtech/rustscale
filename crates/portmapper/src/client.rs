@@ -2815,6 +2815,18 @@ mod tests {
             .any(|cached| cached.lease_expires.is_none()));
         gate.resume().await;
         client.set_test_release_gate(None);
+
+        let error = client
+            .shutdown(Duration::from_secs(2))
+            .await
+            .expect_err("permanent UPnP deletion unexpectedly confirmed");
+        assert!(matches!(
+            error,
+            crate::PortMapError::ExternalReleaseUnconfirmed
+        ));
+        let work = client.inner.work.lock().unwrap();
+        assert_eq!(work.send_in_flight, 0);
+        assert!(work.send_terminal, "typed uncertainty preceded send drain");
     }
 
     #[tokio::test]

@@ -190,7 +190,7 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
 fi
 
 record_phase preflight
-for command_name in awk cargo curl date find getconf go grep id install ip journalctl \
+for command_name in awk cargo cmp cp curl date find getconf go grep id install ip journalctl \
   mktemp ps python3 readlink sed setpriv sha256sum sudo systemctl systemd-run tail tar \
   tee timeout tr wc; do
   command -v "$command_name" >/dev/null 2>&1 \
@@ -296,6 +296,8 @@ JOURNEY_ENV=/etc/default/rustscaled-install-journey
 PREFIX=/usr/local
 DEFAULT_SOCKET=/var/run/rustscaled.sock
 TUN_NAME=tun0
+DNS_BASELINE_TARGET=$(readlink -f /etc/resolv.conf)
+cp -L /etc/resolv.conf "$TMP/resolv.conf.baseline"
 
 stop_pid() {
   local pid=$1 label=$2
@@ -961,6 +963,109 @@ for _ in range(40):
         last = error
         time.sleep(0.5)
 raise SystemExit(f"post-restart Go peer echo failed: {last}")
+PY
+
+# Prove public down/up is an in-process lifecycle transition rather than a
+# daemon restart. Both commands must return only after their kernel and LocalAPI
+# state is immediately truthful, while persisted identity remains unchanged.
+record_phase public-down-up-lifecycle
+run_bounded 15 enable-lifecycle-dns \
+  /usr/local/bin/tailscale set --accept-dns=true
+PID_LIFECYCLE=$(timeout --signal=KILL 5s \
+  systemctl show -p MainPID --value rustscaled.service)
+[[ "$PID_LIFECYCLE" =~ ^[1-9][0-9]*$ ]]
+NODE_COUNT_BEFORE=$(node_count)
+NODE_IDENTITY_BEFORE=$(curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
+  | python3 -c 'import json,sys; wanted=sys.argv[1]; nodes=json.load(sys.stdin)["nodes"]; matches=[node for node in nodes if (node.get("ip") or "").split("/",1)[0] == wanted]; assert len(matches) == 1; node=matches[0]; print("{}|{}|{}".format(node["key"], node["id"], node["ip"]))' "$RUST_IP")
+DNS_ACTIVE_TARGET=$(readlink -f /etc/resolv.conf)
+cp -L /etc/resolv.conf "$TMP/resolv.conf.active"
+
+run_bounded 45 public-down /usr/local/bin/tailscale down
+DOWN_STATUS=$(run_bounded 10 immediate-down-status \
+  /usr/local/bin/tailscale status --json)
+[[ "$(printf '%s' "$DOWN_STATUS" | backend_state)" == Stopped ]]
+run_bounded 10 immediate-down-prefs \
+  /usr/local/bin/tailscale get --json \
+  | python3 -c 'import json,sys; prefs=json.load(sys.stdin); assert prefs["WantRunning"] is False; assert prefs.get("LoggedOut", False) is False'
+[[ "$(timeout --signal=KILL 5s systemctl show -p MainPID --value rustscaled.service)" \
+   == "$PID_LIFECYCLE" ]]
+[[ ! -e "/sys/class/net/$TUN_NAME" ]]
+for family in -4 -6; do
+  ! timeout --signal=KILL 5s ip "$family" -details rule show \
+    | grep -E 'proto 201([[:space:]]|$)' >/dev/null
+  ! timeout --signal=KILL 5s ip "$family" route show table 52 \
+    | grep -F "dev $TUN_NAME" >/dev/null
+done
+[[ "$(readlink -f /etc/resolv.conf)" == "$DNS_BASELINE_TARGET" ]]
+cmp -s "$TMP/resolv.conf.baseline" /etc/resolv.conf
+run_bounded 15 peer-withdrawal python3 - "$GO_IP" "$PEER_PORT" <<'PY'
+import socket
+import sys
+host, port = sys.argv[1], int(sys.argv[2])
+for _ in range(4):
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            raise SystemExit("peer remained reachable after public down")
+    except OSError:
+        pass
+print("peer reachability withdrawn: ok")
+PY
+
+run_bounded 90 public-up \
+  /usr/local/bin/tailscale up --accept-dns=true --timeout=60
+UP_STATUS=$(run_bounded 10 immediate-up-status \
+  /usr/local/bin/tailscale status --json)
+[[ "$(printf '%s' "$UP_STATUS" | backend_state)" == Running ]]
+[[ "$(printf '%s' "$UP_STATUS" | status_ip)" == "$RUST_IP" ]]
+run_bounded 10 immediate-up-prefs \
+  /usr/local/bin/tailscale get --json \
+  | python3 -c 'import json,sys; prefs=json.load(sys.stdin); assert prefs["WantRunning"] is True; assert prefs.get("LoggedOut", False) is False; assert prefs["CorpDNS"] is True'
+[[ "$(timeout --signal=KILL 5s systemctl show -p MainPID --value rustscaled.service)" \
+   == "$PID_LIFECYCLE" ]]
+[[ -d "/sys/class/net/$TUN_NAME" ]]
+ifindex=$(<"/sys/class/net/$TUN_NAME/ifindex")
+[[ "$ifindex" =~ ^[1-9][0-9]*$ ]]
+RULE_BASE=$((5000 + (ifindex % 200) * 100))
+rules=$(timeout --signal=KILL 5s ip -4 -details rule show)
+for expectation in \
+  "$((RULE_BASE + 10)):lookup main" \
+  "$((RULE_BASE + 30)):lookup default" \
+  "$((RULE_BASE + 50)):unreachable" \
+  "$((RULE_BASE + 70)):lookup 52"; do
+  preference=${expectation%%:*}
+  target=${expectation#*:}
+  rule=$(printf '%s\n' "$rules" \
+    | grep -E "^[[:space:]]*${preference}:.*proto 201([[:space:]]|$)" || true)
+  [[ -n "$rule" && "$rule" == *"$target"* ]]
+done
+timeout --signal=KILL 5s ip -4 route show table 52 \
+  | grep -E "^100[.]64[.]0[.]0/10 .*dev $TUN_NAME([[:space:]]|$)" >/dev/null
+[[ "$(readlink -f /etc/resolv.conf)" == "$DNS_ACTIVE_TARGET" ]]
+cmp -s "$TMP/resolv.conf.active" /etc/resolv.conf
+[[ "$(node_count)" == "$NODE_COUNT_BEFORE" ]]
+NODE_IDENTITY_AFTER=$(curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
+  | python3 -c 'import json,sys; wanted=sys.argv[1]; nodes=json.load(sys.stdin)["nodes"]; matches=[node for node in nodes if (node.get("ip") or "").split("/",1)[0] == wanted]; assert len(matches) == 1; node=matches[0]; print("{}|{}|{}".format(node["key"], node["id"], node["ip"]))' "$RUST_IP")
+[[ "$NODE_IDENTITY_AFTER" == "$NODE_IDENTITY_BEFORE" ]]
+run_bounded 120 lifecycle-restored-roundtrip \
+  python3 - "$GO_IP" "$PEER_PORT" <<'PY'
+import socket
+import sys
+import time
+payload = b"public-down-up-roundtrip\n"
+last = None
+for _ in range(40):
+    try:
+        with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2) as connection:
+            connection.settimeout(2)
+            connection.sendall(payload)
+            received = connection.recv(len(payload))
+            if received == payload:
+                raise SystemExit(0)
+            raise RuntimeError(f"echo mismatch: {received!r}")
+    except (OSError, RuntimeError) as error:
+        last = error
+        time.sleep(0.5)
+raise SystemExit(f"post-up Go peer echo failed: {last}")
 PY
 
 # Logout is durable before the LocalAPI call returns. Restart=always then starts

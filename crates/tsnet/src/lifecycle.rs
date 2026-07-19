@@ -833,6 +833,17 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     }
 }
 
+fn close_os_dns_configurator(
+    configurator: &mut Option<Box<dyn OsConfigurator + Send>>,
+) -> Result<(), String> {
+    let Some(owner) = configurator.as_mut() else {
+        return Ok(());
+    };
+    owner.close().map_err(|error| error.to_string())?;
+    configurator.take();
+    Ok(())
+}
+
 async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningState, String)> {
     // Extension shutdown has succeeded, so dependencies owned by the router,
     // DNS configurator, and magicsock can now be released.
@@ -842,12 +853,10 @@ async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningSta
             return Err((inner, format!("route cleanup: {error}")));
         }
     }
-    if let Some(configurator) = inner.os_dns_configurator.as_mut() {
-        if let Err(error) = configurator.close() {
-            log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {error}");
-        }
+    if let Err(error) = close_os_dns_configurator(&mut inner.os_dns_configurator) {
+        log::warn!("tsnet: retaining OS DNS cleanup owner: {error}");
+        return Err((inner, format!("OS DNS cleanup: {error}")));
     }
-    inner.os_dns_configurator.take();
     match shutdown_magicsock(&inner.magicsock).await {
         Ok(PortmapperCleanup::Confirmed) => {}
         Ok(PortmapperCleanup::ExternalReleaseUnconfirmed) => {

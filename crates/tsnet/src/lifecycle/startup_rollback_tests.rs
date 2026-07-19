@@ -71,6 +71,42 @@ impl OsConfigurator for CloseDns {
     }
 }
 
+struct RetryDns(Arc<AtomicUsize>);
+
+impl OsConfigurator for RetryDns {
+    fn set_dns(&mut self, _: &OsConfig) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn close(&mut self) -> std::io::Result<()> {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(std::io::Error::other("injected DNS restoration failure"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn supports_split_dns(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn dns_close_failure_retains_owner_for_lifecycle_retry() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut owner: Option<Box<dyn OsConfigurator + Send>> =
+        Some(Box::new(RetryDns(Arc::clone(&attempts))));
+
+    let first = close_os_dns_configurator(&mut owner);
+    assert!(first.is_err(), "DNS restoration failure was acknowledged");
+    assert!(owner.is_some(), "failed DNS cleanup owner was dropped");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    close_os_dns_configurator(&mut owner).expect("retry did not restore DNS");
+    assert!(owner.is_none(), "successful DNS cleanup owner was retained");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
 struct DropCount(Arc<AtomicUsize>);
 
 impl Drop for DropCount {

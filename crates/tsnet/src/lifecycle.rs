@@ -1727,6 +1727,8 @@ impl Server {
             let state = localapi::LocalApiState {
                 mutation_fence: Arc::clone(&localapi_mutation_fence),
                 mutation_generation: localapi_mutation_generation,
+                #[cfg(test)]
+                status_build_hook: None,
                 peers: b.peers.clone(),
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
@@ -2404,6 +2406,8 @@ impl Server {
             let state = localapi::LocalApiState {
                 mutation_fence: Arc::clone(&localapi_mutation_fence),
                 mutation_generation: localapi_mutation_generation,
+                #[cfg(test)]
+                status_build_hook: None,
                 peers: b.peers.clone(),
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
@@ -2988,6 +2992,8 @@ impl Server {
         let api_state = Arc::new(localapi::LocalApiState {
             mutation_fence: Arc::clone(&mutation_fence),
             mutation_generation,
+            #[cfg(test)]
+            status_build_hook: None,
             peers: Arc::new(RwLock::new(vec![])),
             routecheck: None,
             user_profiles: Arc::new(RwLock::new(BTreeMap::new())),

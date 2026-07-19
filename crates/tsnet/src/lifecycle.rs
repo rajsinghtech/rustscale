@@ -2716,6 +2716,22 @@ impl Server {
     pub async fn start_localapi_only(
         &mut self,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
+        self.start_localapi_with_state(false).await
+    }
+
+    /// Recreate LocalAPI after `down` without restoring the retired runtime.
+    /// The persisted node key remains available for a subsequent `up`, but
+    /// backend status is truthfully `Stopped` rather than `NeedsLogin`.
+    pub async fn start_localapi_stopped(
+        &mut self,
+    ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
+        self.start_localapi_with_state(true).await
+    }
+
+    async fn start_localapi_with_state(
+        &mut self,
+        stopped: bool,
+    ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
         self.shutdown_supervisor.wait().await;
         self.startup_supervisor.wait().await;
         if self.shutdown_supervisor.has_retained_logout()
@@ -2736,11 +2752,13 @@ impl Server {
         Self::retry_pending_router_cleanup().await?;
 
         let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
-        ipn_backend.set_want_running();
-        ipn_backend.set_auth_cant_continue(true);
-        // Block engine updates while waiting for auth — mirrors Go's
-        // blockEngineUpdatesLocked(true) on NeedsLogin enter.
-        ipn_backend.set_blocked(true);
+        if !stopped {
+            ipn_backend.set_want_running();
+            ipn_backend.set_auth_cant_continue(true);
+            // Block engine updates while waiting for auth — mirrors Go's
+            // blockEngineUpdatesLocked(true) on NeedsLogin enter.
+            ipn_backend.set_blocked(true);
+        }
 
         let state = self.load_startup_state()?;
         let was_fresh = state.is_zero();
@@ -2753,8 +2771,20 @@ impl Server {
         };
         ipn_backend.set_has_node_key(!state.is_zero());
 
-        let prefs = self.load_prefs().unwrap_or_default();
-        let prefs = Arc::new(RwLock::new(prefs));
+        let loaded_prefs = self.load_prefs().unwrap_or_default();
+        if stopped {
+            // A logged-out profile must remain NeedsLogin; a retained identity
+            // with WantRunning=false is the distinct Stopped state.
+            ipn_backend.set_logged_out(loaded_prefs.LoggedOut);
+            ipn_backend.update_inputs(|inputs| {
+                inputs.want_running = false;
+                inputs.auth_cant_continue = false;
+                inputs.netmap_present = false;
+                inputs.num_live = 0;
+                inputs.live_derps = 0;
+            });
+        }
+        let prefs = Arc::new(RwLock::new(loaded_prefs));
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let command_tx_clone = command_tx.clone();

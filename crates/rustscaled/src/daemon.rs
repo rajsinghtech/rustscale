@@ -378,6 +378,10 @@ async fn run_with_auth_key(
     }
 
     let mut server = builder.build()?;
+    // Keep the daemon command channel across direct enrollment too. Without
+    // this pre-started LocalAPI generation, `down` from a TS_AUTHKEY daemon
+    // could persist WantRunning=false but leave its live TUN/routes/DNS up.
+    let mut command_rx = server.start_localapi_only().await?;
 
     if tun {
         let config = TunModeConfig {
@@ -400,29 +404,73 @@ async fn run_with_auth_key(
     }
     print_status(&server, socket_path);
 
-    // Wait for either shutdown or logout. A transient register/disk/cleanup
-    // failure resumes the retained transaction rather than falling through to
-    // close and silently abandoning its remaining phases.
+    // Wait for shutdown, logout, or a durable LocalAPI `down` command.
+    // A transient register/disk/cleanup failure resumes the retained
+    // transaction rather than falling through to close and silently
+    // abandoning its remaining phases.
     let logout_trigger = server.logout_trigger();
     let config_path_clone = config_path.clone();
     let mut shutdown = Box::pin(wait_for_shutdown_signal(config_path_clone.as_ref()));
-    let logout_requested = tokio::select! {
-        () = shutdown.as_mut() => false,
-        () = async {
-            if let Some(ref trigger) = logout_trigger {
-                trigger.notified().await;
-            } else {
-                std::future::pending::<()>().await;
+    loop {
+        tokio::select! {
+            () = shutdown.as_mut() => break,
+            () = async {
+                if let Some(ref trigger) = logout_trigger {
+                    trigger.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                log::info!("rustscaled: logout requested");
+                if matches!(
+                    finish_server_logout_until_shutdown(&mut server, shutdown.as_mut()).await?,
+                    DaemonLogoutDisposition::StopNow
+                ) {
+                    return Ok(());
+                }
+                break;
             }
-        } => true,
-    };
-    if logout_requested {
-        log::info!("rustscaled: logout requested");
-        if matches!(
-            finish_server_logout_until_shutdown(&mut server, shutdown.as_mut()).await?,
-            DaemonLogoutDisposition::StopNow
-        ) {
-            return Ok(());
+            Some(command) = command_rx.recv() => match command {
+                DaemonCommand::Down => {
+                    log::info!("rustscaled: down requested via LocalAPI");
+                    close_server(&mut server).await?;
+                    command_rx = server.start_localapi_stopped().await?;
+                    match drive_login_until_running(
+                        &mut server,
+                        &mut command_rx,
+                        tun,
+                        config_path.as_ref(),
+                        shutdown.as_mut(),
+                    ).await? {
+                        LoginLoopOutcome::Running => {
+                            log::info!("rustscaled: resumed retained node (hostname={hostname})");
+                            print_status(&server, socket_path);
+                        }
+                        LoginLoopOutcome::Shutdown | LoginLoopOutcome::CommandsClosed => break,
+                    }
+                }
+                DaemonCommand::Logout => {
+                    log::info!("rustscaled: logout requested via LocalAPI command");
+                    if matches!(
+                        finish_server_logout_until_shutdown(&mut server, shutdown.as_mut()).await?,
+                        DaemonLogoutDisposition::StopNow
+                    ) {
+                        return Ok(());
+                    }
+                    break;
+                }
+                DaemonCommand::Shutdown => break,
+                DaemonCommand::ReloadConfig => {
+                    if let Some(ref cp) = config_path {
+                        server.reload_config(cp.to_str().unwrap_or("")).await?;
+                    }
+                }
+                DaemonCommand::SwitchProfile(id) => server.switch_profile(&id).await?,
+                DaemonCommand::Start { .. } | DaemonCommand::LoginInteractive => {
+                    // The direct-auth generation is already live. A repeated
+                    // `up` only changes prefs through its preceding PATCH.
+                }
+            },
         }
     }
 
@@ -540,6 +588,11 @@ where
             }
             DaemonCommand::LoginInteractive => {
                 server.clear_auth_key();
+            }
+            DaemonCommand::Down => {
+                // Already stopped: preserve the LocalAPI listener and durable
+                // identity, so repeated `down` is idempotent.
+                continue;
             }
             DaemonCommand::Logout => {
                 server.fail_pending_logout_requests("server is not logged in");
@@ -702,6 +755,34 @@ async fn run_interactive(
             }
             Some(cmd) = command_rx.recv() => {
                 match cmd {
+                    DaemonCommand::Down => {
+                        // `PATCH /prefs {WantRunning:false}` committed before
+                        // this command was sent. Retire every generation-owned
+                        // data-plane resource, then re-admit only LocalAPI in
+                        // Stopped state so `up` can resume with the same node
+                        // identity without a daemon restart.
+                        log::info!("rustscaled: down requested via LocalAPI");
+                        close_server(&mut server).await?;
+                        command_rx = server.start_localapi_stopped().await?;
+                        match drive_login_until_running(
+                            &mut server,
+                            &mut command_rx,
+                            tun,
+                            config_path.as_ref(),
+                            shutdown.as_mut(),
+                        ).await? {
+                            LoginLoopOutcome::Running => {
+                                if tun {
+                                    log::info!("rustscaled: resumed TUN mode (hostname={hostname})");
+                                } else {
+                                    log::info!("rustscaled: resumed node (hostname={hostname})");
+                                }
+                                print_status(&server, socket_path);
+                            }
+                            LoginLoopOutcome::Shutdown => break,
+                            LoginLoopOutcome::CommandsClosed => break,
+                        }
+                    }
                     DaemonCommand::Shutdown => {
                         log::debug!("rustscaled: shutdown requested via LocalAPI");
                         break;
@@ -1064,6 +1145,76 @@ mod tests {
             .await
             .expect("restarted server close timed out")
             .expect("restarted server close failed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn localapi_down_withdraws_runtime_and_up_reuses_identity() {
+        let mut control = rustscale_testcontrol::Server::new();
+        control.start().await.unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let socket = state_dir.path().join("down-up.sock");
+        let mut server = rustscale_tsnet::Server::builder()
+            .hostname("down-up")
+            .auth_key("tskey-test-down-up")
+            .control_url(control.base_url())
+            .state_dir(state_dir.path())
+            .localapi_path(&socket)
+            .disable_portmapping(true)
+            .build()
+            .unwrap();
+        let mut commands = server.start_localapi_only().await.unwrap();
+        Box::pin(server.up()).await.unwrap();
+        let original_node_key = control.all_nodes()[0].Key.clone();
+        let client = rustscale_localclient::LocalClient::new(&socket);
+
+        client
+            .edit_prefs(&rustscale_ipn::MaskedPrefs {
+                Prefs: rustscale_ipn::Prefs {
+                    WantRunning: false,
+                    ..Default::default()
+                },
+                WantRunningSet: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(rustscale_tsnet::localapi::DaemonCommand::Down)
+        ));
+
+        server.close().await.unwrap();
+        commands = server.start_localapi_stopped().await.unwrap();
+        let stopped = client.status().await.unwrap();
+        assert_eq!(stopped["BackendState"], "Stopped");
+
+        client
+            .start(&rustscale_ipn::StartOptions {
+                UpdatePrefs: Some(rustscale_ipn::MaskedPrefs {
+                    Prefs: rustscale_ipn::Prefs {
+                        WantRunning: true,
+                        ..Default::default()
+                    },
+                    WantRunningSet: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+        assert_eq!(
+            drive_login_until_running(&mut server, &mut commands, false, None, shutdown.as_mut())
+                .await
+                .unwrap(),
+            LoginLoopOutcome::Running
+        );
+        assert_eq!(control.num_nodes(), 1);
+        assert_eq!(control.all_nodes()[0].Key, original_node_key);
+        assert_eq!(server.ipn_status().await.unwrap().BackendState, "Running");
+        server.close().await.unwrap();
     }
 
     #[cfg(unix)]

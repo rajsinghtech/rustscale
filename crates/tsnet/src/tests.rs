@@ -1353,6 +1353,28 @@ fn builder_sets_ephemeral_flag() {
 }
 
 #[tokio::test]
+async fn stopped_localapi_keeps_identity_and_reports_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("stopped.sock");
+    let mut server = Server::builder()
+        .state_dir(dir.path())
+        .localapi_path(&socket)
+        .build()
+        .unwrap();
+
+    let commands = server.start_localapi_stopped().await.unwrap();
+    let status = rustscale_localclient::LocalClient::new(&socket)
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(status["BackendState"], "Stopped");
+    assert_eq!(status["HaveNodeKey"], true);
+
+    drop(commands);
+    server.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn prelogin_localapi_preferences_feed_initial_registration_config() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = Server::builder()

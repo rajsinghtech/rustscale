@@ -461,13 +461,16 @@ pub(crate) fn global_dial_admission() -> Arc<DialAdmission> {
 }
 
 /// Commands sent from LocalAPI handlers to the daemon for actions that
-/// require server-level operations (start, login, logout).
+/// require server-level operations (start, login, down, logout).
 #[derive(Clone)]
 pub enum DaemonCommand {
     Start {
         auth_key: Option<String>,
     },
     LoginInteractive,
+    /// Retire the live data-plane generation while retaining a stopped
+    /// LocalAPI generation for a later `up`.
+    Down,
     Logout,
     Shutdown,
     /// Re-read the config file and apply the resulting prefs. Fired by
@@ -488,6 +491,7 @@ impl std::fmt::Debug for DaemonCommand {
                 .field("auth_key", &auth_key.as_ref().map(|_| "<redacted>"))
                 .finish(),
             Self::LoginInteractive => formatter.write_str("LoginInteractive"),
+            Self::Down => formatter.write_str("Down"),
             Self::Logout => formatter.write_str("Logout"),
             Self::Shutdown => formatter.write_str("Shutdown"),
             Self::ReloadConfig => formatter.write_str("ReloadConfig"),
@@ -2026,6 +2030,17 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
                 "disconnect requested via LocalAPI",
             ) {
                 log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
+            }
+        }
+        // The durable preference commit above is deliberately before this
+        // command. A daemon restart between the two therefore stays down;
+        // the daemon owns the actual generation teardown and replaces this
+        // listener with a stopped LocalAPI generation when it completes.
+        if let Some(command_tx) = &state.command_tx {
+            if command_tx.send(DaemonCommand::Down).is_err() {
+                let error = serde_json::json!({"error": "daemon lifecycle loop is unavailable"});
+                write_json_response(conn, 503, "Service Unavailable", &error).await?;
+                return Ok(());
             }
         }
     }
@@ -8861,6 +8876,29 @@ mod tests {
             assert!(response.contains("503 Service Unavailable"), "{response}");
             assert!(response.contains("daemon command owner stopped"), "{response}");
         }
+    }
+
+    #[tokio::test]
+    async fn down_pref_commit_notifies_daemon_after_durable_update() {
+        let mut state = make_test_state().await;
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        Arc::get_mut(&mut state).unwrap().command_tx = Some(command_tx);
+        let request = serde_json::to_vec(&MaskedPrefs {
+            Prefs: Prefs {
+                WantRunning: false,
+                ..Default::default()
+            },
+            WantRunningSet: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let (mut conn, _peer) = tokio::io::duplex(4096);
+        handle_patch_prefs(&mut conn, &request, &state)
+            .await
+            .unwrap();
+
+        assert!(!state.prefs.read().await.WantRunning);
+        assert!(matches!(command_rx.recv().await, Some(DaemonCommand::Down)));
     }
 
     #[test]

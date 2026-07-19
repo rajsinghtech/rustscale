@@ -986,15 +986,21 @@ DOWN_STATUS=$(run_bounded 10 immediate-down-status \
 [[ "$(printf '%s' "$DOWN_STATUS" | backend_state)" == Stopped ]]
 run_bounded 10 immediate-down-prefs \
   /usr/local/bin/tailscale get --json \
-  | python3 -c 'import json,sys; prefs=json.load(sys.stdin); assert prefs["WantRunning"] is False; assert prefs.get("LoggedOut", False) is False'
+  | python3 -c 'import json,sys; prefs=json.load(sys.stdin); assert isinstance(prefs, dict); assert prefs.get("WantRunning", False) is False; assert prefs.get("LoggedOut", False) is False; assert prefs.get("CorpDNS") is True'
 [[ "$(timeout --signal=KILL 5s systemctl show -p MainPID --value rustscaled.service)" \
    == "$PID_LIFECYCLE" ]]
 [[ ! -e "/sys/class/net/$TUN_NAME" ]]
 for family in -4 -6; do
-  ! timeout --signal=KILL 5s ip "$family" -details rule show \
-    | grep -E 'proto 201([[:space:]]|$)' >/dev/null
-  ! timeout --signal=KILL 5s ip "$family" route show table 52 \
-    | grep -F "dev $TUN_NAME" >/dev/null
+  rules=$(timeout --signal=KILL 5s ip "$family" -details rule show)
+  if grep -Eq 'proto 201([[:space:]]|$)' <<<"$rules"; then
+    echo "$LABEL ERROR: protocol-201 rule remained after public down ($family)" >&2
+    exit 1
+  fi
+  routes=$(timeout --signal=KILL 5s ip "$family" route show table 52)
+  if grep -Fq "dev $TUN_NAME" <<<"$routes"; then
+    echo "$LABEL ERROR: table-52 route remained after public down ($family)" >&2
+    exit 1
+  fi
 done
 [[ "$(readlink -f /etc/resolv.conf)" == "$DNS_BASELINE_TARGET" ]]
 cmp -s "$TMP/resolv.conf.baseline" /etc/resolv.conf

@@ -5,13 +5,13 @@ use rustscale_localclient::LocalClient;
 use crate::flags::parse_bool_flag;
 use crate::CliError;
 
-pub async fn run(args: Vec<String>, socket: &Path) -> Result<(), CliError> {
+pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), CliError> {
     let lc = LocalClient::new(socket);
-    let json = parse_bool_flag(&args, "json").unwrap_or(false);
+    let want_json = json || parse_bool_flag(&args, "json").unwrap_or(false);
 
     let prefs = lc.get_prefs().await?;
 
-    if json {
+    if want_json {
         println!(
             "{}",
             serde_json::to_string_pretty(&prefs).unwrap_or_default()

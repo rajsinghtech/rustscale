@@ -4253,19 +4253,20 @@ impl Inner {
             health.note_derp_region_frame(region_id);
         }
 
-        // Record the route only while source authorization is ordered against
-        // map replacement. The generation is rechecked again at enqueue.
+        // Authorization identifies which endpoint may receive this frame, but
+        // WireGuard ciphertext remains unauthenticated until the engine
+        // consumes it. Route and status evidence are therefore recorded only
+        // by `handle_disco_derp` after its authenticated disco envelope check.
+        // The generation is rechecked again at enqueue.
         let (node_addr, generation) = {
             let _ordering = self.authorization_delivery_barrier.read().await;
             let Some(generation) = self.peer_authorization.generation(&source) else {
                 return;
             };
-            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
-            let Some(endpoint) = endpoints.get_mut(&source) else {
+            let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+            let Some(endpoint) = endpoints.get(&source) else {
                 return;
             };
-            endpoint.set_last_recv_derp_region(region_id);
-            endpoint.note_derp_transport(region_id, true);
             (endpoint.node_addr(), generation)
         };
 
@@ -4282,7 +4283,7 @@ impl Inner {
         }
 
         if is_disco {
-            self.handle_disco_derp(data, source).await;
+            self.handle_disco_derp(data, source, region_id).await;
         } else {
             // WG datagram via DERP — account only after peer lookup and before
             // delivery. Disco/control frames took the branch above.
@@ -4749,7 +4750,7 @@ impl Inner {
         }
     }
 
-    async fn handle_disco_derp(&self, packet: &[u8], source: NodePublic) {
+    async fn handle_disco_derp(&self, packet: &[u8], source: NodePublic, region_id: i32) {
         let (sender_disco, msg) = match self.disco.open(packet) {
             Some(v) => v,
             None => return,
@@ -4761,18 +4762,23 @@ impl Inner {
             return;
         };
 
-        // Look up the peer's DERP send region (last-recv-region > HomeDERP).
+        // The envelope has authenticated the peer and the DERP frame names
+        // its actual region, so this is the sole point where DERP can refresh
+        // routing or public path status. Ciphertext alone cannot do either.
         let derp_region = {
-            let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
-            endpoints
-                .get(&source)
-                .map_or(0, endpoint::Endpoint::derp_send_region)
+            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+            let Some(endpoint) = endpoints.get_mut(&source) else {
+                return;
+            };
+            endpoint.set_last_recv_derp_region(region_id);
+            endpoint.note_derp_transport(region_id, true);
+            endpoint.derp_send_region()
         };
 
         match msg {
             Message::Ping(ping) => {
-                // Respond with a Pong via the peer's DERP region (arrival
-                // region is already recorded by handle_derp_packet).
+                // Respond with a Pong via the peer's authenticated DERP
+                // region recorded above.
                 let pong = Message::Pong(Pong {
                     tx_id: ping.tx_id,
                     src: rustscale_disco::AddrPort::new(

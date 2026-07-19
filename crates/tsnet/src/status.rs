@@ -13,7 +13,14 @@ use rustscale_tailcfg::Node;
 /// `ipnstate::PeerStatus` fields. A configured candidate never becomes a
 /// direct/relay claim: only a current authenticated transport observation does.
 pub(crate) fn apply_path_telemetry(status: &mut PeerStatus, telemetry: PathTelemetry) {
+    // StatusBuilder may reuse a PeerStatus. Clear every mutually-exclusive
+    // path field before copying the one currently authenticated observation,
+    // so a direct -> DERP -> idle transition cannot leak a stale label.
     status.Active = telemetry.fresh;
+    status.CurAddr.clear();
+    status.Relay.clear();
+    status.PeerRelay.clear();
+    status.LastHandshake = DateTime::UNIX_EPOCH;
     status.LastSeen = telemetry
         .last_rx_at
         .map(DateTime::<Utc>::from)
@@ -199,6 +206,69 @@ mod tests {
         assert!(idle.CurAddr.is_empty());
         assert!(idle.Relay.is_empty());
         assert!(idle.PeerRelay.is_empty());
+    }
+
+    #[test]
+    fn reused_status_clears_previous_path_fields_on_each_transition() {
+        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let direct_addr = "198.51.100.7:41641".parse().unwrap();
+        let mut status = PeerStatus::default();
+
+        apply_path_telemetry(
+            &mut status,
+            PathTelemetry {
+                class: PathClass::Direct,
+                addr: Some(direct_addr),
+                observed_at: Some(at),
+                last_rx_at: Some(at),
+                fresh: true,
+                ..Default::default()
+            },
+        );
+        assert!(status.Active);
+        assert_eq!(status.CurAddr, direct_addr.to_string());
+        assert_eq!(status.LastSeen, DateTime::<Utc>::from(at));
+        assert_eq!(status.LastHandshake, DateTime::<Utc>::from(at));
+
+        apply_path_telemetry(
+            &mut status,
+            PathTelemetry {
+                class: PathClass::Derp,
+                derp_region: Some(7),
+                observed_at: Some(at + std::time::Duration::from_secs(1)),
+                last_rx_at: Some(at + std::time::Duration::from_secs(1)),
+                fresh: true,
+                ..Default::default()
+            },
+        );
+        assert!(status.Active);
+        assert!(status.CurAddr.is_empty());
+        assert_eq!(status.Relay, "derp-7");
+        assert!(status.PeerRelay.is_empty());
+        assert_eq!(
+            status.LastSeen,
+            DateTime::<Utc>::from(at + std::time::Duration::from_secs(1))
+        );
+        assert_eq!(status.LastHandshake, DateTime::UNIX_EPOCH);
+
+        apply_path_telemetry(
+            &mut status,
+            PathTelemetry {
+                observed_at: Some(at + std::time::Duration::from_secs(1)),
+                last_rx_at: Some(at + std::time::Duration::from_secs(1)),
+                fresh: false,
+                ..Default::default()
+            },
+        );
+        assert!(!status.Active);
+        assert!(status.CurAddr.is_empty());
+        assert!(status.Relay.is_empty());
+        assert!(status.PeerRelay.is_empty());
+        assert_eq!(
+            status.LastSeen,
+            DateTime::<Utc>::from(at + std::time::Duration::from_secs(1))
+        );
+        assert_eq!(status.LastHandshake, DateTime::UNIX_EPOCH);
     }
 
     #[test]

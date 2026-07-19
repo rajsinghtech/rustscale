@@ -2438,9 +2438,7 @@ pub(crate) async fn authorize_request_head<W: AsyncWrite + Unpin>(
         return Ok(Some(max_body));
     };
 
-    if is_mutating_request(&head.method, endpoint)
-        && state.mutation_fence.generation() != state.mutation_generation
-    {
+    if stale_listener_blocks_route(state, &head.method, endpoint) {
         write_json_response(
             conn,
             409,
@@ -2622,6 +2620,21 @@ async fn admit_mutation<'a, W: AsyncWrite + Unpin>(
     Ok(permit)
 }
 
+/// A listener accepted immediately before an atomic pathname handoff can
+/// finish its request after the replacement commits. Its state snapshot is
+/// from the retired generation, so it must never report the replacement's
+/// Running state (or a watch notification for it) as its own readiness. A
+/// stale status remains useful while startup is still `Starting`, but it is
+/// rejected before it could expose `Running`.
+fn stale_listener_blocks_route(state: &LocalApiState, method: &str, endpoint: &str) -> bool {
+    if state.mutation_fence.generation() == state.mutation_generation {
+        return false;
+    }
+    is_mutating_request(method, endpoint)
+        || matches!(endpoint, "watch-ipn-bus" | "debug")
+        || (endpoint == "status" && state.ipn_backend.state() == rustscale_ipn::State::Running)
+}
+
 /// Classify the complete LocalAPI mutation surface before route dispatch.
 /// Diagnostic/read operations remain available to a draining stale listener,
 /// including POST-shaped reads such as ping, dial, check-prefs, and routecheck.
@@ -2737,6 +2750,19 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     }
 
     let endpoint = &path[API_PREFIX.len()..];
+    // `dispatch` is also used by in-memory LocalAPI clients in tests. Keep
+    // the same stale-generation readiness fence as the production head phase
+    // so no caller can observe a retired listener as Running.
+    if stale_listener_blocks_route(state, method, endpoint) {
+        write_json_response(
+            conn,
+            409,
+            "Conflict",
+            &serde_json::json!({"error": "stale LocalAPI listener generation"}),
+        )
+        .await?;
+        return Ok(());
+    }
 
     // Generation and peer-identity admission is one route-level decision made
     // before any mutating handler can observe or persist state. Holding the
@@ -7373,7 +7399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_listener_generation_fences_every_mutating_route_but_allows_reads() {
+    async fn stale_listener_generation_cannot_publish_readiness() {
         let state = make_test_state().await;
         let old_prefs = state.prefs.read().await.clone();
         let handoff = state
@@ -7420,11 +7446,24 @@ mod tests {
 
         for request in [
             &b"GET /localapi/v0/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"[..],
-            &b"POST /localapi/v0/check-prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..],
+            &b"GET /localapi/v0/watch-ipn-bus?mask=2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"[..],
+            &b"GET /localapi/v0/debug?action=status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"[..],
         ] {
             let response = send_request_to_state(request, &state).await;
-            assert!(!response.contains("409 Conflict"), "read was fenced: {response}");
+            assert!(
+                response.contains("409 Conflict"),
+                "stale listener published readiness: {response}"
+            );
         }
+        let response = send_request_to_state(
+            b"POST /localapi/v0/check-prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            &state,
+        )
+        .await;
+        assert!(
+            !response.contains("409 Conflict"),
+            "non-readiness diagnostic was fenced: {response}"
+        );
         assert_eq!(*state.prefs.read().await, old_prefs);
         assert!(!state.ipn_backend.logged_out());
     }

@@ -704,14 +704,18 @@ status_ip() {
 }
 
 wait_backend() {
-  local expected=$1 seconds=${2:-60} output state deadline
+  local expected=$1 seconds=${2:-60} expected_ipv4=${3:-} output state observed_ipv4 deadline
   deadline=$((SECONDS + seconds))
-  echo "$LABEL $(timestamp) wait: LocalAPI BackendState=$expected (deadline=${seconds}s)" >&2
+  echo "$LABEL $(timestamp) wait: LocalAPI BackendState=$expected${expected_ipv4:+ IPv4=$expected_ipv4} (deadline=${seconds}s)" >&2
   while (( SECONDS < deadline )); do
     if output=$(timeout --signal=KILL 3s \
         /usr/local/bin/tailscale status --json 2>/dev/null); then
       state=$(printf '%s' "$output" | backend_state 2>/dev/null || true)
-      if [[ "$state" == "$expected" ]]; then
+      observed_ipv4=$(printf '%s' "$output" | status_ip 2>/dev/null || true)
+      # A Running answer is readiness evidence only when this one LocalAPI
+      # snapshot also carries the expected current-generation tailnet IP.
+      if [[ "$state" == "$expected" \
+        && ( -z "$expected_ipv4" || "$observed_ipv4" == "$expected_ipv4" ) ]]; then
         printf '%s' "$output"
         return 0
       fi
@@ -722,7 +726,7 @@ wait_backend() {
     timeout --signal=KILL 3s systemctl is-active --quiet rustscaled.service || true
     sleep 0.25
   done
-  echo "$LABEL $(timestamp) ERROR: timed out waiting for LocalAPI BackendState=$expected" >&2
+  echo "$LABEL $(timestamp) ERROR: timed out waiting for LocalAPI BackendState=$expected${expected_ipv4:+ IPv4=$expected_ipv4}" >&2
   timeout --signal=KILL 5s systemctl status rustscaled.service --no-pager >&2 || true
   return 1
 }
@@ -1063,7 +1067,10 @@ sudo -n timeout --signal=KILL 5s cat /var/lib/rustscale/prefs.json \
 PID_BEFORE=$(timeout --signal=KILL 5s \
   systemctl show -p MainPID --value rustscaled.service)
 run_root_bounded 45 restart-without-key systemctl restart rustscaled.service
-persisted_status=$(wait_backend Running 80)
+# Require one current-generation LocalAPI snapshot to prove both Running
+# and the original IPv4 identity after restart; a stale handoff listener or
+# cache may not satisfy this readiness boundary.
+persisted_status=$(wait_backend Running 80 "$RUST_IP")
 PID_AFTER=$(timeout --signal=KILL 5s \
   systemctl show -p MainPID --value rustscaled.service)
 [[ "$PID_BEFORE" =~ ^[1-9][0-9]*$ && "$PID_AFTER" =~ ^[1-9][0-9]*$ ]] \

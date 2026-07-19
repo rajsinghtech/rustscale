@@ -1125,6 +1125,8 @@ pub(crate) struct Bootstrap {
     pub(crate) key_expired: Arc<std::sync::atomic::AtomicBool>,
     /// IPN state machine backend (shared with LocalApiState).
     pub(crate) ipn_backend: Arc<IpnBackend>,
+    /// Admission token whose owner alone may publish public Running.
+    pub(crate) startup_generation: u64,
     /// Shared map-session state for delta-tracking across reconnections.
     pub(crate) map_session: Arc<MapSessionState>,
     /// Per-label socket TX/RX counter registry (shared with magicsock,

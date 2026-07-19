@@ -1923,8 +1923,12 @@ impl Server {
 
         self.inner = Some(running);
         // Publish Running only after the complete runtime generation is owned
-        // by `self.inner`; cancellation before this point retains Starting.
-        startup_backend.set_blocked(false);
+        // by `self.inner`; stale map/engine callbacks have no publication
+        // authority. Cancellation before this point remains non-Running.
+        assert!(
+            startup_backend.commit_startup_generation(b.startup_generation),
+            "startup generation was superseded before commit"
+        );
         if retire_prestarted {
             self.retire_prestarted_after_handoff();
         }
@@ -2606,7 +2610,13 @@ impl Server {
             extension_subscription,
         });
 
-        startup_backend.set_blocked(false);
+        // This is the sole TUN-mode Running publication point: TUN/router,
+        // DNS outcome, pump tasks, LocalAPI handoff, and cleanup ownership are
+        // now all part of `self.inner`.
+        assert!(
+            startup_backend.commit_startup_generation(b.startup_generation),
+            "startup generation was superseded before commit"
+        );
         if retire_prestarted {
             self.retire_prestarted_after_handoff();
         }
@@ -3215,15 +3225,16 @@ impl Server {
         // increments with no error paths.
         let sockstats = Arc::new(rustscale_sockstats::SockStats::new());
 
-        // IPN state machine backend. Created early so state transitions
-        // are tracked from the start. Want_running is set immediately;
-        // other inputs are set as bootstrap progresses.
+        // Admit a new startup transaction before any control/map task can
+        // report telemetry. This revokes the stopped generation's stale map
+        // and engine observations and keeps public state non-Running until
+        // the final ownership + LocalAPI handoff commit below.
         let ipn_backend = if let Some(ref ps) = self.pre_started {
             ps.backend.clone()
         } else {
             Arc::new(IpnBackend::new("rustscale"))
         };
-        ipn_backend.set_want_running();
+        let startup_generation = ipn_backend.begin_startup_generation();
 
         // 1. Generate persistent key material when no state was loaded.
         let was_fresh = state.is_zero();
@@ -4076,6 +4087,7 @@ impl Server {
             overrides: self.config.overrides.clone(),
             key_expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ipn_backend,
+            startup_generation,
             map_session,
             sockstats,
             backend_log_id,

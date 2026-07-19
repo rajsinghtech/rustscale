@@ -47,7 +47,7 @@ MATRIX_MANIFEST_PATH="/dev/null"
 MATRIX_OBSERVED_PATH="/dev/null"
 DURATION=10
 PEER_COUNT=1
-PARALLELISM_CSV="1,10,100"
+PARALLELISM_CSV="1,10,100,500,1000"
 MATRIX_PRESET="custom"
 LOAD_PRESET="routine-v1"
 TOPOLOGY_SOURCE="explicit"
@@ -233,9 +233,9 @@ matrix_authkey_file_self_test() {
   local directory mode args secret=tskey-fixture-sentinel
   directory=$(mktemp -d) || return 1
   TMPDIR="$directory" matrix_create_authkey_file "$secret" || return 1
-  mode=$(stat -f %Lp "$ACTIVE_AUTHKEY_FILE" 2>/dev/null || stat -c %a "$ACTIVE_AUTHKEY_FILE") || return 1
+  mode=$(portable_file_mode "$ACTIVE_AUTHKEY_FILE") || return 1
   [[ "$mode" == 600 && "$(cat "$ACTIVE_AUTHKEY_FILE")" == "$secret" ]] || return 1
-  REPEAT=3; PARALLELISM_CSV=1,10,100; DURATION=10; PEER_COUNT=1
+  REPEAT=3; PARALLELISM_CSV=1,10,100,500,1000; DURATION=10; PEER_COUNT=1
   MATRIX_MANIFEST_PATH=/dev/null; MATRIX_OBSERVED_PATH=/dev/null
   matrix_build_run_config_args rs-userspace s c sz cz "$ACTIVE_AUTHKEY_FILE" out srv cli
   args="${RUN_CONFIG_ARGS[*]}"
@@ -278,7 +278,7 @@ matrix_profile_self_test() {
   local config
   local -a calls=()
   REPEAT=4
-  PARALLELISM_CSV="1,10,100"
+  PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
   PROFILE=1
@@ -294,9 +294,9 @@ matrix_profile_self_test() {
   unset -f matrix_test_record_run_config matrix_test_record_profile
 
   [[ ${#calls[@]} -eq 3 ]] || return 1
-  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz /tmp/profile-authkey-file dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz /tmp/profile-authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
 }
 
 # Build the directly invocable run-config command shape used by each cell.
@@ -343,7 +343,7 @@ matrix_parse_args() {
   DRY_RUN=0
   PROFILE=0
   REPEAT=3
-  PARALLELISM_CSV="1,10,100"
+  PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
   SCALE_STREAMS=0
@@ -391,7 +391,7 @@ matrix_parse_args() {
       --repeat)
         (( seen_repeat == 0 )) || { echo "duplicate option: --repeat" >&2; return 2; }
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
-        [[ "$2" =~ ^[1-9]$ ]] || { echo "--repeat must be an integer in 1..=9" >&2; return 2; }
+        [[ "$2" =~ ^[3-9]$ ]] || { echo "--repeat must be an integer in 3..=9" >&2; return 2; }
         REPEAT="$2"; seen_repeat=1; shift 2 ;;
       --parallelism)
         (( seen_parallelism == 0 && seen_scale == 0 )) || { echo "--parallelism conflicts with a duplicate or --scale-streams" >&2; return 2; }
@@ -400,7 +400,7 @@ matrix_parse_args() {
         PARALLELISM_CSV="$2"; LOAD_PRESET=custom; seen_parallelism=1; shift 2 ;;
       --scale-streams)
         (( seen_scale == 0 && seen_parallelism == 0 )) || { echo "--scale-streams conflicts with a duplicate or --parallelism" >&2; return 2; }
-        PARALLELISM_CSV="1,2,4,8,16,32,64,100,200,500,1000"; LOAD_PRESET=scale-streams-v1; SCALE_STREAMS=1; seen_scale=1; shift ;;
+        PARALLELISM_CSV="1,10,100,500,1000"; LOAD_PRESET=routine-v1; SCALE_STREAMS=1; seen_scale=1; shift ;;
       --duration)
         (( seen_duration == 0 )) || { echo "duplicate option: --duration" >&2; return 2; }
         [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 3 && "$2" -le 120 ]] || { echo "--duration must be an integer in 3..=120" >&2; return 2; }
@@ -434,20 +434,21 @@ validate_matrix_parallelism_csv() {
     [[ "$seen" != *",$item,"* ]] || { echo "duplicate --parallelism value: $item" >&2; return 1; }
     seen+="$item,"
   done
+  [[ "$csv" == "1,10,100,500,1000" ]] || { echo "--parallelism must be exactly 1,10,100,500,1000" >&2; return 1; }
 }
 
 matrix_option_parsing_self_test() {
   local actual status
   actual=$(matrix_parse_args; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
   [[ "$actual" == '3/0/0/0///' ]] || return 1
-  actual=$(matrix_parse_args --full --repeat 1 --profile --topology same-zone --path direct --config rs-tun,ts-tun; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
-  [[ "$actual" == '1/1/0/1/same-zone/direct/rs-tun,ts-tun' ]] || return 1
+  actual=$(matrix_parse_args --full --repeat 3 --profile --topology same-zone --path direct --config rs-tun,ts-tun; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
+  [[ "$actual" == '3/1/0/1/same-zone/direct/rs-tun,ts-tun' ]] || return 1
   actual=$(matrix_parse_args --dry-run --help --not-an-error; printf '%s/%s/%s\n' "$DRY_RUN" "$SHOW_HELP" "$REPEAT") || return 1
   [[ "$actual" == '1/1/3' ]] || return 1
-  actual=$(matrix_parse_args --parallelism 1,10,100,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
-  [[ "$actual" == '1,10,100,1000/20/250' ]] || return 1
+  actual=$(matrix_parse_args --parallelism 1,10,100,500,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
+  [[ "$actual" == '1,10,100,500,1000/20/250' ]] || return 1
   actual=$(matrix_parse_args --scale-streams; printf '%s' "$PARALLELISM_CSV") || return 1
-  [[ "$actual" == '1,2,4,8,16,32,64,100,200,500,1000' ]] || return 1
+  [[ "$actual" == '1,10,100,500,1000' ]] || return 1
   local -a case_args=()
   for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--full --full' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1 --parallelism 2' '--scale-streams --scale-streams' '--scale-streams --parallelism 1' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001'; do
     read -r -a case_args <<< "$args"
@@ -673,7 +674,7 @@ matrix_write_manifest() {
   [[ "$repeat" =~ ^[1-9][0-9]*$ ]] || return 1
   for value in "${parallelism[@]}"; do [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1; done
   local selected_load_preset="$LOAD_PRESET"
-  [[ "$selected_load_preset" != routine-v1 || "${parallelism[*]}" == "1 10 100" ]] || selected_load_preset=custom
+  [[ "$selected_load_preset" != routine-v1 || "${parallelism[*]}" == "1 10 100 500 1000" ]] || selected_load_preset=custom
   [[ "$selected_load_preset" != scale-streams-v1 || "${parallelism[*]}" == "1 2 4 8 16 32 64 100 200 500 1000" ]] || selected_load_preset=custom
   [[ "$dry_run" == 1 ]] && dry_flag=(--dry-run)
   python3 tools/bench/gcp/provenance.py manifest "$output" \
@@ -793,13 +794,13 @@ def result(root, status):
     if status=="ok":
         series={"rss_peak_kb":1,"rss_avg_kb":1,"cpu_peak_pct":0,"cpu_avg_pct":0,"samples":1,"missing_samples":0,"sample_cadence_s":1,"clock":"monotonic","series":[{"offset_ms":0,"rss_kb":1,"cpu_pct":0,"included_processes":["1:rustscaled","2:rustscale-bench"],"status":"observed"}],"series_truncated":False}
         scope={"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
-        samples=list(range(1,51))
+        samples=list(range(1,201))
         common.update({"error":"","transport":"kernel-tcp","throughput":[{"parallel":1,"mbps":1.0,"duration_s":10,"samples_mbps":[1.0],"statistic":"median","min_mbps":1.0,"max_mbps":1.0,"population_stddev_mbps":0.0,"coefficient_of_variation_pct":0.0}],
           "warmup_evidence":{"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_secs":3,"parallel":1,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"},
           "throughput_trials":[{"parallel":1,"repeat_index":1,"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_s":10,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"}],
-          "latency":{"protocol":"RSB1-tcp-pingpong","requested":50,"successful":50,"timed_out":0,"malformed":0,"count":50,"min_ns":1,"mean_ns":25.5,"p50_ns":26,"p95_ns":48,"p99_ns":50,"max_ns":50,"min_us":0.001,"mean_us":0.0255,"p50_us":0.026,"p95_us":0.048,"p99_us":0.05,"max_us":0.05,"samples_ns":samples},
+          "latency":{"protocol":"RSB1-tcp-pingpong","requested":200,"successful":200,"timed_out":0,"malformed":0,"count":200,"min_ns":1,"mean_ns":100.5,"p50_ns":101,"p95_ns":190,"p99_ns":198,"max_ns":200,"min_us":0.001,"mean_us":0.1005,"p50_us":0.101,"p95_us":0.19,"p99_us":0.198,"max_us":0.2,"samples_ns":samples},
           "footprint":dict(series,binary_size_bytes=1,subject="rustscaled",scope=scope),
-          "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3,"max_attempts":1},"client_lifecycle":"new_benchmark_process_per_trial","transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,"latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"latency_count":50,"transport_path":"kernel-tcp-via-rustscaled-tun","userspace_portmapping":"not-applicable"},
+          "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3,"max_attempts":1},"client_lifecycle":"new_benchmark_process_per_trial","transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,"latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"latency_count":200,"transport_path":"kernel-tcp-via-rustscaled-tun","userspace_portmapping":"not-applicable"},
           "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,"server":dict(series,endpoint="server",subjects=["rustscaled","rustscale-bench"],scope=scope,binary_identities=[obs["product"]["server"][1],obs["product"]["server"][2]]),"client":dict(series,endpoint="client",subjects=["rustscaled","rustscale-bench"],scope=scope,binary_identities=[obs["product"]["client"][1],obs["product"]["client"][2]])},
           "binary":dict(obs["product"]["server"][1],subject="rustscaled",size_bytes=1),
           "path_class_reported":"direct","path_gate":{"requested":"direct","pre":"direct","post":"direct","matched":True},"cleanup":{"status":"clean","samplers_stopped":True,"workload_stopped":True,"transport_stopped":True,"postconditions_verified":True},
@@ -841,11 +842,11 @@ matrix_manifest_self_test() {
   temp_dir=$(mktemp -d)
   manifest="$temp_dir/matrix.json"
   invalid_manifest="$temp_dir/invalid.json"
-  matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 || { rm -rf "$temp_dir"; return 1; }
+  matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 500 1000 || { rm -rf "$temp_dir"; return 1; }
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
   python3 - "$manifest" "$GCP_MACHINE" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_toolchain_archive"] == "go1.26.4.linux-amd64.tar.gz" and build["go_toolchain_archive_sha256"] == "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100,500,1000] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_toolchain_archive"] == "go1.26.4.linux-amd64.tar.gz" and build["go_toolchain_archive_sha256"] == "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1
@@ -960,7 +961,7 @@ Runs same-zone/direct rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun with o
   --path     comma-separated subset: direct,derp
   --config   comma-separated subset: rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun
   --repeat N run each throughput point N times (1..=9; default 3)
-  --parallelism LIST ordered unique stream counts in 1..=1000 (default 1,10,100)
+  --parallelism LIST ordered unique stream counts in 1..=1000 (required 1,10,100,500,1000)
   --scale-streams opt in to the honest all-cell 1,2,4,8,16,32,64,100,200,500,1000 RSB1 sweep
   --duration N measured throughput seconds (3..=120; default 10)
   --peer-count N record configured remote-peer load (1..=1000; default 1)

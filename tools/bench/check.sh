@@ -38,7 +38,7 @@ run grep -Fq "GO_TOOLCHAIN_ARCHIVE_SHA256 = \"1153d3d50e0ac764b447adfe05c2bcf08e
 run grep -Fq "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f  /tmp/go1.26.4.linux-amd64.tar.gz" tools/bench/gcp/lib.sh
 run grep -Fq 'fixed 256 KiB TCP send and' docs/benchmarks.md
 run grep -Fq 'defaults of 1 MiB send and 1 MiB receive' docs/benchmarks.md
-run grep -Fq 'PARALLELS=(1 10 100)' tools/bench/run-native-baseline.sh
+run grep -Fq 'PARALLELS=(1 10 100 500 1000)' tools/bench/run-native-baseline.sh
 run grep -Fq 'bench_mint_authkey true' tools/bench/run-native-baseline.sh
 run tools/bench/run-native-baseline.sh --self-test
 run tools/bench/gcp/run-config.sh --self-test
@@ -143,7 +143,7 @@ run python3 - "$tmp/scale" <<'PYEOF'
 import json, pathlib, sys
 root = next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json")).parent
 m = json.load(open(root / "matrix.json"))
-assert m["parallelism"] == [1,2,4,8,16,32,64,100,200,500,1000]
+assert m["parallelism"] == [1,10,100,500,1000]
 assert m["duration_s"] == 20 and m["sample_cadence_s"] == 1
 assert m["peer_count_requested"] == 250
 assert m["configs"] == ["rs-userspace", "rs-tun", "ts-embedded", "ts-userspace", "ts-tun"]

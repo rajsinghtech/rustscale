@@ -186,8 +186,8 @@ def validate_manifest(manifest):
         peer = load.get("peer_load")
         if peer != {"requested": manifest.get("peer_count_requested"), "effective": None, "observed": None, "status": "not-applied"}:
             raise ValueError("invalid peer-load evidence")
-        if load["preset"] == "routine-v1" and manifest["parallelism"] != [1, 10, 100]:
-            raise ValueError("routine-v1 requires streams 1,10,100")
+        if load["preset"] == "routine-v1" and manifest["parallelism"] != [1, 10, 100, 500, 1000]:
+            raise ValueError("routine-v1 requires exactly streams 1,10,100,500,1000")
         if load["preset"] == "scale-streams-v1" and manifest["parallelism"] != SCALE_STREAMS:
             raise ValueError("scale-streams-v1 requires the complete scale list")
     validate_run(manifest.get("run"))

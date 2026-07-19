@@ -24,6 +24,22 @@
 : "${GCP_IMAGE_PROJECT:=ubuntu-os-cloud}"
 : "${GCP_DRY_RUN:=}"
 
+# Print an owner/group/other mode portably. GNU stat accepts BSD's -f operand
+# as a filesystem-format request and may succeed with non-mode output, so each
+# candidate must be validated before it is accepted.
+portable_file_mode() {
+  local path="$1" mode
+  if mode=$(stat -c %a -- "$path" 2>/dev/null) && [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  if mode=$(stat -f %Lp "$path" 2>/dev/null) && [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  return 1
+}
+
 configure_rs_tun_inbound_pipeline() {
   [[ -n "${RS_TUN_INBOUND_PIPELINE+x}" ]] || RS_TUN_INBOUND_PIPELINE=0
   case "$RS_TUN_INBOUND_PIPELINE" in

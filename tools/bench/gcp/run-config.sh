@@ -50,7 +50,7 @@ parse_run_config_options() {
   PROFILE=0
   PROFILE_ONLY=0
   REPEAT=3
-  PARALLELISM_CSV="1,10,100"
+  PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
   RESULT_MANIFEST=""
@@ -67,7 +67,7 @@ parse_run_config_options() {
       --repeat)
         (( seen_repeat == 0 )) || { echo "duplicate option: --repeat" >&2; return 2; }
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
-        [[ "$2" =~ ^[1-9]$ ]] || { echo "--repeat must be an integer in 1..=9" >&2; return 2; }
+        [[ "$2" =~ ^[3-9]$ ]] || { echo "--repeat must be an integer in 3..=9" >&2; return 2; }
         REPEAT="$2"; seen_repeat=1; shift 2 ;;
       --parallelism)
         (( seen_parallelism == 0 )) || { echo "duplicate option: --parallelism" >&2; return 2; }
@@ -106,20 +106,21 @@ validate_parallelism_csv() {
     [[ "$seen" != *",$item,"* ]] || { echo "duplicate --parallelism value: $item" >&2; return 1; }
     seen+="$item,"
   done
+  [[ "$csv" == "1,10,100,500,1000" ]] || { echo "--parallelism must be exactly 1,10,100,500,1000" >&2; return 1; }
 }
 
 run_config_option_parsing_self_test() {
   local actual status
-  actual=$(parse_run_config_options --profile --repeat 1; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
-  [[ "$actual" == '1/0/1' ]] || return 1
-  actual=$(parse_run_config_options --profile-only --repeat 1; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
-  [[ "$actual" == '0/1/1' ]] || return 1
+  actual=$(parse_run_config_options --profile --repeat 3; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
+  [[ "$actual" == '1/0/3' ]] || return 1
+  actual=$(parse_run_config_options --profile-only --repeat 3; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
+  [[ "$actual" == '0/1/3' ]] || return 1
   actual=$(parse_run_config_options --repeat 9 --profile; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
   [[ "$actual" == '1/0/9' ]] || return 1
   actual=$(parse_run_config_options; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
   [[ "$actual" == '0/0/3' ]] || return 1
-  actual=$(parse_run_config_options --parallelism 1,10,100,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
-  [[ "$actual" == '1,10,100,1000/20/250' ]] || return 1
+  actual=$(parse_run_config_options --parallelism 1,10,100,500,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
+  [[ "$actual" == '1,10,100,500,1000/20/250' ]] || return 1
   local -a case_args=()
   for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--parallelism' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1,a' '--parallelism 1 --parallelism 2' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001' '--profile --profile' '--profile-only --profile-only' '--profile --profile-only' '--unknown'; do
     read -r -a case_args <<< "$args"
@@ -196,7 +197,7 @@ linux_udp_tx_gso_mode_self_test() {
 validate_authkey_file() {
   local path="$1" mode value
   [[ -f "$path" && ! -L "$path" ]] || { echo "auth key file must be a regular, non-symlink file" >&2; return 2; }
-  mode=$(stat -f %Lp "$path" 2>/dev/null || stat -c %a "$path" 2>/dev/null) || return 2
+  mode=$(portable_file_mode "$path") || return 2
   [[ "$mode" == 600 || "$mode" == 400 ]] || { echo "auth key file must be owner-only" >&2; return 2; }
   [[ "$(awk 'END { print NR }' "$path")" == 1 ]] || { echo "auth key file must contain exactly one line" >&2; return 2; }
   value=$(cat "$path")
@@ -276,7 +277,7 @@ if (( SELF_TEST )); then
   PROFILE=1
   PROFILE_ONLY=0
   REPEAT=3
-  PARALLELISM_CSV="1,10,100"
+  PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
 else
@@ -307,7 +308,7 @@ if [[ "$CONFIG" == rs-tun ]]; then
 fi
 
 IFS=, read -r -a PARALLELS <<<"$PARALLELISM_CSV"
-LATENCY_COUNT=50
+LATENCY_COUNT=200
 LATENCY_INTERVAL=0.1
 PORT=5201
 RUNTIME_STATS_MAX_LINES=80
@@ -340,7 +341,7 @@ if (( SELF_TEST )); then
   python3 "$PROVENANCE_HELPER" manifest "$RESULT_MANIFEST" --run-id gcp-20260714-000000-selftest \
     --started-at-utc 2026-07-14T00:00:00Z --commit "$self_commit" --dirty 0 --project dry-run \
     --image-project ubuntu-os-cloud --image-family ubuntu-2204-lts --machine "$GCP_MACHINE" --network default \
-    --disk-type pd-standard --disk-gb 200 --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" --dry-run --topologies same-zone --paths direct --configs rs-tun --parallelism 1 10 100 --repeat 3
+    --disk-type pd-standard --disk-gb 200 --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" --dry-run --topologies same-zone --paths direct --configs rs-tun --parallelism 1 10 100 500 1000 --repeat 3
   # The self-test config intentionally uses a non-production topology; the
   # provenance helper only validates endpoint identity when it is non-dry.
   python3 "$PROVENANCE_HELPER" dry-observed "$OBSERVED_METADATA"
@@ -2471,7 +2472,7 @@ obj={"schema_version":6,"status":"ok","tool":tool,
              "client_lifecycle":"new_benchmark_process_per_trial",
              "transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,
              "latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,
-             "latency_count":50,"transport_path":transport_path,"userspace_portmapping":portmapping},
+             "latency_count":200,"transport_path":transport_path,"userspace_portmapping":portmapping},
  "warmup_evidence":json.loads(warmup_evidence),"throughput":json.loads(tp),
  "throughput_trials":json.loads(trials),"latency":json.loads(lat),
  "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,

@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 GCP = ROOT / "tools/bench/gcp"
-PARALLELS = [1, 10, 100]
+PARALLELS = [1, 10, 100, 500, 1000]
 
 
 def run(*args, ok=True, env=None):
@@ -71,8 +71,8 @@ def valid(*, repeat=2, config="rs-tun", path="direct", parallels=PARALLELS, iden
     return {"schema_version": 3, "status": "ok", "tool": "rustscale", "mode": "tun",
             "topology": "same-zone", "path": path, "config": config, "repeat": repeat,
             "parallelism_requested": list(parallels), "error": "", "log_tail": "",
-            "throughput": rows, "latency": {"requested": 50, "transmitted": 50, "received": 50,
-                                                "loss": 0, "p50_us": 10, "p95_us": 20, "p99_us": 30, "count": 50},
+            "throughput": rows, "latency": {"requested": 200, "transmitted": 200, "received": 200,
+                                                "loss": 0, "p50_us": 10, "p95_us": 20, "p99_us": 30, "count": 200},
             "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 2, "rss_avg_kb": 1,
                           "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1,
                           "sample_cadence_s": 1,
@@ -96,13 +96,13 @@ def matched_manifest(root, identity):
     modes = {"rs-userspace": "embedded", "rs-tun": "tun", "ts-embedded": "embedded",
              "ts-userspace": "daemon-proxy", "ts-tun": "tun"}
     data = {"schema_version": 4, "topologies": ["same-zone"], "paths": ["direct"],
-            "configs": configs, "parallelism": [1], "repeat": 1, "duration_s": 10,
+            "configs": configs, "parallelism": PARALLELS, "repeat": 3, "duration_s": 10,
             "sample_cadence_s": 1, "peer_count_requested": 1, "dry_run": False,
             "warmup": {"parallel": 1, "duration_s": 3, "direction": "down", "protocol": "RSB1"},
             "selection": {"preset": "normal-v1", "source": {"topologies": "default", "paths": "default", "configs": "default"},
                           "cells": [{"id": config, "implementation": "rustscale" if config.startswith("rs-") else "tailscale",
                                      "mode": modes[config]} for config in configs]},
-            "load": {"preset": "custom", "parallelism_target": [1], "repeat": 1, "duration_s": 10,
+            "load": {"preset": "routine-v1", "parallelism_target": PARALLELS, "repeat": 3, "duration_s": 10,
                      "sample_cadence_s": 1, "peer_load": {"requested": 1, "effective": None,
                                                             "observed": None, "status": "not-applied"}},
             "run": identity}
@@ -165,37 +165,38 @@ def matched_result(root, config, manifest):
     server = resource("server", subject_map[config][0])
     client = resource("client", subject_map[config][1])
     warmup_path = "direct" if config in {"rs-userspace", "ts-embedded"} else "externally-gated"
-    raw_latency = list(range(1, 51))
+    raw_latency = list(range(1, 201))
     result = {"schema_version": 6, "status": "ok", "tool": tool, "implementation": implementation,
               "mode": mode, "topology": "same-zone", "path": "direct", "config": config,
-              "repeat": 1, "parallelism_requested": [1], "duration_s_requested": 10,
+              "repeat": 3, "parallelism_requested": PARALLELS, "duration_s_requested": 10,
               "sample_cadence_s": 1, "peer_count_requested": 1, "error": "", "log_tail": "",
               "path_class_reported": "direct", "transport": transport,
               "warmup_evidence": {"transport": transport, "protocol": "RSB1", "direction": "down",
                                   "duration_secs": 3, "parallel": 1, "established": 1,
                                   "handshaken": 1, "completed": 1, "total_mbps": 10.0,
                                   "path_class": warmup_path},
-              "throughput": [{"parallel": 1, "mbps": 100.0, "duration_s": 10,
-                              "samples_mbps": [100.0], "statistic": "median",
+              "throughput": [{"parallel": p, "mbps": 100.0, "duration_s": 10,
+                              "samples_mbps": [100.0, 100.0, 100.0], "statistic": "median",
                               "min_mbps": 100.0, "max_mbps": 100.0,
                               "population_stddev_mbps": 0.0,
-                              "coefficient_of_variation_pct": 0.0}],
-              "throughput_trials": [{"parallel": 1, "repeat_index": 1, "transport": transport,
+                              "coefficient_of_variation_pct": 0.0} for p in PARALLELS],
+              "throughput_trials": [{"parallel": p, "repeat_index": repeat_index, "transport": transport,
                                      "protocol": "RSB1", "direction": "down", "duration_s": 10,
-                                     "established": 1, "handshaken": 1, "completed": 1,
-                                     "total_mbps": 100.0, "path_class": warmup_path}],
-              "latency": {"protocol": "RSB1-tcp-pingpong", "requested": 50, "successful": 50,
-                          "timed_out": 0, "malformed": 0, "count": 50, "min_ns": 1,
-                          "max_ns": 50, "mean_ns": 25.5, "p50_ns": 26, "p95_ns": 48, "p99_ns": 50,
-                          "min_us": .001, "max_us": .05, "mean_us": .0255,
-                          "p50_us": .026, "p95_us": .048, "p99_us": .05, "samples_ns": raw_latency},
+                                     "established": p, "handshaken": p, "completed": p,
+                                     "total_mbps": 100.0, "path_class": warmup_path}
+                                    for p in PARALLELS for repeat_index in (1, 2, 3)],
+              "latency": {"protocol": "RSB1-tcp-pingpong", "requested": 200, "successful": 200,
+                          "timed_out": 0, "malformed": 0, "count": 200, "min_ns": 1,
+                          "max_ns": 200, "mean_ns": 100.5, "p50_ns": 101, "p95_ns": 190, "p99_ns": 198,
+                          "min_us": .001, "max_us": .2, "mean_us": .1005,
+                          "p50_us": .101, "p95_us": .19, "p99_us": .198, "samples_ns": raw_latency},
               "workload": {"implementation": "go-tsnet-rsb1" if config == "ts-embedded" else "rustscale-bench",
                            "protocol": "RSB1", "direction": "down", "payload_bytes": 1280,
                            "warmup": {"parallel": 1, "duration_s": 3, "max_attempts": 1},
                            "client_lifecycle": "new_benchmark_process_per_trial",
                            "transport_identity_lifecycle": "one_persisted_identity_per_endpoint_cell",
                            "measured_trial_attempts": 1, "latency_protocol": "RSB1-tcp-pingpong",
-                           "latency_payload_bytes": 8, "latency_count": 50, "transport_path": transport_path,
+                           "latency_payload_bytes": 8, "latency_count": 200, "transport_path": transport_path,
                            "userspace_portmapping": {"rs-userspace": "disabled", "ts-embedded": "upstream-default"}.get(config, "not-applicable")},
               "resources": {"phase_set": ["measured_client_process_lifecycle", "inter_trial_gap", "latency"],
                             "sample_cadence_ms": 1000, "server": server, "client": client},
@@ -206,7 +207,7 @@ def matched_result(root, config, manifest):
                           "transport_stopped": True, "postconditions_verified": True},
               "identity": {"key": f"same-zone/direct/{config}", "cell_id": config,
                            "implementation": implementation, "mode": mode, "topology": "same-zone", "path": "direct"},
-              "load": {"preset": "custom", "parallelism_requested": [1], "repeat": 1, "duration_s": 10,
+              "load": {"preset": "routine-v1", "parallelism_requested": PARALLELS, "repeat": 3, "duration_s": 10,
                        "peer_load": manifest["load"]["peer_load"]},
               "manifest_sha256": hashlib.sha256((root / "matrix.json").read_bytes()).hexdigest(),
               "run": manifest["run"], "observed": obs}
@@ -244,7 +245,7 @@ with tempfile.TemporaryDirectory() as tmp:
     matrix(root); cell = write_cell(root, valid())
     result = run("python3", GCP / "aggregate.py", root)
     manifest = json.loads((root / "matrix.json").read_text())
-    assert manifest["parallelism"] == [1, 10, 100]
+    assert manifest["parallelism"] == [1, 10, 100, 500, 1000]
     assert all(type(value) is int for value in manifest["parallelism"])
     assert len(json.loads(result.stdout)) == 1
 
@@ -391,7 +392,7 @@ with tempfile.TemporaryDirectory() as tmp:
     for field in ("requested", "transmitted", "received", "count"):
         partial_latency["latency"][field] = 1
     write_cell(root, partial_latency)
-    assert "all 50 requested replies" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
+    assert "all 200 requested replies" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
     # Schema-v3 history is aggregate-only. Raw-series fields, when present,
     # are not reinterpreted as a modern monotonic process-set contract.
     historical_series = valid(); historical_series["footprint"].pop("series"); historical_series["footprint"].pop("series_truncated"); historical_series["footprint"].pop("sample_cadence_s"); write_cell(root, historical_series)

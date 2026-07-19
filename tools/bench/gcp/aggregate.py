@@ -18,7 +18,7 @@ CONFIG_ORDER = {"rs-userspace": 0, "ts-embedded": 1, "ts-userspace": 2, "rs-tun"
 LEGACY_CONFIGS = ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"]
 PATH_ORDER = {"direct": 0, "derp": 1}
 TOPO_ORDER = {"same-zone": 0, "cross-region": 1}
-DEFAULT_PARALLELISM = [1, 10, 100]
+DEFAULT_PARALLELISM = [1, 10, 100, 500, 1000]
 DEFAULT_MATRIX = {"topologies": list(TOPO_ORDER), "paths": list(PATH_ORDER), "configs": LEGACY_CONFIGS,
                   "parallelism": DEFAULT_PARALLELISM}
 RESULT_SCHEMA_VERSION = 6
@@ -135,6 +135,8 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
     if not isinstance(repeat, int) or isinstance(repeat, bool) or repeat <= 0:
         errors.append("repeat must be a positive integer")
         repeat = 0
+    elif current and matrix.get("load", {}).get("preset") != "custom" and repeat < 3:
+        errors.append("current publishable evidence requires at least three successful repeats")
     elif matrix["repeat"] is not None and repeat != matrix["repeat"]:
         errors.append(f"repeat={repeat!r}, expected matrix repeat {matrix['repeat']!r}")
     requested = obj.get("parallelism_requested")
@@ -201,11 +203,11 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         if not all(finite_positive(value) for value in percentiles) or percentiles != sorted(percentiles):
             errors.append("latency percentiles must be finite, positive, and ordered")
         if scoped:
-            expected = 50
+            expected = 200
             if (latency.get("protocol") != "RSB1-tcp-pingpong" or latency.get("requested") != expected
                     or latency.get("successful") != expected or latency.get("timed_out") != 0
                     or latency.get("malformed") != 0 or latency.get("count") != expected):
-                errors.append("scoped latency must contain all 50 RSB1 ping-pong replies")
+                errors.append("scoped latency must contain all 200 RSB1 ping-pong replies")
             raw = latency.get("samples_ns")
             if not isinstance(raw, list) or len(raw) != expected or not all(positive_int(value) for value in raw):
                 errors.append("scoped latency samples_ns must contain every positive RTT")
@@ -226,10 +228,10 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
                     if not finite_positive(latency.get(us_name)) or not finite_positive(latency.get(ns_name)) or not math.isclose(latency[us_name], latency[ns_name] / 1000, rel_tol=MEDIAN_REL_TOL, abs_tol=MEDIAN_ABS_TOL):
                         errors.append(f"latency {us_name} does not match {ns_name}")
         elif expected_mode == "tun":
-            expected = 50
+            expected = 200
             complete_fields = ("requested", "transmitted", "received", "count")
             if any(latency.get(name) != expected for name in complete_fields):
-                errors.append("TUN latency must contain all 50 requested replies")
+                errors.append("TUN latency must contain all 200 requested replies")
             loss = latency.get("loss")
             if not isinstance(loss, (int, float)) or isinstance(loss, bool) or not math.isfinite(loss) or loss != 0:
                 errors.append("TUN latency loss must be zero")
@@ -325,7 +327,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
                 or workload.get("transport_identity_lifecycle") != "one_persisted_identity_per_endpoint_cell"
                 or workload.get("measured_trial_attempts") != 1
                 or workload.get("latency_protocol") != "RSB1-tcp-pingpong"
-                or workload.get("latency_payload_bytes") != 8 or workload.get("latency_count") != 50
+                or workload.get("latency_payload_bytes") != 8 or workload.get("latency_count") != 200
                 or workload.get("transport_path") != expected_transport_path
                 or workload.get("userspace_portmapping") != expected_portmapping):
             errors.append("invalid five-cell matched RSB1 workload identity")

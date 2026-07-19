@@ -167,21 +167,21 @@ MATRIX_SKIP_COLLECT=1 tools/bench/gcp/run-matrix.sh --dry-run
 # Ordinary five-cell matched run (the defaults shown above).
 tools/bench/gcp/run-matrix.sh
 
-# Explicit all-cell scale contract.
+# Compatibility alias for the same exact certification stream contract.
 tools/bench/gcp/run-matrix.sh --scale-streams
 ```
 
 Every selected cell executes byte-identical RSB1 download semantics (direction
 `down`, 1280-byte writes), one P1/3-second warmup before sampling, the ordered
-throughput points and repeats, and 50 complete 8-byte TCP ping-pongs with raw
+throughput points and repeats, and 200 complete 8-byte TCP ping-pongs with raw
 nanosecond samples. Rust, daemon-proxy, and TUN cells use `rustscale-bench`;
 `ts-embedded` uses `go-tsnet-rsb1`. The daemon-proxy bridge admits 1100
 simultaneous connections, above the public P1000 contract.
 
-`--parallelism` preserves order, rejects duplicates, and accepts only 1–1000.
-`--scale-streams` expands to
-`1,2,4,8,16,32,64,100,200,500,1000` and conflicts with an explicit list. No
-cell is capped or silently truncated. Every measured trial must report exactly
+Certification accepts exactly the ordered stream set
+`1,10,100,500,1000`; `--parallelism` rejects every other list and
+`--scale-streams` is a compatibility alias for that same set. No cell is capped
+or silently truncated. Every measured trial must report exactly
 the requested `established`, `handshaken`, and `completed` counts after all
 connections finish the RSB1 ready/GO barrier under one bounded setup deadline.
 The Go package has a hermetic P100 lifecycle gate; Rust retains its local P1000
@@ -429,8 +429,11 @@ preserves batching.
   receive buffers per socket. Pinned Tailscale 1.100.0 uses the pinned gVisor
   defaults of 1 MiB send and 1 MiB receive, with Tailscale maxima of 8 MiB RX
   and 6 MiB TX on non-iOS builds. The matrix does not normalize this
-  buffer/window asymmetry: it compares declared product defaults, not
-  buffer-matched stacks.
+  buffer/window asymmetry. This is disclosed as a certification blocker rather
+  than treated as comparable: paid publication remains prohibited until a
+  controlled same-binary Rust A/B at 256 KiB and 1 MiB is captured with the
+  same exact matrix and demonstrates an immaterial effect, or both stacks are
+  normalized. No current data may support a winner claim.
 - Throughput is limited by per-packet userspace processing overhead (WG
   encapsulation/decapsulation, smoltcp/gVisor TCP processing, magicsock IO).
   Both sides face the same fundamental bottleneck.

@@ -14,6 +14,22 @@ use rustscale_wg::WgTunn;
 use crate::{DialStats, Netstack, DEFAULT_MTU, TCP_BUF, TCP_DIAL_TIMEOUT};
 
 #[test]
+fn tcp_ephemeral_allocator_wraps_skips_live_ports_and_exhausts() {
+    let mut allocated = std::collections::HashSet::from([u16::MAX, 49152]);
+    let mut next = u16::MAX;
+    assert_eq!(
+        crate::allocate_ephemeral_tcp_port(&mut allocated, &mut next).unwrap(),
+        49153
+    );
+    assert_eq!(next, 49154);
+
+    allocated.extend(49152..=u16::MAX);
+    let error = crate::allocate_ephemeral_tcp_port(&mut allocated, &mut next)
+        .expect_err("a full client port range must fail closed");
+    assert!(error.to_string().contains("port range exhausted"));
+}
+
+#[test]
 fn constructor_without_runtime_is_typed_error() {
     let result = std::panic::catch_unwind(|| Netstack::new(Ipv4Addr::LOCALHOST, DEFAULT_MTU));
     let error = match result.expect("must not panic") {

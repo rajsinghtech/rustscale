@@ -186,7 +186,10 @@ the requested `established`, `handshaken`, and `completed` counts after all
 connections finish the RSB1 ready/GO barrier under one bounded setup deadline.
 Embedded Rust resolves the target once and admits TCP plus RSB1 setup in a
 bounded listener-safe window; it does not retry, serialize, truncate, or submit
-an unbounded P500/P1000 SYN/header burst. Credential-free Rust regressions retain
+an unbounded P500/P1000 SYN/header burst. Outbound TCP ports start at a fresh
+process offset and remain collision-owned through socket teardown, preventing
+restarted trial processes from immediately reusing live peer four-tuples.
+Credential-free Rust regressions retain
 all P500 netstack streams, bound a failing P1000 request's pending ownership, and
 exercise the complete P500 RSB1 lifecycle. The Go package has a hermetic P100
 lifecycle gate; Rust also retains its local P1000 kernel setup gate. Paid P1000

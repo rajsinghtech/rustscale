@@ -3567,6 +3567,7 @@ version = "0.1.4"
 dependencies = [
  "bytes",
  "futures-util",
+ "rand 0.8.7",
  "rustscale-key",
  "rustscale-packet",
  "rustscale-wg",

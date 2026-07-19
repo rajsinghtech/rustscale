@@ -45,6 +45,7 @@ use tokio_util::sync::PollSender;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, StreamExt};
+use rand::Rng;
 use rustscale_key::NodePublic;
 use rustscale_packet::{Parsed, TCPFlag, TCP};
 
@@ -445,6 +446,7 @@ impl Netstack {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let inbound_flows = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let dial_stats = Arc::new(DialStatsInner::default());
+        let tcp_ephemeral_start = rand::thread_rng().gen_range(49152..=u16::MAX);
 
         let device =
             LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu, tx_notify.clone());
@@ -455,6 +457,7 @@ impl Netstack {
             notify.clone(),
             inbound_flows.clone(),
             Arc::clone(&dial_stats),
+            tcp_ephemeral_start,
         ));
 
         Ok(Self {
@@ -778,6 +781,8 @@ struct ConnState {
     app_tx: mpsc::Sender<Bytes>,
     app_rx: mpsc::Receiver<Bytes>,
     pending_write: Vec<u8>,
+    /// Client-side ephemeral port owned until this socket is removed.
+    local_port: Option<u16>,
 }
 
 /// A TCP listener's socket backlog + accept channel sender.
@@ -797,6 +802,7 @@ struct PendingDial {
     id: u64,
     reply: oneshot::Sender<Result<NetstackStream, NetstackError>>,
     remote: SocketAddr,
+    local_port: u16,
     deadline: tokio::time::Instant,
 }
 
@@ -859,17 +865,26 @@ fn allocate_ephemeral_udp_port(allocated: &HashSet<u16>) -> u16 {
     }
 }
 
-/// Simple monotonic ephemeral port allocator.
-fn ephemeral_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(49152);
-    let p = NEXT.fetch_add(1, Ordering::Relaxed);
-    if p < 49152 {
-        NEXT.store(49152, Ordering::Relaxed);
-        49152
-    } else {
-        p
+/// Allocate a client TCP port without colliding with any pending or
+/// established outbound socket. Each netstack starts at a random offset so a
+/// restarted embedded process does not immediately reuse the prior process's
+/// live/TIME_WAIT four-tuples on a long-lived peer.
+fn allocate_ephemeral_tcp_port(
+    allocated: &mut HashSet<u16>,
+    next: &mut u16,
+) -> Result<u16, NetstackError> {
+    const MIN: u16 = 49152;
+    const COUNT: usize = 16_384;
+    for _ in 0..COUNT {
+        let port = *next;
+        *next = if port == u16::MAX { MIN } else { port + 1 };
+        if allocated.insert(port) {
+            return Ok(port);
+        }
     }
+    Err(NetstackError::DialFailed(
+        "ephemeral TCP port range exhausted".into(),
+    ))
 }
 
 /// Convert an Ipv4Addr to a smoltcp IpAddress.
@@ -888,6 +903,7 @@ fn make_stream_and_conn(
     notify: Arc<Notify>,
     remote_addr: Option<SocketAddr>,
     peer_node_key: Option<NodePublic>,
+    local_port: Option<u16>,
 ) -> (NetstackStream, ConnState) {
     let (app_tx, stream_rx) = mpsc::channel(64);
     let (stream_tx, app_rx) = mpsc::channel(64);
@@ -897,6 +913,7 @@ fn make_stream_and_conn(
         app_tx,
         app_rx,
         pending_write: Vec::new(),
+        local_port,
     };
     (stream, conn)
 }
@@ -909,6 +926,7 @@ async fn poll_loop(
     notify: Arc<Notify>,
     inbound_flows: Arc<std::sync::Mutex<HashMap<TcpFlow, NodePublic>>>,
     dial_stats: Arc<DialStatsInner>,
+    mut next_tcp_port: u16,
 ) {
     let start = std::time::Instant::now();
     let smol_now = || SmolInstant::from_millis(start.elapsed().as_millis() as i64);
@@ -925,6 +943,7 @@ async fn poll_loop(
     let mut sockets: SocketSet<'static> = SocketSet::new(vec![]);
     let mut conns: HashMap<SocketHandle, ConnState> = HashMap::new();
     let mut pending_dials: HashMap<SocketHandle, PendingDial> = HashMap::new();
+    let mut tcp_allocated_ports: HashSet<u16> = HashSet::new();
     // (ip, port) -> (listener_socket_handle, accept_sender)
     let mut listeners: HashMap<(IpAddr, u16), ListenerEntry> = HashMap::new();
     // UDP listener state: (ip, port) -> UdpSocketState
@@ -972,6 +991,8 @@ async fn poll_loop(
                                 &mut iface,
                                 &mut sockets,
                                 &mut pending_dials,
+                                &mut tcp_allocated_ports,
+                                &mut next_tcp_port,
                                 addr,
                                 id,
                                 remote,
@@ -984,7 +1005,9 @@ async fn poll_loop(
                             .iter()
                             .find_map(|(handle, pending)| (pending.id == id).then_some(*handle))
                         {
-                            pending_dials.remove(&handle);
+                            if let Some(pending) = pending_dials.remove(&handle) {
+                                tcp_allocated_ports.remove(&pending.local_port);
+                            }
                             let _ = sockets.remove(handle);
                         }
                     }
@@ -1088,7 +1111,7 @@ async fn poll_loop(
                         })
                     });
                     let (stream, conn) =
-                        make_stream_and_conn(notify.clone(), remote_addr, peer_node_key);
+                        make_stream_and_conn(notify.clone(), remote_addr, peer_node_key, None);
                     conns.insert(conn_handle, conn);
 
                     if let Some(entry) = listeners.get(&key) {
@@ -1129,7 +1152,9 @@ async fn poll_loop(
                 .get(&handle)
                 .is_some_and(|pending| pending.reply.is_closed())
             {
-                pending_dials.remove(&handle);
+                if let Some(pending) = pending_dials.remove(&handle) {
+                    tcp_allocated_ports.remove(&pending.local_port);
+                }
                 let _ = sockets.remove(handle);
                 continue;
             }
@@ -1138,6 +1163,7 @@ async fn poll_loop(
                 .is_some_and(|pending| tokio::time::Instant::now() >= pending.deadline)
             {
                 if let Some(pending) = pending_dials.remove(&handle) {
+                    tcp_allocated_ports.remove(&pending.local_port);
                     let _ = pending.reply.send(Err(NetstackError::DialFailed(
                         "dial deadline exceeded".into(),
                     )));
@@ -1149,17 +1175,24 @@ async fn poll_loop(
             match state {
                 State::Established => {
                     if let Some(pd) = pending_dials.remove(&handle) {
-                        let (stream, conn) =
-                            make_stream_and_conn(notify.clone(), Some(pd.remote), None);
+                        let local_port = pd.local_port;
+                        let (stream, conn) = make_stream_and_conn(
+                            notify.clone(),
+                            Some(pd.remote),
+                            None,
+                            Some(local_port),
+                        );
                         conns.insert(handle, conn);
                         if pd.reply.send(Ok(stream)).is_err() {
                             conns.remove(&handle);
+                            tcp_allocated_ports.remove(&local_port);
                             let _ = sockets.remove(handle);
                         }
                     }
                 }
                 State::Closed | State::TimeWait => {
                     if let Some(pd) = pending_dials.remove(&handle) {
+                        tcp_allocated_ports.remove(&pd.local_port);
                         let _ = pd.reply.send(Err(NetstackError::ConnectionRefused));
                     }
                     let _ = sockets.remove(handle);
@@ -1198,7 +1231,12 @@ async fn poll_loop(
         }
 
         // Pass 5: clean up closed connections.
-        cleanup_closed(&mut sockets, &mut conns, &mut listeners);
+        cleanup_closed(
+            &mut sockets,
+            &mut conns,
+            &mut listeners,
+            &mut tcp_allocated_ports,
+        );
     }
     dial_stats.pending_dials.store(0, Ordering::Release);
     dial_stats.pending_buffer_bytes.store(0, Ordering::Release);
@@ -1265,15 +1303,13 @@ fn do_dial(
     iface: &mut Interface,
     sockets: &mut SocketSet<'static>,
     pending_dials: &mut HashMap<SocketHandle, PendingDial>,
+    allocated_ports: &mut HashSet<u16>,
+    next_port: &mut u16,
     local_addr: Ipv4Addr,
     id: u64,
     remote: SocketAddr,
     reply: oneshot::Sender<Result<NetstackStream, NetstackError>>,
 ) {
-    let mut socket = new_tcp_socket();
-    let local_port = ephemeral_port();
-    let local_ep = IpListenEndpoint::from((to_smoltcp_v4(local_addr), local_port));
-
     let remote_ip = match remote.ip() {
         IpAddr::V4(v4) => to_smoltcp_v4(v4),
         IpAddr::V6(_) => {
@@ -1281,10 +1317,20 @@ fn do_dial(
             return;
         }
     };
+    let local_port = match allocate_ephemeral_tcp_port(allocated_ports, next_port) {
+        Ok(port) => port,
+        Err(error) => {
+            let _ = reply.send(Err(error));
+            return;
+        }
+    };
+    let mut socket = new_tcp_socket();
+    let local_ep = IpListenEndpoint::from((to_smoltcp_v4(local_addr), local_port));
     let remote_ep = IpEndpoint::new(remote_ip, remote.port());
 
     let cx = iface.context();
     if let Err(e) = socket.connect(cx, remote_ep, local_ep) {
+        allocated_ports.remove(&local_port);
         let _ = reply.send(Err(NetstackError::DialFailed(format!("{e:?}"))));
         return;
     }
@@ -1295,6 +1341,7 @@ fn do_dial(
             id,
             reply,
             remote,
+            local_port,
             deadline: tokio::time::Instant::now() + TCP_DIAL_TIMEOUT,
         },
     );
@@ -1535,6 +1582,7 @@ fn cleanup_closed(
     sockets: &mut SocketSet<'static>,
     conns: &mut HashMap<SocketHandle, ConnState>,
     listeners: &mut HashMap<(IpAddr, u16), ListenerEntry>,
+    tcp_allocated_ports: &mut HashSet<u16>,
 ) {
     // Connections.
     let dead: Vec<SocketHandle> = conns
@@ -1546,7 +1594,11 @@ fn cleanup_closed(
         .copied()
         .collect();
     for h in dead {
-        conns.remove(&h);
+        if let Some(conn) = conns.remove(&h) {
+            if let Some(port) = conn.local_port {
+                tcp_allocated_ports.remove(&port);
+            }
+        }
         let _ = sockets.remove(h);
     }
 

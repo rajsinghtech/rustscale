@@ -2168,11 +2168,13 @@
       ]
     },
     {
-      "classification": "unsupported",
+      "classification": "semantic",
       "denominator_id": "flag:set:accept-dns",
       "id": "compare:flag:set:accept-dns",
-      "local_ids": [],
-      "note": "no local flag on this command",
+      "local_ids": [
+        "flag:set:--accept-dns"
+      ],
+      "note": "canonical flag is present; missing accepted spelling(s): -accept-dns",
       "upstream_ids": [
         "flag:set:accept-dns"
       ]
@@ -3593,7 +3595,7 @@
   "generator_version": 1,
   "guards": {
     "local": {
-      "count": 161,
+      "count": 162,
       "ids": [
         "behavior:help_long",
         "behavior:help_short",
@@ -3713,6 +3715,7 @@
         "flag:serve:--set-path",
         "flag:serve:--tcp",
         "flag:serve:--tls-terminated-tcp",
+        "flag:set:--accept-dns",
         "flag:set:--accept-routes",
         "flag:set:--advertise-exit-node",
         "flag:set:--advertise-routes",
@@ -3757,10 +3760,10 @@
         "flag:web:--readonly",
         "flag:web:--unsafe-any-addr"
       ],
-      "sha256": "cfe57ee96e56ec581d72f48baede36d71497cc3b4a3d88ddd08ca6d0eb47da2d"
+      "sha256": "66df713bfa9e577b1f8a7fa1f722d09850252a004e16904ec49a3a0bfb4492c1"
     },
     "local_shape": {
-      "count": 161,
+      "count": 162,
       "ids": [
         "behavior:help_long@6370d984ead0c8e41243740ad5bd231e30a0f812efb9093316e7a1283c3f86b4",
         "behavior:help_short@44fe55bfa383037add1c562e2531ab16b1df9ae82aee68133e787497ad6356f8",
@@ -3880,6 +3883,7 @@
         "flag:serve:--set-path@bba508c4f7920fe0fa7b1ec4f98846b8b7aaaba5f94d273658fe7da18ceff6eb",
         "flag:serve:--tcp@0b218ad65a59096866b33387a5ad34f2ae6e72d09f56f51fa17265dfa49deb00",
         "flag:serve:--tls-terminated-tcp@92c88ae36fc04c6af24d8cea5db82e62a6027e33c59b3957968511d041a77523",
+        "flag:set:--accept-dns@7b8be830e5beaa5607b462a2323f7031e99e704f5bb8edfb8946e9b94a3f2a8d",
         "flag:set:--accept-routes@f81d066271a1db44ee3a96c1ad2beb222b4499065d0c4bc5e9120642a9421a64",
         "flag:set:--advertise-exit-node@b9483350220cbd0bb90e9973be97f237106035bce9a5b4169e6e23169f28d25b",
         "flag:set:--advertise-routes@3d7ed7db8adf5fd0a57413fde411189f340a7fcfe3adff5304f713765fc56cc5",
@@ -3924,7 +3928,7 @@
         "flag:web:--readonly@621b501b992c37f8f46f237def91ead31f2e82c435559eb2ac3b023390cf503e",
         "flag:web:--unsafe-any-addr@c40583bae449b7a2774a58d936b4d89234ab0776f61e4c90d7241e9fcbb37d75"
       ],
-      "sha256": "79800e5c06edc4f636c16ed17f9cfa237804914487e019b9d50c240ae11a083b"
+      "sha256": "cc98f0471f7e2ac8282da68dc39a4fc82f60c068a773ef0d8a1ad423719af3f2"
     },
     "upstream": {
       "count": 270,
@@ -5404,6 +5408,15 @@
           "name": "--tls-terminated-tcp",
           "value": {
             "kind": "value"
+          }
+        },
+        {
+          "aliases": [],
+          "command": "set",
+          "id": "flag:set:--accept-dns",
+          "name": "--accept-dns",
+          "value": {
+            "kind": "bool"
           }
         },
         {

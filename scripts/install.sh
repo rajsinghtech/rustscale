@@ -29,9 +29,11 @@
 #   --version <tag>   Pin to a specific release tag.
 #   --no-service      Do not install or start a system service.
 #   --tailscale-compatible
-#                     Install tailscale/tailscaled command aliases. Existing
-#                     commands are never replaced; use only on an isolated
-#                     replacement host. RustScale keeps its own state paths.
+#                     Require tailscale/tailscaled command aliases. Aliases are
+#                     installed automatically when both names are available;
+#                     this flag makes an existing-command collision fatal.
+#   --no-tailscale-compatible
+#                     Do not install tailscale/tailscaled command aliases.
 #   --help, -h        Show this help.
 #
 # Examples:
@@ -73,9 +75,11 @@ Flags:
   --version <tag>   Pin to a specific release tag.
   --no-service      Do not install or start a system service.
   --tailscale-compatible
-                    Install tailscale/tailscaled aliases without replacing
-                    existing commands. Use only on an isolated replacement
-                    host; RustScale keeps separate state and socket paths.
+                    Require tailscale/tailscaled aliases; fail if either name
+                    belongs to another installation. Without this flag,
+                    aliases are installed automatically when both are free.
+  --no-tailscale-compatible
+                    Do not install tailscale/tailscaled aliases.
   --help, -h        Show this help.
 
 Examples:
@@ -96,7 +100,7 @@ run_as_root() {
 
 main() {
     UNINSTALL=0
-    TAILSCALE_COMPATIBLE=0
+    TAILSCALE_COMPATIBLE=auto
     while [ $# -gt 0 ]; do
         case "$1" in
             --uninstall) UNINSTALL=1 ;;
@@ -110,6 +114,7 @@ main() {
                 ;;
             --no-service) INSTALL_SERVICE=0 ;;
             --tailscale-compatible) TAILSCALE_COMPATIBLE=1 ;;
+            --no-tailscale-compatible) TAILSCALE_COMPATIBLE=0 ;;
             --help|-h) usage; exit 0 ;;
             *)
                 echo "rustscale: unknown option '$1' (try --help)" >&2
@@ -462,12 +467,14 @@ download_and_install() {
     post_install
 }
 
-# Compatibility mode is explicit and must never adopt or replace commands from
-# an official Tailscale installation. Validate both destinations before the
-# first installed file is mutated so a collision cannot leave a partial
-# RustScale installation behind.
+# A replacement install should provide the upstream command names without
+# requiring users to discover a special installer flag. In auto mode, install
+# aliases only when both destinations are free (or already ours). An explicit
+# compatibility request remains fail-closed on collisions. Validate before the
+# first installed file is mutated so strict mode cannot leave a partial install.
 validate_alias_targets() {
-    [ "$TAILSCALE_COMPATIBLE" = 1 ] || return 0
+    INSTALL_ALIASES=0
+    [ "$TAILSCALE_COMPATIBLE" = 0 ] && return 0
     for alias in tailscale tailscaled; do
         case "$alias" in
             tailscale) expected=rustscale ;;
@@ -480,14 +487,19 @@ validate_alias_targets() {
         if [ -L "$alias_path" ] && [ "$(readlink "$alias_path")" = "$expected" ]; then
             continue
         fi
-        echo "rustscale: refusing to replace existing compatibility command $alias_path" >&2
-        echo "Remove or relocate the existing Tailscale installation, or install without --tailscale-compatible." >&2
-        exit 1
+        if [ "$TAILSCALE_COMPATIBLE" = 1 ]; then
+            echo "rustscale: refusing to replace existing compatibility command $alias_path" >&2
+            echo "Remove or relocate the existing Tailscale installation, or omit --tailscale-compatible." >&2
+            exit 1
+        fi
+        echo "rustscale: existing $alias_path detected; leaving Tailscale command names unchanged"
+        return 0
     done
+    INSTALL_ALIASES=1
 }
 
 install_aliases() {
-    [ "$TAILSCALE_COMPATIBLE" = 1 ] || return 0
+    [ "${INSTALL_ALIASES:-0}" = 1 ] || return 0
     echo "rustscale: installing Tailscale-compatible command aliases"
     for alias in tailscale tailscaled; do
         case "$alias" in
@@ -619,7 +631,7 @@ post_install() {
         *) echo; echo "If $PREFIX/bin is not on your PATH, add it:" \
               "export PATH=$PREFIX/bin:\$PATH" ;;
     esac
-    if [ "$TAILSCALE_COMPATIBLE" = 1 ]; then
+    if [ "${INSTALL_ALIASES:-0}" = 1 ]; then
         echo
         echo "Tailscale-compatible aliases installed: tailscale, tailscaled"
         echo "RustScale state remains separate: /var/lib/rustscale and /var/run/rustscaled.sock"

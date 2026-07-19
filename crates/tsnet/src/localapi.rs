@@ -2036,12 +2036,15 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
         // command. A daemon restart between the two therefore stays down;
         // the daemon owns the actual generation teardown and replaces this
         // listener with a stopped LocalAPI generation when it completes.
-        if let Some(command_tx) = &state.command_tx {
-            if command_tx.send(DaemonCommand::Down).is_err() {
-                let error = serde_json::json!({"error": "daemon lifecycle loop is unavailable"});
-                write_json_response(conn, 503, "Service Unavailable", &error).await?;
-                return Ok(());
-            }
+        let Some(command_tx) = &state.command_tx else {
+            let error = serde_json::json!({"error": "daemon lifecycle owner is unavailable"});
+            write_json_response(conn, 503, "Service Unavailable", &error).await?;
+            return Ok(());
+        };
+        if command_tx.send(DaemonCommand::Down).is_err() {
+            let error = serde_json::json!({"error": "daemon lifecycle loop is unavailable"});
+            write_json_response(conn, 503, "Service Unavailable", &error).await?;
+            return Ok(());
         }
     }
 
@@ -8905,6 +8908,37 @@ mod tests {
 
         assert!(!state.prefs.read().await.WantRunning);
         assert!(matches!(command_rx.recv().await, Some(DaemonCommand::Down)));
+    }
+
+    #[tokio::test]
+    async fn down_fails_when_no_daemon_lifecycle_owner_exists() {
+        let state = make_test_state().await;
+        let request = serde_json::to_vec(&MaskedPrefs {
+            Prefs: Prefs {
+                WantRunning: false,
+                ..Default::default()
+            },
+            WantRunningSet: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        let response = tokio::spawn(async move {
+            handle_patch_prefs(&mut server, &request, &state)
+                .await
+                .unwrap();
+        });
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        response.await.unwrap();
+        let response = String::from_utf8(bytes).unwrap();
+
+        assert!(response.contains("503 Service Unavailable"), "{response}");
+        assert!(
+            response.contains("daemon lifecycle owner is unavailable"),
+            "{response}"
+        );
     }
 
     #[test]

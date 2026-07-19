@@ -3458,7 +3458,6 @@ version = "0.1.4"
 dependencies = [
  "async-trait",
  "bytes",
- "futures-util",
  "hex",
  "if-addrs",
  "libc",

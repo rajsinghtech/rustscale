@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use rustscale_key::NLPublic;
-use rustscale_localclient::LocalClient;
+use rustscale_localclient::{LocalClient, WatchIpnBus};
 use rustscale_safesocket::connect;
 use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_tka::{disablement_kdf, Key, KeyKind};
@@ -30,6 +30,27 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) {
             path.display()
         );
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Reconnect across the intentional pre-login to full LocalAPI handoff. Socket
+/// publication and old-acceptor shutdown are separate bounded steps, so one
+/// immediate connect can observe the retiring endpoint.
+async fn reconnect_watch_until(client: &LocalClient, deadline: std::time::Instant) -> WatchIpnBus {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "timeout reconnecting watch-ipn-bus");
+        let attempt = tokio::time::timeout(
+            remaining.min(Duration::from_secs(2)),
+            client.watch_ipn_bus(rustscale_ipn::NOTIFY_INITIAL_STATE),
+        )
+        .await;
+        match attempt {
+            Ok(Ok(watch)) => return watch,
+            Ok(Err(error)) => eprintln!("watch-ipn-bus reconnect not ready: {error}"),
+            Err(_) => eprintln!("watch-ipn-bus reconnect attempt timed out"),
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(200))).await;
     }
 }
 
@@ -895,20 +916,12 @@ async fn interactive_auth_flow() {
             Ok(Ok(None)) => {
                 eprintln!("watch-ipn-bus stream closed; reconnecting...");
                 // The pre-started LocalAPI may have been replaced by the full one.
-                // Reconnect to the new LocalAPI.
-                watch = lc
-                    .watch_ipn_bus(NOTIFY_INITIAL_STATE)
-                    .await
-                    .expect("watch_ipn_bus reconnect");
+                watch = reconnect_watch_until(&lc, deadline).await;
                 continue;
             }
             Ok(Err(e)) => {
                 eprintln!("watch-ipn-bus error: {e}; reconnecting...");
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                watch = lc
-                    .watch_ipn_bus(NOTIFY_INITIAL_STATE)
-                    .await
-                    .expect("watch_ipn_bus reconnect");
+                watch = reconnect_watch_until(&lc, deadline).await;
                 continue;
             }
             Err(elapsed) => panic!("timeout waiting for Running state: {elapsed:?}"),

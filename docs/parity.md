@@ -226,8 +226,15 @@ resolution, WhoIs identity, direct path (disco vs Go magicsock), pinned-DERP
 relay, DERP→direct upgrade without byte loss, and subnet route accept. The
 separate `tools/interop-tun.sh` CI path runs one exact serial Linux privileged
 regression test: fail-closed `up_tun`, real interface/rule/table-52 assertions,
-and an OS-socket echo roundtrip through the packet pump. Additional ignored TUN
-tests retain inbound and subnet-forwarding coverage for explicit manual runs.
+and an OS-socket echo roundtrip through the packet pump. The corrected
+out-of-process parity gate `tools/interop-tun-oops.sh` then runs the
+bench-style split: two independent rustscale TUN nodes as separate OS
+processes under sudo, each with the same kernel-state assertions and full
+captured logs, exchanging the issue-#75-shaped cadenced UDP traffic and a
+TCP echo roundtrip across the process boundary (the in-process repro can
+pass while the separated failure mode appears only across processes).
+Additional ignored TUN tests retain inbound and subnet-forwarding coverage
+for explicit manual runs.
 CI: interop + interop-tun jobs in e2e.yml. The separate required
 `linux-replacement` job installs a locally assembled release archive with the
 shipped systemd unit and completes a kernel-TUN echo roundtrip to a pinned

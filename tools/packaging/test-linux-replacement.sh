@@ -309,6 +309,9 @@ INSTALL_STARTED=0
 OFFICIAL_SENTINELS=0
 RULE_BASE=
 JOURNEY_FINISHED=0
+# Set only while the credential-free privileged selector owns its isolated
+# kernel names. The EXIT trap uses this solely for failure attribution.
+REQUIRED_TUN_DNS_GATE_ACTIVE=0
 CONFIG_PATH=/etc/rustscale-install-journey.json
 DROPIN_DIR=/etc/systemd/system/rustscaled.service.d
 JOURNEY_ENV=/etc/default/rustscaled-install-journey
@@ -404,6 +407,9 @@ PYTHON
 
   # This is intentionally a dedicated mode of the existing reviewed selector.
   # It neither receives nor can fall through to the secret-backed interop path.
+  # Mark only the privileged mutation window so EXIT cleanup can attribute an
+  # interrupted selector to its isolated interface, socket, and rule chain.
+  REQUIRED_TUN_DNS_GATE_ACTIVE=1
   echo "$LABEL $(timestamp) start: required TUN DNS readiness (root deadline=180s)" >&2
   if ! sudo -n timeout --signal=TERM --kill-after=5s 180s \
       env RUSTSCALE_REQUIRED_TUN_DNS_FAILURE=1 \
@@ -424,6 +430,7 @@ PYTHON
     echo "$LABEL ERROR: required TUN DNS readiness gate failed" >&2
     return 1
   fi
+  REQUIRED_TUN_DNS_GATE_ACTIVE=0
   echo "$LABEL $(timestamp) finish: required TUN DNS readiness" >&2
 }
 
@@ -599,6 +606,9 @@ cleanup() {
   # later stage must never mask either that failure or an earlier cleanup leak.
   if [[ "$primary_status" != 0 ]]; then
     capture_failure_diagnostics
+  fi
+  if [[ "$REQUIRED_TUN_DNS_GATE_ACTIVE" == 1 ]]; then
+    echo "$LABEL $(timestamp) cleanup attribution: exact required TUN DNS selector owned $DNS_TUN_NAME, $DNS_SOCKET, and protocol-201 rules" >&2
   fi
   echo "$LABEL $(timestamp) cleanup: begin (deadline=${RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT:-90}s)" >&2
 

@@ -3231,6 +3231,21 @@ async fn handle_debug_capture<W: AsyncWrite + Unpin>(
 /// - `Peer` is a JSON object keyed by node public key string (same as Go).
 /// - `TUN`: true when the server was started via `up_tun()`.
 /// - `SuggestedExitNode`: omitted (Go does not emit it in ipnstate.Status).
+// Status keeps Go-compatible `Health: []string`; structured warning identity
+// belongs to `/health`. Both views take their snapshot from the same
+// generation-owned tracker rather than a backend notification cache.
+pub(crate) fn health_status_text(health: &Tracker) -> Vec<String> {
+    health
+        .current_warnings()
+        .iter()
+        .map(|warning| warning.text.clone())
+        .collect()
+}
+
+pub(crate) fn health_json(health: &Tracker) -> serde_json::Value {
+    serde_json::to_value(health.current_warnings()).unwrap_or(serde_json::json!([]))
+}
+
 async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
     let _map_snapshot = state.peer_map.gate.read().await;
     let peers = state.peers.read().await;
@@ -3244,12 +3259,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
         s.TUN = state.tun_mode;
         s.BackendState = state.ipn_backend.state().as_str().to_string();
         s.HaveNodeKey = Some(true);
-        s.Health = state
-            .health
-            .current_warnings()
-            .iter()
-            .map(|w| w.text.clone())
-            .collect();
+        s.Health = health_status_text(&state.health);
         for ip in &state.tailscale_ips {
             s.TailscaleIPs.push(*ip);
         }
@@ -3542,8 +3552,7 @@ fn build_metrics_text(state: &LocalApiState) -> String {
 
 /// Build health JSON — an array of active warnings (same shape as C2N).
 fn build_health_json(state: &LocalApiState) -> serde_json::Value {
-    let warnings = state.health.current_warnings();
-    serde_json::to_value(&warnings).unwrap_or(serde_json::json!([]))
+    health_json(&state.health)
 }
 
 // ---------------------------------------------------------------------------

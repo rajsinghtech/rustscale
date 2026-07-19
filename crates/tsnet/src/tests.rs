@@ -1926,8 +1926,9 @@ fn status_empty_health_when_not_up() {
 }
 
 #[test]
-fn requested_os_dns_failure_is_immediately_health_degraded_and_retains_cleanup_owner() {
+fn requested_os_dns_health_is_generation_owned_and_serialized_consistently() {
     struct FailingDns(Arc<AtomicBool>);
+    struct SuccessfulDns;
 
     impl rustscale_dns::OsConfigurator for FailingDns {
         fn set_dns(&mut self, _: &rustscale_dns::OsConfig) -> std::io::Result<()> {
@@ -1944,16 +1945,81 @@ fn requested_os_dns_failure_is_immediately_health_degraded_and_retains_cleanup_o
         }
     }
 
+    impl rustscale_dns::OsConfigurator for SuccessfulDns {
+        fn set_dns(&mut self, _: &rustscale_dns::OsConfig) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn supports_split_dns(&self) -> bool {
+            true
+        }
+    }
+
+    // All committed-generation consumers receive clones of this one tracker.
     let health = Tracker::new();
+    let returned_status_health = health.clone();
+    let localapi_status_health = health.clone();
+    let localapi_rich_health = health.clone();
     let closed = Arc::new(AtomicBool::new(false));
     let mut owner = crate::lifecycle::configure_requested_os_dns(
         Box::new(FailingDns(Arc::clone(&closed))),
         &OsConfig::default(),
         &health,
     );
-    assert!(health.current_warnings().iter().any(|warning| {
-        warning.id == rustscale_health::WARN_OS_DNS && warning.text.contains("permission denied")
-    }));
+
+    assert!(returned_status_health
+        .current_warnings()
+        .iter()
+        .any(|warning| {
+            warning.id == rustscale_health::WARN_OS_DNS
+                && warning.text.contains("permission denied")
+        }));
+    assert!(crate::localapi::health_status_text(&localapi_status_health)
+        .iter()
+        .any(|text| text.contains("requested OS DNS configuration failed: permission denied")));
+    let rich = crate::localapi::health_json(&localapi_rich_health);
+    assert!(rich
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|warning| {
+            warning["id"] == rustscale_health::WARN_OS_DNS
+                && warning["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("permission denied"))
+        })));
+
+    // A map keepalive may clear control health, never OS-DNS health.
+    health.set_healthy(rustscale_health::WARN_CONTROL);
+    assert!(health
+        .current_warnings()
+        .iter()
+        .any(|warning| warning.id == rustscale_health::WARN_OS_DNS));
+
+    // A retired generation has a different tracker; its late clear cannot
+    // mutate the published generation's DNS warning.
+    let stale_generation_health = Tracker::new();
+    stale_generation_health.set_unhealthy(rustscale_health::WARN_OS_DNS, "stale failure");
+    stale_generation_health.set_healthy(rustscale_health::WARN_OS_DNS);
+    assert!(health
+        .current_warnings()
+        .iter()
+        .any(|warning| warning.id == rustscale_health::WARN_OS_DNS));
+
+    // Only a genuine successful DNS reconfiguration of the committed tracker
+    // clears the warning.
+    let mut successful_owner = crate::lifecycle::configure_requested_os_dns(
+        Box::new(SuccessfulDns),
+        &OsConfig::default(),
+        &health,
+    );
+    assert!(!health
+        .current_warnings()
+        .iter()
+        .any(|warning| warning.id == rustscale_health::WARN_OS_DNS));
+    successful_owner.close().unwrap();
     owner.close().unwrap();
     assert!(closed.load(Ordering::SeqCst));
 }
@@ -5992,126 +6058,236 @@ fn required_command_output(program: &str, args: &[&str], assertion: &str) -> Str
 }
 
 #[cfg(target_os = "linux")]
-fn assert_linux_tun_kernel_state(tun: &rustscale_tun::TunConfig) {
+fn bounded_linux_command_output(
+    program: &str,
+    args: &[&str],
+    label: &str,
+) -> Result<String, String> {
+    let output = std::process::Command::new("timeout")
+        .args(["--signal=KILL", "3s", program])
+        .args(args)
+        .output()
+        .map_err(|error| format!("{label}: failed to run {program} {args:?}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{label}: {program} {args:?} failed with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("{label}: command output was not UTF-8: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tun_kernel_state_failures(tun: &rustscale_tun::TunConfig, ifindex: u32) -> Vec<String> {
+    let mut failures = Vec::new();
     let sysfs = std::path::Path::new("/sys/class/net").join(&tun.name);
-    let read_sysfs = |field: &str| {
-        std::fs::read_to_string(sysfs.join(field)).unwrap_or_else(|error| {
-            panic!(
-                "real TUN gate: failed to read {} {field}: {error}",
+    for field in ["ifindex", "flags", "mtu"] {
+        if let Err(error) = std::fs::read_to_string(sysfs.join(field)) {
+            failures.push(format!("failed to read {} {field}: {error}", tun.name));
+        }
+    }
+    if let Ok(actual) = std::fs::read_to_string(sysfs.join("ifindex")) {
+        match actual.trim().parse::<u32>() {
+            Ok(actual) if actual == ifindex && actual != 0 => {}
+            Ok(actual) => failures.push(format!(
+                "{} has unexpected ifindex {actual} (expected nonzero {ifindex})",
                 tun.name
-            )
-        })
-    };
-
-    let ifindex = read_sysfs("ifindex")
-        .trim()
-        .parse::<u32>()
-        .expect("real TUN gate: interface index must be numeric");
-    assert_ne!(ifindex, 0, "real TUN gate: interface index must be nonzero");
-
-    let flags_text = read_sysfs("flags");
-    let flags = u32::from_str_radix(flags_text.trim().trim_start_matches("0x"), 16)
-        .expect("real TUN gate: interface flags must be hexadecimal");
-    assert_ne!(
-        flags & 1,
-        0,
-        "real TUN gate: {} must have IFF_UP set (flags={flags_text:?})",
-        tun.name
-    );
-
-    let mtu = read_sysfs("mtu")
-        .trim()
-        .parse::<usize>()
-        .expect("real TUN gate: interface MTU must be numeric");
-    assert_eq!(
-        mtu, tun.mtu,
-        "real TUN gate: kernel MTU for {} does not match the configured MTU",
-        tun.name
-    );
-
-    let rules = required_command_output(
-        "ip",
-        &["-4", "-details", "rule", "show"],
-        "real TUN gate policy rules",
-    );
-    let base = 5_000 + (ifindex % 200) * 100;
-    for (preference, target) in [
-        (base + 10, "lookup main"),
-        (base + 30, "lookup default"),
-        (base + 50, "unreachable"),
-        (base + 70, "lookup 52"),
-    ] {
-        let prefix = format!("{preference}:");
-        let rule = rules
-            .lines()
-            .find(|line| line.split_whitespace().next() == Some(prefix.as_str()))
-            .unwrap_or_else(|| {
-                panic!(
-                    "real TUN gate: missing IPv4 policy rule at preference {preference}\n{rules}"
-                )
-            });
-        assert!(
-            rule.contains("proto 201"),
-            "real TUN gate: rule {preference} is not protocol 201: {rule}"
-        );
-        assert!(
-            rule.contains(target),
-            "real TUN gate: rule {preference} does not select {target}: {rule}"
-        );
+            )),
+            Err(error) => failures.push(format!("{} has nonnumeric ifindex: {error}", tun.name)),
+        }
+    }
+    if let Ok(flags) = std::fs::read_to_string(sysfs.join("flags")) {
+        match u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16) {
+            Ok(flags) if flags & 1 != 0 => {}
+            Ok(flags) => failures.push(format!("{} is not IFF_UP (flags={flags:#x})", tun.name)),
+            Err(error) => failures.push(format!("{} has invalid flags: {error}", tun.name)),
+        }
+    }
+    if let Ok(mtu) = std::fs::read_to_string(sysfs.join("mtu")) {
+        match mtu.trim().parse::<usize>() {
+            Ok(actual) if actual == tun.mtu => {}
+            Ok(actual) => failures.push(format!(
+                "{} MTU {actual} differs from configured {}",
+                tun.name, tun.mtu
+            )),
+            Err(error) => failures.push(format!("{} has invalid MTU: {error}", tun.name)),
+        }
     }
 
-    let routes = required_command_output(
+    let base = 5_000 + (ifindex % 200) * 100;
+    match bounded_linux_command_output("ip", &["-4", "-details", "rule", "show"], "TUN IPv4 rules")
+    {
+        Ok(rules) => {
+            for (preference, target) in [
+                (base + 10, "lookup main"),
+                (base + 30, "lookup default"),
+                (base + 50, "unreachable"),
+                (base + 70, "lookup 52"),
+            ] {
+                let prefix = format!("{preference}:");
+                match rules
+                    .lines()
+                    .find(|line| line.split_whitespace().next() == Some(prefix.as_str()))
+                {
+                    Some(rule) if rule.contains("proto 201") && rule.contains(target) => {}
+                    Some(rule) => failures.push(format!("IPv4 rule {preference} is wrong: {rule}")),
+                    None => failures.push(format!(
+                        "missing IPv4 protocol-201 rule at preference {preference}"
+                    )),
+                }
+            }
+        }
+        Err(error) => failures.push(error),
+    }
+    match bounded_linux_command_output(
         "ip",
         &["-4", "route", "show", "table", "52"],
-        "real TUN gate table 52 routes",
-    );
-    let tailnet_route = routes.lines().find(|line| {
-        line.split_whitespace().next() == Some("100.64.0.0/10")
-            && line.contains(&format!("dev {}", tun.name))
-    });
+        "TUN table 52 routes",
+    ) {
+        Ok(routes)
+            if routes.lines().any(|line| {
+                line.split_whitespace().next() == Some("100.64.0.0/10")
+                    && line.contains(&format!("dev {}", tun.name))
+            }) => {}
+        Ok(routes) => failures.push(format!(
+            "table 52 lacks 100.64.0.0/10 via {}: {routes}",
+            tun.name
+        )),
+        Err(error) => failures.push(error),
+    }
+    failures
+}
+
+#[cfg(target_os = "linux")]
+fn assert_linux_tun_kernel_state(tun: &rustscale_tun::TunConfig) {
+    let ifindex = std::fs::read_to_string(
+        std::path::Path::new("/sys/class/net")
+            .join(&tun.name)
+            .join("ifindex"),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "real TUN gate: failed to read {} ifindex: {error}",
+            tun.name
+        )
+    })
+    .trim()
+    .parse::<u32>()
+    .expect("real TUN gate: interface index must be numeric");
+    let failures = linux_tun_kernel_state_failures(tun, ifindex);
     assert!(
-        tailnet_route.is_some(),
-        "real TUN gate: table 52 is missing 100.64.0.0/10 via {}\n{routes}",
-        tun.name
+        failures.is_empty(),
+        "real TUN gate state failures:\n{}",
+        failures.join("\n")
     );
 }
 
 #[cfg(target_os = "linux")]
-fn assert_linux_tun_kernel_cleanup(tun: &rustscale_tun::TunConfig, ifindex: u32) {
-    assert!(
-        !std::path::Path::new("/sys/class/net")
-            .join(&tun.name)
-            .exists(),
-        "real TUN gate: {} remained after close",
-        tun.name
-    );
-    let rules = required_command_output(
-        "ip",
-        &["-4", "-details", "rule", "show"],
-        "real TUN gate policy-rule cleanup",
-    );
-    let base = 5_000 + (ifindex % 200) * 100;
-    for preference in [base + 10, base + 30, base + 50, base + 70] {
-        let prefix = format!("{preference}:");
-        assert!(
-            !rules.lines().any(|line| {
-                line.split_whitespace().next() == Some(prefix.as_str())
-                    && line.contains("proto 201")
-            }),
-            "real TUN gate: protocol-201 rule at preference {preference} leaked after close\n{rules}"
-        );
+fn linux_tun_kernel_cleanup_failures(tun: &rustscale_tun::TunConfig, ifindex: u32) -> Vec<String> {
+    let mut failures = Vec::new();
+    if std::path::Path::new("/sys/class/net")
+        .join(&tun.name)
+        .exists()
+    {
+        failures.push(format!("{} remained after close", tun.name));
     }
-    let routes = required_command_output(
-        "ip",
-        &["-4", "route", "show", "table", "52"],
-        "real TUN gate table-52 cleanup",
-    );
+    let base = 5_000 + (ifindex % 200) * 100;
+    for family in ["-4", "-6"] {
+        match bounded_linux_command_output(
+            "ip",
+            &[family, "-details", "rule", "show"],
+            "TUN policy-rule cleanup",
+        ) {
+            Ok(rules) => {
+                for preference in [base + 10, base + 30, base + 50, base + 70] {
+                    let prefix = format!("{preference}:");
+                    if rules.lines().any(|line| {
+                        line.split_whitespace().next() == Some(prefix.as_str())
+                            && line.contains("proto 201")
+                    }) {
+                        failures.push(format!(
+                            "IPv{} protocol-201 rule {preference} leaked",
+                            &family[1..]
+                        ));
+                    }
+                }
+            }
+            Err(error) => failures.push(error),
+        }
+        match bounded_linux_command_output(
+            "ip",
+            &[family, "route", "show", "table", "52"],
+            "TUN table-52 cleanup",
+        ) {
+            Ok(routes)
+                if !routes
+                    .lines()
+                    .any(|line| line.contains(&format!("dev {}", tun.name))) => {}
+            Ok(routes) => failures.push(format!(
+                "IPv{} table 52 still routes through {}: {routes}",
+                &family[1..],
+                tun.name
+            )),
+            Err(error) => failures.push(error),
+        }
+    }
+    failures
+}
+
+#[cfg(target_os = "linux")]
+fn linux_tun_early_cleanup_failures(tun: &rustscale_tun::TunConfig) -> Vec<String> {
+    let mut failures = Vec::new();
+    if std::path::Path::new("/sys/class/net")
+        .join(&tun.name)
+        .exists()
+    {
+        failures.push(format!("{} remained after close", tun.name));
+    }
+    // The scenario preflight rejects any pre-existing protocol-201 rule, so
+    // before an ifindex is available every such rule is still attributable to
+    // this isolated test generation.
+    for family in ["-4", "-6"] {
+        match bounded_linux_command_output(
+            "ip",
+            &[family, "-details", "rule", "show"],
+            "early TUN policy-rule cleanup",
+        ) {
+            Ok(rules) if !rules.lines().any(|line| line.contains("proto 201")) => {}
+            Ok(rules) => failures.push(format!(
+                "IPv{} protocol-201 rule remained without a captured ifindex: {rules}",
+                &family[1..]
+            )),
+            Err(error) => failures.push(error),
+        }
+        match bounded_linux_command_output(
+            "ip",
+            &[family, "route", "show", "table", "52"],
+            "early TUN table-52 cleanup",
+        ) {
+            Ok(routes)
+                if !routes
+                    .lines()
+                    .any(|line| line.contains(&format!("dev {}", tun.name))) => {}
+            Ok(routes) => failures.push(format!(
+                "IPv{} table 52 still routes through {}: {routes}",
+                &family[1..],
+                tun.name
+            )),
+            Err(error) => failures.push(error),
+        }
+    }
+    failures
+}
+
+#[cfg(target_os = "linux")]
+fn assert_linux_tun_kernel_cleanup(tun: &rustscale_tun::TunConfig, ifindex: u32) {
+    let failures = linux_tun_kernel_cleanup_failures(tun, ifindex);
     assert!(
-        !routes
-            .lines()
-            .any(|line| line.contains(&format!("dev {}", tun.name))),
-        "real TUN gate: table 52 still routes through {} after close\n{routes}",
-        tun.name
+        failures.is_empty(),
+        "real TUN gate cleanup failures:\n{}",
+        failures.join("\n")
     );
 }
 
@@ -6203,89 +6379,157 @@ async fn run_required_tun_dns_failure_scenario() {
         .build()
         .unwrap();
 
-    // Pause after DNS setup but before the one TUN Running commit. This proves
-    // LocalAPI reports Starting rather than prematurely publishing readiness.
+    // Keep every post-acquisition assertion in a result body. The cleanup
+    // phase below always owns `server.close()`, including when readiness or
+    // LocalAPI assertions fail.
     let entered = Arc::new(tokio::sync::Barrier::new(2));
     let release = Arc::new(tokio::sync::Barrier::new(2));
-    server.startup_localapi_test_hook = Some((Arc::clone(&entered), Arc::clone(&release), false));
-    let mut up = Box::pin(server.up_tun(TunModeConfig {
-        tun: tun.clone(),
-        apply_routes: true,
-        exit_node: None,
-    }));
-    tokio::select! {
-        _ = entered.wait() => {}
-        result = &mut up => panic!("TUN DNS scenario finished before startup barrier: {result:?}"),
-    }
-    let starting = String::from_utf8(localapi_status_response(&socket).await).unwrap();
-    assert!(
-        starting.contains("\"BackendState\":\"Starting\""),
-        "{starting}"
-    );
-    assert!(
-        !starting.contains("\"BackendState\":\"Running\""),
-        "{starting}"
-    );
-    release.wait().await;
-    let returned = up
-        .await
-        .expect("injected DNS failure must not revoke committed TUN startup");
-    assert!(
-        set_called.load(Ordering::SeqCst),
-        "injected DNS configurator was not called"
-    );
-    assert!(returned.health.iter().any(|warning| {
-        warning.id == rustscale_health::WARN_OS_DNS && warning.text.contains("injected DNS failure")
-    }));
-    assert_eq!(
-        server.inner.as_ref().unwrap().ipn_backend.state(),
-        rustscale_ipn::State::Running
-    );
-    assert!(
-        server.inner.as_ref().unwrap().os_dns_configurator.is_some(),
-        "failed DNS configurator was not retained for cleanup"
-    );
-    assert!(
-        !dns_closed.load(Ordering::SeqCst),
-        "DNS configurator closed before server.close()"
-    );
-    assert!(
-        socket.exists(),
-        "LocalAPI socket was not retained while Running"
-    );
-    let local_status = rustscale_localclient::LocalClient::new(&socket)
-        .status()
-        .await
-        .unwrap();
-    assert!(local_status["Health"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|warning| {
-            warning["WarnableCode"] == rustscale_health::WARN_OS_DNS
-                && warning.to_string().contains("injected DNS failure")
+    let mut captured_ifindex = None;
+    let primary: Result<(), String> = async {
+        // Pause after DNS setup but before the one TUN Running commit. This
+        // proves LocalAPI reports Starting rather than prematurely publishing
+        // readiness.
+        server.startup_localapi_test_hook = Some((Arc::clone(&entered), Arc::clone(&release), false));
+        let mut up = Box::pin(server.up_tun(TunModeConfig {
+            tun: tun.clone(),
+            apply_routes: true,
+            exit_node: None,
         }));
-    assert_linux_tun_kernel_state(&tun);
-    let ifindex = std::fs::read_to_string(
-        std::path::Path::new("/sys/class/net")
-            .join(&tun.name)
-            .join("ifindex"),
-    )
-    .unwrap()
-    .trim()
-    .parse::<u32>()
-    .unwrap();
+        tokio::select! {
+            _ = entered.wait() => {}
+            result = &mut up => return Err(format!("TUN DNS scenario finished before startup barrier: {result:?}")),
+        }
+        let starting = String::from_utf8(localapi_status_response(&socket).await)
+            .map_err(|error| format!("Starting LocalAPI response was not UTF-8: {error}"))?;
+        if !starting.contains("\"BackendState\":\"Starting\"") {
+            return Err(format!("LocalAPI did not report Starting before handoff: {starting}"));
+        }
+        if starting.contains("\"BackendState\":\"Running\"") {
+            return Err(format!("LocalAPI published Running before handoff: {starting}"));
+        }
+        release.wait().await;
+        let returned = up
+            .await
+            .map_err(|error| format!("injected DNS failure revoked committed TUN startup: {error}"))?;
 
-    server.close().await.unwrap();
-    assert!(
-        dns_closed.load(Ordering::SeqCst),
-        "DNS configurator close callback did not run"
-    );
-    assert!(
-        !socket.exists(),
-        "LocalAPI socket leaked after server.close()"
-    );
-    assert_linux_tun_kernel_cleanup(&tun, ifindex);
+        // Capture kernel identity immediately after the successful startup,
+        // before any fallible health or route assertion.
+        let ifindex = std::fs::read_to_string(
+            std::path::Path::new("/sys/class/net")
+                .join(&tun.name)
+                .join("ifindex"),
+        )
+        .map_err(|error| format!("failed to capture {} ifindex: {error}", tun.name))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| format!("{} ifindex was not numeric: {error}", tun.name))?;
+        if ifindex == 0 {
+            return Err(format!("{} ifindex must be nonzero", tun.name));
+        }
+        captured_ifindex = Some(ifindex);
+
+        if !set_called.load(Ordering::SeqCst) {
+            return Err("injected DNS configurator was not called".into());
+        }
+        if !returned.health.iter().any(|warning| {
+            warning.id == rustscale_health::WARN_OS_DNS
+                && warning.text.contains("injected DNS failure")
+        }) {
+            return Err(format!("returned status lost OS-DNS warning: {:?}", returned.health));
+        }
+        if server.inner.as_ref().map(|inner| inner.ipn_backend.state())
+            != Some(rustscale_ipn::State::Running)
+        {
+            return Err("independent TUN/router readiness did not commit Running".into());
+        }
+        if server
+            .inner
+            .as_ref()
+            .is_none_or(|inner| inner.os_dns_configurator.is_none())
+        {
+            return Err("failed DNS configurator was not retained for cleanup".into());
+        }
+        if dns_closed.load(Ordering::SeqCst) {
+            return Err("DNS configurator closed before server.close()".into());
+        }
+        if !socket.exists() {
+            return Err("LocalAPI socket was not retained while Running".into());
+        }
+
+        let local_status = rustscale_localclient::LocalClient::new(&socket)
+            .status()
+            .await
+            .map_err(|error| format!("LocalAPI status request failed: {error}"))?;
+        if !local_status["Health"].as_array().is_some_and(|warnings| {
+            warnings.iter().any(|warning| {
+                warning
+                    .as_str()
+                    .is_some_and(|text| text.contains("injected DNS failure"))
+            })
+        }) {
+            return Err(format!(
+                "LocalAPI /status did not serialize OS-DNS warning text: {local_status}"
+            ));
+        }
+        let local_health = rustscale_localclient::LocalClient::new(&socket)
+            .health()
+            .await
+            .map_err(|error| format!("LocalAPI health request failed: {error}"))?;
+        if !local_health.as_array().is_some_and(|warnings| warnings.iter().any(|warning| {
+            warning["id"] == rustscale_health::WARN_OS_DNS
+                && warning["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("injected DNS failure"))
+        })) {
+            return Err(format!(
+                "LocalAPI /health did not retain structured OS-DNS warning: {local_health}"
+            ));
+        }
+
+        let failures = linux_tun_kernel_state_failures(&tun, ifindex);
+        if !failures.is_empty() {
+            return Err(format!("real TUN gate state failures:\n{}", failures.join("\n")));
+        }
+        Ok(())
+    }
+    .await;
+
+    // Never let a primary assertion bypass ownership teardown. Each cleanup
+    // probe is independently bounded and collected, so a later cleanup error
+    // cannot hide the first readiness failure.
+    let mut cleanup_failures = Vec::new();
+    match tokio::time::timeout(std::time::Duration::from_secs(30), server.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => cleanup_failures.push(format!("Server::close failed: {error}")),
+        Err(_) => cleanup_failures.push("Server::close timed out after 30s".into()),
+    }
+    if !dns_closed.load(Ordering::SeqCst) {
+        cleanup_failures.push("DNS configurator close callback did not run".into());
+    }
+    if socket.exists() {
+        cleanup_failures.push(format!(
+            "LocalAPI socket leaked after close: {}",
+            socket.display()
+        ));
+    }
+    if let Some(ifindex) = captured_ifindex {
+        cleanup_failures.extend(linux_tun_kernel_cleanup_failures(&tun, ifindex));
+    } else {
+        cleanup_failures.extend(linux_tun_early_cleanup_failures(&tun));
+    }
+
+    match (primary, cleanup_failures.is_empty()) {
+        (Ok(()), true) => {}
+        (Ok(()), false) => panic!(
+            "required TUN DNS cleanup failed:\n{}",
+            cleanup_failures.join("\n")
+        ),
+        (Err(primary), true) => panic!("required TUN DNS readiness failed: {primary}"),
+        (Err(primary), false) => panic!(
+            "required TUN DNS readiness failed: {primary}\nsecondary cleanup failures:\n{}",
+            cleanup_failures.join("\n")
+        ),
+    }
 }
 
 /// Interop TUN: rustscale in TUN mode dials the Go node's serve echo via

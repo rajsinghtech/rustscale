@@ -2405,7 +2405,7 @@ impl Magicsock {
                     #[cfg(target_os = "linux")]
                     {
                         return self
-                            .send_direct_batch_linux(&udp, addr, node_addr, datagrams)
+                            .send_direct_batch_linux(&peer, &udp, addr, node_addr, datagrams)
                             .await;
                     }
                     #[cfg(not(target_os = "linux"))]
@@ -2522,6 +2522,7 @@ impl Magicsock {
     #[cfg(target_os = "linux")]
     async fn send_direct_batch_linux<T: AsRef<[u8]>>(
         &self,
+        peer: &NodePublic,
         udp: &Arc<UdpSocket>,
         addr: SocketAddr,
         node_addr: Option<IpAddr>,

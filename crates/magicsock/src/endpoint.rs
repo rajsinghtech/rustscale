@@ -593,6 +593,27 @@ impl Endpoint {
         wall_at: SystemTime,
         received: bool,
     ) {
+        if !received {
+            // A successful local socket write is not evidence that the peer
+            // received or authenticated the packet. Preserve LastWrite only
+            // when it uses the same still-current, receive-authenticated path;
+            // never promote a fallback or extend transport freshness here.
+            let matches_current = self.last_transport.as_ref().is_some_and(|observation| {
+                observation.class == class
+                    && observation.addr == addr
+                    && observation.derp_region == derp_region
+                    && monotonic_at
+                        .checked_duration_since(observation.monotonic_at)
+                        .is_some_and(|age| age < PATH_ACTIVITY_TIMEOUT)
+                    && (class != PathClass::Direct
+                        || self.trusted_direct_addr(monotonic_at) == addr)
+            });
+            if matches_current {
+                self.last_transport_tx = Some(TransportTimestamp { wall_at });
+            }
+            return;
+        }
+
         self.last_transport = Some(TransportObservation {
             class,
             addr,
@@ -600,12 +621,7 @@ impl Endpoint {
             monotonic_at,
             wall_at,
         });
-        let timestamp = TransportTimestamp { wall_at };
-        if received {
-            self.last_transport_rx = Some(timestamp);
-        } else {
-            self.last_transport_tx = Some(timestamp);
-        }
+        self.last_transport_rx = Some(TransportTimestamp { wall_at });
     }
 
     /// Record authenticated traffic on a direct UDP path.
@@ -651,7 +667,9 @@ impl Endpoint {
         let Some(observation) = self.last_transport.as_ref() else {
             return PathTelemetry::default();
         };
-        let fresh = now.duration_since(observation.monotonic_at) < PATH_ACTIVITY_TIMEOUT;
+        let fresh = now
+            .checked_duration_since(observation.monotonic_at)
+            .is_some_and(|age| age < PATH_ACTIVITY_TIMEOUT);
         let direct_current =
             observation.class != PathClass::Direct || self.trusted_direct_addr(now).is_some();
         let current = fresh && direct_current;
@@ -1145,6 +1163,54 @@ mod tests {
         assert_eq!(idle.class, PathClass::None);
         assert!(!idle.fresh);
         assert_eq!(idle.observed_at, Some(wall + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn local_send_never_promotes_or_refreshes_transport_evidence() {
+        let mut endpoint = ep();
+        let start = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        endpoint.record_transport_at(PathClass::Derp, None, Some(7), start, wall, false);
+        let unknown = endpoint.path_telemetry_at(start);
+        assert_eq!(unknown.class, PathClass::None);
+        assert_eq!(unknown.last_tx_at, None);
+
+        endpoint.record_transport_at(PathClass::Derp, None, Some(7), start, wall, true);
+        endpoint.record_transport_at(
+            PathClass::Derp,
+            None,
+            Some(7),
+            start + Duration::from_secs(1),
+            wall + Duration::from_secs(1),
+            false,
+        );
+        let active = endpoint.path_telemetry_at(start + Duration::from_secs(2));
+        assert_eq!(active.class, PathClass::Derp);
+        assert_eq!(active.last_tx_at, Some(wall + Duration::from_secs(1)));
+
+        let stale_at = start + PATH_ACTIVITY_TIMEOUT;
+        endpoint.record_transport_at(
+            PathClass::Derp,
+            None,
+            Some(7),
+            stale_at,
+            wall + PATH_ACTIVITY_TIMEOUT,
+            false,
+        );
+        let stale = endpoint.path_telemetry_at(stale_at);
+        assert_eq!(stale.class, PathClass::None);
+        assert!(!stale.fresh);
+        assert_eq!(stale.last_tx_at, Some(wall + Duration::from_secs(1)));
+
+        // A timestamp older than the observation is invalid, not fresh and
+        // must not panic or promote a configured fallback.
+        assert_eq!(
+            endpoint
+                .path_telemetry_at(start.checked_sub(Duration::from_secs(1)).unwrap())
+                .class,
+            PathClass::None
+        );
     }
 
     #[test]

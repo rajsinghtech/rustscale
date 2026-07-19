@@ -116,6 +116,12 @@ pub async fn run_userspace(
         .await
     }
     .await;
+    // Stream Drop queues the netstack TCP close. Keep the packet pump alive
+    // for the same bounded drain grace used by the server writer so FINs reach
+    // the long-lived peer before this short-lived trial tears down tsnet.
+    // Without this, later trial processes can encounter prior live four-tuples
+    // even though every preceding workload worker completed.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let shutdown = close_userspace(&mut server).await;
     match (operation, shutdown) {
         (Ok(result), Ok(())) => {

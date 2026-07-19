@@ -1817,6 +1817,11 @@ pub(crate) fn build_router_config(
     exit_node_allow_lan_access: bool,
     tun_name: &str,
 ) -> Result<rustscale_router::RouterConfig, TsnetError> {
+    // The host resolver reaches the in-process MagicDNS responder through the
+    // TUN service address. Keep it in every router reconciliation, not merely
+    // initial startup, so map updates cannot withdraw the listener address.
+    let mut local_addrs = local_addrs.to_vec();
+    local_addrs.push(IpAddr::V4(MAGICDNS_VIP));
     let prefixes = if route_table.exit_node_requested() {
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut prefixes =
@@ -1854,7 +1859,7 @@ pub(crate) fn build_router_config(
         Vec::new()
     };
     Ok(build_router_config_with_local_routes(
-        local_addrs,
+        &local_addrs,
         route_table,
         exit_node_allow_lan_access,
         prefixes,

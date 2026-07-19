@@ -5688,6 +5688,43 @@ fn assert_linux_tun_kernel_state(tun: &rustscale_tun::TunConfig) {
     );
 }
 
+/// Prove the system resolver reaches the TUN's MagicDNS responder. These are
+/// deliberately out-of-process commands: a netmap-only resolver is not enough
+/// evidence that ordinary host applications can resolve peer names.
+#[cfg(target_os = "linux")]
+fn assert_linux_magicdns_reachable(tun: &rustscale_tun::TunConfig, go: &InteropEnv) {
+    let dns = required_command_output(
+        "resolvectl",
+        &["dns", &tun.name],
+        "MagicDNS resolvectl DNS link state",
+    );
+    assert!(
+        dns.contains("100.100.100.100"),
+        "MagicDNS resolvectl DNS state for {} lacks service VIP:\n{dns}",
+        tun.name
+    );
+    let domains = required_command_output(
+        "resolvectl",
+        &["domain", &tun.name],
+        "MagicDNS resolvectl domain link state",
+    );
+    assert!(
+        domains.contains('~'),
+        "MagicDNS resolvectl domain state for {} lacks a routing domain:\n{domains}",
+        tun.name
+    );
+
+    let name = go.go_name.trim_end_matches('.');
+    let hosts = required_command_output("getent", &["ahostsv4", name], "MagicDNS getent lookup");
+    assert!(
+        hosts
+            .lines()
+            .any(|line| line.starts_with(&go.go_ip.to_string())),
+        "MagicDNS getent lookup for {name} did not return {}:\n{hosts}",
+        go.go_ip
+    );
+}
+
 /// Interop TUN: rustscale in TUN mode dials the Go node's serve echo via
 /// an OS socket. Traffic flows: OS TCP → TUN → WG → magicsock → Go netstack.
 #[tokio::test]
@@ -5705,6 +5742,7 @@ async fn interop_tun_rust_dials_go() {
         .hostname(format!("rustscale-tun-dial-{uid}"))
         .auth_key(ienv.authkey.clone())
         .ephemeral(true)
+        .configure_os_dns(true)
         .disable_portmapping(true)
         .build()
         .expect("build");
@@ -5712,7 +5750,10 @@ async fn interop_tun_rust_dials_go() {
     let tun = Box::pin(up_tun_required(&mut server, "interop_tun_rust_dials_go")).await;
 
     #[cfg(target_os = "linux")]
-    assert_linux_tun_kernel_state(&tun);
+    {
+        assert_linux_tun_kernel_state(&tun);
+        assert_linux_magicdns_reachable(&tun, &ienv);
+    }
     #[cfg(not(target_os = "linux"))]
     let _ = tun;
 

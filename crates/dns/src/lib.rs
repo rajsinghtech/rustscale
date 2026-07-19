@@ -34,6 +34,10 @@ pub use osconfig::{
 };
 #[cfg(target_os = "macos")]
 pub use osconfig_darwin::DarwinConfigurator;
+#[cfg(target_os = "linux")]
+mod osconfig_linux;
+#[cfg(target_os = "linux")]
+pub use osconfig_linux::LinuxResolvedConfigurator;
 pub use wire::{
     build_a_response, build_aaaa_response, build_format_error_response, build_nxdomain,
     build_ptr_response, build_rcode_response, check_response_size_and_set_tc, parse_question,
@@ -1044,30 +1048,16 @@ struct ResponderContext {
 async fn bind_dns_sockets(
     requested: SocketAddr,
 ) -> std::io::Result<(tokio::net::UdpSocket, tokio::net::TcpListener, SocketAddr)> {
-    let mut candidates = vec![
-        requested,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-    ];
-    candidates.dedup();
-
-    let mut last_error = None;
-    for candidate in candidates {
-        let tcp = match tokio::net::TcpListener::bind(candidate).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-        let local_addr = tcp.local_addr()?;
-        match tokio::net::UdpSocket::bind(local_addr).await {
-            Ok(udp) => return Ok((udp, tcp, local_addr)),
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| std::io::Error::other("all DNS bind addresses failed")))
+    // MagicDNS is reachable only when both transports own the advertised VIP.
+    // Do not hide a failed TUN/privilege setup behind localhost or an ephemeral
+    // port: callers use this failure to report degraded DNS truthfully.
+    let tcp = tokio::net::TcpListener::bind(requested).await?;
+    let local_addr = tcp.local_addr()?;
+    // A zero port is test-only caller-selected allocation. Once selected,
+    // UDP still binds that exact address; production passes the service VIP
+    // and port 53 and gets no alternative address.
+    let udp = tokio::net::UdpSocket::bind(local_addr).await?;
+    Ok((udp, tcp, local_addr))
 }
 
 async fn run_responder(

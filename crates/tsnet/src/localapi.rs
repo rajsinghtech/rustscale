@@ -3181,7 +3181,11 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
                 Some((_, d)) => d,
                 None => suffix,
             };
-            (suffix.to_string(), suffix.to_string(), dns.Proxied)
+            (
+                suffix.to_string(),
+                suffix.to_string(),
+                dns.Proxied && (!state.tun_mode || !state.health.is_unhealthy("subsystem-dns")),
+            )
         } else {
             (String::new(), String::new(), false)
         };
@@ -5037,7 +5041,9 @@ async fn handle_dns_query<W: AsyncWrite + Unpin>(
     }
 
     // Check if MagicDNS is enabled and provide context.
-    let magicdns_enabled = dns_config.as_ref().is_some_and(|c| c.Proxied);
+    let magicdns_enabled = dns_config.as_ref().is_some_and(|c| {
+        c.Proxied && (!state.tun_mode || !state.health.is_unhealthy("subsystem-dns"))
+    });
 
     let response = serde_json::json!({
         "name": name,

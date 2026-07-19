@@ -96,7 +96,13 @@ impl Server {
                         Some((_, d)) => d,
                         None => suffix,
                     };
-                    (suffix.to_string(), suffix.to_string(), dns.Proxied)
+                    (
+                        suffix.to_string(),
+                        suffix.to_string(),
+                        dns.Proxied
+                            && (!matches!(inner.data_plane, DataPlane::Tun)
+                                || !inner.health.is_unhealthy("subsystem-dns")),
+                    )
                 } else {
                     (String::new(), String::new(), false)
                 };

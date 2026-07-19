@@ -104,15 +104,41 @@ pub fn build_os_dns_config(dns_config: &DNSConfig, magic_dns_suffix: &str) -> Os
 }
 
 /// Create the platform-appropriate OS DNS configurator.
-#[cfg(target_os = "macos")]
-pub fn new_os_configurator() -> crate::osconfig_darwin::DarwinConfigurator {
-    crate::osconfig_darwin::DarwinConfigurator::default()
+///
+/// Linux is deliberately explicit: MagicDNS in TUN mode requires a real
+/// systemd-resolved per-link configurator, not a successful no-op. Other
+/// unsupported platforms keep the no-op implementation for embedding callers.
+#[cfg(target_os = "linux")]
+pub fn new_os_configurator(
+    interface: Option<&str>,
+) -> std::io::Result<Box<dyn OsConfigurator + Send>> {
+    let interface = interface.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Linux DNS configuration requires a TUN interface",
+        )
+    })?;
+    Ok(Box::new(
+        crate::osconfig_linux::LinuxResolvedConfigurator::new(interface)?,
+    ))
 }
 
 /// Create the platform-appropriate OS DNS configurator.
-#[cfg(not(target_os = "macos"))]
-pub fn new_os_configurator() -> NoopConfigurator {
-    NoopConfigurator
+#[cfg(target_os = "macos")]
+pub fn new_os_configurator(
+    _interface: Option<&str>,
+) -> std::io::Result<Box<dyn OsConfigurator + Send>> {
+    Ok(Box::new(
+        crate::osconfig_darwin::DarwinConfigurator::default(),
+    ))
+}
+
+/// Create the platform-appropriate OS DNS configurator.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn new_os_configurator(
+    _interface: Option<&str>,
+) -> std::io::Result<Box<dyn OsConfigurator + Send>> {
+    Ok(Box::new(NoopConfigurator))
 }
 
 #[cfg(test)]

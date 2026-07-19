@@ -359,10 +359,12 @@ pub struct ServerBuilder {
     /// defaults to `<state_dir>/rustscale.sock`.
     pub(crate) localapi_path: Option<PathBuf>,
     /// Whether to configure the OS DNS resolver in TUN mode. When true,
-    /// `up_tun` writes `/etc/resolver/` entries (macOS) pointing at
-    /// `100.100.100.100` for the MagicDNS suffix and split-DNS routes.
-    /// **Requires root** (writing `/etc/resolver` needs privileged access).
-    /// Default `false`. Ignored in netstack mode (`up()`).
+    /// `up_tun` installs per-link DNS pointing at `100.100.100.100` for the
+    /// MagicDNS suffix and split-DNS routes. macOS owns marked
+    /// `/etc/resolver/` entries; Linux uses systemd-resolved's per-link API
+    /// and reverts that link on shutdown. It never replaces foreign DNS state.
+    /// **Requires root** and a supported platform DNS manager. Default
+    /// `false`. Ignored in netstack mode (`up()`).
     pub(crate) configure_os_dns: bool,
     /// Whether to run this node as a peer relay server. When true, a
     /// `udprelay::Server` is started in magicsock and
@@ -797,16 +799,11 @@ impl ServerBuilder {
 
     /// Enable OS-level DNS configuration in TUN mode (default: `false`).
     ///
-    /// When enabled, [`Server::up_tun`] writes `/etc/resolver/` entries on
-    /// macOS (or calls the platform-appropriate configurator) pointing at
-    /// `100.100.100.100` for the MagicDNS suffix and any split-DNS routes
-    /// from the control-plane DNS config. Search domains from the netmap are
-    /// also installed.
-    ///
-    /// **Requires root** — writing `/etc/resolver` needs privileged access.
-    /// Permission failures are logged as warnings and do not prevent `up_tun`
-    /// from completing; the TUN data plane and MagicDNS responder still
-    /// operate.
+    /// On Linux this programs systemd-resolved only for the TUN link; on macOS
+    /// it owns marked `/etc/resolver/` entries. Both preserve foreign resolver
+    /// state and are reverted on shutdown. If configuration or the exact
+    /// MagicDNS VIP listener fails, TUN startup remains available but status
+    /// reports MagicDNS as disabled with degraded DNS health.
     ///
     /// Ignored in netstack mode ([`Server::up`]).
     pub fn configure_os_dns(mut self, on: bool) -> Self {

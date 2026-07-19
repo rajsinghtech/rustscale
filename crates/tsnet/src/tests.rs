@@ -6365,6 +6365,16 @@ async fn run_required_tun_dns_failure_scenario() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();
     let state = tempfile::tempdir().unwrap();
+    // This scenario exercises a *requested* OS-DNS failure. The live DNS
+    // manager correctly leaves the configurator closed when CorpDNS is false,
+    // so persist the same explicit accept-dns intent used by the public CLI.
+    rustscale_ipn::Prefs {
+        WantRunning: true,
+        CorpDNS: true,
+        ..Default::default()
+    }
+    .save(state.path())
+    .unwrap();
     let tun_name = std::env::var("RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME")
         .expect("required TUN DNS gate did not provide RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME");
     assert!(

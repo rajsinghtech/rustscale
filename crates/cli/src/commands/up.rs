@@ -116,7 +116,6 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
 
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
     let mut last_url: Option<String> = None;
-    let mut handoff_reconnects = 0_u8;
     loop {
         let msg = match tokio::time::timeout(
             deadline.saturating_duration_since(std::time::Instant::now()),
@@ -127,20 +126,43 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
             Ok(Ok(Some(n))) => n,
             Ok(Ok(None) | Err(_)) => {
                 // Starting a stopped/pre-login daemon atomically replaces its
-                // LocalAPI generation. The old watch closes only after the new
-                // socket is published, so reconnect and consume that
-                // generation's initial state instead of treating the expected
-                // handoff as a failed `up`.
-                handoff_reconnects = handoff_reconnects.saturating_add(1);
-                if handoff_reconnects > 4 {
-                    return Err(CliError(
-                        "daemon LocalAPI repeatedly closed while waiting for up".into(),
-                    ));
+                // LocalAPI generation. Several already-accepted watches can
+                // close while the listener ownership transfer drains. First
+                // accept an authoritative Running status from the replacement;
+                // otherwise keep reconnecting within the caller's one deadline.
+                // A reconnect count is not a valid generation boundary.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(CliError("timeout waiting for up".into()));
                 }
-                watch = lc
-                    .watch_ipn_bus(NOTIFY_INITIAL_STATE)
-                    .await
-                    .map_err(|e| CliError(format!("reconnect after LocalAPI handoff: {e}")))?;
+                if let Ok(Ok(status)) = tokio::time::timeout(remaining, lc.status()).await {
+                    if status.get("BackendState").and_then(|v| v.as_str()) == Some("Running") {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&status).unwrap_or_default()
+                            );
+                        } else {
+                            println!("Tailscale is running.");
+                        }
+                        return Ok(());
+                    }
+                }
+
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(CliError("timeout waiting for up".into()));
+                }
+                tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(CliError("timeout waiting for up".into()));
+                }
+                if let Ok(Ok(next_watch)) =
+                    tokio::time::timeout(remaining, lc.watch_ipn_bus(NOTIFY_INITIAL_STATE)).await
+                {
+                    watch = next_watch;
+                }
                 continue;
             }
             Err(_) => return Err(CliError("timeout waiting for up".into())),

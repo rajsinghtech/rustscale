@@ -6425,6 +6425,8 @@ async fn run_required_tun_dns_failure_scenario() {
             .await
             .map_err(|_| "TUN DNS scenario startup timed out after release".to_owned())?
             .map_err(|error| format!("injected DNS failure revoked committed TUN startup: {error}"))?;
+        // The completed future still owns its `&mut Server` borrow until drop.
+        drop(up);
 
         // Capture kernel identity immediately after the successful startup,
         // before any fallible health or route assertion.

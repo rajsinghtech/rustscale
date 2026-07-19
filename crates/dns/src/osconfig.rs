@@ -104,6 +104,21 @@ pub fn build_os_dns_config(dns_config: &DNSConfig, magic_dns_suffix: &str) -> Os
             match_domains.push(suffix.to_string());
         }
     }
+    // Resolvers/FallbackResolvers compile to the responder's root route even
+    // when Routes does not spell one out. The OS plan must select the same VIP
+    // globally or those control-selected upstreams are unreachable.
+    let has_default_resolvers = dns_config
+        .Resolvers
+        .iter()
+        .chain(&dns_config.FallbackResolvers)
+        .any(|resolver| !resolver.Addr.is_empty());
+    if has_default_resolvers
+        && !match_domains
+            .iter()
+            .any(|domain| domain.trim_end_matches('.').is_empty())
+    {
+        match_domains.push(".".into());
+    }
 
     // Search-only config must not turn the VIP into a global resolver.
     let nameservers = if match_domains.is_empty() {
@@ -202,6 +217,20 @@ mod tests {
         assert!(os
             .match_domains
             .contains(&"internal.example.com".to_string()));
+    }
+
+    #[test]
+    fn build_os_dns_config_default_resolvers_install_root_route() {
+        let cfg = DNSConfig {
+            Resolvers: vec![resolver("9.9.9.9")],
+            ..Default::default()
+        };
+        let os = build_os_dns_config(&cfg, "tailnet.ts.net");
+        assert_eq!(
+            os.nameservers,
+            vec![rustscale_tsaddr::tailscale_service_ip()]
+        );
+        assert_eq!(os.match_domains, vec!["."]);
     }
 
     #[test]

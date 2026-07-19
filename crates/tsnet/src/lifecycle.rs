@@ -464,14 +464,6 @@ impl Drop for PrestartedMagicsockRollback {
     }
 }
 
-fn set_os_dns_retaining_owner(
-    mut configurator: Box<dyn OsConfigurator + Send>,
-    config: &OsConfig,
-) -> (Box<dyn OsConfigurator + Send>, std::io::Result<()>) {
-    let result = configurator.set_dns(config);
-    (configurator, result)
-}
-
 struct StartupRollback {
     armed: bool,
     supervisor: Arc<BootstrapSupervisor>,
@@ -490,7 +482,8 @@ struct StartupRollback {
     localapi_generation_handoff: Option<localapi::LocalApiGenerationHandoff>,
     serve: Option<Arc<serve::ServeRunner>>,
     localapi_socket: Option<PathBuf>,
-    os_dns_configurator: Option<Box<dyn OsConfigurator + Send>>,
+    dns_manager: Option<Arc<crate::dns_manager::DnsManager>>,
+    dns_responder_task: Option<JoinHandle<()>>,
     hostinfo_hooks: Vec<hostinfo::HostinfoHookHandle>,
 }
 
@@ -520,7 +513,8 @@ impl StartupRollback {
             localapi_generation_handoff: None,
             serve: None,
             localapi_socket: None,
-            os_dns_configurator: None,
+            dns_manager: None,
+            dns_responder_task: None,
             hostinfo_hooks: Vec::new(),
         }
     }
@@ -577,8 +571,12 @@ impl StartupRollback {
         self.serve.take()
     }
 
-    fn take_os_dns_configurator(&mut self) -> Option<Box<dyn OsConfigurator + Send>> {
-        self.os_dns_configurator.take()
+    fn take_dns_manager(&mut self) -> Option<Arc<crate::dns_manager::DnsManager>> {
+        self.dns_manager.take()
+    }
+
+    fn take_dns_responder_task(&mut self) -> Option<JoinHandle<()>> {
+        self.dns_responder_task.take()
     }
 
     fn take_hostinfo_hooks(&mut self) -> Vec<hostinfo::HostinfoHookHandle> {
@@ -615,7 +613,8 @@ impl Drop for StartupRollback {
                 let _ = std::fs::remove_file(path);
             }
         }
-        let mut configurator = self.os_dns_configurator.take();
+        let dns_manager = self.dns_manager.take();
+        let dns_responder_task = self.dns_responder_task.take();
         let audit_logger = self.audit_logger.take();
         let netlog = self.netlog.take();
         let monitor = self.monitor.take();
@@ -631,7 +630,7 @@ impl Drop for StartupRollback {
         let watchdog = self.watchdog.clone();
         let completion = self.supervisor.begin_cleanup();
         spawn_rollback_cleanup("rustscale-startup-rollback", async move {
-            let _completion = completion;
+            let completion_guard = completion;
             if let Some(localapi) = localapi {
                 // A prepared handoff still owns only its private staging
                 // pathname, so ordinary shutdown removes exactly that.
@@ -650,10 +649,39 @@ impl Drop for StartupRollback {
             }
             // Every route-mutating owner is now joined. Clear DNS while the
             // router/VIP is still retained, then release routes last.
-            if let Some(configurator) = configurator.as_mut() {
-                if let Err(error) = configurator.close() {
-                    log::warn!("tsnet: startup rollback DNS cleanup failed: {error}");
+            if let Some(manager) = dns_manager.as_ref() {
+                let mut last_error = None;
+                for attempt in 0..5 {
+                    match manager.close().await {
+                        Ok(()) => {
+                            last_error = None;
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = Some(error);
+                            if attempt < 4 {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
                 }
+                if let Some(error) = last_error {
+                    log::error!(
+                        "tsnet: startup rollback DNS cleanup remains uncertain; retaining generation: {error}"
+                    );
+                    // Fail closed: retain the cleanup gate and complete
+                    // responder/VIP owner instead of permitting an overlapping
+                    // startup after bounded retries were exhausted.
+                    std::mem::forget(completion_guard);
+                    std::mem::forget(dns_manager);
+                    std::mem::forget(dns_responder_task);
+                    std::mem::forget(router);
+                    return;
+                }
+            }
+            if let Some(task) = dns_responder_task {
+                task.abort();
+                let _ = task.await;
             }
             if let Some(router) = router {
                 let _ = Server::cleanup_or_supervise(router).await;
@@ -843,23 +871,20 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     }
 }
 
-fn close_os_dns_configurator(
-    configurator: &mut Option<Box<dyn OsConfigurator + Send>>,
-) -> Result<(), String> {
-    let Some(owner) = configurator.as_mut() else {
-        return Ok(());
-    };
-    owner.close().map_err(|error| error.to_string())?;
-    configurator.take();
-    Ok(())
-}
-
 async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningState, String)> {
     // Revert DNS while the complete TUN generation is retained. A failed
-    // RevertLink must leave the router/VIP generation available to its retry.
-    if let Err(error) = close_os_dns_configurator(&mut inner.os_dns_configurator) {
-        log::warn!("tsnet: retaining OS DNS cleanup owner: {error}");
-        return Err((inner, format!("OS DNS cleanup: {error}")));
+    // RevertLink leaves the manager, responder generation, and router in the
+    // resumable CleanupOwner.
+    if let Some(manager) = inner.dns_manager.as_ref() {
+        if let Err(error) = manager.close().await {
+            log::warn!("tsnet: retaining OS DNS cleanup owner: {error}");
+            return Err((inner, format!("OS DNS cleanup: {error}")));
+        }
+    }
+    inner.dns_manager.take();
+    if let Some(task) = inner.dns_responder_task.take() {
+        task.abort();
+        let _ = task.await;
     }
     // DNS is confirmed clear; route teardown can no longer strand its owner.
     if let Some(router) = inner.router.take() {
@@ -1480,6 +1505,7 @@ impl Server {
             suggested_exit_node.clone(),
             client_updater.clone(),
             b.tailnet_lock.clone(),
+            None,
             b.domain.clone(),
             b.peer_snapshot_fresh,
         );
@@ -1691,6 +1717,7 @@ impl Server {
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
                 dns_config: b.dns_config.clone(),
+                dns_manager: None,
                 packet_drops: b.packet_drops.clone(),
                 capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
@@ -1912,7 +1939,8 @@ impl Server {
             localapi_socket,
             localapi_handle: rollback.take_localapi(),
             key_expired: b.key_expired,
-            os_dns_configurator: None,
+            dns_manager: None,
+            dns_responder_task: None,
             ipn_backend: b.ipn_backend,
             logout_trigger: Arc::clone(&self.logout_trigger),
             logout_completion: Arc::clone(&self.logout_completion),
@@ -2110,7 +2138,7 @@ impl Server {
         );
         let magicdns_responder_ready = match responder.spawn().await {
             Ok(handle) => {
-                rollback.track(handle.into_join_handle());
+                rollback.dns_responder_task = Some(handle.into_join_handle());
                 true
             }
             Err(error) => {
@@ -2122,6 +2150,17 @@ impl Server {
                 false
             }
         };
+        let dns_manager = crate::dns_manager::DnsManager::new(
+            b.resolver.clone(),
+            b.dns_config.clone(),
+            b.peers.clone(),
+            b.domain.clone(),
+            b.health.clone(),
+            magicdns_responder_ready,
+            prefs.read().await.CorpDNS,
+            dns_cfg_snapshot,
+        );
+        rollback.dns_manager = Some(Arc::clone(&dns_manager));
 
         // Periodic endpoint update (Bug 4).
         let periodic_ep = spawn_periodic_endpoint_updates(
@@ -2218,6 +2257,7 @@ impl Server {
             suggested_exit_node.clone(),
             client_updater.clone(),
             b.tailnet_lock.clone(),
+            Some(Arc::clone(&dns_manager)),
             b.domain.clone(),
             b.peer_snapshot_fresh,
         );
@@ -2389,6 +2429,7 @@ impl Server {
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
                 dns_config: b.dns_config.clone(),
+                dns_manager: Some(Arc::clone(&dns_manager)),
                 packet_drops: b.packet_drops.clone(),
                 capture: capture.clone(),
                 metrics: localapi::default_metric_registry(),
@@ -2539,74 +2580,42 @@ impl Server {
         // systemd-resolved's RevertLink-backed per-link API, so public and
         // foreign resolver state are never overwritten. Keep the configurator
         // owner until shutdown/rollback so cleanup is retried if necessary.
-        rollback.os_dns_configurator = if self.config.configure_os_dns {
-            let dns_cfg_snapshot = b.dns_config.read().await.clone();
-            let os_cfg = if let Some(ref dc) = dns_cfg_snapshot {
-                build_os_dns_config(dc, &b.domain)
-            } else {
-                OsConfig {
-                    nameservers: vec![IpAddr::V4(MAGICDNS_VIP)],
-                    ..Default::default()
-                }
-            };
-            match new_os_configurator(Some(tun.name())) {
-                Ok(configurator) => {
-                    let (configurator, setup) = set_os_dns_retaining_owner(configurator, &os_cfg);
-                    match setup {
-                        Ok(()) => {
-                            if magicdns_responder_ready {
-                                b.health.set_healthy("subsystem-dns");
-                            }
-                            log::info!(
-                                "tsnet: OS DNS configured ({} match domains, {} search domains)",
-                                os_cfg.match_domains.len(),
-                                os_cfg.search_domains.len()
-                            );
-                            Some(configurator)
-                        }
-                        Err(error) => {
-                            b.health.set_unhealthy(
-                                "subsystem-dns",
-                                format!("OS DNS configuration failed: {error}"),
-                            );
-                            log::warn!(
-                                "tsnet: OS DNS configuration failed; retaining cleanup owner: {error}"
-                            );
-                            // set_dns may have changed the link and then failed
-                            // to compensate. Keep the configurator in the
-                            // generation so shutdown and startup rollback retry
-                            // RevertLink.
-                            Some(configurator)
-                        }
+        // Attach an owner even while accept-dns is false. The manager applies
+        // a confirmed clear now and can later service false→true without a
+        // daemon restart or an unowned resolved mutation.
+        match new_os_configurator(Some(tun.name())) {
+            Ok(configurator) => match dns_manager.attach(configurator).await {
+                Ok(()) => {
+                    if magicdns_responder_ready {
+                        b.health.set_healthy("subsystem-dns");
                     }
+                    log::info!("tsnet: live OS DNS manager attached");
                 }
                 Err(error) => {
                     b.health.set_unhealthy(
                         "subsystem-dns",
-                        format!("OS DNS configurator unavailable: {error}"),
+                        format!("OS DNS configuration failed: {error}"),
                     );
-                    log::warn!("tsnet: OS DNS configurator unavailable: {error}");
-                    None
+                    log::warn!(
+                        "tsnet: OS DNS configuration failed; retaining cleanup owner: {error}"
+                    );
                 }
-            }
-        } else {
-            if dns_cfg_snapshot
-                .as_ref()
-                .is_some_and(|config| config.Proxied)
-            {
+            },
+            Err(error) => {
                 b.health.set_unhealthy(
                     "subsystem-dns",
-                    "MagicDNS is disabled because OS DNS configuration is disabled",
+                    format!("OS DNS configurator unavailable: {error}"),
                 );
+                log::warn!("tsnet: OS DNS configurator unavailable: {error}");
             }
-            None
-        };
+        }
         let extension_subscription = self
             .finish_tun_startup(b.ipn_backend.clone(), prefs.clone())
             .await?;
         rollback.commit_localapi_handoff()?;
         let retire_prestarted = self.pre_started.is_some();
-        let os_dns_configurator = rollback.take_os_dns_configurator();
+        let dns_manager = rollback.take_dns_manager();
+        let dns_responder_task = rollback.take_dns_responder_task();
         let tasks = rollback.commit_tasks();
         let task_aborts = tasks.iter().map(JoinHandle::abort_handle).collect();
 
@@ -2656,7 +2665,8 @@ impl Server {
             localapi_socket,
             localapi_handle: rollback.take_localapi(),
             key_expired: b.key_expired,
-            os_dns_configurator,
+            dns_manager,
+            dns_responder_task,
             ipn_backend: b.ipn_backend,
             logout_trigger: Arc::clone(&self.logout_trigger),
             logout_completion: Arc::clone(&self.logout_completion),
@@ -2991,6 +3001,7 @@ impl Server {
             user_profiles: Arc::new(RwLock::new(BTreeMap::new())),
             health: Tracker::new(),
             dns_config: Arc::new(RwLock::new(None)),
+            dns_manager: None,
             packet_drops: Arc::new(AtomicU64::new(0)),
             capture: crate::capture::new_slot(),
             metrics: localapi::default_metric_registry(),

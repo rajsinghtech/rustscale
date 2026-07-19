@@ -579,6 +579,7 @@ impl Server {
             user_profiles: inner.user_profiles.clone(),
             health: inner.health.clone(),
             dns_config: inner.dns_config.clone(),
+            dns_manager: inner.dns_manager.clone(),
             packet_drops: inner.packet_drops.clone(),
             capture: inner.capture.clone(),
             metrics: crate::localapi::default_metric_registry(),

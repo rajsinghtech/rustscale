@@ -33,6 +33,7 @@ mod api;
 mod appc;
 mod c2n;
 mod capture;
+mod dns_manager;
 mod dns_resolve;
 mod drive;
 mod filter_build;
@@ -965,10 +966,11 @@ pub(crate) struct RunningState {
     /// `NodeKeyExpired` in a MapResponse. The client should transition to
     /// a "NeedsLogin" state; un-expiring clears it.
     pub(crate) key_expired: Arc<std::sync::atomic::AtomicBool>,
-    /// OS DNS configurator, active only in TUN mode when
-    /// `configure_os_dns` is enabled. `close()` is called on server
-    /// shutdown to remove `/etc/resolver` entries.
-    pub(crate) os_dns_configurator: Option<Box<dyn OsConfigurator + Send>>,
+    /// Serialized TUN DNS generation owner. It retains the OS configurator
+    /// until RevertLink is confirmed and coordinates live map/prefs updates.
+    pub(crate) dns_manager: Option<Arc<dns_manager::DnsManager>>,
+    /// Kept reachable until OS DNS no longer routes queries to the VIP.
+    pub(crate) dns_responder_task: Option<JoinHandle<()>>,
     /// IPN state machine backend — tracks the current IPN state, holds
     /// the notification bus, and drives state transitions.
     pub(crate) ipn_backend: Arc<IpnBackend>,

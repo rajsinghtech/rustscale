@@ -745,6 +745,8 @@ pub(crate) struct LocalApiState {
     pub user_profiles: Arc<RwLock<BTreeMap<UserID, UserProfile>>>,
     pub health: Tracker,
     pub dns_config: Arc<RwLock<Option<DNSConfig>>>,
+    /// Serialized live DNS owner for TUN generations.
+    pub(crate) dns_manager: Option<Arc<crate::dns_manager::DnsManager>>,
     pub packet_drops: Arc<AtomicU64>,
     /// Shared optional packet-capture sink, also used by data-plane pumps.
     pub capture: crate::capture::CaptureSlot,
@@ -973,11 +975,25 @@ async fn commit_prefs_update(
     }
     let changed = candidate != *prefs;
     let operator_changed = candidate.OperatorUser != prefs.OperatorUser;
+    let dns_changed = candidate.CorpDNS != prefs.CorpDNS;
+    if dns_changed {
+        if let Some(manager) = state.dns_manager.as_ref() {
+            manager
+                .set_accept_dns(candidate.CorpDNS)
+                .await
+                .map_err(|error| format!("reconciling DNS preference: {error}"))?;
+        }
+    }
     if changed {
         if let Some(ref dir) = state.state_dir {
-            candidate
-                .save(dir)
-                .map_err(|error| format!("saving preferences: {error}"))?;
+            if let Err(error) = candidate.save(dir) {
+                if dns_changed {
+                    if let Some(manager) = state.dns_manager.as_ref() {
+                        let _ = manager.set_accept_dns(prefs.CorpDNS).await;
+                    }
+                }
+                return Err(format!("saving preferences: {error}"));
+            }
         }
         *prefs = candidate;
         if operator_changed {
@@ -2019,11 +2035,28 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
             return Ok(());
         }
     }
+    // Reconcile DNS before persisting intent or reporting success. The manager
+    // keeps the previous generation effective if replacement/clear fails.
+    let dns_changed = next_prefs.CorpDNS != old_prefs.CorpDNS;
+    if dns_changed {
+        if let Some(manager) = state.dns_manager.as_ref() {
+            if let Err(error) = manager.set_accept_dns(next_prefs.CorpDNS).await {
+                let error = serde_json::json!({"error": format!("DNS update failed: {error}")});
+                write_json_response(conn, 500, "Internal Server Error", &error).await?;
+                return Ok(());
+            }
+        }
+    }
     // Stage durable prefs before touching routes. A persistence failure then
     // cannot leave a cleared exit route active. Router failure restores the
     // staged file while the router transaction retains its prior state.
     if let Some(ref dir) = state.state_dir {
         if let Err(error) = next_prefs.save(dir) {
+            if dns_changed {
+                if let Some(manager) = state.dns_manager.as_ref() {
+                    let _ = manager.set_accept_dns(old_prefs.CorpDNS).await;
+                }
+            }
             let error = serde_json::json!({"error": format!("prefs save failed: {error}")});
             write_json_response(conn, 500, "Internal Server Error", &error).await?;
             return Ok(());
@@ -2031,6 +2064,11 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     }
     if exit_node_changed {
         if let Err(error) = apply_exit_node_prefs_locked(state, &next_prefs).await {
+            if dns_changed {
+                if let Some(manager) = state.dns_manager.as_ref() {
+                    let _ = manager.set_accept_dns(old_prefs.CorpDNS).await;
+                }
+            }
             let rollback_error = state
                 .state_dir
                 .as_ref()
@@ -5599,6 +5637,7 @@ mod tests {
             user_profiles: Arc::new(RwLock::new(profiles)),
             health: Tracker::new(),
             dns_config: Arc::new(RwLock::new(None)),
+            dns_manager: None,
             packet_drops: Arc::new(AtomicU64::new(0)),
             capture: crate::capture::new_slot(),
             metrics: default_metric_registry(),
@@ -7921,6 +7960,7 @@ mod tests {
             user_profiles: state.user_profiles.clone(),
             health: state.health.clone(),
             dns_config: state.dns_config.clone(),
+            dns_manager: state.dns_manager.clone(),
             packet_drops: state.packet_drops.clone(),
             capture: state.capture.clone(),
             metrics: default_metric_registry(),
@@ -8166,6 +8206,7 @@ mod tests {
                 CertDomains: cert_domains,
                 ..Default::default()
             }))),
+            dns_manager: None,
             packet_drops: base.packet_drops.clone(),
             capture: base.capture.clone(),
             metrics: default_metric_registry(),

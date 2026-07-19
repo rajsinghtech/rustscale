@@ -7,7 +7,8 @@
 //! the cleanup owner for a later `close` retry.
 
 use std::io;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::osconfig::{OsConfig, OsConfigurator};
 
@@ -17,19 +18,54 @@ trait ResolvectlRunner: Send {
 
 struct ProcessResolvectl;
 
+fn validate_interface(interface: &str) -> io::Result<()> {
+    if interface.is_empty()
+        || interface.len() > 15
+        || interface
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Linux DNS interface name",
+        ));
+    }
+    Ok(())
+}
+
 impl ResolvectlRunner for ProcessResolvectl {
     fn run(&mut self, args: &[String]) -> io::Result<()> {
-        let output = Command::new("resolvectl").args(args).output()?;
-        if output.status.success() {
+        let mut child = Command::new("resolvectl")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("resolvectl {} timed out", args.join(" ")),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut detail = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use std::io::Read;
+            let _ = stderr.read_to_string(&mut detail);
+        }
+        if status.success() {
             return Ok(());
         }
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = detail.trim();
         Err(io::Error::other(if detail.is_empty() {
-            format!(
-                "resolvectl {} exited with {}",
-                args.join(" "),
-                output.status
-            )
+            format!("resolvectl {} exited with {status}", args.join(" "))
         } else {
             format!("resolvectl {}: {detail}", args.join(" "))
         }))
@@ -50,7 +86,15 @@ pub struct LinuxResolvedConfigurator {
 
 impl LinuxResolvedConfigurator {
     pub fn new(interface: impl Into<String>) -> io::Result<Self> {
-        Self::with_runner(interface, Box::new(ProcessResolvectl))
+        let interface = interface.into();
+        validate_interface(&interface)?;
+        let ifindex = std::fs::read_to_string(format!("/sys/class/net/{interface}/ifindex"))?
+            .trim()
+            .parse::<u32>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        // resolved accepts a numeric link index. Latching it prevents a later
+        // rename/reuse from redirecting cleanup onto another interface.
+        Self::with_runner(ifindex.to_string(), Box::new(ProcessResolvectl))
     }
 
     fn with_runner(
@@ -58,17 +102,7 @@ impl LinuxResolvedConfigurator {
         runner: Box<dyn ResolvectlRunner>,
     ) -> io::Result<Self> {
         let interface = interface.into();
-        if interface.is_empty()
-            || interface.len() > 15
-            || interface
-                .bytes()
-                .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid Linux DNS interface name",
-            ));
-        }
+        validate_interface(&interface)?;
         Ok(Self {
             interface,
             runner,
@@ -122,11 +156,31 @@ impl LinuxResolvedConfigurator {
             .match_domains
             .iter()
             .any(|domain| domain.trim_end_matches('.').is_empty());
-        self.run([
+        if let Err(error) = self.run([
             "default-route".into(),
             self.interface.clone(),
             if global { "yes" } else { "no" }.into(),
-        ])
+        ]) {
+            // DefaultRoute was added after the core per-link DNS methods.
+            // Tolerate only the old-systemd missing-method response.
+            if !error.to_string().contains("UnknownMethod") {
+                return Err(error);
+            }
+        }
+
+        // Avoid competing per-link multicast/security modes. Older resolved
+        // versions may not expose every verb, so these are intentionally
+        // best-effort after the authoritative DNS/domain transaction.
+        for (verb, value) in [
+            ("llmnr", "no"),
+            ("mdns", "no"),
+            ("dnssec", "no"),
+            ("dnsovertls", "no"),
+        ] {
+            let _ = self.run([verb.into(), self.interface.clone(), value.into()]);
+        }
+        let _ = self.run(["flush-caches".into()]);
+        Ok(())
     }
 
     fn restore_after_failure(
@@ -253,6 +307,11 @@ mod tests {
                 args(&["dns", "rustscale0", "100.100.100.100"]),
                 args(&["domain", "rustscale0", "tailnet.ts.net", "~corp.example"]),
                 args(&["default-route", "rustscale0", "no"]),
+                args(&["llmnr", "rustscale0", "no"]),
+                args(&["mdns", "rustscale0", "no"]),
+                args(&["dnssec", "rustscale0", "no"]),
+                args(&["dnsovertls", "rustscale0", "no"]),
+                args(&["flush-caches"]),
                 args(&["revert", "rustscale0"]),
             ]
         );
@@ -279,6 +338,11 @@ mod tests {
                 args(&["dns", "rustscale0", "100.100.100.100"]),
                 args(&["domain", "rustscale0", "~."]),
                 args(&["default-route", "rustscale0", "yes"]),
+                args(&["llmnr", "rustscale0", "no"]),
+                args(&["mdns", "rustscale0", "no"]),
+                args(&["dnssec", "rustscale0", "no"]),
+                args(&["dnsovertls", "rustscale0", "no"]),
+                args(&["flush-caches"]),
             ]
         );
     }
@@ -290,7 +354,7 @@ mod tests {
             "rustscale0",
             Box::new(RecordingRunner {
                 calls: calls.clone(),
-                fail_calls: vec![5],
+                fail_calls: vec![10],
             }),
         )
         .unwrap();
@@ -299,11 +363,16 @@ mod tests {
         replacement.match_domains = vec!["new.example".into()];
         assert!(c.set_dns(&replacement).is_err());
         assert_eq!(
-            &calls.lock().unwrap()[5..],
+            &calls.lock().unwrap()[10..],
             [
                 args(&["dns", "rustscale0", "100.100.100.100"]),
                 args(&["domain", "rustscale0", "tailnet.ts.net", "~corp.example"]),
                 args(&["default-route", "rustscale0", "no"]),
+                args(&["llmnr", "rustscale0", "no"]),
+                args(&["mdns", "rustscale0", "no"]),
+                args(&["dnssec", "rustscale0", "no"]),
+                args(&["dnsovertls", "rustscale0", "no"]),
+                args(&["flush-caches"]),
             ]
         );
         c.close().unwrap();
@@ -316,7 +385,7 @@ mod tests {
             "rustscale0",
             Box::new(RecordingRunner {
                 calls: calls.clone(),
-                fail_calls: vec![5, 6, 7],
+                fail_calls: vec![10, 11, 12],
             }),
         )
         .unwrap();

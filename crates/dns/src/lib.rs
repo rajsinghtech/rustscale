@@ -864,7 +864,11 @@ pub fn system_nameservers() -> Vec<SocketAddr> {
             if let Some(rest) = line.strip_prefix("nameserver ") {
                 let ip = rest.trim();
                 if let Ok(addr) = ip.parse::<IpAddr>() {
-                    servers.push(SocketAddr::new(addr, 53));
+                    // resolved's local stub and our own service VIP would loop
+                    // once the host routes global DNS through MagicDNS.
+                    if !addr.is_loopback() && addr != rustscale_tsaddr::tailscale_service_ip() {
+                        servers.push(SocketAddr::new(addr, 53));
+                    }
                 }
             }
         }

@@ -298,7 +298,21 @@ async fn incomplete_close_preserves_router_dns_and_magicsock_until_retry() {
     inner.router = Some(shared_test_router(Box::new(FlagRouter(Arc::clone(
         &router_closed,
     )))));
-    inner.os_dns_configurator = Some(Box::new(FlagDns(Arc::clone(&dns_closed))));
+    let dns_manager = crate::dns_manager::DnsManager::new(
+        inner.resolver.clone(),
+        inner.dns_config.clone(),
+        inner.peers.clone(),
+        inner.domain.clone(),
+        inner.health.clone(),
+        true,
+        true,
+        inner.dns_config.read().await.clone(),
+    );
+    dns_manager
+        .attach(Box::new(FlagDns(Arc::clone(&dns_closed))))
+        .await
+        .unwrap();
+    inner.dns_manager = Some(dns_manager);
 
     assert!(matches!(
         server.close().await,
@@ -1865,7 +1879,11 @@ fn os_dns_config_from_netmap_proxied() {
         vec![std::net::IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100))]
     );
     assert_eq!(os.search_domains, vec!["tailnet.ts.net", "corp.example"]);
-    assert_eq!(os.match_domains, vec!["tailnet.ts.net"]);
+    assert_eq!(
+        os.match_domains,
+        vec!["tailnet.ts.net", "."],
+        "control default resolvers require the same root route in the OS plan"
+    );
 }
 
 #[test]

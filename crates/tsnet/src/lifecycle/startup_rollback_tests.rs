@@ -99,19 +99,33 @@ impl OsConfigurator for RetryDns {
     }
 }
 
-#[test]
-fn dns_close_failure_retains_owner_for_lifecycle_retry() {
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let mut owner: Option<Box<dyn OsConfigurator + Send>> =
-        Some(Box::new(RetryDns(Arc::clone(&attempts))));
+fn test_dns_manager() -> Arc<crate::dns_manager::DnsManager> {
+    crate::dns_manager::DnsManager::new(
+        Arc::new(tokio::sync::RwLock::new(MagicDnsResolver::default())),
+        Arc::new(tokio::sync::RwLock::new(None)),
+        Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        "tailnet.ts.net".into(),
+        Tracker::new(),
+        true,
+        true,
+        Some(rustscale_tailcfg::DNSConfig::default()),
+    )
+}
 
-    let first = close_os_dns_configurator(&mut owner);
+#[tokio::test]
+async fn dns_close_failure_retains_owner_for_lifecycle_retry() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let manager = test_dns_manager();
+    manager
+        .attach(Box::new(RetryDns(Arc::clone(&attempts))))
+        .await
+        .unwrap();
+
+    let first = manager.close().await;
     assert!(first.is_err(), "DNS restoration failure was acknowledged");
-    assert!(owner.is_some(), "failed DNS cleanup owner was dropped");
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
-    close_os_dns_configurator(&mut owner).expect("retry did not restore DNS");
-    assert!(owner.is_none(), "successful DNS cleanup owner was retained");
+    manager.close().await.expect("retry did not restore DNS");
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
@@ -850,15 +864,15 @@ async fn dropped_startup_transaction_rolls_back_owned_resources() {
     let dns_closed = Arc::new(AtomicBool::new(false));
     rollback.router = Some(router);
     rollback.localapi_socket = Some(socket.clone());
-    let (dns_owner, setup) = set_os_dns_retaining_owner(
-        Box::new(CloseDns {
+    let dns_manager = test_dns_manager();
+    let setup = dns_manager
+        .attach(Box::new(CloseDns {
             closed: Arc::clone(&dns_closed),
             fail_setup: true,
-        }),
-        &OsConfig::default(),
-    );
+        }))
+        .await;
     assert!(setup.is_err(), "injected DNS setup failure was accepted");
-    rollback.os_dns_configurator = Some(dns_owner);
+    rollback.dns_manager = Some(dns_manager);
     drop(rollback);
 
     assert!(cancel.is_cancelled());

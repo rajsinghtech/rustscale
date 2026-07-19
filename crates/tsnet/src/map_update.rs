@@ -573,6 +573,7 @@ pub(crate) fn spawn_map_update_task(
     suggested_exit_node: Arc<RwLock<String>>,
     client_updater: Arc<std::sync::Mutex<rustscale_clientupdate::ClientUpdater>>,
     tailnet_lock: Arc<crate::tailnet_lock::TailnetLock>,
+    dns_manager: Option<Arc<crate::dns_manager::DnsManager>>,
     tailnet_identity: String,
     mut peer_snapshot_fresh: bool,
 ) -> JoinHandle<()> {
@@ -1199,17 +1200,26 @@ pub(crate) fn spawn_map_update_task(
                     // Refresh the shared MagicDNS resolver with the new peers.
                     resolver.write().await.set_peers(peers.clone());
 
-                    // Apply DNSConfig delta (None means unchanged).
+                    // Apply DNSConfig delta (None means unchanged). TUN mode
+                    // commits OS state and the responder plan through one
+                    // serialized generation owner; failed/stale replacements
+                    // never publish a mismatched resolver snapshot.
                     if let Some(cfg) = &resp.DNSConfig {
-                        dns_config.write().await.clone_from(&resp.DNSConfig);
-                        // Rebuild the resolver config from the new DNSConfig,
-                        // preserving the current peers and domain. This wires
-                        // split-DNS Routes, ExtraRecords hosts, and local
-                        // domains from the control plane.
-                        let mut r = resolver.write().await;
-                        let domain = r.domain().to_string();
-                        let new_config = config_from_dns(cfg, &domain, &peers);
-                        r.set_config(new_config);
+                        if let Some(manager) = dns_manager.as_ref() {
+                            if let Err(error) = manager.update_control(cfg.clone()).await {
+                                health.set_unhealthy(
+                                    "subsystem-dns",
+                                    format!("live DNS replacement failed: {error}"),
+                                );
+                                log::warn!("tsnet: live DNS replacement failed: {error}");
+                            }
+                        } else {
+                            dns_config.write().await.clone_from(&resp.DNSConfig);
+                            let mut r = resolver.write().await;
+                            let domain = r.domain().to_string();
+                            let new_config = config_from_dns(cfg, &domain, &peers);
+                            r.set_config(new_config);
+                        }
                     }
                     // tsdial must see one complete, authorization-filtered
                     // snapshot rather than the control delta; replacing its

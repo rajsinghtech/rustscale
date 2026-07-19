@@ -1024,8 +1024,9 @@ impl DnsResponderHandle {
         }
     }
 
-    /// Transfer task ownership to an outer supervisor. Aborting the returned
-    /// task drops both listeners and aborts every child query/session.
+    /// Transfer task ownership to an outer supervisor. This leaves the
+    /// responder running; aborting the returned task drops both listeners and
+    /// aborts every child query/session.
     pub fn into_join_handle(mut self) -> JoinHandle<()> {
         self.task
             .take()
@@ -1035,8 +1036,11 @@ impl DnsResponderHandle {
 
 impl Drop for DnsResponderHandle {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        // A transferred task retains the cancellation token. Do not cancel it
+        // here: dropping `self` after `into_join_handle` is the ownership
+        // handoff to the outer supervisor, not a responder shutdown.
         if let Some(task) = self.task.take() {
+            self.cancel.cancel();
             task.abort();
         }
     }

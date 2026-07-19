@@ -1,0 +1,55 @@
+name: Privileged TUN
+
+# This trusted-repository PR gate runs the exact isolated two-TUN workload.
+# Keep it separate from ordinary checks: it needs Linux root, an OIDC-minted
+# disposable tailnet, and unconditional harness cleanup.
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-tun:
+    name: Privileged isolated TUN interop
+    # Fork PRs must not receive an OIDC credential. The protected context is
+    # therefore emitted only for branches owned by this trusted repository.
+    if: github.repository == 'rajsinghtech/rustscale' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Establish Linux TUN prerequisites (credential-free)
+        run: tools/interop-tun-preflight.sh
+
+      - name: Mint Tailscale org token via GitHub OIDC (WIF)
+        id: tsauth
+        run: |
+          AUD="api.tailscale.com/TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL"
+          JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
+          test -n "$JWT" && test "$JWT" != "null"
+          echo "::add-mask::$JWT"
+          TOKEN=$(curl -sS -X POST https://api.tailscale.com/api/v2/oauth/token-exchange \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d 'client_id=TbqNGJkY5611CNTRL-kz4CwX2LK721CNTRL' -d "jwt=$JWT" | jq -r '.access_token')
+          test -n "$TOKEN" && test "$TOKEN" != "null"
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Run isolated out-of-process TUN repro
+        env:
+          TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
+        run: tools/interop-tun-oops.sh

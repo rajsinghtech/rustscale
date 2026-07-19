@@ -66,10 +66,13 @@ RustScale-TUN-to-Go-userspace modes. The gate requires both processes to exit
 0 with the complete structured evidence in both logs and fails on any cleanup
 leak.
 
-This credentialed job is deliberately not part of ordinary local or pull
-request validation. It uses only short-lived OIDC and an ephemeral tailnet with
-unconditional teardown; run it locally only when explicitly supplying the
-documented disposable tailnet credentials.
+This credentialed job is deliberately not part of ordinary local validation.
+Trusted pull requests also run the same exact workload in the separate
+`Privileged TUN / Privileged isolated TUN interop` context, using only
+short-lived OIDC and an ephemeral tailnet with unconditional teardown. That
+context must have a successful run at the exact PR head before it can become a
+protected merge requirement. Run the harness locally only when explicitly
+supplying the documented disposable tailnet credentials.
 
 ### Installed Linux replacement journey
 

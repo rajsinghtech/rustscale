@@ -80,12 +80,7 @@ impl Server {
             s.Version = "rustscale".into();
             s.BackendState = inner.ipn_backend.state().as_str().to_string();
             s.HaveNodeKey = Some(true);
-            s.Health = inner
-                .health
-                .current_warnings()
-                .iter()
-                .map(|w| w.text.clone())
-                .collect();
+            s.Health = crate::localapi::health_status_text(&inner.health);
             for ip in &inner.tailscale_ips {
                 s.TailscaleIPs.push(*ip);
             }

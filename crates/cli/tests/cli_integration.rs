@@ -287,6 +287,47 @@ async fn cli_status_json_via_binary() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_get_honors_global_json_before_or_after_subcommand() {
+    let mut env = setup().await;
+    LocalClient::new(&env.socket_path)
+        .edit_prefs(&rustscale_ipn::MaskedPrefs {
+            Prefs: rustscale_ipn::Prefs {
+                Hostname: "get-json-test".into(),
+                ..Default::default()
+            },
+            HostnameSet: true,
+            ..Default::default()
+        })
+        .await
+        .expect("set known get preference");
+
+    for args in [["get", "--json"], ["--json", "get"]] {
+        let output = run_cli(&env.socket_path, &args);
+        assert!(
+            output.status.success(),
+            "rustscale {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let prefs: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("get --json output should be JSON");
+        assert_eq!(prefs["Hostname"], "get-json-test");
+    }
+
+    let output = run_cli(&env.socket_path, &["get"]);
+    assert!(
+        output.status.success(),
+        "rustscale get failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("ControlURL: "));
+    assert!(!stdout.trim_start().starts_with('{'));
+
+    env.server.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_status_table_via_binary() {
     let mut env = setup().await;
 

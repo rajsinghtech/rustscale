@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rustscale_key::{DiscoPrivate, MachinePrivate, NLPrivate, NodePrivate, NodePublic};
+use rustscale_key::{
+    DiscoPrivate, MachinePrivate, MachinePublic, NLPrivate, NodePrivate, NodePublic,
+};
 use rustscale_tailcfg::MapResponse;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -217,7 +219,7 @@ impl PersistedState {
 /// On-disk netmap cache: a `MapResponse` tagged with the node public key
 /// and a version header so stale caches from a re-keyed node or an
 /// incompatible format are rejected on load.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NetMapCacheData {
     /// Envelope version — must match [`NETMAP_CACHE_VERSION`].
     #[serde(default)]
@@ -239,6 +241,7 @@ pub struct NetMapCacheData {
 /// skipped (dedup), avoiding unnecessary disk I/O on every MapResponse.
 pub struct NetMapCache {
     path: PathBuf,
+    control_key_path: PathBuf,
     profile_id: String,
     control_identity: String,
     expected_tailnet_identity: String,
@@ -250,6 +253,7 @@ impl NetMapCache {
     pub fn new(dir: &Path) -> Self {
         Self {
             path: dir.join("netmap-cache.json"),
+            control_key_path: dir.join("control-server-key.json"),
             profile_id: String::new(),
             control_identity: String::new(),
             expected_tailnet_identity: String::new(),
@@ -260,6 +264,7 @@ impl NetMapCache {
     pub(crate) fn new_scoped(scope: &StateScope, expected_tailnet_identity: &str) -> Self {
         Self {
             path: scope.dir.join("netmap-cache.json"),
+            control_key_path: scope.dir.join("control-server-key.json"),
             profile_id: scope.profile_id.clone(),
             control_identity: scope.control_identity.clone(),
             expected_tailnet_identity: expected_tailnet_identity.to_string(),
@@ -296,15 +301,48 @@ impl NetMapCache {
             }
             Ok(_) => {
                 log::warn!("tsnet: netmap cache identity binding mismatch; discarding");
-                let _ = std::fs::remove_file(&self.path);
+                self.clear();
                 None
             }
             Err(e) => {
                 log::warn!("tsnet: netmap cache corrupt ({e}); discarding");
-                let _ = std::fs::remove_file(&self.path);
+                self.clear();
                 None
             }
         }
+    }
+
+    /// Load the authenticated control Noise key retained with this scoped
+    /// cache. It is useful only alongside a separately validated netmap.
+    pub(crate) fn load_control_server_key(&self) -> Option<MachinePublic> {
+        let data = std::fs::read(&self.control_key_path).ok()?;
+        match serde_json::from_slice::<MachinePublic>(&data) {
+            Ok(key) if !key.is_zero() => Some(key),
+            Ok(_) | Err(_) => {
+                log::warn!("tsnet: control server key cache is invalid; discarding");
+                let _ = std::fs::remove_file(&self.control_key_path);
+                None
+            }
+        }
+    }
+
+    /// Persist the authenticated control Noise key for a later validated
+    /// offline restart. The path is profile/control scoped with the netmap.
+    pub(crate) fn save_control_server_key(
+        &self,
+        key: &MachinePublic,
+    ) -> Result<(), std::io::Error> {
+        if key.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to cache zero control server key",
+            ));
+        }
+        if let Some(parent) = self.control_key_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_vec(key).map_err(std::io::Error::other)?;
+        rustscale_atomicfile::write(&self.control_key_path, &data)
     }
 
     /// Serialize, compute SHA-256, and skip the write if the digest
@@ -342,9 +380,12 @@ impl NetMapCache {
         Ok(())
     }
 
-    /// Remove the cache file (best-effort) and reset the in-memory hash.
+    /// Remove cache authority (best-effort) and reset the in-memory hash.
+    /// The control key is useful only with this exact validated netmap, so it
+    /// must never survive cache invalidation, logout, or identity rotation.
     pub fn clear(&self) {
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.control_key_path);
         *self.last_hash.lock().unwrap() = None;
     }
 }

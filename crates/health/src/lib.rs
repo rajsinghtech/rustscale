@@ -25,6 +25,11 @@ use chrono::{DateTime, Utc};
 
 /// Control-plane connection (map stream). High severity.
 pub const WARN_CONTROL: &str = "control-connection";
+/// Startup is operating from a validated cached netmap until control supplies
+/// a fresh complete peer snapshot and Tailnet Lock synchronization finishes.
+/// This is independent from live stream transport: keepalives prove liveness,
+/// not current peer authority. High severity.
+pub const WARN_CACHED_NETMAP: &str = "cached-netmap";
 /// Home DERP region unreachable. Medium severity.
 pub const WARN_DERP_HOME: &str = "derp-home-unreachable";
 /// A specific DERP region is unreachable. Medium severity.
@@ -90,6 +95,10 @@ pub const WARN_TLS_CERT_PENDING: &str = "tls-cert-pending";
 /// Prefix for subsystem warnables (`"subsystem-dns"`, `"subsystem-tailnet-lock"`, etc.).
 /// Go creates these dynamically for `SysRouter`, `SysDNS`, `SysDNSManager`, `SysTKA`.
 pub const WARN_SUBSYSTEM_PREFIX: &str = "subsystem-";
+/// Requested OS DNS configuration could not be committed. Medium severity.
+/// This is deliberately independent from data-plane readiness: callers may
+/// be Running while status truthfully reports that CorpDNS is degraded.
+pub const WARN_OS_DNS: &str = "subsystem-dns";
 
 // --- Arg key constants used in Go's `health.Args` for dynamic text ---
 
@@ -208,6 +217,12 @@ impl Tracker {
             ..Warnable::default()
         });
         t.register(Warnable {
+            id: WARN_CACHED_NETMAP.into(),
+            severity: Severity::High,
+            title: "Cached network map".into(),
+            ..Warnable::default()
+        });
+        t.register(Warnable {
             id: WARN_DERP_HOME.into(),
             severity: Severity::Medium,
             title: "DERP home region".into(),
@@ -322,6 +337,12 @@ impl Tracker {
             id: WARN_TLS_CERT_PENDING.into(),
             severity: Severity::Low,
             title: "Fetching TLS certificate".into(),
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_OS_DNS.into(),
+            severity: Severity::Medium,
+            title: "DNS configuration".into(),
             ..Warnable::default()
         });
         t.register(Warnable {

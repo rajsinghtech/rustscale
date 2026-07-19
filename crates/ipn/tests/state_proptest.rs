@@ -42,6 +42,7 @@ fn inputs_strategy() -> impl Strategy<Value = StateMachineInputs> {
         any::<bool>(),
         0..10i32,
         0..10i32,
+        any::<bool>(),
     )
         .prop_map(
             |(
@@ -55,6 +56,7 @@ fn inputs_strategy() -> impl Strategy<Value = StateMachineInputs> {
                 machine_authorized,
                 num_live,
                 live_derps,
+                startup_ready,
             )| {
                 StateMachineInputs {
                     want_running,
@@ -67,6 +69,7 @@ fn inputs_strategy() -> impl Strategy<Value = StateMachineInputs> {
                     machine_authorized,
                     num_live,
                     live_derps,
+                    startup_ready,
                 }
             },
         )
@@ -109,11 +112,11 @@ proptest! {
     ) {
         let result = next_state(&inputs, state);
 
-        // Invariant 1: if result == Running, blocked must be false.
+        // Running requires a completed lifecycle-owned readiness commit.
         if result == State::Running {
             prop_assert!(
-                !inputs.blocked,
-                "invariant 1: Running state with blocked=true (current={:?}, inputs={:?})",
+                !inputs.blocked && inputs.startup_ready,
+                "Running without an unblocked committed generation (current={:?}, inputs={:?})",
                 state,
                 inputs
             );
@@ -164,6 +167,7 @@ fn invariant_1_running_with_blocked_true() {
         machine_authorized: true,
         num_live: 0,
         live_derps: 0,
+        startup_ready: false,
     };
     let result = next_state(&inputs, State::Running);
     assert_eq!(
@@ -188,6 +192,7 @@ fn invariant_2_logged_out_returns_stopped_not_needs_login() {
         machine_authorized: true,
         num_live: 0,
         live_derps: 0,
+        startup_ready: false,
     };
     let result = next_state(&inputs, State::NoState);
     assert_eq!(
@@ -213,6 +218,7 @@ fn invariant_3_not_want_running_but_running() {
         machine_authorized: true,
         num_live: 0,
         live_derps: 0,
+        startup_ready: false,
     };
     let result = next_state(&inputs, State::Running);
     assert_ne!(

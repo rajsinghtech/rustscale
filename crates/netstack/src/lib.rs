@@ -43,6 +43,8 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_util::sync::PollSender;
 
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
+use futures_util::{FutureExt, StreamExt};
 use rustscale_key::NodePublic;
 use rustscale_packet::{Parsed, TCPFlag, TCP};
 
@@ -68,6 +70,13 @@ const TCP_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 /// listening sockets allows N simultaneous handshakes — the same role as
 /// the OS `listen(backlog)` parameter.
 const LISTEN_BACKLOG: usize = 32;
+
+/// Maximum number of TCP handshakes submitted by [`Netstack::dial_many`].
+///
+/// This stays below the passive listener pool so bulk setup cannot create a
+/// SYN burst larger than a peer can admit and leaves room while established
+/// passive sockets are replenished.
+pub const TCP_DIAL_WINDOW: usize = LISTEN_BACKLOG / 2;
 
 /// Depth of the accept channel between the poll loop and the application's
 /// `Listener::accept()` call. Large enough to buffer a burst of accepted
@@ -104,6 +113,13 @@ pub enum NetstackError {
     ListenFailed(String),
     #[error("dial failed: {0}")]
     DialFailed(String),
+    #[error("established {established} of {requested} requested connections: {source}")]
+    DialCapacity {
+        established: usize,
+        requested: usize,
+        #[source]
+        source: Box<NetstackError>,
+    },
     #[error("udp listen failed: {0}")]
     UdpListenFailed(String),
     #[error("tls error: {0}")]
@@ -593,6 +609,74 @@ impl Netstack {
         let result = reply_rx.await.map_err(|_| NetstackError::ShuttingDown)?;
         guard.disarm();
         result
+    }
+
+    /// Dial `requested` streams to one resolved address with bounded admission.
+    ///
+    /// At most [`TCP_DIAL_WINDOW`] handshakes are in flight. Results retain
+    /// request order. The operation is atomic: a failure or `deadline` drops
+    /// completed streams and cancels every pending dial.
+    pub async fn dial_many(
+        &self,
+        remote: SocketAddr,
+        requested: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<NetstackStream>, NetstackError> {
+        if requested == 0 {
+            return Ok(Vec::new());
+        }
+
+        type DialFuture<'a> = BoxFuture<'a, (usize, Result<NetstackStream, NetstackError>)>;
+        let mut pending = futures_util::stream::FuturesUnordered::<DialFuture<'_>>::new();
+        let mut next = 0;
+        while next < requested && pending.len() < TCP_DIAL_WINDOW {
+            let index = next;
+            pending.push(async move { (index, self.dial(remote).await) }.boxed());
+            next += 1;
+        }
+
+        let mut established = 0;
+        let mut ordered: Vec<Option<NetstackStream>> =
+            std::iter::repeat_with(|| None).take(requested).collect();
+        while !pending.is_empty() {
+            let completed = match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(Some(completed)) => completed,
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(NetstackError::DialCapacity {
+                        established,
+                        requested,
+                        source: Box::new(NetstackError::DialFailed(
+                            "common setup deadline exceeded".into(),
+                        )),
+                    });
+                }
+            };
+            let (index, stream) = completed;
+            match stream {
+                Ok(stream) => {
+                    ordered[index] = Some(stream);
+                    established += 1;
+                }
+                Err(source) => {
+                    return Err(NetstackError::DialCapacity {
+                        established,
+                        requested,
+                        source: Box::new(source),
+                    });
+                }
+            }
+            if next < requested {
+                let index = next;
+                pending.push(async move { (index, self.dial(remote).await) }.boxed());
+                next += 1;
+            }
+        }
+
+        Ok(ordered
+            .into_iter()
+            .map(|stream| stream.expect("every bounded dial completed"))
+            .collect())
     }
 
     /// Return current pending-dial socket and buffer ownership counts.

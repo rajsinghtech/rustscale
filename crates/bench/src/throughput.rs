@@ -95,22 +95,13 @@ pub async fn run_userspace(
             wait_for_peer(&server, ip, Duration::from_secs(90)).await?;
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
-        // tsnet's public dial operation borrows the embedded server mutably,
-        // so these connections are serialized. One common deadline covers
-        // the complete fan-out; an individual measured stream is never retried.
-        let connect_all = async {
-            let mut streams = Vec::with_capacity(parallel);
-            for index in 0..parallel {
-                let stream = server.dial(&target).await.map_err(|error| {
-                    format!("capacity error: established {index} of {parallel} requested connections: {error}")
-                })?;
-                streams.push(stream);
-            }
-            Ok::<_, String>(streams)
-        };
-        let streams = tokio::time::timeout(SETUP_DEADLINE, connect_all)
+        // Resolve once and admit TCP handshakes in the netstack's bounded
+        // listener-sized window. The primitive owns the common deadline and
+        // fails the requested set atomically without retrying a stream.
+        let streams = server
+            .dial_many(&target, parallel, SETUP_DEADLINE)
             .await
-            .map_err(|_| format!("capacity error: did not establish all {parallel} requested userspace connections before the common setup deadline"))??;
+            .map_err(|error| format!("capacity error: {error}"))?;
         let path_class = extract_path_class(&server.status(), &target);
         measure(
             streams,
@@ -210,6 +201,23 @@ pub async fn run_kernel(
     .await
 }
 
+async fn handshake_stream<S>(
+    index: usize,
+    mut stream: S,
+    header: Header,
+) -> Result<(usize, S), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_header(&mut stream, &header)
+        .await
+        .map_err(|error| format!("stream {index} header: {error}"))?;
+    read_ack(&mut stream)
+        .await
+        .map_err(|error| format!("stream {index} ACK: {error}"))?;
+    Ok((index, stream))
+}
+
 async fn measure<S>(
     mut streams: Vec<S>,
     transport: &'static str,
@@ -236,27 +244,23 @@ where
         count: 0,
     };
     let established = streams.len();
-    // Send every header and await every ACK concurrently under one deadline.
-    // The returned streams are reassembled by index before the common GO
-    // barrier; no workload byte can flow while any handshake is incomplete.
+    // Bound header/ACK admission by the same receive-safe window as TCP
+    // setup. Streams are reassembled by index before the common GO barrier;
+    // no workload byte can flow while any handshake is incomplete.
     let setup = async move {
+        let mut input = streams.drain(..).enumerate();
         let mut tasks = tokio::task::JoinSet::new();
-        for (index, mut stream) in streams.drain(..).enumerate() {
-            tasks.spawn(async move {
-                write_header(&mut stream, &header)
-                    .await
-                    .map_err(|error| format!("stream {index} header: {error}"))?;
-                read_ack(&mut stream)
-                    .await
-                    .map_err(|error| format!("stream {index} ACK: {error}"))?;
-                Ok::<_, String>((index, stream))
-            });
+        for (index, stream) in input.by_ref().take(rustscale_netstack::TCP_DIAL_WINDOW) {
+            tasks.spawn(handshake_stream(index, stream, header));
         }
         let mut ready = Vec::with_capacity(parallel);
         while let Some(joined) = tasks.join_next().await {
             let item =
                 joined.map_err(|error| format!("protocol setup worker failed: {error}"))??;
             ready.push(item);
+            if let Some((index, stream)) = input.next() {
+                tasks.spawn(handshake_stream(index, stream, header));
+            }
         }
         ready.sort_unstable_by_key(|(index, _)| *index);
         Ok::<_, String>(
@@ -568,9 +572,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn repeated_userspace_p1_p10_p100_rounds_count_every_stream() {
+    async fn repeated_userspace_p1_p10_p100_p500_rounds_count_every_stream() {
         for _ in 0..3 {
-            for parallel in [1, 10, 100] {
+            for parallel in [1, 10, 100, 500] {
                 let result = synthetic_rsb1_round(parallel).await;
                 assert_eq!(
                     (result.established, result.handshaken, result.completed),

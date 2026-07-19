@@ -3566,6 +3566,7 @@ name = "rustscale-netstack"
 version = "0.1.4"
 dependencies = [
  "bytes",
+ "futures-util",
  "rustscale-key",
  "rustscale-packet",
  "rustscale-wg",

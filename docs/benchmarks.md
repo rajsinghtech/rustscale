@@ -184,9 +184,13 @@ Certification accepts exactly the ordered stream set
 or silently truncated. Every measured trial must report exactly
 the requested `established`, `handshaken`, and `completed` counts after all
 connections finish the RSB1 ready/GO barrier under one bounded setup deadline.
-The Go package has a hermetic P100 lifecycle gate; Rust retains its local P1000
-kernel setup gate. Paid P1000 publication still requires all selected cells to
-complete the requested point.
+Embedded Rust resolves the target once and admits TCP plus RSB1 setup in a
+bounded listener-safe window; it does not retry, serialize, truncate, or submit
+an unbounded P500/P1000 SYN/header burst. Credential-free Rust regressions retain
+all P500 netstack streams, bound a failing P1000 request's pending ownership, and
+exercise the complete P500 RSB1 lifecycle. The Go package has a hermetic P100
+lifecycle gate; Rust also retains its local P1000 kernel setup gate. Paid P1000
+publication still requires all selected cells to complete the requested point.
 
 The warmup, each measured throughput trial, and latency are each attempted
 exactly once. One failed or incomplete trial discards the cell. Every trial uses

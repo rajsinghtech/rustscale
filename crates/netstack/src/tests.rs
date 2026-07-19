@@ -602,6 +602,136 @@ async fn concurrent_connections_all_succeed() {
     );
 }
 
+/// Production bulk dialing must retain every P500 stream while never
+/// exceeding the peer's listener-sized admission window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_bulk_dial_establishes_and_retains_p500() {
+    const STREAMS: usize = 500;
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+    let a_addr = Ipv4Addr::new(100, 64, 0, 1);
+    let b_addr = Ipv4Addr::new(100, 64, 0, 2);
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
+    let a_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
+    ));
+    let b_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&b_priv, &a_pub, 2).expect("B tunnel"),
+    ));
+
+    let pump = {
+        let a_tunn = a_tunn.clone();
+        let b_tunn = b_tunn.clone();
+        let a_net = a_net.clone();
+        let b_net = b_net.clone();
+        tokio::spawn(async move {
+            let a_tx = a_net.tx_notify();
+            let b_tx = b_net.tx_notify();
+            loop {
+                if !pump_cycle(&a_tunn, &b_tunn, &a_net, &b_net) {
+                    tokio::select! {
+                        () = a_tx.notified() => {}
+                        () = b_tx.notified() => {}
+                        () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
+                }
+            }
+        })
+    };
+
+    let mut listener = b_net.listen(41000).await.expect("listen");
+    let accept = tokio::spawn(async move {
+        let mut streams = Vec::with_capacity(STREAMS);
+        for _ in 0..STREAMS {
+            streams.push(listener.accept().await.expect("accept"));
+        }
+        streams
+    });
+    let dial = {
+        let a_net = a_net.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                a_net.dial_many(
+                    SocketAddr::new(b_addr.into(), 41000),
+                    STREAMS,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(25),
+                ),
+            )
+            .await
+        })
+    };
+    let mut maximum = 0;
+    while !dial.is_finished() {
+        maximum = maximum.max(a_net.dial_stats().pending_dials);
+        tokio::task::yield_now().await;
+    }
+    let client_streams = dial
+        .await
+        .expect("dial worker")
+        .expect("P500 outer deadline")
+        .expect("P500 bulk dial");
+    let server_streams = accept.await.expect("accept worker");
+
+    assert_eq!(client_streams.len(), STREAMS);
+    assert_eq!(server_streams.len(), STREAMS);
+    assert!(
+        maximum <= crate::TCP_DIAL_WINDOW,
+        "maximum in flight: {maximum}"
+    );
+    assert_eq!(a_net.dial_stats(), DialStats::default());
+    drop(client_streams);
+    drop(server_streams);
+    pump.abort();
+}
+
+/// A P1000 request that cannot connect still owns at most one bounded window,
+/// and common-deadline cancellation reclaims every pending socket and buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_bulk_dial_p1000_cancels_without_task_pileup() {
+    const STREAMS: usize = 1000;
+    let net = Arc::new(Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).unwrap());
+    let dial = {
+        let net = net.clone();
+        tokio::spawn(async move {
+            net.dial_many(
+                SocketAddr::from(([100, 64, 0, 254], 9)),
+                STREAMS,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(500),
+            )
+            .await
+        })
+    };
+    let mut maximum = 0;
+    while !dial.is_finished() {
+        maximum = maximum.max(net.dial_stats().pending_dials);
+        tokio::task::yield_now().await;
+    }
+    let error = match dial.await.expect("dial worker") {
+        Ok(_) => panic!("unreachable P1000 dial must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("established 0 of 1000"),
+        "{error}"
+    );
+    assert!(maximum > 0);
+    assert!(
+        maximum <= crate::TCP_DIAL_WINDOW,
+        "maximum in flight: {maximum}"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while net.dial_stats() != DialStats::default() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled P1000 dials leaked resources");
+}
+
 /// Verify that `add_addr` + `listen_on` allows listening on a VIP address
 /// distinct from the node's primary tailnet IP. This exercises the service
 /// listener path: a netstack with primary IP 100.64.0.2 adds a VIP

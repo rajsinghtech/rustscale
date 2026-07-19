@@ -715,17 +715,25 @@ pub(crate) async fn connect_home_derp(
 
     let certificate_policy =
         rustscale_derp::CertificatePolicy::from_derp_cert_name(&node.CertName)?;
+    let (use_tls, insecure) = derp_tls_options(node.InsecureForTests);
     DerpClient::connect_with_upgrade_dial_policy(
         &dial_addr,
         &tls_host,
         port,
-        !node.InsecureForTests,
-        node.InsecureForTests,
+        use_tls,
+        insecure,
         certificate_policy,
         node_key.clone(),
         None,
     )
     .await
+}
+
+/// `InsecureForTests` permits an untrusted test certificate; it does not
+/// change a DERP endpoint into plaintext HTTP. Testcontrol deliberately uses
+/// a self-signed TLS listener, just like an ordinary DERP endpoint.
+fn derp_tls_options(insecure_for_tests: bool) -> (bool, bool) {
+    (true, insecure_for_tests)
 }
 
 #[cfg(test)]
@@ -735,6 +743,12 @@ mod tests {
     use rustscale_key::NodePrivate;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn insecure_test_derp_keeps_tls_and_only_relaxes_certificate_validation() {
+        assert_eq!(derp_tls_options(false), (true, false));
+        assert_eq!(derp_tls_options(true), (true, true));
+    }
 
     struct BlockCountingRouter(Arc<AtomicUsize>);
 

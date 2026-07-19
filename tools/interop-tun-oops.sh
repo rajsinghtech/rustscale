@@ -132,23 +132,28 @@ cleanup() {
 
   if (( NAT_RULE_ADDED )); then
     timeout 10s sudo -n iptables -w 5 -t nat -D POSTROUTING -s "$SUBNET" -o "$EGRESS" \
-      -m comment --comment "${GATE_ID}-nat" -j MASQUERADE 2>/dev/null || cleanup_rc=1
+      -m comment --comment "${GATE_ID}-nat" -j MASQUERADE 2>/dev/null \
+      || { echo "[interop-tun-oops] ERROR: could not delete tagged NAT rule" >&2; cleanup_rc=1; }
   fi
   if (( FORWARD_OUT_RULE_ADDED )); then
     timeout 10s sudo -n iptables -w 5 -D FORWARD -i "$BRIDGE" -o "$EGRESS" \
-      -m comment --comment "${GATE_ID}-out" -j ACCEPT 2>/dev/null || cleanup_rc=1
+      -m comment --comment "${GATE_ID}-out" -j ACCEPT 2>/dev/null \
+      || { echo "[interop-tun-oops] ERROR: could not delete tagged outbound rule" >&2; cleanup_rc=1; }
   fi
   if (( FORWARD_IN_RULE_ADDED )); then
     timeout 10s sudo -n iptables -w 5 -D FORWARD -i "$EGRESS" -o "$BRIDGE" \
       -m conntrack --ctstate ESTABLISHED,RELATED \
-      -m comment --comment "${GATE_ID}-in" -j ACCEPT 2>/dev/null || cleanup_rc=1
+      -m comment --comment "${GATE_ID}-in" -j ACCEPT 2>/dev/null \
+      || { echo "[interop-tun-oops] ERROR: could not delete tagged inbound rule" >&2; cleanup_rc=1; }
   fi
   if (( IP_FORWARD_CHANGED )); then
-    timeout 10s sudo -n sysctl -q -w "net.ipv4.ip_forward=$IP_FORWARD_ORIGINAL" >/dev/null 2>&1 || cleanup_rc=1
+    timeout 10s sudo -n sysctl -q -w "net.ipv4.ip_forward=$IP_FORWARD_ORIGINAL" >/dev/null 2>&1 \
+      || { echo "[interop-tun-oops] ERROR: could not restore IPv4 forwarding" >&2; cleanup_rc=1; }
   fi
 
   if [[ -n "$STATE_DIR" ]]; then
-    timeout 10s sudo -n rm -rf "$STATE_DIR" 2>/dev/null || cleanup_rc=1
+    timeout 10s sudo -n rm -rf "$STATE_DIR" 2>/dev/null \
+      || { echo "[interop-tun-oops] ERROR: could not delete state directory" >&2; cleanup_rc=1; }
   fi
 
   # Run API cleanup in a subshell so its complete retry sequence also has an
@@ -160,18 +165,28 @@ cleanup() {
     kill -KILL "$tailnet_pid" 2>/dev/null
     cleanup_rc=1
   fi
-  wait "$tailnet_pid" || cleanup_rc=1
+  wait "$tailnet_pid" \
+    || { echo "[interop-tun-oops] ERROR: ephemeral tailnet cleanup failed" >&2; cleanup_rc=1; }
 
-  timeout 5s sudo -n ip netns list | awk '{print $1}' | grep -Eq "^(${NS_SERVER}|${NS_CLIENT})$" && cleanup_rc=1
+  if timeout 5s sudo -n ip netns list | awk '{print $1}' | grep -Eq "^(${NS_SERVER}|${NS_CLIENT})$"; then
+    echo "[interop-tun-oops] ERROR: leaked network namespace" >&2
+    cleanup_rc=1
+  fi
   for link in "$BRIDGE" "$VETH_SERVER" "${VETH_SERVER}p" "$VETH_CLIENT" "${VETH_CLIENT}p"; do
-    timeout 5s sudo -n ip link show dev "$link" >/dev/null 2>&1 && cleanup_rc=1
+    if timeout 5s sudo -n ip link show dev "$link" >/dev/null 2>&1; then
+      echo "[interop-tun-oops] ERROR: leaked link $link" >&2
+      cleanup_rc=1
+    fi
   done
   if timeout 5s sudo -n iptables -w 3 -S | grep -Fq -- "--comment ${GATE_ID}-" \
     || timeout 5s sudo -n iptables -w 3 -t nat -S | grep -Fq -- "--comment ${GATE_ID}-"; then
     echo "[interop-tun-oops] ERROR: leaked tagged firewall rule" >&2
     cleanup_rc=1
   fi
-  [[ -z "$STATE_DIR" || ! -e "$STATE_DIR" ]] || cleanup_rc=1
+  if [[ -n "$STATE_DIR" && -e "$STATE_DIR" ]]; then
+    echo "[interop-tun-oops] ERROR: leaked state directory $STATE_DIR" >&2
+    cleanup_rc=1
+  fi
 
   if (( cleanup_rc )); then
     echo "[interop-tun-oops] ERROR: cleanup was incomplete" >&2
@@ -292,8 +307,9 @@ mkfifo -m 600 "$READY_FIFO"
 AUTHKEY_FILE="$STATE_DIR/authkey"
 UNDERLAY_PCAP="$STATE_DIR/underlay.pcap"
 # Capture at the bridge before host NAT. Later assertions correlate each
-# namespace source address to the other endpoint's externally discovered UDP
-# port, independent of RustScale's path enum or configured candidates.
+# namespace source address to the other node's advertised local UDP endpoint,
+# independent of RustScale's path enum or configured candidates. This also
+# excludes public DERP/STUN traffic from the direct-underlay packet counts.
 # Log redirection intentionally remains owned by the invoking user; tcpdump
 # alone needs privilege and writes the pcap removed by root cleanup.
 # shellcheck disable=SC2024
@@ -386,19 +402,19 @@ if ! timeout --foreground --signal=TERM --kill-after=2s 10s tail --pid="$CAPTURE
 fi
 wait "$CAPTURE_PID" || fail "underlay packet capture failed"
 CAPTURE_PID=""
-SERVER_PUBLIC_PORT=$(sed -n 's/.*STUN endpoint: [^: ]*:\([0-9][0-9]*\).*/\1/p' "$SERVER_LOG" | tail -n 1)
-CLIENT_PUBLIC_PORT=$(sed -n 's/.*STUN endpoint: [^: ]*:\([0-9][0-9]*\).*/\1/p' "$CLIENT_LOG" | tail -n 1)
-[[ "$SERVER_PUBLIC_PORT" =~ ^[1-9][0-9]*$ && "$CLIENT_PUBLIC_PORT" =~ ^[1-9][0-9]*$ ]] \
-  || fail "could not identify both externally discovered endpoint ports"
+SERVER_DIRECT_PORT=$(sed -n 's/.*local UDP endpoints: .*198\.18\.83\.2:\([0-9][0-9]*\).*/\1/p' "$SERVER_LOG" | tail -n 1)
+CLIENT_DIRECT_PORT=$(sed -n 's/.*local UDP endpoints: .*198\.18\.83\.3:\([0-9][0-9]*\).*/\1/p' "$CLIENT_LOG" | tail -n 1)
+[[ "$SERVER_DIRECT_PORT" =~ ^[1-9][0-9]*$ && "$CLIENT_DIRECT_PORT" =~ ^[1-9][0-9]*$ ]] \
+  || fail "could not identify both advertised local UDP endpoint ports"
 CLIENT_DIRECT_PACKETS=$(sudo -n tcpdump -n -r "$UNDERLAY_PCAP" \
-  "src host 198.18.83.3 and udp dst port $SERVER_PUBLIC_PORT" 2>/dev/null | wc -l | tr -d ' ')
+  "src host 198.18.83.3 and dst host 198.18.83.2 and udp dst port $SERVER_DIRECT_PORT" 2>/dev/null | wc -l | tr -d ' ')
 SERVER_DIRECT_PACKETS=$(sudo -n tcpdump -n -r "$UNDERLAY_PCAP" \
-  "src host 198.18.83.2 and udp dst port $CLIENT_PUBLIC_PORT" 2>/dev/null | wc -l | tr -d ' ')
+  "src host 198.18.83.2 and dst host 198.18.83.3 and udp dst port $CLIENT_DIRECT_PORT" 2>/dev/null | wc -l | tr -d ' ')
 [[ "$SERVER_DIRECT_PACKETS" =~ ^[1-9][0-9]*$ ]] \
   || fail "no externally captured direct UDP underlay packets from server to client"
 [[ "$CLIENT_DIRECT_PACKETS" =~ ^[1-9][0-9]*$ ]] \
   || fail "no externally captured direct UDP underlay packets from client to server"
-echo "[interop-tun-oops] OOPS_DIRECT_UNDERLAY_EVIDENCE server_to_client_packets=$SERVER_DIRECT_PACKETS client_to_server_packets=$CLIENT_DIRECT_PACKETS server_port=$SERVER_PUBLIC_PORT client_port=$CLIENT_PUBLIC_PORT src_server=198.18.83.2 src_client=198.18.83.3" >&2
+echo "[interop-tun-oops] OOPS_DIRECT_UNDERLAY_EVIDENCE server_to_client_packets=$SERVER_DIRECT_PACKETS client_to_server_packets=$CLIENT_DIRECT_PACKETS server_endpoint=198.18.83.2:$SERVER_DIRECT_PORT client_endpoint=198.18.83.3:$CLIENT_DIRECT_PORT" >&2
 
 # `OOPS_KERNEL_OK` is emitted only after each live endpoint has verified its
 # own namespace-local table-52 route. Routes are intentionally retired by

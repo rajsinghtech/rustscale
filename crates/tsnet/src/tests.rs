@@ -1059,7 +1059,14 @@ async fn dropped_loopback_handle_is_joined_by_central_close() {
         .await
         .unwrap();
     let addr = handle.local_addr();
-    let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Leave an accepted LocalAPI connection waiting for the rest of its
+    // request. Central close must cancel and join this child as well as the
+    // listener before an immediate bind can reuse the address.
+    tokio::io::AsyncWriteExt::write_all(&mut idle, b"G")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
     drop(handle);
     server.close().await.unwrap();
     drop(idle);

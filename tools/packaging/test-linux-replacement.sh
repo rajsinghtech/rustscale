@@ -1017,6 +1017,31 @@ for _ in range(4):
 print("peer reachability withdrawn: ok")
 PY
 
+# Down flushes its disconnect audit before returning. Prove the control server
+# is still alive and that exactly one strictly validated inner-Noise audit event
+# was accepted before public-up can mask a control-plane failure.
+run_bounded 10 audit-log-after-public-down \
+  python3 - "$CONTROL_URL" <<'PY'
+import json
+import re
+import sys
+import urllib.request
+base = sys.argv[1]
+with urllib.request.urlopen(base + "/testapi/health", timeout=2) as response:
+    assert response.status == 200
+    assert json.load(response) == {"ok": True}
+with urllib.request.urlopen(base + "/testapi/audit-log", timeout=2) as response:
+    assert response.status == 200
+    stats = json.load(response)
+assert stats["accepted"] == 1, stats
+assert stats["rejected"] == 0, stats
+assert stats["action"] == "DISCONNECT_NODE", stats
+assert stats["detailsLen"] > 0, stats
+assert stats["timestampSet"] is True, stats
+assert re.fullmatch(r"[0-9a-f]{64}", stats["bodySHA256"]), stats
+assert stats["lastError"] == "", stats
+PY
+
 run_bounded 90 public-up \
   /usr/local/bin/tailscale up --accept-dns=true --timeout=60
 UP_STATUS=$(run_bounded 10 immediate-up-status \

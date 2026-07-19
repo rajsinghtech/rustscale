@@ -132,8 +132,11 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
       || { echo "$LABEL ERROR: $value_name must be positive" >&2; exit 2; }
   done
 
-  manager_state=$(sudo -n timeout --signal=KILL 10s \
-    systemctl is-system-running 2>/dev/null || true)
+  # GitHub-hosted runners can still report "starting" immediately after the
+  # job begins. Let systemd perform one bounded readiness wait instead of
+  # failing a required journey on that transient state.
+  manager_state=$(sudo -n timeout --signal=KILL 60s \
+    systemctl is-system-running --wait 2>/dev/null || true)
   case "$manager_state" in
     running|degraded) ;;
     *) skip "systemd manager is unavailable for privileged cgroup supervision (state=${manager_state:-unknown})" ;;

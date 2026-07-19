@@ -660,30 +660,54 @@ async fn run_client(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
     for attempt in 1..=UDP_DIRECT_PROBE_ATTEMPTS {
         let payload = format!("interop-tun-oops-direct-probe attempt={attempt}");
         udp.send(payload.as_bytes()).await?;
-        let mut buf = [0u8; 2048];
-        match tokio::time::timeout(UDP_ECHO_TIMEOUT, udp.recv(&mut buf)).await {
-            Ok(Ok(n)) if buf[..n] == *payload.as_bytes() => {
-                line(
-                    start,
-                    args.role,
-                    &format!("OOPS_CLIENT_DIRECT_PROBE_OK attempt={attempt}"),
-                );
-                direct_ready = true;
-                break;
+        let deadline = Instant::now() + UDP_ECHO_TIMEOUT;
+        loop {
+            let mut buf = [0u8; 2048];
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, udp.recv(&mut buf)).await {
+                Ok(Ok(n)) if buf[..n] == *payload.as_bytes() => {
+                    line(
+                        start,
+                        args.role,
+                        &format!("OOPS_CLIENT_DIRECT_PROBE_OK attempt={attempt}"),
+                    );
+                    direct_ready = true;
+                    break;
+                }
+                Ok(Ok(n))
+                    if String::from_utf8_lossy(&buf[..n])
+                        .starts_with("interop-tun-oops-direct-probe attempt=") =>
+                {
+                    // A timed-out probe can still be echoed after the next
+                    // attempt is sent. Drain that authenticated application
+                    // echo within this attempt's original deadline rather
+                    // than mistaking ordinary UDP reordering for corruption.
+                    line(
+                        start,
+                        args.role,
+                        &format!("OOPS_CLIENT_DIRECT_PROBE_STALE attempt={attempt}"),
+                    );
+                }
+                Ok(Ok(n)) => {
+                    return Err(format!(
+                        "UDP direct probe mismatch attempt={attempt}: sent {payload:?}, got {:?}",
+                        String::from_utf8_lossy(&buf[..n])
+                    )
+                    .into());
+                }
+                Ok(Err(error)) => return Err(format!("UDP direct probe failed: {error}").into()),
+                Err(_) => {
+                    line(
+                        start,
+                        args.role,
+                        &format!("OOPS_CLIENT_DIRECT_PROBE_TIMEOUT attempt={attempt}"),
+                    );
+                    break;
+                }
             }
-            Ok(Ok(n)) => {
-                return Err(format!(
-                    "UDP direct probe mismatch attempt={attempt}: sent {payload:?}, got {:?}",
-                    String::from_utf8_lossy(&buf[..n])
-                )
-                .into());
-            }
-            Ok(Err(error)) => return Err(format!("UDP direct probe failed: {error}").into()),
-            Err(_) => line(
-                start,
-                args.role,
-                &format!("OOPS_CLIENT_DIRECT_PROBE_TIMEOUT attempt={attempt}"),
-            ),
+        }
+        if direct_ready {
+            break;
         }
     }
     if !direct_ready {

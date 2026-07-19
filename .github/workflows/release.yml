@@ -212,22 +212,11 @@ jobs:
         run: |
           test -f include/rustscale.h || { echo "header not generated"; exit 1; }
 
-      - name: Bundle
+      - name: Bundle exact Linux production archive
         run: |
-          set -e
-          mkdir -p dist
-          libdir="target/${{ matrix.target }}/release"
-          # cdylib: .so on Linux (gnu + musl)
-          cp "$libdir/librustscale.so" dist/ 2>/dev/null || true
-          cp "$libdir/librustscale.a" dist/
-          cp include/rustscale.h LICENSE dist/
-          cp packaging/systemd/rustscaled.service dist/
-          cp packaging/systemd/rustscaled.default dist/
-          for entry in $BIN_PKGS; do
-            bin="${entry##*:}"
-            cp "$libdir/$bin" dist/ 2>/dev/null || true
-          done
-          tar --format=ustar -czf rustscale-${{ matrix.target }}.tar.gz -C dist .
+          tools/packaging/assemble-linux-release.sh \
+            "${{ matrix.target }}" "target/${{ matrix.target }}/release" dist
+          mv "dist/rustscale-${{ matrix.target }}.tar.gz" .
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

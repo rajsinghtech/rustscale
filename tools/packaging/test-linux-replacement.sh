@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Installed Linux replacement journey. Builds a release archive, installs it
-# through scripts/install.sh with explicit Tailscale-compatible aliases, starts
-# the shipped systemd unit, enrolls against pinned Go testcontrol, and proves a
-# kernel-TUN packet roundtrip to a pinned Go tailscaled peer.
+# Installed Linux replacement journey. Consumes a candidate's already-built
+# production archive and SHA256SUMS, installs it through the ordinary documented
+# installer (including its default aliases), starts the shipped systemd unit,
+# enrolls against pinned Go testcontrol, and proves a kernel-TUN packet
+# roundtrip to a pinned Go tailscaled peer. This is intentionally build-free.
 
 set -euo pipefail
 
@@ -192,7 +193,9 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
   for variable in CARGO_HOME CARGO_TARGET_DIR CI GITHUB_ACTIONS \
     RUSTUP_HOME RUSTFLAGS TMPDIR \
     CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS \
-    CARGO_PROFILE_RELEASE_OPT_LEVEL RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE; do
+    CARGO_PROFILE_RELEASE_OPT_LEVEL RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE \
+    RUSTSCALE_RELEASE_DIR RUSTSCALE_RELEASE_TAG RUSTSCALE_RELEASE_SHA \
+    RUSTSCALE_RELEASE_VERSION; do
     if [[ -n "${!variable:-}" ]]; then
       environment+=("$variable=${!variable}")
     fi
@@ -220,7 +223,7 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
 fi
 
 record_phase preflight
-for command_name in awk cargo cmp cp curl date find getconf go grep id install ip journalctl \
+for command_name in awk cmp cp curl date find getconf go grep id install ip journalctl \
   mktemp ps python3 readlink sed setpriv sha256sum sudo systemctl systemd-run tail tar \
   tee timeout tr wc; do
   command -v "$command_name" >/dev/null 2>&1 \
@@ -309,26 +312,12 @@ INSTALL_STARTED=0
 OFFICIAL_SENTINELS=0
 RULE_BASE=
 JOURNEY_FINISHED=0
-# Set only while the credential-free privileged selector owns its isolated
-# kernel names. The EXIT trap uses this solely for failure attribution.
-REQUIRED_TUN_DNS_GATE_ACTIVE=0
 CONFIG_PATH=/etc/rustscale-install-journey.json
 DROPIN_DIR=/etc/systemd/system/rustscaled.service.d
 JOURNEY_ENV=/etc/default/rustscaled-install-journey
 PREFIX=/usr/local
 DEFAULT_SOCKET=/var/run/rustscaled.sock
 TUN_NAME=tun0
-# The credential-free readiness test has independently attributable names.
-# Keep them in the journey tempdir and reject collisions before it can mutate
-# the kernel, so the EXIT fallback can safely remove only this journey's state.
-DNS_TUN_NAME="rsdns-$$"
-DNS_SOCKET="$TMP/required-tun-dns.sock"
-[[ ${#DNS_TUN_NAME} -le 15 ]] \
-  || { echo "$LABEL ERROR: required TUN DNS interface name is too long: $DNS_TUN_NAME" >&2; exit 1; }
-[[ ! -e "/sys/class/net/$DNS_TUN_NAME" ]] \
-  || skip "required TUN DNS interface already exists: $DNS_TUN_NAME"
-[[ ! -e "$DNS_SOCKET" && ! -L "$DNS_SOCKET" ]] \
-  || skip "required TUN DNS LocalAPI socket already exists: $DNS_SOCKET"
 DNS_BASELINE_TARGET=$(readlink -f /etc/resolv.conf)
 cp -L /etc/resolv.conf "$TMP/resolv.conf.baseline"
 
@@ -361,85 +350,12 @@ uninstall_release() {
       sh "$ROOT/scripts/install.sh" --uninstall
 }
 
-run_required_tun_dns_failure_gate() {
-  local test_json selected_count
-  local -a test_bins
-
-  # Compile as the journey runner, not root. Cargo's JSON is the sole source
-  # for the libtest executable; reject ambiguity rather than selecting first.
-  test_json="$TMP/required-tun-dns-test.json"
-  run_bounded 300 required-tun-dns-build \
-    cargo test -p rustscale-tsnet --lib --no-run --message-format=json >"$test_json"
-  mapfile -t test_bins < <(python3 - "$test_json" <<'PYTHON'
-import json
-import sys
-
-matches = []
-for line in open(sys.argv[1], encoding="utf-8"):
-    try:
-        item = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    target = item.get("target", {})
-    if (item.get("profile", {}).get("test")
-            and target.get("name") == "rustscale_tsnet"
-            and "lib" in target.get("kind", [])
-            and item.get("executable")):
-        matches.append(item["executable"])
-if len(matches) == 1:
-    print(matches[0])
-else:
-    raise SystemExit(f"expected one rustscale_tsnet libtest executable, found {len(matches)}")
-PYTHON
-)
-  if [[ ${#test_bins[@]} != 1 || ! -x "${test_bins[0]:-}" ]]; then
-    echo "$LABEL ERROR: required TUN DNS gate could not resolve one executable" >&2
-    return 1
-  fi
-  TEST_BIN=${test_bins[0]}
-
-  selected_count=$("$TEST_BIN" --ignored --list \
-    | grep -Fxc 'tests::interop_tun_rust_dials_go: test' || true)
-  if [[ "$selected_count" != 1 ]]; then
-    echo "$LABEL ERROR: required TUN DNS exact selector matched $selected_count tests (expected 1)" >&2
-    return 1
-  fi
-
-  # This is intentionally a dedicated mode of the existing reviewed selector.
-  # It neither receives nor can fall through to the secret-backed interop path.
-  # Mark only the privileged mutation window so EXIT cleanup can attribute an
-  # interrupted selector to its isolated interface, socket, and rule chain.
-  REQUIRED_TUN_DNS_GATE_ACTIVE=1
-  echo "$LABEL $(timestamp) start: required TUN DNS readiness (root deadline=180s)" >&2
-  if ! sudo -n timeout --signal=TERM --kill-after=5s 180s \
-      env RUSTSCALE_REQUIRED_TUN_DNS_FAILURE=1 \
-        RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME="$DNS_TUN_NAME" \
-        RUSTSCALE_REQUIRED_TUN_DNS_SOCKET="$DNS_SOCKET" \
-      sh -ceu '
-        test "$(uname -s)" = Linux || { echo "required TUN DNS gate requires Linux" >&2; exit 1; }
-        test "$(id -u)" -eq 0 || { echo "required TUN DNS gate did not run as root" >&2; exit 1; }
-        test -c /dev/net/tun || { echo "required TUN DNS gate requires /dev/net/tun" >&2; exit 1; }
-        command -v ip >/dev/null || { echo "required TUN DNS gate requires ip" >&2; exit 1; }
-        test "${RUSTSCALE_REQUIRED_TUN_DNS_FAILURE:-}" = 1 || exit 1
-        test -n "${RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME:-}" || exit 1
-        test -n "${RUSTSCALE_REQUIRED_TUN_DNS_SOCKET:-}" || exit 1
-        exec "$@"
-      ' sh "$TEST_BIN" \
-      --ignored --exact tests::interop_tun_rust_dials_go \
-      --nocapture --test-threads=1; then
-    echo "$LABEL ERROR: required TUN DNS readiness gate failed" >&2
-    return 1
-  fi
-  REQUIRED_TUN_DNS_GATE_ACTIVE=0
-  echo "$LABEL $(timestamp) finish: required TUN DNS readiness" >&2
-}
-
 # Last-resort host restoration for an interrupted or wedged service stop. The
 # preflight rejects every one of these names/selectors before the journey, so
 # this removes only state attributable to this isolated run. Successful journey
 # assertions happen before this function can be used.
 emergency_kernel_cleanup() {
-  local family preference table ifindex rules tun_name socket_name
+  local family preference table ifindex rules
   sudo -n timeout --signal=KILL 5s \
     systemctl kill --kill-whom=all --signal=KILL rustscaled.service \
     >/dev/null 2>&1 || true
@@ -495,32 +411,22 @@ emergency_kernel_cleanup() {
   done
   sudo -n timeout --signal=KILL 3s \
     rm -rf /run/rustscale/rule-owners >/dev/null 2>&1 || true
-  for tun_name in "$TUN_NAME" "$DNS_TUN_NAME"; do
-    sudo -n timeout --signal=KILL 3s \
-      ip link delete dev "$tun_name" >/dev/null 2>&1 || true
-  done
-  for socket_name in "$DEFAULT_SOCKET" "$DNS_SOCKET"; do
-    sudo -n timeout --signal=KILL 3s rm -f "$socket_name" || true
-  done
+  sudo -n timeout --signal=KILL 3s \
+    ip link delete dev "$TUN_NAME" >/dev/null 2>&1 || true
+  sudo -n timeout --signal=KILL 3s rm -f "$DEFAULT_SOCKET" || true
 }
 
 assert_kernel_clean() {
   local socket_must_be_absent=${1:-yes}
   local leaked=0 family rules preference routes
-  local tun_name socket_name
-  for tun_name in "$TUN_NAME" "$DNS_TUN_NAME"; do
-    if [[ -e "/sys/class/net/$tun_name" ]]; then
-      echo "$LABEL cleanup leak: interface $tun_name still exists" >&2
-      leaked=1
-    fi
-  done
-  if [[ "$socket_must_be_absent" == yes ]]; then
-    for socket_name in "$DEFAULT_SOCKET" "$DNS_SOCKET"; do
-      if [[ -e "$socket_name" || -L "$socket_name" ]]; then
-        echo "$LABEL cleanup leak: LocalAPI path $socket_name still exists" >&2
-        leaked=1
-      fi
-    done
+  if [[ -e "/sys/class/net/$TUN_NAME" ]]; then
+    echo "$LABEL cleanup leak: interface $TUN_NAME still exists" >&2
+    leaked=1
+  fi
+  if [[ "$socket_must_be_absent" == yes ]] \
+      && [[ -e "$DEFAULT_SOCKET" || -L "$DEFAULT_SOCKET" ]]; then
+    echo "$LABEL cleanup leak: LocalAPI path $DEFAULT_SOCKET still exists" >&2
+    leaked=1
   fi
   if [[ -n "$RULE_BASE" ]]; then
     for family in -4 -6; do
@@ -548,12 +454,10 @@ assert_kernel_clean() {
     fi
   done
   routes=$(timeout --signal=KILL 3s ip -4 route show table 52 2>/dev/null || true)
-  for tun_name in "$TUN_NAME" "$DNS_TUN_NAME"; do
-    if printf '%s\n' "$routes" | grep -F "dev $tun_name" >/dev/null; then
-      echo "$LABEL cleanup leak: table 52 still routes through $tun_name" >&2
-      leaked=1
-    fi
-  done
+  if printf '%s\n' "$routes" | grep -F "dev $TUN_NAME" >/dev/null; then
+    echo "$LABEL cleanup leak: table 52 still routes through $TUN_NAME" >&2
+    leaked=1
+  fi
   [[ "$leaked" == 0 ]]
 }
 
@@ -607,9 +511,6 @@ cleanup() {
   if [[ "$primary_status" != 0 ]]; then
     capture_failure_diagnostics
   fi
-  if [[ "$REQUIRED_TUN_DNS_GATE_ACTIVE" == 1 ]]; then
-    echo "$LABEL $(timestamp) cleanup attribution: exact required TUN DNS selector owned $DNS_TUN_NAME, $DNS_SOCKET, and protocol-201 rules" >&2
-  fi
   echo "$LABEL $(timestamp) cleanup: begin (deadline=${RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT:-90}s)" >&2
 
   if [[ "$INSTALL_STARTED" == 1 ]]; then
@@ -652,8 +553,6 @@ cleanup() {
 
   if ! assert_kernel_clean; then
     cleanup_failed=1
-    # This also owns the dedicated readiness mode's names, even when it
-    # failed before the install phase set INSTALL_STARTED.
     emergency_kernel_cleanup || cleanup_failed=1
     assert_kernel_clean || cleanup_failed=1
   fi
@@ -701,6 +600,47 @@ backend_state() {
 
 status_ip() {
   python3 -c 'import json,sys; values=json.load(sys.stdin).get("TailscaleIPs") or []; print(next((value for value in values if "." in value), ""))'
+}
+
+assert_cli_contract() {
+  local stdout stderr
+  stdout="$TMP/cli.stdout"
+  stderr="$TMP/cli.stderr"
+
+  # Top-level help retains the documented usage stream and success code.
+  if ! /usr/local/bin/tailscale --help >"$stdout" 2>"$stderr"; then
+    echo "$LABEL ERROR: tailscale --help did not exit successfully" >&2
+    return 1
+  fi
+  if ! [[ ! -s "$stdout" ]] || ! grep -Fq 'usage:' "$stderr"; then
+    echo "$LABEL ERROR: tailscale --help stream contract changed" >&2
+    return 1
+  fi
+
+  # Both command-help spellings must be offline, successful, and stdout-only.
+  for help_args in 'status --help' 'help status'; do
+    # Intentional word splitting: each case is a fixed two-argument vector.
+    # shellcheck disable=SC2086
+    if ! /usr/local/bin/tailscale $help_args >"$stdout" 2>"$stderr"; then
+      echo "$LABEL ERROR: tailscale $help_args did not exit successfully" >&2
+      return 1
+    fi
+    if ! [[ -s "$stdout" && ! -s "$stderr" ]] \
+        || ! grep -Fq 'usage: tailscale status' "$stdout"; then
+      echo "$LABEL ERROR: tailscale $help_args stream contract changed" >&2
+      return 1
+    fi
+  done
+
+  if /usr/local/bin/tailscale definitely-not-a-command >"$stdout" 2>"$stderr"; then
+    echo "$LABEL ERROR: invalid tailscale command unexpectedly succeeded" >&2
+    return 1
+  fi
+  if ! [[ ! -s "$stdout" && -s "$stderr" ]] \
+      || ! grep -Fq "unknown subcommand 'definitely-not-a-command'" "$stderr"; then
+    echo "$LABEL ERROR: invalid tailscale command stream contract changed" >&2
+    return 1
+  fi
 }
 
 wait_backend() {
@@ -770,19 +710,52 @@ sys.stdout.write("\n")
 PY
 }
 
-# Run the credential-free real-TUN readiness contract before the install
-# mutates system state. Its exact ignored selector cannot report a zero-test
-# success and its fallback cleanup remains attributable to this journey.
-record_phase required-tun-dns-readiness
-run_required_tun_dns_failure_gate
-assert_kernel_clean
+# The journey must consume the already-published candidate bytes, never a
+# source build. The producing CI job provides this exact release tree:
+# <base>/download/<candidate-tag>/{archive,SHA256SUMS}.
+RELEASE_DIR=${RUSTSCALE_RELEASE_DIR:-}
+RELEASE_TAG=${RUSTSCALE_RELEASE_TAG:-}
+RELEASE_SHA=${RUSTSCALE_RELEASE_SHA:-}
+RELEASE_VERSION=${RUSTSCALE_RELEASE_VERSION:-}
+[[ -n "$RELEASE_DIR" && -n "$RELEASE_TAG" && -n "$RELEASE_SHA" && -n "$RELEASE_VERSION" ]] \
+  || { echo "$LABEL ERROR: release artifact directory, tag, SHA, and version are required" >&2; exit 2; }
+[[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+  || { echo "$LABEL ERROR: candidate SHA must be a full lowercase git SHA" >&2; exit 2; }
+[[ -d "$RELEASE_DIR" && ! -L "$RELEASE_DIR" ]] \
+  || { echo "$LABEL ERROR: candidate release directory is missing or symlinked: $RELEASE_DIR" >&2; exit 1; }
+[[ "$(basename "$RELEASE_DIR")" == "$RELEASE_TAG" && "$(basename "$(dirname "$RELEASE_DIR")")" == download ]] \
+  || { echo "$LABEL ERROR: candidate archive is not in download/$RELEASE_TAG" >&2; exit 1; }
+RELEASE_BASE="file://$(dirname "$(dirname "$RELEASE_DIR")")"
 
-# Build every artifact before touching system state.
-record_phase rust-release-build
-echo "$LABEL building real release binaries and libraries" >&2
-run_bounded 600 rust-release-build \
-  cargo build --release --locked \
-    -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
+record_phase exact-production-artifact
+[[ -f "$RELEASE_DIR/$ARCHIVE" && ! -L "$RELEASE_DIR/$ARCHIVE" && -f "$RELEASE_DIR/SHA256SUMS" && ! -L "$RELEASE_DIR/SHA256SUMS" ]] \
+  || { echo "$LABEL ERROR: exact production archive and SHA256SUMS are required" >&2; exit 1; }
+expected_archive_sha=$(awk -v name="$ARCHIVE" '$2 == name || $2 == "*" name { print $1; exit }' "$RELEASE_DIR/SHA256SUMS")
+[[ "$expected_archive_sha" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "$LABEL ERROR: SHA256SUMS lacks a valid checksum for $ARCHIVE" >&2; exit 1; }
+actual_archive_sha=$(sha256sum "$RELEASE_DIR/$ARCHIVE" | awk '{print $1}')
+[[ "$actual_archive_sha" == "$expected_archive_sha" ]] \
+  || { echo "$LABEL ERROR: candidate production archive checksum mismatch" >&2; exit 1; }
+# Archive extraction here is verification only. The installer below downloads
+# the same archive and SHA256SUMS through its ordinary release URL.
+ARTIFACT_STAGE=$(mktemp -d "$TMP/artifact-stage.XXXXXX")
+run_bounded 30 verify-production-archive \
+  tar --format=ustar -xzf "$RELEASE_DIR/$ARCHIVE" -C "$ARTIFACT_STAGE"
+for candidate_file in rustscale rustscaled librustscale.so librustscale.a rustscale.h rustscaled.service rustscaled.default LICENSE RUSTSCALE_BUILD_SHA; do
+  [[ -f "$ARTIFACT_STAGE/$candidate_file" && ! -L "$ARTIFACT_STAGE/$candidate_file" ]] \
+    || { echo "$LABEL ERROR: production archive is missing $candidate_file" >&2; exit 1; }
+done
+ARTIFACT_BUILD_SHA=$(tr -d '\r\n' < "$ARTIFACT_STAGE/RUSTSCALE_BUILD_SHA")
+[[ "$ARTIFACT_BUILD_SHA" == "$RELEASE_SHA" ]] \
+  || { echo "$LABEL ERROR: archive build identity $ARTIFACT_BUILD_SHA does not match $RELEASE_SHA" >&2; exit 1; }
+CLI_VERSION=$(timeout --signal=KILL 10s "$ARTIFACT_STAGE/rustscale" --version)
+DAEMON_VERSION=$(timeout --signal=KILL 10s "$ARTIFACT_STAGE/rustscaled" --version)
+[[ "$CLI_VERSION" == *"$RELEASE_VERSION"* && "$CLI_VERSION" == *"${RELEASE_SHA:0:7}"* ]] \
+  || { echo "$LABEL ERROR: CLI embedded version does not identify $RELEASE_VERSION/$RELEASE_SHA" >&2; exit 1; }
+[[ "$DAEMON_VERSION" == "rustscaled $RELEASE_VERSION" ]] \
+  || { echo "$LABEL ERROR: daemon embedded version does not identify $RELEASE_VERSION" >&2; exit 1; }
+
+echo "$LABEL verified exact production archive $ARCHIVE for $RELEASE_TAG ($RELEASE_SHA)" >&2
 
 record_phase pinned-go-build
 TESTCONTROL_BIN="$TMP/testcontrol"
@@ -795,27 +768,6 @@ GO_DAEMON="$GO_CLIENT_DIR/tailscaled"
 GO_VERSION=$(timeout --signal=KILL 10s "$GO_CLI" version | sed -n '1p')
 [[ "$GO_VERSION" == 1.100.0* ]] \
   || { echo "$LABEL ERROR: unexpected pinned Go client version: $GO_VERSION" >&2; exit 1; }
-
-VERSION=$(awk '
-  /^\[workspace.package\]/ { workspace = 1; next }
-  workspace && /^version = / { gsub(/[" ]/, "", $3); print $3; exit }
-' "$ROOT/Cargo.toml")
-[[ -n "$VERSION" ]] || { echo "$LABEL ERROR: workspace version not found" >&2; exit 1; }
-RELEASE_DIR="$TMP/releases/download/v$VERSION"
-STAGE="$TMP/stage"
-mkdir -p "$RELEASE_DIR" "$STAGE"
-install -m 755 "$ROOT/target/release/rustscale" "$STAGE/rustscale"
-install -m 755 "$ROOT/target/release/rustscaled" "$STAGE/rustscaled"
-install -m 755 "$ROOT/target/release/librustscale.so" "$STAGE/librustscale.so"
-install -m 644 "$ROOT/target/release/librustscale.a" "$STAGE/librustscale.a"
-install -m 644 "$ROOT/include/rustscale.h" "$STAGE/rustscale.h"
-install -m 644 "$ROOT/packaging/systemd/rustscaled.service" "$STAGE/rustscaled.service"
-install -m 644 "$ROOT/packaging/systemd/rustscaled.default" "$STAGE/rustscaled.default"
-install -m 644 "$ROOT/LICENSE" "$STAGE/LICENSE"
-run_bounded 30 package-release-archive \
-  tar --format=ustar -czf "$RELEASE_DIR/$ARCHIVE" -C "$STAGE" .
-printf '%s  %s\n' "$(sha256sum "$RELEASE_DIR/$ARCHIVE" | awk '{print $1}')" "$ARCHIVE" \
-  >"$RELEASE_DIR/SHA256SUMS"
 
 # Start the standalone pinned-Go control plane and retain all logs for a failed
 # run without writing generated binaries into the checkout.
@@ -876,29 +828,32 @@ run_root_bounded 10 install-service-drop-in \
     "$DROPIN_DIR/10-rustscale-install-journey.conf"
 
 record_phase install-and-first-start
-echo "$LABEL installing archive with explicit aliases and shipped systemd service" >&2
+echo "$LABEL installing exact candidate archive with ordinary aliases and shipped systemd service" >&2
 run_runner_supervised_bounded 120 archive-install \
   env INSTALL_SERVICE=1 PREFIX="$PREFIX" \
-    RUSTSCALE_RELEASE_BASE="file://$TMP/releases" \
+    RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
     RUSTSCALE_HTTP_CLIENT=curl RUSTSCALE_UNAME_S=Linux \
     RUSTSCALE_UNAME_M="$MACHINE" RUSTSCALE_LIBC=gnu \
-    sh "$ROOT/scripts/install.sh" --version "$VERSION" --tailscale-compatible \
+    sh "$ROOT/scripts/install.sh" --version "$RELEASE_TAG" \
   | tee "$TMP/install.log"
 
 [[ "$(readlink /usr/local/bin/tailscale)" == rustscale ]]
 [[ "$(readlink /usr/local/bin/tailscaled)" == rustscaled ]]
 [[ "$(sha256sum /usr/local/bin/rustscale | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/rustscale" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/rustscale" | awk '{print $1}')" ]]
 [[ "$(sha256sum /usr/local/bin/rustscaled | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/rustscaled" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/rustscaled" | awk '{print $1}')" ]]
 [[ "$(sha256sum /usr/local/lib/librustscale.so | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/librustscale.so" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/librustscale.so" | awk '{print $1}')" ]]
 [[ "$(sha256sum /usr/local/lib/librustscale.a | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/librustscale.a" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/librustscale.a" | awk '{print $1}')" ]]
 [[ "$(sha256sum /usr/local/include/rustscale.h | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/rustscale.h" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/rustscale.h" | awk '{print $1}')" ]]
 [[ "$(sha256sum /etc/default/rustscaled | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/rustscaled.default" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/rustscaled.default" | awk '{print $1}')" ]]
+[[ "$(/usr/local/bin/tailscale --version)" == *"$RELEASE_VERSION"* && "$(/usr/local/bin/tailscale --version)" == *"${RELEASE_SHA:0:7}"* ]]
+[[ "$(/usr/local/bin/tailscaled --version)" == "rustscaled $RELEASE_VERSION" ]]
+assert_cli_contract
 run_bounded 5 verify-service-enabled systemctl is-enabled --quiet rustscaled.service
 run_bounded 5 verify-service-active systemctl is-active --quiet rustscaled.service
 initial_status=$(wait_backend NeedsLogin)
@@ -1292,5 +1247,5 @@ INSTALL_STARTED=0
 
 JOURNEY_FINISHED=1
 record_phase complete
-echo "$LABEL PASS: installed archive + explicit aliases + systemd + LocalAPI + restart/logout/uninstall" >&2
+echo "$LABEL PASS: exact artifact + ordinary aliases + systemd + LocalAPI + restart/logout/uninstall" >&2
 echo "$LABEL PASS: real Linux tun0 packet roundtrip to pinned Go peer $GO_VERSION ($GO_IP:$PEER_PORT)" >&2

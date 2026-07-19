@@ -904,12 +904,14 @@ start_rs_tun_transport_cleanup() {
 
 wait_rs_tun_transport_cleanup() {
   local vm="$1" zone="$2" role="$3" script log status_file result="" attempt
+  local max_attempts=35
   script=$(rs_tun_transport_cleanup_path "$role" sh) || return $?
   log=$(rs_tun_transport_cleanup_path "$role" log) || return $?
   status_file=$(rs_tun_transport_cleanup_path "$role" status) || return $?
-  # ssh_cmd already makes three bounded transport attempts. Cap this outer
-  # handoff loop as well so a stale policy rule cannot multiply into hours.
-  for attempt in 1 2 3; do
+  # The detached worker has a two-second handoff plus two bounded 30-second
+  # graceful/forced postcondition waits. Keep the fresh-SSH verifier bounded,
+  # but give that documented worst case time to write its status file.
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
     if result=$(ssh_sudo "$vm" "$zone" "test -f $status_file && cat $status_file" 2>/dev/null); then
       break
     fi
@@ -1388,8 +1390,9 @@ cleanup_self_test() {
   decoded=$(printf '%s' "$encoded" | base64 -d) || return 1
   [[ "$decoded" == "$detached_program" ]] || return 1
 
-  # Polling must tolerate a running worker, accept only an explicit zero
-  # status, and remove the status/program/log through a fresh SSH session.
+  # Waiting must tolerate a worker that outlives the former three-attempt
+  # budget, accept only an explicit zero status, and remove the
+  # status/program/log through a fresh SSH session.
   wait_count_file=$(mktemp "$RDIR/rs-tun-wait-count.XXXXXX") || return 1
   wait_log_file=$(mktemp "$RDIR/rs-tun-wait-log.XXXXXX") || return 1
   printf '0\n' >"$wait_count_file"
@@ -1400,13 +1403,13 @@ cleanup_self_test() {
       count=$(<"$wait_count_file")
       count=$((count + 1))
       printf '%s\n' "$count" >"$wait_count_file"
-      (( count >= 3 )) || return 1
+      (( count >= 4 )) || return 1
       printf '0\n'
     fi
     return 0
   }
   wait_rs_tun_transport_cleanup "$SVM" "$SZONE" srv || return 1
-  [[ "$(<"$wait_count_file")" == 3 \
+  [[ "$(<"$wait_count_file")" == 4 \
     && "$(<"$wait_log_file")" == *'test -f /tmp/rs-tun-srv-cleanup.status'* \
     && "$(<"$wait_log_file")" == *'rm -f /tmp/rs-tun-srv-cleanup.sh /tmp/rs-tun-srv-cleanup.log /tmp/rs-tun-srv-cleanup.status'* ]] || return 1
   rm -f "$wait_count_file" "$wait_log_file"

@@ -215,6 +215,36 @@ matrix_authkey_policy_self_test() {
   if bench_mint_authkey invalid >/dev/null 2>&1; then return 1; else [[ $? -eq 2 ]]; fi
 }
 
+# Write one credential to an owner-only local file. Only the path crosses the
+# run-matrix -> run-config argv boundary.
+ACTIVE_AUTHKEY_FILE=""
+matrix_create_authkey_file() {
+  local value="$1"
+  umask 077
+  ACTIVE_AUTHKEY_FILE=$(mktemp "${TMPDIR:-/tmp}/rustscale-bench-authkey.XXXXXX") || return 1
+  printf '%s\n' "$value" >"$ACTIVE_AUTHKEY_FILE"
+  chmod 600 "$ACTIVE_AUTHKEY_FILE"
+}
+matrix_remove_authkey_file() {
+  [[ -z "$ACTIVE_AUTHKEY_FILE" ]] || rm -f "$ACTIVE_AUTHKEY_FILE"
+  ACTIVE_AUTHKEY_FILE=""
+}
+matrix_authkey_file_self_test() {
+  local directory mode args secret=tskey-fixture-sentinel
+  directory=$(mktemp -d) || return 1
+  TMPDIR="$directory" matrix_create_authkey_file "$secret" || return 1
+  mode=$(stat -f %Lp "$ACTIVE_AUTHKEY_FILE" 2>/dev/null || stat -c %a "$ACTIVE_AUTHKEY_FILE") || return 1
+  [[ "$mode" == 600 && "$(cat "$ACTIVE_AUTHKEY_FILE")" == "$secret" ]] || return 1
+  REPEAT=3; PARALLELISM_CSV=1,10,100; DURATION=10; PEER_COUNT=1
+  MATRIX_MANIFEST_PATH=/dev/null; MATRIX_OBSERVED_PATH=/dev/null
+  matrix_build_run_config_args rs-userspace s c sz cz "$ACTIVE_AUTHKEY_FILE" out srv cli
+  args="${RUN_CONFIG_ARGS[*]}"
+  [[ "$args" == *"$ACTIVE_AUTHKEY_FILE"* && "$args" != *"$secret"* ]] || return 1
+  matrix_remove_authkey_file
+  [[ ! -e "$directory"/rustscale-bench-authkey.* ]] || return 1
+  rmdir "$directory"
+}
+
 matrix_config_failure_policy_self_test() {
   local output status
 
@@ -258,19 +288,19 @@ matrix_profile_self_test() {
   # The profile diagnostic must be distinct from, and follow, all normal
   # selected cells. Its profile-only option preserves the accepted rs-tun JSON.
   for config in rs-tun ts-tun; do
-    matrix_run_config_cell "$config" s c sz cz key dir host client matrix_test_record_run_config
+    matrix_run_config_cell "$config" s c sz cz /tmp/authkey-file dir host client matrix_test_record_run_config
   done
-  matrix_run_profile_diagnostic s c sz cz profile-key dir host client matrix_test_record_profile
+  matrix_run_profile_diagnostic s c sz cz /tmp/profile-authkey-file dir host client matrix_test_record_profile
   unset -f matrix_test_record_run_config matrix_test_record_profile
 
   [[ ${#calls[@]} -eq 3 ]] || return 1
-  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz key dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz key dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz profile-key dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz /tmp/profile-authkey-file dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
 }
 
 # Build the directly invocable run-config command shape used by each cell.
-# Args: CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE AUTHKEY RESULTS_DIR
+# Args: CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE AUTHKEY_FILE RESULTS_DIR
 #       SERVER_HOSTNAME CLIENT_HOSTNAME
 matrix_build_run_config_args() {
   local config="$1"
@@ -285,11 +315,11 @@ matrix_build_run_config_args() {
 # helper lets the local self-test exercise the same loop without GCP access.
 matrix_run_config_cell() {
   local config="$1" server_vm="$2" client_vm="$3" server_zone="$4" client_zone="$5"
-  local authkey="$6" results_dir="$7" server_hostname="$8" client_hostname="$9"
+  local authkey_file="$6" results_dir="$7" server_hostname="$8" client_hostname="$9"
   local policy_fn="${10:-matrix_run_config_with_policy}"
 
   matrix_build_run_config_args "$config" "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
-    "$authkey" "$results_dir" "$server_hostname" "$client_hostname"
+    "$authkey_file" "$results_dir" "$server_hostname" "$client_hostname"
   "$policy_fn" "$config" " -> $results_dir/$config.json" \
     tools/bench/gcp/run-config.sh "${RUN_CONFIG_ARGS[@]}"
 }
@@ -299,10 +329,10 @@ matrix_run_config_cell() {
 # silently treated as a successful matrix run.
 matrix_run_profile_diagnostic() {
   local server_vm="$1" client_vm="$2" server_zone="$3" client_zone="$4"
-  local authkey="$5" results_dir="$6" server_hostname="$7" client_hostname="$8"
+  local authkey_file="$5" results_dir="$6" server_hostname="$7" client_hostname="$8"
   local runner="${9:-tools/bench/gcp/run-config.sh}"
   "$runner" rs-tun "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
-    "$authkey" "$results_dir" "$server_hostname" "$client_hostname" \
+    "$authkey_file" "$results_dir" "$server_hostname" "$client_hostname" \
     --repeat "$REPEAT" --parallelism "$PARALLELISM_CSV" --duration "$DURATION" --peer-count "$PEER_COUNT" \
     --profile-only --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
 }
@@ -892,6 +922,7 @@ configure_linux_udp_tx_gso_mode || exit $?
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
 matrix_authkey_policy_self_test
+matrix_authkey_file_self_test
 matrix_config_failure_policy_self_test
 matrix_profile_self_test
 matrix_option_parsing_self_test
@@ -1107,6 +1138,7 @@ CLEANUP_RAN=0
    [[ $CLEANUP_RAN -eq 0 ]] || return 0
    CLEANUP_RAN=1
    local status=0
+   matrix_remove_authkey_file || status=1
    echo "[gcp] cleanup: finalizing VMs + tailnet before result publication" >&2
    if [[ -z "${SKIP_VM_DELETE:-}" ]]; then
      if [[ -n "$ACTIVE_SRV" ]]; then delete_vm "$ACTIVE_SRV" "$ACTIVE_SRV_ZONE" || status=1; fi
@@ -1135,7 +1167,7 @@ gcp_bench_on_signal() {
 # ---------------------------------------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "[dry-run] skipping tailnet provisioning" >&2
-  AUTHKEY="tskey-dryrun-placeholder"
+  :
 else
   bench_provision_tailnet
   export BENCH_DNS BENCH_CHILD_TOKEN BENCH_CHILD_CID BENCH_CHILD_CSEC BENCH_API
@@ -1205,32 +1237,39 @@ for TOPO in "${TOPOLOGIES[@]}"; do
       # expiry, while an ephemeral embedded identity can be reaped during the
       # intentional disconnect between measured client processes.
       if [[ $DRY_RUN -eq 1 ]]; then
-        AUTHKEY="tskey-dryrun-placeholder"
+        AUTHKEY_VALUE="tskey-dryrun-placeholder"
       else
-        AUTHKEY=$(bench_mint_authkey "$(matrix_authkey_ephemeral_for_config "$CFG")")
+        AUTHKEY_VALUE=$(bench_mint_authkey "$(matrix_authkey_ephemeral_for_config "$CFG")")
         echo "[gcp] minted fresh authkey for $CFG" >&2
       fi
+      matrix_create_authkey_file "$AUTHKEY_VALUE" || exit 1
+      unset AUTHKEY_VALUE
 
       matrix_run_config_cell "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
-        "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"
+        "$ACTIVE_AUTHKEY_FILE" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"
+      matrix_remove_authkey_file
     done
 
     if (( PROFILE )); then
       # Keep the profile diagnostic outside the normal selected-cell loop: it
       # gets a fresh key and cannot repeat or overwrite rs-tun measurements.
       if [[ $DRY_RUN -eq 1 ]]; then
-        AUTHKEY="tskey-dryrun-placeholder"
+        AUTHKEY_VALUE="tskey-dryrun-placeholder"
       else
-        AUTHKEY=$(bench_mint_authkey true)
+        AUTHKEY_VALUE=$(bench_mint_authkey true)
         echo "[gcp] minted fresh authkey for rs-tun profile diagnostic" >&2
       fi
+      matrix_create_authkey_file "$AUTHKEY_VALUE" || exit 1
+      unset AUTHKEY_VALUE
       matrix_select_cell_observed "$TOPO" rs-tun "$Z_A" "$Z_B"
       echo "[gcp] >>> profile: rs-tun (topo=$TOPO path=$PATH_TAG) <<<"
       if matrix_run_profile_diagnostic "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
-        "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"; then
+        "$ACTIVE_AUTHKEY_FILE" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"; then
+        matrix_remove_authkey_file
         echo "[gcp] rs-tun profile: OK"
       else
         profile_status=$?
+        matrix_remove_authkey_file
         echo "[gcp] rs-tun profile: FAILED" >&2
         exit "$profile_status"
       fi

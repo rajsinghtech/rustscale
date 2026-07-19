@@ -3,7 +3,7 @@
 #
 # Usage:
 #   run-config.sh CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE \
-#                 AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME [--profile]
+#                 AUTHKEY_FILE RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME [--profile]
 #
 # CONFIG ∈ {rs-userspace, rs-tun, ts-embedded, ts-userspace, ts-tun}
 # Emits <RESULTS_DIR>/<CONFIG>.json with benchmark results and provenance.
@@ -30,7 +30,7 @@ source "$(dirname "$0")/footprint.sh"
 usage() {
   cat >&2 <<EOF
 usage: $0 CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE \
-AUTHKEY RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
+AUTHKEY_FILE RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
 
 CONFIG: rs-userspace | rs-tun | ts-embedded | ts-userspace | ts-tun
 --profile: rs-tun only; collect a Linux perf profile after normal metrics
@@ -193,20 +193,49 @@ linux_udp_tx_gso_mode_self_test() {
   (( status == 2 ))
 }
 
+validate_authkey_file() {
+  local path="$1" mode value
+  [[ -f "$path" && ! -L "$path" ]] || { echo "auth key file must be a regular, non-symlink file" >&2; return 2; }
+  mode=$(stat -f %Lp "$path" 2>/dev/null || stat -c %a "$path" 2>/dev/null) || return 2
+  [[ "$mode" == 600 || "$mode" == 400 ]] || { echo "auth key file must be owner-only" >&2; return 2; }
+  [[ "$(awk 'END { print NR }' "$path")" == 1 ]] || { echo "auth key file must contain exactly one line" >&2; return 2; }
+  value=$(cat "$path")
+  [[ "$value" =~ ^tskey-[A-Za-z0-9_-]+$ ]] || { echo "auth key file has invalid content" >&2; return 2; }
+}
+
+authkey_file_self_test() {
+  local directory valid
+  directory=$(mktemp -d "$RDIR/authkey-test.XXXXXX") || return 1
+  valid="$directory/key"
+  printf '%s\n' tskey-fixture-sentinel >"$valid"
+  chmod 600 "$valid"
+  validate_authkey_file "$valid" || return 1
+  chmod 644 "$valid"
+  if validate_authkey_file "$valid" >/dev/null 2>&1; then return 1; fi
+  chmod 600 "$valid"
+  printf '%s\n%s\n' tskey-first tskey-second >"$valid"
+  if validate_authkey_file "$valid" >/dev/null 2>&1; then return 1; fi
+  printf '%s\n' tskey-fixture-sentinel >"$valid"
+  ln -s "$valid" "$directory/link"
+  if validate_authkey_file "$directory/link" >/dev/null 2>&1; then return 1; fi
+  rm -rf "$directory"
+}
+
 validate_rs_tun_daemon_input() {
-  local authkey="$1" hostname="$2"
-  [[ "$authkey" =~ ^tskey-[A-Za-z0-9_-]+$ ]] || { echo "invalid rs-tun auth key" >&2; return 2; }
+  local authfile="$1" hostname="$2"
+  [[ "$authfile" == /tmp/rustscale-bench-authkey ]] || { echo "invalid remote auth key file" >&2; return 2; }
   [[ "$hostname" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || { echo "invalid rs-tun hostname" >&2; return 2; }
 }
 
 validate_rs_tun_daemon_inputs() {
-  validate_rs_tun_daemon_input "$AUTHKEY" "$SHOST" || return $?
-  validate_rs_tun_daemon_input "$AUTHKEY" "$CHOST"
+  validate_authkey_file "$AUTHKEY_FILE" || return $?
+  validate_rs_tun_daemon_input "$REMOTE_AUTHKEY_FILE" "$SHOST" || return $?
+  validate_rs_tun_daemon_input "$REMOTE_AUTHKEY_FILE" "$CHOST"
 }
 
 rs_tun_daemon_input_self_test() {
   local value status
-  validate_rs_tun_daemon_input tskey-auth-selftest rs-srv-same-zone || return 1
+  validate_rs_tun_daemon_input /tmp/rustscale-bench-authkey rs-srv-same-zone || return 1
   for value in '' 'tskey-auth bad' "tskey-auth-'bad" 'tskey-auth-bad;id' 'tskey-auth-$(id)' 'not-a-tskey'; do
     if ( validate_rs_tun_daemon_input "$value" rs-srv-same-zone ) >/dev/null 2>&1; then
       return 1
@@ -216,7 +245,7 @@ rs_tun_daemon_input_self_test() {
     (( status == 2 )) || return 1
   done
   for value in '' 'bad host' "bad'host" 'bad;id' 'bad$(id)' '-bad' 'bad-'; do
-    if ( validate_rs_tun_daemon_input tskey-auth-selftest "$value" ) >/dev/null 2>&1; then
+    if ( validate_rs_tun_daemon_input /tmp/rustscale-bench-authkey "$value" ) >/dev/null 2>&1; then
       return 1
     else
       status=$?
@@ -225,6 +254,7 @@ rs_tun_daemon_input_self_test() {
   done
 }
 
+REMOTE_AUTHKEY_FILE=/tmp/rustscale-bench-authkey
 SELF_TEST=0
 if [[ "${1:-}" == "--self-test" ]]; then
   SELF_TEST=1
@@ -237,8 +267,10 @@ if (( SELF_TEST )); then
   CVM=self-test-client
   SZONE=self-test-zone
   CZONE=self-test-zone
-  AUTHKEY=tskey-auth-selftest
   RDIR=$(mktemp -d)
+  AUTHKEY_FILE="$RDIR/authkey"
+  printf '%s\n' tskey-auth-selftest >"$AUTHKEY_FILE"
+  chmod 600 "$AUTHKEY_FILE"
   SHOST=self-test-server
   CHOST=self-test-client
   PROFILE=1
@@ -254,7 +286,7 @@ else
   CVM="$3"
   SZONE="$4"
   CZONE="$5"
-  AUTHKEY="$6"
+  AUTHKEY_FILE="$6"
   RDIR="$7"
   SHOST="$8"
   CHOST="$9"
@@ -269,6 +301,7 @@ if (( PROFILE || PROFILE_ONLY )) && [[ "$CONFIG" != rs-tun ]]; then
   echo "--profile and --profile-only are only valid for rs-tun" >&2
   exit 2
 fi
+validate_authkey_file "$AUTHKEY_FILE" || exit $?
 if [[ "$CONFIG" == rs-tun ]]; then
   validate_rs_tun_daemon_inputs || exit $?
 fi
@@ -362,6 +395,22 @@ echo "[gcp] config=$CONFIG topo=$TOPOLOGY path=$PATH_TAG server=$SVM client=$CVM
 # ---------------------------------------------------------------------------
 # Helpers shared across all configs.
 # ---------------------------------------------------------------------------
+
+# Copy the owner-only credential by file path; its value never enters argv,
+# rendered commands, logs, or process listings.
+install_remote_authkeys() {
+  scp_to "$AUTHKEY_FILE" "$SVM" "$SZONE" "$REMOTE_AUTHKEY_FILE" || return 1
+  scp_to "$AUTHKEY_FILE" "$CVM" "$CZONE" "$REMOTE_AUTHKEY_FILE" || return 1
+  ssh_cmd "$SVM" "$SZONE" "chmod 600 $REMOTE_AUTHKEY_FILE" || return 1
+  ssh_cmd "$CVM" "$CZONE" "chmod 600 $REMOTE_AUTHKEY_FILE" || return 1
+}
+
+cleanup_remote_authkeys() {
+  local status=0
+  ssh_cmd "$SVM" "$SZONE" "rm -f $REMOTE_AUTHKEY_FILE" >/dev/null 2>&1 || status=1
+  ssh_cmd "$CVM" "$CZONE" "rm -f $REMOTE_AUTHKEY_FILE" >/dev/null 2>&1 || status=1
+  return "$status"
+}
 
 # Capture the last N lines (default 40) of a remote log file.
 # Args: VM ZONE LOGFILE [LINES]
@@ -549,7 +598,7 @@ linux_udp_environment() {
 }
 
 rs_tun_daemon_start_command() {
-  local pipeline="$1" batch="$2" gro="$3" authkey="$4" statedir="$5" socket="$6" hostname="$7" logfile="$8" pidfile="$9" outbound="${10:-0}" gso environment
+  local pipeline="$1" batch="$2" gro="$3" authfile="$4" statedir="$5" socket="$6" hostname="$7" logfile="$8" pidfile="$9" outbound="${10:-0}" gso environment
   if (( $# >= 11 )); then
     gso="${11}"
   elif [[ "$batch" == 0 ]]; then
@@ -564,8 +613,8 @@ rs_tun_daemon_start_command() {
   [[ "$gso" == 0 || "$gso" == 1 ]] || return 2
   [[ "$batch" != 0 || "$gro" == 0 ]] || return 2
   [[ "$batch" != 0 || "$gso" == 0 ]] || return 2
-  validate_rs_tun_daemon_input "$authkey" "$hostname" || return $?
-  environment="$(linux_udp_environment "$batch" "$gro" "$gso")TS_AUTHKEY=$authkey "
+  validate_rs_tun_daemon_input "$authfile" "$hostname" || return $?
+  environment="$(linux_udp_environment "$batch" "$gro" "$gso")TS_AUTHKEY=\"\$(cat $authfile)\" "
   [[ "$pipeline" == 1 ]] && environment="RUSTSCALE_TUN_INBOUND_PIPELINE=1 $environment"
   [[ "$outbound" == 1 ]] && environment="RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 $environment"
   nohup_background_command "$environment" \
@@ -574,36 +623,36 @@ rs_tun_daemon_start_command() {
 }
 
 rs_userspace_server_start_command() {
-  local batch="$1" gro="$2" gso="$3" authkey="$4" port="$5" hostname="$6" statedir="$7" logfile="$8" pidfile="$9" environment
+  local batch="$1" gro="$2" gso="$3" authfile="$4" port="$5" hostname="$6" statedir="$7" logfile="$8" pidfile="$9" environment
   environment="$(linux_udp_environment "$batch" "$gro" "$gso")"
   nohup_background_command "$environment" \
-    "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --authkey $authkey --port $port --hostname $hostname --state-dir $statedir" \
+    "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --authkey-file $authfile --port $port --hostname $hostname --state-dir $statedir" \
     "$logfile" "$pidfile"
 }
 
 rs_userspace_client_command() {
-  local batch="$1" gro="$2" gso="$3" authkey="$4" target="$5" duration="$6" parallel="$7" hostname="$8" statedir="$9" logfile="${10}" environment
+  local batch="$1" gro="$2" gso="$3" authfile="$4" target="$5" duration="$6" parallel="$7" hostname="$8" statedir="$9" logfile="${10}" environment
   environment="$(linux_udp_environment "$batch" "$gro" "$gso")"
-  printf '%s/opt/rustscale/target/release/rustscale-bench client --authkey %s --target %s --duration %s --parallel %s --hostname %s --state-dir %s --json 2>%s' \
-    "$environment" "$authkey" "$target" "$duration" "$parallel" "$hostname" "$statedir" "$logfile"
+  printf '%s/opt/rustscale/target/release/rustscale-bench client --authkey-file %s --target %s --duration %s --parallel %s --hostname %s --state-dir %s --json 2>%s' \
+    "$environment" "$authfile" "$target" "$duration" "$parallel" "$hostname" "$statedir" "$logfile"
 }
 
 go_tsnet_server_start_command() {
-  local authkey="$1" port="$2" hostname="$3" statedir="$4" logfile="$5" pidfile="$6"
+  local authfile="$1" port="$2" hostname="$3" statedir="$4" logfile="$5" pidfile="$6"
   nohup_background_command "" \
-    "prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey $authkey --port $port --hostname $hostname --state-dir $statedir" \
+    "prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey-file $authfile --port $port --hostname $hostname --state-dir $statedir" \
     "$logfile" "$pidfile"
 }
 
 go_tsnet_client_command() {
-  local operation="$1" authkey="$2" target="$3" value="$4" parallel="$5" hostname="$6" statedir="$7" logfile="$8"
+  local operation="$1" authfile="$2" target="$3" value="$4" parallel="$5" hostname="$6" statedir="$7" logfile="$8"
   case "$operation" in
     throughput)
-      printf '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
-        "$authkey" "$target" "$value" "$parallel" "$hostname" "$statedir" "$logfile" ;;
+      printf '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey-file %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
+        "$authfile" "$target" "$value" "$parallel" "$hostname" "$statedir" "$logfile" ;;
     latency)
-      printf '/opt/rustscale/bin/go-tsnet-rsb1 latency --authkey %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
-        "$authkey" "$target" "$value" "$hostname" "$statedir" "$logfile" ;;
+      printf '/opt/rustscale/bin/go-tsnet-rsb1 latency --authkey-file %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
+        "$authfile" "$target" "$value" "$hostname" "$statedir" "$logfile" ;;
     *) return 2 ;;
   esac
 }
@@ -667,7 +716,7 @@ start_ts_userspace_bridge() {
 command_shape_self_test() {
   local ts_direct rs_direct ts_derp rs_derp nofile_gate bridge_calls bridge_definition
   local rs_server_off rs_client_off rs_server_on rs_client_on rs_server_outbound rs_server_scalar rs_server_plain rs_server_gso_off rs_userspace_server rs_userspace_client
-  local go_server go_client go_latency
+  local go_server go_client go_latency credential_commands
   ts_direct=$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)
   rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
   ts_derp=$(tun_ping_invocation tailscale /tmp/ts.sock derp 100.64.0.1)
@@ -696,42 +745,46 @@ command_shape_self_test() {
     && "$bridge_calls" != *'SOCKS5-CONNECT'* && "$bridge_calls" != *'socat'* \
     && "$bridge_definition" == *'[^ ]+[[:space:]]+[^ ]+[[:space:]]+[^ ]+[[:space:]]+127\.0\.0\.1:5300'* ]] || return 1
   if start_ts_userspace_bridge '100.64.0.1;id' >/dev/null 2>&1; then return 1; fi
-  rs_server_off=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
-  rs_client_off=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/cli /tmp/cli.sock cli /tmp/cli.log /tmp/cli.pid)
+  rs_server_off=$(rs_tun_daemon_start_command 0 1 1 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
+  rs_client_off=$(rs_tun_daemon_start_command 0 1 1 /tmp/rustscale-bench-authkey /tmp/cli /tmp/cli.sock cli /tmp/cli.log /tmp/cli.pid)
   [[ "$rs_server_off" != *RUSTSCALE_TUN_INBOUND_PIPELINE* && "$rs_client_off" != *RUSTSCALE_TUN_INBOUND_PIPELINE* ]] || return 1
-  [[ "$rs_server_off" == 'TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
-  [[ "$rs_client_off" == 'TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
-  rs_server_on=$(rs_tun_daemon_start_command 1 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
-  rs_client_on=$(rs_tun_daemon_start_command 1 1 1 tskey-auth-selftest /tmp/cli /tmp/cli.sock cli /tmp/cli.log /tmp/cli.pid)
-  [[ "$rs_server_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
-  [[ "$rs_client_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
+  [[ "$rs_server_off" == 'TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_client_off" == 'TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
+  rs_server_on=$(rs_tun_daemon_start_command 1 1 1 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
+  rs_client_on=$(rs_tun_daemon_start_command 1 1 1 /tmp/rustscale-bench-authkey /tmp/cli /tmp/cli.sock cli /tmp/cli.log /tmp/cli.pid)
+  [[ "$rs_server_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  [[ "$rs_client_on" == 'RUSTSCALE_TUN_INBOUND_PIPELINE=1 TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/cli --socket /tmp/cli.sock --hostname cli > /tmp/cli.log 2>&1 & echo $! > /tmp/cli.pid' ]] || return 1
   [[ "${rs_server_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* && "${rs_client_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* ]] || return 1
-  rs_server_outbound=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 1)
-  [[ "$rs_server_outbound" == 'RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
-  rs_server_scalar=$(rs_tun_daemon_start_command 0 0 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
-  [[ "$rs_server_scalar" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 RUSTSCALE_DISABLE_UDP_GSO=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  rs_server_outbound=$(rs_tun_daemon_start_command 0 1 1 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 1)
+  [[ "$rs_server_outbound" == 'RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  rs_server_scalar=$(rs_tun_daemon_start_command 0 0 0 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
+  [[ "$rs_server_scalar" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 RUSTSCALE_DISABLE_UDP_GSO=1 TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   [[ "$(linux_udp_environment 0 0)" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 RUSTSCALE_DISABLE_UDP_GSO=1 ' ]] || return 1
-  rs_server_plain=$(rs_tun_daemon_start_command 0 1 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
-  [[ "$rs_server_plain" == 'RUSTSCALE_DISABLE_UDP_GRO=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
-  rs_server_gso_off=$(rs_tun_daemon_start_command 0 1 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 0 0)
-  [[ "$rs_server_gso_off" == 'RUSTSCALE_DISABLE_UDP_GSO=1 TS_AUTHKEY=tskey-auth-selftest nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
-  if rs_tun_daemon_start_command 0 0 1 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid >/dev/null 2>&1; then return 1; else status=$?; fi
+  rs_server_plain=$(rs_tun_daemon_start_command 0 1 0 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
+  [[ "$rs_server_plain" == 'RUSTSCALE_DISABLE_UDP_GRO=1 TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  rs_server_gso_off=$(rs_tun_daemon_start_command 0 1 1 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 0 0)
+  [[ "$rs_server_gso_off" == 'RUSTSCALE_DISABLE_UDP_GSO=1 TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  if rs_tun_daemon_start_command 0 0 1 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid >/dev/null 2>&1; then return 1; else status=$?; fi
   (( status == 2 )) || return 1
-  if rs_tun_daemon_start_command 0 0 0 tskey-auth-selftest /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 0 1 >/dev/null 2>&1; then return 1; else status=$?; fi
+  if rs_tun_daemon_start_command 0 0 0 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 0 1 >/dev/null 2>&1; then return 1; else status=$?; fi
   (( status == 2 )) || return 1
   if linux_udp_environment 0 0 1 >/dev/null 2>&1; then return 1; else status=$?; fi
   (( status == 2 )) || return 1
-  rs_userspace_server=$(rs_userspace_server_start_command 1 1 0 tskey-auth-selftest 7777 srv /tmp/rs-srv /tmp/rs-srv.log /tmp/rs-srv.pid)
-  [[ "$rs_userspace_server" == 'RUSTSCALE_DISABLE_UDP_GSO=1 nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --authkey tskey-auth-selftest --port 7777 --hostname srv --state-dir /tmp/rs-srv > /tmp/rs-srv.log 2>&1 & echo $! > /tmp/rs-srv.pid' ]] || return 1
-  rs_userspace_client=$(rs_userspace_client_command 1 1 0 tskey-auth-selftest 100.64.0.1:7777 10 1 cli /tmp/rs-cli /tmp/rs-cli.log)
-  [[ "$rs_userspace_client" == 'RUSTSCALE_DISABLE_UDP_GSO=1 /opt/rustscale/target/release/rustscale-bench client --authkey tskey-auth-selftest --target 100.64.0.1:7777 --duration 10 --parallel 1 --hostname cli --state-dir /tmp/rs-cli --json 2>/tmp/rs-cli.log' ]] || return 1
-  go_server=$(go_tsnet_server_start_command tskey-auth-selftest 7777 srv /tmp/go-srv /tmp/go-srv.log /tmp/go-srv.pid)
-  [[ "$go_server" == 'nohup prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey tskey-auth-selftest --port 7777 --hostname srv --state-dir /tmp/go-srv > /tmp/go-srv.log 2>&1 & echo $! > /tmp/go-srv.pid' ]] || return 1
-  go_client=$(go_tsnet_client_command throughput tskey-auth-selftest 100.64.0.1:7777 10 100 cli /tmp/go-cli /tmp/go-client.log)
-  [[ "$go_client" == '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey tskey-auth-selftest --target 100.64.0.1:7777 --duration 10 --parallel 100 --direction down --hostname cli --state-dir /tmp/go-cli --json 2>/tmp/go-client.log' ]] || return 1
-  go_latency=$(go_tsnet_client_command latency tskey-auth-selftest 100.64.0.1:7777 50 1 cli /tmp/go-cli /tmp/go-latency.log)
-  [[ "$go_latency" == '/opt/rustscale/bin/go-tsnet-rsb1 latency --authkey tskey-auth-selftest --target 100.64.0.1:7777 --count 50 --hostname cli --state-dir /tmp/go-cli --json 2>/tmp/go-latency.log' ]] || return 1
+  rs_userspace_server=$(rs_userspace_server_start_command 1 1 0 /tmp/rustscale-bench-authkey 7777 srv /tmp/rs-srv /tmp/rs-srv.log /tmp/rs-srv.pid)
+  [[ "$rs_userspace_server" == 'RUSTSCALE_DISABLE_UDP_GSO=1 nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --authkey-file /tmp/rustscale-bench-authkey --port 7777 --hostname srv --state-dir /tmp/rs-srv > /tmp/rs-srv.log 2>&1 & echo $! > /tmp/rs-srv.pid' ]] || return 1
+  rs_userspace_client=$(rs_userspace_client_command 1 1 0 /tmp/rustscale-bench-authkey 100.64.0.1:7777 10 1 cli /tmp/rs-cli /tmp/rs-cli.log)
+  [[ "$rs_userspace_client" == 'RUSTSCALE_DISABLE_UDP_GSO=1 /opt/rustscale/target/release/rustscale-bench client --authkey-file /tmp/rustscale-bench-authkey --target 100.64.0.1:7777 --duration 10 --parallel 1 --hostname cli --state-dir /tmp/rs-cli --json 2>/tmp/rs-cli.log' ]] || return 1
+  go_server=$(go_tsnet_server_start_command /tmp/rustscale-bench-authkey 7777 srv /tmp/go-srv /tmp/go-srv.log /tmp/go-srv.pid)
+  [[ "$go_server" == 'nohup prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey-file /tmp/rustscale-bench-authkey --port 7777 --hostname srv --state-dir /tmp/go-srv > /tmp/go-srv.log 2>&1 & echo $! > /tmp/go-srv.pid' ]] || return 1
+  go_client=$(go_tsnet_client_command throughput /tmp/rustscale-bench-authkey 100.64.0.1:7777 10 100 cli /tmp/go-cli /tmp/go-client.log)
+  [[ "$go_client" == '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey-file /tmp/rustscale-bench-authkey --target 100.64.0.1:7777 --duration 10 --parallel 100 --direction down --hostname cli --state-dir /tmp/go-cli --json 2>/tmp/go-client.log' ]] || return 1
+  go_latency=$(go_tsnet_client_command latency /tmp/rustscale-bench-authkey 100.64.0.1:7777 50 1 cli /tmp/go-cli /tmp/go-latency.log)
+  [[ "$go_latency" == '/opt/rustscale/bin/go-tsnet-rsb1 latency --authkey-file /tmp/rustscale-bench-authkey --target 100.64.0.1:7777 --count 50 --hostname cli --state-dir /tmp/go-cli --json 2>/tmp/go-latency.log' ]] || return 1
   if go_tsnet_client_command invalid x x 1 1 x x x >/dev/null 2>&1; then return 1; fi
+  credential_commands="$rs_server_off$rs_userspace_server$rs_userspace_client$go_server$go_client$go_latency"
+  [[ "$credential_commands" != *tskey-* \
+    && "$credential_commands" == *'TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)"'* \
+    && "$credential_commands" == *'--authkey-file /tmp/rustscale-bench-authkey'* ]] || return 1
 }
 
 pid_capture_semantics_self_test() {
@@ -1580,6 +1633,7 @@ rs_tun_inbound_pipeline_self_test
 rs_tun_outbound_send_pipeline_self_test
 linux_udp_receive_modes_self_test
 linux_udp_tx_gso_mode_self_test
+authkey_file_self_test
 rs_tun_daemon_input_self_test
 
 if (( SELF_TEST )); then
@@ -2283,11 +2337,11 @@ rsb1_client_command() {
   local kind="$1" operation="$2" target="$3" value="$4" parallel="$5" state_dir="$6" logfile="$7"
   case "$kind/$operation" in
     rust-userspace/throughput)
-      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport userspace --authkey %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
-        "$AUTHKEY" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
+      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport userspace --authkey-file %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
+        "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
     rust-userspace/latency)
-      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport userspace --authkey %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
-        "$AUTHKEY" "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
+      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport userspace --authkey-file %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
+        "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
     rust-kernel/throughput)
       printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport kernel-tcp --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
         "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
@@ -2295,9 +2349,9 @@ rsb1_client_command() {
       printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport kernel-tcp --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
         "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
     go-userspace/throughput)
-      printf 'prlimit --nofile=65535:65535 -- %s' "$(go_tsnet_client_command throughput "$AUTHKEY" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile")" ;;
+      printf 'prlimit --nofile=65535:65535 -- %s' "$(go_tsnet_client_command throughput "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile")" ;;
     go-userspace/latency)
-      printf 'prlimit --nofile=65535:65535 -- %s' "$(go_tsnet_client_command latency "$AUTHKEY" "$target" "$value" 1 "$CHOST" "$state_dir" "$logfile")" ;;
+      printf 'prlimit --nofile=65535:65535 -- %s' "$(go_tsnet_client_command latency "$REMOTE_AUTHKEY_FILE" "$target" "$value" 1 "$CHOST" "$state_dir" "$logfile")" ;;
     *) return 2 ;;
   esac
 }
@@ -2468,6 +2522,7 @@ cell_exit_cleanup() {
     (( status == 0 )) && status=1
     (( cleanup_status == 0 )) || status=$FATAL_HANDOFF_STATUS
   fi
+  cleanup_remote_authkeys || { (( status == 0 )) && status=1; }
   rm -f "$PENDING_OUT"
   exit "$status"
 }
@@ -2521,7 +2576,7 @@ run_rs_userspace() {
   arm_cell_cleanup cleanup_rs_userspace
   echo "[gcp] rs-userspace: starting bench server on $SVM" >&2
   ssh_cmd "$SVM" "$SZONE" \
-    "$(rs_userspace_server_start_command "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" "$AUTHKEY" "$PORT" "$SHOST" /tmp/rs-srv /tmp/rs-srv.log /tmp/rs-srv.pid)"
+    "$(rs_userspace_server_start_command "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" "$REMOTE_AUTHKEY_FILE" "$PORT" "$SHOST" /tmp/rs-srv /tmp/rs-srv.log /tmp/rs-srv.pid)"
 
   # Wait for BENCH_READY 1. DERP path (UDP blocked) can take significantly longer
   # than direct for the control plane handshake and IP assignment.
@@ -2581,8 +2636,8 @@ run_rs_tun() {
   fi
   ssh_sudo "$SVM" "$SZONE"  'rm -rf /tmp/rs-tun-srv; rm -f /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid /tmp/rs-tun-srv.sock'
   ssh_sudo "$CVM" "$CZONE"  'rm -rf /tmp/rs-tun-cli; rm -f /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid /tmp/rs-tun-cli.sock'
-  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$AUTHKEY" /tmp/rs-tun-srv /tmp/rs-tun-srv.sock "$SHOST" /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_GSO")"
-  ssh_sudo "$CVM" "$CZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$AUTHKEY" /tmp/rs-tun-cli /tmp/rs-tun-cli.sock "$CHOST" /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_GSO")"
+  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$REMOTE_AUTHKEY_FILE" /tmp/rs-tun-srv /tmp/rs-tun-srv.sock "$SHOST" /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_GSO")"
+  ssh_sudo "$CVM" "$CZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$REMOTE_AUTHKEY_FILE" /tmp/rs-tun-cli /tmp/rs-tun-cli.sock "$CHOST" /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_GSO")"
 
   local server_ip
   server_ip=$(wait_tun_ip 1 "$SVM" "$SZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-srv.sock /tmp/rs-tun-srv.log) || {
@@ -2666,7 +2721,7 @@ run_ts_embedded() {
   arm_cell_cleanup cleanup_ts_embedded
   echo "[gcp] ts-embedded: starting pinned Go tsnet RSB1 server on $SVM" >&2
   if ! ssh_cmd "$SVM" "$SZONE" \
-      "rm -rf /tmp/go-tsnet-srv; rm -f /tmp/go-tsnet-srv.{log,pid}; $(go_tsnet_server_start_command "$AUTHKEY" "$PORT" "$SHOST" /tmp/go-tsnet-srv /tmp/go-tsnet-srv.log /tmp/go-tsnet-srv.pid)"; then
+      "rm -rf /tmp/go-tsnet-srv; rm -f /tmp/go-tsnet-srv.{log,pid}; $(go_tsnet_server_start_command "$REMOTE_AUTHKEY_FILE" "$PORT" "$SHOST" /tmp/go-tsnet-srv /tmp/go-tsnet-srv.log /tmp/go-tsnet-srv.pid)"; then
     fail_userspace_config cleanup_ts_embedded "ts-embedded-server-start-failed"
     return 1
   fi
@@ -2738,7 +2793,7 @@ run_ts_userspace() {
     }
   sleep 2
   if ! ssh_cmd "$SVM" "$SZONE" \
-    "tailscale --socket=/tmp/ts-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-srv.log"; then
+    "tailscale --socket=/tmp/ts-srv.sock up --authkey=file:$REMOTE_AUTHKEY_FILE --hostname=$SHOST --timeout=120s 2>>/tmp/ts-srv.log"; then
     fail_userspace_config cleanup_ts_userspace "ts-up-failed-srv" "$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-srv.log)"
     return 1
   fi
@@ -2755,7 +2810,7 @@ run_ts_userspace() {
     }
   sleep 2
   if ! ssh_cmd "$CVM" "$CZONE" \
-    "tailscale --socket=/tmp/ts-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-cli.log"; then
+    "tailscale --socket=/tmp/ts-cli.sock up --authkey=file:$REMOTE_AUTHKEY_FILE --hostname=$CHOST --timeout=120s 2>>/tmp/ts-cli.log"; then
     fail_userspace_config cleanup_ts_userspace "ts-up-failed-cli" "$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-cli.log)"
     return 1
   fi
@@ -2850,7 +2905,7 @@ run_ts_tun() {
     "nohup prlimit --nofile=65535:65535 -- tailscaled --socket=/tmp/ts-tun-srv.sock --statedir=/tmp/ts-tun-srv > /tmp/ts-tun-srv.log 2>&1 & echo \$! > /tmp/ts-tun-srv.pid"
   sleep 3
   if ! ssh_sudo "$SVM" "$SZONE" \
-    "tailscale --socket=/tmp/ts-tun-srv.sock up --authkey=$AUTHKEY --hostname=$SHOST --timeout=120s 2>>/tmp/ts-tun-srv.log"; then
+    "tailscale --socket=/tmp/ts-tun-srv.sock up --authkey=file:$REMOTE_AUTHKEY_FILE --hostname=$SHOST --timeout=120s 2>>/tmp/ts-tun-srv.log"; then
     echo "[gcp] ERROR: tailscale up failed on server" >&2
     local _lt
     _lt=$(capture_log_tail "$SVM" "$SZONE" /tmp/ts-tun-srv.log)
@@ -2873,7 +2928,7 @@ run_ts_tun() {
     "nohup prlimit --nofile=65535:65535 -- tailscaled --socket=/tmp/ts-tun-cli.sock --statedir=/tmp/ts-tun-cli > /tmp/ts-tun-cli.log 2>&1 & echo \$! > /tmp/ts-tun-cli.pid"
   sleep 3
   if ! ssh_sudo "$CVM" "$CZONE" \
-    "tailscale --socket=/tmp/ts-tun-cli.sock up --authkey=$AUTHKEY --hostname=$CHOST --timeout=120s 2>>/tmp/ts-tun-cli.log"; then
+    "tailscale --socket=/tmp/ts-tun-cli.sock up --authkey=file:$REMOTE_AUTHKEY_FILE --hostname=$CHOST --timeout=120s 2>>/tmp/ts-tun-cli.log"; then
     echo "[gcp] ERROR: tailscale up failed on client" >&2
     local _lt
     _lt=$(capture_log_tail "$CVM" "$CZONE" /tmp/ts-tun-cli.log)
@@ -2959,6 +3014,7 @@ fi
 trap cell_exit_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+install_remote_authkeys || { echo "[gcp] credential file delivery failed" >&2; exit 1; }
 case "$CONFIG" in
   rs-userspace)  run_rs_userspace ;;
   rs-tun)        run_rs_tun ;;

@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,10 +35,11 @@ const (
 var hostnamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
 type commonOptions struct {
-	authKey    string
-	hostname   string
-	controlURL string
-	stateDir   string
+	authKey     string
+	authKeyFile string
+	hostname    string
+	controlURL  string
+	stateDir    string
 }
 
 func main() {
@@ -73,9 +75,9 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage:
-  %[1]s server --authkey KEY [--port 5201] [--hostname NAME] [--state-dir DIR]
-  %[1]s client --authkey KEY --target IP:PORT --duration SECONDS --direction down --parallel N --json [--hostname NAME] [--state-dir DIR]
-  %[1]s latency --authkey KEY --target IP:PORT --count N --json [--hostname NAME] [--state-dir DIR]
+  %[1]s server --authkey-file FILE [--port 5201] [--hostname NAME] [--state-dir DIR]
+  %[1]s client --authkey-file FILE --target IP:PORT --duration SECONDS --direction down --parallel N --json [--hostname NAME] [--state-dir DIR]
+  %[1]s latency --authkey-file FILE --target IP:PORT --count N --json [--hostname NAME] [--state-dir DIR]
   %[1]s --version
 `, toolName)
 }
@@ -83,6 +85,7 @@ func usage() {
 func addCommonFlags(flags *flag.FlagSet, defaultHostname string) *commonOptions {
 	options := new(commonOptions)
 	flags.StringVar(&options.authKey, "authkey", "", "preauthorized Tailscale auth key")
+	flags.StringVar(&options.authKeyFile, "authkey-file", "", "owner-only file containing the auth key")
 	flags.StringVar(&options.hostname, "hostname", defaultHostname, "tailnet hostname")
 	flags.StringVar(&options.controlURL, "control-url", "", "optional coordination server URL")
 	flags.StringVar(&options.stateDir, "state-dir", "", "persistent tsnet state directory")
@@ -90,8 +93,29 @@ func addCommonFlags(flags *flag.FlagSet, defaultHostname string) *commonOptions 
 }
 
 func validateCommon(options *commonOptions) error {
+	if options.authKey != "" && options.authKeyFile != "" {
+		return errors.New("--authkey and --authkey-file are mutually exclusive")
+	}
+	if options.authKeyFile != "" {
+		info, err := os.Lstat(options.authKeyFile)
+		if err != nil {
+			return fmt.Errorf("inspect --authkey-file: %w", err)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+			return errors.New("--authkey-file must be an owner-only regular, non-symlink file")
+		}
+		value, err := os.ReadFile(options.authKeyFile)
+		if err != nil {
+			return fmt.Errorf("read --authkey-file: %w", err)
+		}
+		options.authKey = string(value)
+		options.authKey = strings.TrimSuffix(strings.TrimSuffix(options.authKey, "\n"), "\r")
+		if options.authKey == "" || strings.ContainsAny(options.authKey, "\r\n") {
+			return errors.New("--authkey-file must contain exactly one non-empty line")
+		}
+	}
 	if options.authKey == "" {
-		return errors.New("--authkey is required")
+		return errors.New("--authkey or --authkey-file is required")
 	}
 	if !hostnamePattern.MatchString(options.hostname) {
 		return errors.New("--hostname must be a valid DNS label")

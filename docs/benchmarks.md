@@ -131,23 +131,34 @@ is not embedded Go tsnet evidence.
 # Build
 cargo build -p rustscale-bench --release
 
+# Put the key in an owner-only file so it never appears in process argv.
+umask 077
+printf '%s\n' "$TS_AUTHKEY" > /tmp/rustscale-bench-authkey
+unset TS_AUTHKEY
+
 # Server (one terminal)
-target/release/rustscale-bench server --authkey tskey-... --port 5201
+target/release/rustscale-bench server --authkey-file /tmp/rustscale-bench-authkey --port 5201
 
 # Client (another terminal)
-target/release/rustscale-bench client --authkey tskey-... --target 100.64.0.1:5201 \
-  --duration 10 --direction down --parallel 1 --json
+target/release/rustscale-bench client --authkey-file /tmp/rustscale-bench-authkey \
+  --target 100.64.0.1:5201 --duration 10 --direction down --parallel 1 --json
 
 # Latency
-target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5201 \
-  --count 1000 --json
+target/release/rustscale-bench latency --authkey-file /tmp/rustscale-bench-authkey \
+  --target 100.64.0.1:5201 --count 1000 --json
+
+rm -f /tmp/rustscale-bench-authkey
 ```
 
 ### GCP five-cell matched matrix
 
 The ordinary paid GCP run is one affordable same-region/cross-zone, direct-path
 slice with all five cells and the routine load: three 10-second repeats at 1,
-10, and 100 streams.
+10, and 100 streams. Each freshly minted key is written to a temporary
+owner-only local file, copied to owner-only files on the two VMs, and removed
+at cell exit. Only file paths cross local or remote argv/rendered-command
+boundaries; self-tests fail closed on permissions, symlinks, malformed content,
+or a secret value in the run-config argument vector.
 
 ```bash
 # Credential-free command, provenance, aggregation, and dashboard validation.

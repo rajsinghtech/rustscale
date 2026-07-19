@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Installed Linux replacement journey. Builds a release archive, installs it
-# through scripts/install.sh with explicit Tailscale-compatible aliases, starts
-# the shipped systemd unit, enrolls against pinned Go testcontrol, and proves a
-# kernel-TUN packet roundtrip to a pinned Go tailscaled peer.
+# Installed Linux replacement journey. Consumes a candidate's already-built
+# production archive and SHA256SUMS, installs it through the ordinary documented
+# installer (including its default aliases), starts the shipped systemd unit,
+# enrolls against pinned Go testcontrol, and proves a kernel-TUN packet
+# roundtrip to a pinned Go tailscaled peer. This is intentionally build-free.
 
 set -euo pipefail
 
@@ -190,7 +191,7 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
 fi
 
 record_phase preflight
-for command_name in awk cargo curl date find getconf go grep id install ip journalctl \
+for command_name in awk curl date find getconf go grep id install ip journalctl \
   mktemp ps python3 readlink sed setpriv sha256sum sudo systemctl systemd-run tail tar \
   tee timeout tr wc; do
   command -v "$command_name" >/dev/null 2>&1 \
@@ -575,6 +576,47 @@ status_ip() {
   python3 -c 'import json,sys; values=json.load(sys.stdin).get("TailscaleIPs") or []; print(next((value for value in values if "." in value), ""))'
 }
 
+assert_cli_contract() {
+  local stdout stderr
+  stdout="$TMP/cli.stdout"
+  stderr="$TMP/cli.stderr"
+
+  # Top-level help retains the documented usage stream and success code.
+  if ! /usr/local/bin/tailscale --help >"$stdout" 2>"$stderr"; then
+    echo "$LABEL ERROR: tailscale --help did not exit successfully" >&2
+    return 1
+  fi
+  if ! [[ ! -s "$stdout" ]] || ! grep -Fq 'usage:' "$stderr"; then
+    echo "$LABEL ERROR: tailscale --help stream contract changed" >&2
+    return 1
+  fi
+
+  # Both command-help spellings must be offline, successful, and stdout-only.
+  for help_args in 'status --help' 'help status'; do
+    # Intentional word splitting: each case is a fixed two-argument vector.
+    # shellcheck disable=SC2086
+    if ! /usr/local/bin/tailscale $help_args >"$stdout" 2>"$stderr"; then
+      echo "$LABEL ERROR: tailscale $help_args did not exit successfully" >&2
+      return 1
+    fi
+    if ! [[ -s "$stdout" && ! -s "$stderr" ]] \
+        || ! grep -Fq 'usage: tailscale status' "$stdout"; then
+      echo "$LABEL ERROR: tailscale $help_args stream contract changed" >&2
+      return 1
+    fi
+  done
+
+  if /usr/local/bin/tailscale definitely-not-a-command >"$stdout" 2>"$stderr"; then
+    echo "$LABEL ERROR: invalid tailscale command unexpectedly succeeded" >&2
+    return 1
+  fi
+  if ! [[ ! -s "$stdout" && -s "$stderr" ]] \
+      || ! grep -Fq "unknown subcommand 'definitely-not-a-command'" "$stderr"; then
+    echo "$LABEL ERROR: invalid tailscale command stream contract changed" >&2
+    return 1
+  fi
+}
+
 wait_backend() {
   local expected=$1 seconds=${2:-60} output state deadline
   deadline=$((SECONDS + seconds))
@@ -638,12 +680,49 @@ sys.stdout.write("\n")
 PY
 }
 
-# Build every artifact before touching system state.
-record_phase rust-release-build
-echo "$LABEL building real release binaries and libraries" >&2
-run_bounded 600 rust-release-build \
-  cargo build --release --locked \
-    -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
+# The journey must consume the already-published candidate bytes, never a
+# source build. The producing CI job provides this exact release tree:
+# <base>/download/<candidate-tag>/{archive,SHA256SUMS}.
+RELEASE_DIR=${RUSTSCALE_RELEASE_DIR:-}
+RELEASE_TAG=${RUSTSCALE_RELEASE_TAG:-}
+RELEASE_SHA=${RUSTSCALE_RELEASE_SHA:-}
+RELEASE_VERSION=${RUSTSCALE_RELEASE_VERSION:-}
+[[ -n "$RELEASE_DIR" && -n "$RELEASE_TAG" && -n "$RELEASE_SHA" && -n "$RELEASE_VERSION" ]] \
+  || { echo "$LABEL ERROR: release artifact directory, tag, SHA, and version are required" >&2; exit 2; }
+[[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+  || { echo "$LABEL ERROR: candidate SHA must be a full lowercase git SHA" >&2; exit 2; }
+[[ -d "$RELEASE_DIR" && ! -L "$RELEASE_DIR" ]] \
+  || { echo "$LABEL ERROR: candidate release directory is missing or symlinked: $RELEASE_DIR" >&2; exit 1; }
+[[ "$(basename "$RELEASE_DIR")" == "$RELEASE_TAG" && "$(basename "$(dirname "$RELEASE_DIR")")" == download ]] \
+  || { echo "$LABEL ERROR: candidate archive is not in download/$RELEASE_TAG" >&2; exit 1; }
+RELEASE_BASE="file://$(dirname "$(dirname "$RELEASE_DIR")")"
+
+record_phase exact-production-artifact
+[[ -f "$RELEASE_DIR/$ARCHIVE" && ! -L "$RELEASE_DIR/$ARCHIVE" && -f "$RELEASE_DIR/SHA256SUMS" && ! -L "$RELEASE_DIR/SHA256SUMS" ]] \
+  || { echo "$LABEL ERROR: exact production archive and SHA256SUMS are required" >&2; exit 1; }
+expected_archive_sha=$(awk -v name="$ARCHIVE" '$2 == name || $2 == "*" name { print $1; exit }' "$RELEASE_DIR/SHA256SUMS")
+[[ "$expected_archive_sha" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "$LABEL ERROR: SHA256SUMS lacks a valid checksum for $ARCHIVE" >&2; exit 1; }
+actual_archive_sha=$(sha256sum "$RELEASE_DIR/$ARCHIVE" | awk '{print $1}')
+[[ "$actual_archive_sha" == "$expected_archive_sha" ]] \
+  || { echo "$LABEL ERROR: candidate production archive checksum mismatch" >&2; exit 1; }
+# Archive extraction here is verification only. The installer below downloads
+# the same archive and SHA256SUMS through its ordinary release URL.
+ARTIFACT_STAGE=$(mktemp -d "$TMP/artifact-stage.XXXXXX")
+run_bounded 30 verify-production-archive \
+  tar --format=ustar -xzf "$RELEASE_DIR/$ARCHIVE" -C "$ARTIFACT_STAGE"
+for candidate_file in rustscale rustscaled librustscale.so librustscale.a rustscale.h rustscaled.service rustscaled.default LICENSE; do
+  [[ -f "$ARTIFACT_STAGE/$candidate_file" && ! -L "$ARTIFACT_STAGE/$candidate_file" ]] \
+    || { echo "$LABEL ERROR: production archive is missing $candidate_file" >&2; exit 1; }
+done
+CLI_VERSION=$(timeout --signal=KILL 10s "$ARTIFACT_STAGE/rustscale" --version)
+DAEMON_VERSION=$(timeout --signal=KILL 10s "$ARTIFACT_STAGE/rustscaled" --version)
+[[ "$CLI_VERSION" == *"$RELEASE_VERSION"* && "$CLI_VERSION" == *"${RELEASE_SHA:0:7}"* ]] \
+  || { echo "$LABEL ERROR: CLI embedded version does not identify $RELEASE_VERSION/$RELEASE_SHA" >&2; exit 1; }
+[[ "$DAEMON_VERSION" == "rustscaled $RELEASE_VERSION" ]] \
+  || { echo "$LABEL ERROR: daemon embedded version does not identify $RELEASE_VERSION" >&2; exit 1; }
+
+echo "$LABEL verified exact production archive $ARCHIVE for $RELEASE_TAG ($RELEASE_SHA)" >&2
 
 record_phase pinned-go-build
 TESTCONTROL_BIN="$TMP/testcontrol"
@@ -656,27 +735,6 @@ GO_DAEMON="$GO_CLIENT_DIR/tailscaled"
 GO_VERSION=$(timeout --signal=KILL 10s "$GO_CLI" version | sed -n '1p')
 [[ "$GO_VERSION" == 1.100.0* ]] \
   || { echo "$LABEL ERROR: unexpected pinned Go client version: $GO_VERSION" >&2; exit 1; }
-
-VERSION=$(awk '
-  /^\[workspace.package\]/ { workspace = 1; next }
-  workspace && /^version = / { gsub(/[" ]/, "", $3); print $3; exit }
-' "$ROOT/Cargo.toml")
-[[ -n "$VERSION" ]] || { echo "$LABEL ERROR: workspace version not found" >&2; exit 1; }
-RELEASE_DIR="$TMP/releases/download/v$VERSION"
-STAGE="$TMP/stage"
-mkdir -p "$RELEASE_DIR" "$STAGE"
-install -m 755 "$ROOT/target/release/rustscale" "$STAGE/rustscale"
-install -m 755 "$ROOT/target/release/rustscaled" "$STAGE/rustscaled"
-install -m 755 "$ROOT/target/release/librustscale.so" "$STAGE/librustscale.so"
-install -m 644 "$ROOT/target/release/librustscale.a" "$STAGE/librustscale.a"
-install -m 644 "$ROOT/include/rustscale.h" "$STAGE/rustscale.h"
-install -m 644 "$ROOT/packaging/systemd/rustscaled.service" "$STAGE/rustscaled.service"
-install -m 644 "$ROOT/packaging/systemd/rustscaled.default" "$STAGE/rustscaled.default"
-install -m 644 "$ROOT/LICENSE" "$STAGE/LICENSE"
-run_bounded 30 package-release-archive \
-  tar --format=ustar -czf "$RELEASE_DIR/$ARCHIVE" -C "$STAGE" .
-printf '%s  %s\n' "$(sha256sum "$RELEASE_DIR/$ARCHIVE" | awk '{print $1}')" "$ARCHIVE" \
-  >"$RELEASE_DIR/SHA256SUMS"
 
 # Start the standalone pinned-Go control plane and retain all logs for a failed
 # run without writing generated binaries into the checkout.
@@ -737,29 +795,32 @@ run_root_bounded 10 install-service-drop-in \
     "$DROPIN_DIR/10-rustscale-install-journey.conf"
 
 record_phase install-and-first-start
-echo "$LABEL installing archive with explicit aliases and shipped systemd service" >&2
+echo "$LABEL installing exact candidate archive with ordinary aliases and shipped systemd service" >&2
 run_runner_supervised_bounded 120 archive-install \
   env INSTALL_SERVICE=1 PREFIX="$PREFIX" \
-    RUSTSCALE_RELEASE_BASE="file://$TMP/releases" \
+    RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
     RUSTSCALE_HTTP_CLIENT=curl RUSTSCALE_UNAME_S=Linux \
     RUSTSCALE_UNAME_M="$MACHINE" RUSTSCALE_LIBC=gnu \
-    sh "$ROOT/scripts/install.sh" --version "$VERSION" --tailscale-compatible \
+    sh "$ROOT/scripts/install.sh" --version "$RELEASE_TAG" \
   | tee "$TMP/install.log"
 
 [[ "$(readlink /usr/local/bin/tailscale)" == rustscale ]]
 [[ "$(readlink /usr/local/bin/tailscaled)" == rustscaled ]]
 [[ "$(sha256sum /usr/local/bin/rustscale | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/rustscale" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/rustscale" | awk '{print $1}')" ]]
 [[ "$(sha256sum /usr/local/bin/rustscaled | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/rustscaled" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/rustscaled" | awk '{print $1}')" ]]
 [[ "$(sha256sum /usr/local/lib/librustscale.so | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/librustscale.so" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/librustscale.so" | awk '{print $1}')" ]]
 [[ "$(sha256sum /usr/local/lib/librustscale.a | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/librustscale.a" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/librustscale.a" | awk '{print $1}')" ]]
 [[ "$(sha256sum /usr/local/include/rustscale.h | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/rustscale.h" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/rustscale.h" | awk '{print $1}')" ]]
 [[ "$(sha256sum /etc/default/rustscaled | awk '{print $1}')" \
-   == "$(sha256sum "$STAGE/rustscaled.default" | awk '{print $1}')" ]]
+   == "$(sha256sum "$ARTIFACT_STAGE/rustscaled.default" | awk '{print $1}')" ]]
+[[ "$(/usr/local/bin/tailscale --version)" == *"$RELEASE_VERSION"* && "$(/usr/local/bin/tailscale --version)" == *"${RELEASE_SHA:0:7}"* ]]
+[[ "$(/usr/local/bin/tailscaled --version)" == "rustscaled $RELEASE_VERSION" ]]
+assert_cli_contract
 run_bounded 5 verify-service-enabled systemctl is-enabled --quiet rustscaled.service
 run_bounded 5 verify-service-active systemctl is-active --quiet rustscaled.service
 initial_status=$(wait_backend NeedsLogin)
@@ -1019,5 +1080,5 @@ INSTALL_STARTED=0
 
 JOURNEY_FINISHED=1
 record_phase complete
-echo "$LABEL PASS: installed archive + explicit aliases + systemd + LocalAPI + restart/logout/uninstall" >&2
+echo "$LABEL PASS: exact artifact + ordinary aliases + systemd + LocalAPI + restart/logout/uninstall" >&2
 echo "$LABEL PASS: real Linux tun0 packet roundtrip to pinned Go peer $GO_VERSION ($GO_IP:$PEER_PORT)" >&2

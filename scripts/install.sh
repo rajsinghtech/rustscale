@@ -28,10 +28,10 @@
 #   --uninstall       Remove installed files.
 #   --version <tag>   Pin to a specific release tag.
 #   --no-service      Do not install or start a system service.
-#   --tailscale-compatible
-#                     Install tailscale/tailscaled command aliases. Existing
-#                     commands are never replaced; use only on an isolated
-#                     replacement host. RustScale keeps its own state paths.
+#   --no-tailscale-compatible
+#                     Do not install the default tailscale/tailscaled command
+#                     aliases. The default aliases never replace existing
+#                     commands and RustScale keeps separate state paths.
 #   --help, -h        Show this help.
 #
 # Examples:
@@ -72,10 +72,10 @@ Flags:
   --uninstall       Remove installed files.
   --version <tag>   Pin to a specific release tag.
   --no-service      Do not install or start a system service.
-  --tailscale-compatible
-                    Install tailscale/tailscaled aliases without replacing
-                    existing commands. Use only on an isolated replacement
-                    host; RustScale keeps separate state and socket paths.
+  --no-tailscale-compatible
+                    Do not install the default tailscale/tailscaled aliases.
+                    Default aliases never replace existing commands; RustScale
+                    keeps separate state and socket paths.
   --help, -h        Show this help.
 
 Examples:
@@ -96,7 +96,10 @@ run_as_root() {
 
 main() {
     UNINSTALL=0
-    TAILSCALE_COMPATIBLE=0
+    # Ordinary installs provide the documented upstream command names. This
+    # is collision-safe: validate_alias_targets refuses to replace either name
+    # before RustScale files are mutated.
+    TAILSCALE_COMPATIBLE=1
     while [ $# -gt 0 ]; do
         case "$1" in
             --uninstall) UNINSTALL=1 ;;
@@ -110,6 +113,7 @@ main() {
                 ;;
             --no-service) INSTALL_SERVICE=0 ;;
             --tailscale-compatible) TAILSCALE_COMPATIBLE=1 ;;
+            --no-tailscale-compatible) TAILSCALE_COMPATIBLE=0 ;;
             --help|-h) usage; exit 0 ;;
             *)
                 echo "rustscale: unknown option '$1' (try --help)" >&2
@@ -462,8 +466,8 @@ download_and_install() {
     post_install
 }
 
-# Compatibility mode is explicit and must never adopt or replace commands from
-# an official Tailscale installation. Validate both destinations before the
+# Default compatibility aliases must never adopt or replace commands from an
+# official Tailscale installation. Validate both destinations before the
 # first installed file is mutated so a collision cannot leave a partial
 # RustScale installation behind.
 validate_alias_targets() {
@@ -481,7 +485,7 @@ validate_alias_targets() {
             continue
         fi
         echo "rustscale: refusing to replace existing compatibility command $alias_path" >&2
-        echo "Remove or relocate the existing Tailscale installation, or install without --tailscale-compatible." >&2
+        echo "Remove or relocate the existing Tailscale installation, or use --no-tailscale-compatible." >&2
         exit 1
     done
 }

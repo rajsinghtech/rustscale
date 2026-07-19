@@ -64,7 +64,7 @@ run_case() {
     INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
         RUSTSCALE_UNAME_S="$uname_s" RUSTSCALE_UNAME_M="$uname_m" \
         RUSTSCALE_LIBC="$libc" \
-        sh "$ROOT/scripts/install.sh" --version 0.1.1 --tailscale-compatible >/dev/null
+        sh "$ROOT/scripts/install.sh" --version 0.1.1 >/dev/null
 
     test -x "$prefix/bin/rustscale"
     test "$("$prefix/bin/rustscale")" = "$expected_archive"
@@ -139,32 +139,32 @@ INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
     sh "$ROOT/scripts/install.sh" >/dev/null
 test -x "$prefix/bin/rustscale"
 
-# Uninstall must not remove an upstream installation that rustscale did not
-# create. This is the safety boundary for drop-in replacement mode.
+# An explicit no-alias install and its uninstall must not remove an upstream
+# installation that RustScale did not create.
 prefix="$TMP/prefix-upstream"
 mkdir -p "$prefix/bin"
 printf 'official tailscale\n' > "$prefix/bin/tailscale"
 ln -s /opt/tailscale/tailscaled "$prefix/bin/tailscaled"
 INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
     RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
-    sh "$ROOT/scripts/install.sh" --version "$VERSION" >/dev/null
+    sh "$ROOT/scripts/install.sh" --version "$VERSION" --no-tailscale-compatible >/dev/null
 INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_UNAME_S=Linux \
     RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
     sh "$ROOT/scripts/install.sh" --uninstall >/dev/null
 grep -q 'official tailscale' "$prefix/bin/tailscale"
 test "$(readlink "$prefix/bin/tailscaled")" = /opt/tailscale/tailscaled
 
-# Explicit compatibility mode must fail before installing anything when either
-# alias would replace an official command. Exercise each destination so the
-# validation cannot accidentally stop after checking only the CLI alias.
+# The ordinary documented installation must fail before installing anything
+# when either default alias would replace an official command. Exercise each
+# destination so validation cannot accidentally stop after only the CLI alias.
 prefix="$TMP/prefix-compat-cli-collision"
 mkdir -p "$prefix/bin"
 printf 'official tailscale\n' > "$prefix/bin/tailscale"
 if INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
     RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
     sh "$ROOT/scripts/install.sh" --version "$VERSION" \
-        --tailscale-compatible >"$TMP/compat-cli-collision.out" 2>&1; then
-    echo "compatibility install unexpectedly replaced the official CLI" >&2
+        >"$TMP/compat-cli-collision.out" 2>&1; then
+    echo "ordinary install unexpectedly replaced the official CLI" >&2
     exit 1
 fi
 grep -q 'refusing to replace existing compatibility command' "$TMP/compat-cli-collision.out"
@@ -180,8 +180,8 @@ ln -s /opt/tailscale/tailscaled "$prefix/bin/tailscaled"
 if INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
     RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
     sh "$ROOT/scripts/install.sh" --version "$VERSION" \
-        --tailscale-compatible >"$TMP/compat-daemon-collision.out" 2>&1; then
-    echo "compatibility install unexpectedly replaced the official daemon alias" >&2
+        >"$TMP/compat-daemon-collision.out" 2>&1; then
+    echo "ordinary install unexpectedly replaced the official daemon alias" >&2
     exit 1
 fi
 grep -q 'refusing to replace existing compatibility command' "$TMP/compat-daemon-collision.out"
@@ -191,8 +191,8 @@ test ! -e "$prefix/bin/rustscale"
 test ! -e "$prefix/bin/rustscaled"
 test ! -e "$prefix/bin/.rustscale-install-receipt-v1"
 
-# Pre-existing installer-owned links are idempotent and remain relative. The
-# installer never redirects compatibility mode into official state/socket
+# Pre-existing installer-owned default links are idempotent and remain
+# relative. The installer never redirects aliases into official state/socket
 # paths; those remain the RustScale paths encoded by the shipped unit.
 prefix="$TMP/prefix-compat-owned"
 mkdir -p "$prefix/bin"
@@ -200,10 +200,19 @@ ln -s rustscale "$prefix/bin/tailscale"
 ln -s rustscaled "$prefix/bin/tailscaled"
 INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
     RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
-    sh "$ROOT/scripts/install.sh" --version "$VERSION" \
-        --tailscale-compatible >/dev/null
+    sh "$ROOT/scripts/install.sh" --version "$VERSION" >/dev/null
 test "$(readlink "$prefix/bin/tailscale")" = rustscale
 test "$(readlink "$prefix/bin/tailscaled")" = rustscaled
+
+# An explicit opt-out is portable-install behavior only; ordinary installs
+# above remain the replacement journey's default contract.
+prefix="$TMP/prefix-no-aliases"
+INSTALL_SERVICE=0 PREFIX="$prefix" RUSTSCALE_RELEASE_BASE="$RELEASE_BASE" \
+    RUSTSCALE_UNAME_S=Linux RUSTSCALE_UNAME_M=x86_64 RUSTSCALE_LIBC=gnu \
+    sh "$ROOT/scripts/install.sh" --version "$VERSION" --no-tailscale-compatible >/dev/null
+test ! -e "$prefix/bin/tailscale"
+test ! -e "$prefix/bin/tailscaled"
+
 grep -Fq '/var/lib/rustscale' "$ROOT/packaging/systemd/rustscaled.service"
 grep -Fq '/var/run/rustscaled.sock' "$ROOT/packaging/systemd/rustscaled.service"
 if grep -Eq '/var/(lib|run)/tailscale|/var/run/tailscaled[.]sock' \

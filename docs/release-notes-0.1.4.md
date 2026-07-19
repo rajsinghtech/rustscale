@@ -41,16 +41,18 @@ establish this idle-send latency property.
 
 ## Installation and release acceptance
 
-- `--tailscale-compatible` installation now refuses to replace either an
-  existing `tailscale` or `tailscaled` command and validates both destinations
-  before installing files. RustScale continues to use its own state and socket
-  paths.
-- Added a credential-free installed Linux replacement journey that assembles
-  the candidate archive from the exact checkout, installs the shipped systemd
-  unit, checks LocalAPI authorization and restart/logout behavior, and proves a
-  real kernel-TUN roundtrip to pinned Go tooling. The release workflow remains
-  authoritative for executing the separately uploaded GNU archive on Debian
-  12.
+- Ordinary installation now provides collision-safe `tailscale` and
+  `tailscaled` aliases by default; it refuses to replace either existing command
+  before installing files. `--no-tailscale-compatible` is the explicit portable
+  opt-out. RustScale continues to use its own state and socket paths.
+- Added a credential-free installed Linux replacement journey that consumes the
+  exact separately assembled production candidate archive plus `SHA256SUMS`,
+  verifies checksums and embedded candidate versions, installs the shipped
+  systemd unit, checks help/error streams, LocalAPI authorization and
+  restart/logout behavior, and proves a real kernel-TUN roundtrip to pinned Go
+  tooling. The release workflow uses the same archive assembly helper and
+  remains authoritative for executing the separately uploaded GNU archive on
+  Debian 12.
 - Added evidence-backed worktree and saved-session reconciliation for the
   optional agent harness.
 

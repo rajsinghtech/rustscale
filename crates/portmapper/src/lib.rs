@@ -74,6 +74,11 @@ pub enum PortMapError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// Local portmapper work is fully stopped, but a NAT-PMP/PCP/UPnP
+    /// deletion could not be confirmed. The external lease may age out; it
+    /// must not retain the daemon's sockets, routes, or TUN ownership.
+    #[error("portmapper cleanup remains externally unconfirmed")]
+    ExternalReleaseUnconfirmed,
 }
 
 impl Clone for PortMapError {
@@ -85,6 +90,7 @@ impl Clone for PortMapError {
             Self::Disabled => Self::Disabled,
             Self::Io(error) => Self::Io(std::io::Error::new(error.kind(), error.to_string())),
             Self::Protocol(error) => Self::Protocol(error.clone()),
+            Self::ExternalReleaseUnconfirmed => Self::ExternalReleaseUnconfirmed,
         }
     }
 }

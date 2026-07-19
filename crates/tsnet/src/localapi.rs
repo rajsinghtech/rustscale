@@ -461,13 +461,19 @@ pub(crate) fn global_dial_admission() -> Arc<DialAdmission> {
 }
 
 /// Commands sent from LocalAPI handlers to the daemon for actions that
-/// require server-level operations (start, login, logout).
+/// require server-level operations (start, login, down, logout).
 #[derive(Clone)]
 pub enum DaemonCommand {
     Start {
         auth_key: Option<String>,
     },
     LoginInteractive,
+    /// Retire the live data-plane generation while retaining a stopped
+    /// LocalAPI generation for a later `up`. The daemon owns the sender, so
+    /// a disconnected HTTP client cannot cancel an admitted teardown.
+    Down {
+        completion: Arc<DownCompletion>,
+    },
     Logout,
     Shutdown,
     /// Re-read the config file and apply the resulting prefs. Fired by
@@ -488,6 +494,7 @@ impl std::fmt::Debug for DaemonCommand {
                 .field("auth_key", &auth_key.as_ref().map(|_| "<redacted>"))
                 .finish(),
             Self::LoginInteractive => formatter.write_str("LoginInteractive"),
+            Self::Down { .. } => formatter.write_str("Down"),
             Self::Logout => formatter.write_str("Logout"),
             Self::Shutdown => formatter.write_str("Shutdown"),
             Self::ReloadConfig => formatter.write_str("ReloadConfig"),
@@ -495,6 +502,38 @@ impl std::fmt::Debug for DaemonCommand {
                 .debug_tuple("SwitchProfile")
                 .field(profile)
                 .finish(),
+        }
+    }
+}
+
+/// Completion of a daemon-owned LocalAPI down flight. Only the daemon can
+/// resolve it; request cancellation only drops a receiver.
+pub struct DownCompletion {
+    sender: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>,
+}
+
+impl DownCompletion {
+    pub fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<Result<(), String>>,
+    ) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                sender: std::sync::Mutex::new(Some(sender)),
+            }),
+            receiver,
+        )
+    }
+
+    pub fn complete(&self, result: Result<(), String>) {
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .expect("down completion lock poisoned")
+            .take()
+        {
+            let _ = sender.send(result);
         }
     }
 }
@@ -700,6 +739,9 @@ impl Drop for LocalApiGenerationHandoff {
 pub(crate) struct LocalApiState {
     pub mutation_fence: Arc<LocalApiMutationFence>,
     pub mutation_generation: u64,
+    /// Deterministically pauses status construction in the publication-race test.
+    #[cfg(test)]
+    pub(crate) status_build_hook: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
     pub peers: Arc<RwLock<Vec<Node>>>,
     /// HA subnet-router reachability checker. Unavailable before the first netmap.
     pub routecheck: Option<Arc<rustscale_routecheck::Client>>,
@@ -1002,7 +1044,7 @@ impl LocalApiHandle {
 
     /// Join this listener without unlinking its recorded path. Used only when
     /// an atomic handoff has already republished another listener there.
-    pub(crate) async fn shutdown_preserving_path(mut self) {
+    pub async fn shutdown_preserving_path(mut self) {
         self.unlink_on_drop = false;
         self.shutdown().await;
     }
@@ -1939,6 +1981,18 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     let exit_node_changed =
         masked.ExitNodeIDSet || masked.ExitNodeIPSet || masked.ExitNodeAllowLANAccessSet;
     let disconnect_requested = masked.WantRunningSet && !masked.Prefs.WantRunning;
+    // Admission precedes durable mutation. A failed owner must not report a
+    // rejected down while silently persisting WantRunning=false.
+    if disconnect_requested
+        && state
+            .command_tx
+            .as_ref()
+            .is_none_or(tokio::sync::mpsc::UnboundedSender::is_closed)
+    {
+        let error = serde_json::json!({"error": "daemon lifecycle owner is unavailable"});
+        write_json_response(conn, 503, "Service Unavailable", &error).await?;
+        return Ok(());
+    }
     let authorization_changed = exit_node_changed || masked.ShieldsUpSet;
     let exit_map_guard = if exit_node_changed {
         Some(state.exit_map_gate.lock().await)
@@ -2026,6 +2080,48 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
                 "disconnect requested via LocalAPI",
             ) {
                 log::warn!("tsnet: failed to persist audit log (non-fatal): {error}");
+            }
+        }
+        // The durable preference commit above is deliberately before this
+        // command. A daemon restart between the two therefore stays down;
+        // the daemon owns the actual generation teardown and replaces this
+        // listener with a stopped LocalAPI generation when it completes.
+        let Some(command_tx) = &state.command_tx else {
+            let error = serde_json::json!({"error": "daemon lifecycle owner is unavailable"});
+            write_json_response(conn, 503, "Service Unavailable", &error).await?;
+            return Ok(());
+        };
+        let (completion, completion_rx) = DownCompletion::new();
+        if command_tx.send(DaemonCommand::Down { completion }).is_err() {
+            let error = serde_json::json!({"error": "daemon lifecycle loop is unavailable"});
+            write_json_response(conn, 503, "Service Unavailable", &error).await?;
+            return Ok(());
+        }
+        // Success certifies that the daemon has withdrawn the running
+        // generation and published the stopped LocalAPI replacement. The
+        // completion sender is daemon-owned; dropping this request only drops
+        // its waiter, never the teardown flight.
+        match completion_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                write_json_response(
+                    conn,
+                    500,
+                    "Internal Server Error",
+                    &serde_json::json!({"error": format!("down lifecycle failed: {error}")}),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                write_json_response(
+                    conn,
+                    503,
+                    "Service Unavailable",
+                    &serde_json::json!({"error": "daemon lifecycle completion is unavailable"}),
+                )
+                .await?;
+                return Ok(());
             }
         }
     }
@@ -2345,9 +2441,7 @@ pub(crate) async fn authorize_request_head<W: AsyncWrite + Unpin>(
         return Ok(Some(max_body));
     };
 
-    if is_mutating_request(&head.method, endpoint)
-        && state.mutation_fence.generation() != state.mutation_generation
-    {
+    if stale_listener_blocks_route(state, &head.method, endpoint) {
         write_json_response(
             conn,
             409,
@@ -2512,21 +2606,56 @@ async fn write_drive_owner_denied<W: AsyncWrite + Unpin>(
     write_json_response(conn, 403, "Forbidden", &body).await
 }
 
+async fn write_stale_listener_generation<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+) -> Result<(), std::io::Error> {
+    write_json_response(
+        conn,
+        409,
+        "Conflict",
+        &serde_json::json!({"error": "stale LocalAPI listener generation"}),
+    )
+    .await
+}
+
+/// Admit one response publication under the listener-generation gate. The
+/// caller must retain the returned guard through its response write so a
+/// handoff cannot make an already-built snapshot look like its successor.
+async fn admit_current_listener(state: &LocalApiState) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+    state.mutation_fence.admit(state.mutation_generation).await
+}
+
+async fn admit_readiness<'a, W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &'a LocalApiState,
+) -> Result<Option<tokio::sync::MutexGuard<'a, ()>>, std::io::Error> {
+    let permit = admit_current_listener(state).await;
+    if permit.is_none() {
+        write_stale_listener_generation(conn).await?;
+    }
+    Ok(permit)
+}
+
 async fn admit_mutation<'a, W: AsyncWrite + Unpin>(
     conn: &mut W,
     state: &'a LocalApiState,
 ) -> Result<Option<tokio::sync::MutexGuard<'a, ()>>, std::io::Error> {
-    let permit = state.mutation_fence.admit(state.mutation_generation).await;
-    if permit.is_none() {
-        write_json_response(
-            conn,
-            409,
-            "Conflict",
-            &serde_json::json!({"error": "stale LocalAPI listener generation"}),
-        )
-        .await?;
+    admit_readiness(conn, state).await
+}
+
+/// A listener accepted immediately before an atomic pathname handoff can
+/// finish its request after the replacement commits. Its state snapshot is
+/// from the retired generation, so it must never report the replacement's
+/// Running state (or a watch notification for it) as its own readiness. A
+/// every `Running` readiness response is revalidated immediately before
+/// publication.
+fn stale_listener_blocks_route(state: &LocalApiState, method: &str, endpoint: &str) -> bool {
+    if state.mutation_fence.generation() == state.mutation_generation {
+        return false;
     }
-    Ok(permit)
+    is_mutating_request(method, endpoint)
+        || matches!(endpoint, "watch-ipn-bus" | "debug")
+        || (endpoint == "status" && state.ipn_backend.state() == rustscale_ipn::State::Running)
 }
 
 /// Classify the complete LocalAPI mutation surface before route dispatch.
@@ -2644,6 +2773,19 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
     }
 
     let endpoint = &path[API_PREFIX.len()..];
+    // `dispatch` is also used by in-memory LocalAPI clients in tests. Keep
+    // the same stale-generation readiness fence as the production head phase
+    // so no caller can observe a retired listener as Running.
+    if stale_listener_blocks_route(state, method, endpoint) {
+        write_json_response(
+            conn,
+            409,
+            "Conflict",
+            &serde_json::json!({"error": "stale LocalAPI listener generation"}),
+        )
+        .await?;
+        return Ok(());
+    }
 
     // Generation and peer-identity admission is one route-level decision made
     // before any mutating handler can observe or persist state. Holding the
@@ -2701,7 +2843,16 @@ pub(crate) async fn dispatch<W: AsyncRead + AsyncWrite + Unpin>(
                     status.remove("User");
                 }
             }
-            write_json_response(conn, 200, "OK", &st).await?;
+            if st["BackendState"] == "Running" {
+                let Some(_publication) = admit_readiness(conn, state).await? else {
+                    return Ok(());
+                };
+                write_json_response(conn, 200, "OK", &st).await?;
+            } else {
+                // A stale pre-handoff snapshot can still truthfully report
+                // Starting; only a Running publication needs the handoff gate.
+                write_json_response(conn, 200, "OK", &st).await?;
+            }
         }
 
         // --- GET /localapi/v0/whois?addr=ip:port ---
@@ -3138,7 +3289,28 @@ async fn handle_debug_capture<W: AsyncWrite + Unpin>(
 /// - `Peer` is a JSON object keyed by node public key string (same as Go).
 /// - `TUN`: true when the server was started via `up_tun()`.
 /// - `SuggestedExitNode`: omitted (Go does not emit it in ipnstate.Status).
+// Status keeps Go-compatible `Health: []string`; structured warning identity
+// belongs to `/health`. Both views take their snapshot from the same
+// generation-owned tracker rather than a backend notification cache.
+pub(crate) fn health_status_text(health: &Tracker) -> Vec<String> {
+    health
+        .current_warnings()
+        .iter()
+        .map(|warning| warning.text.clone())
+        .collect()
+}
+
+pub(crate) fn health_json(health: &Tracker) -> serde_json::Value {
+    serde_json::to_value(health.current_warnings()).unwrap_or(serde_json::json!([]))
+}
+
 async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
+    #[cfg(test)]
+    if let Some((entered, release)) = &state.status_build_hook {
+        entered.wait().await;
+        release.wait().await;
+    }
+
     let _map_snapshot = state.peer_map.gate.read().await;
     let peers = state.peers.read().await;
     let user_profiles = state.user_profiles.read().await;
@@ -3151,12 +3323,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
         s.TUN = state.tun_mode;
         s.BackendState = state.ipn_backend.state().as_str().to_string();
         s.HaveNodeKey = Some(true);
-        s.Health = state
-            .health
-            .current_warnings()
-            .iter()
-            .map(|w| w.text.clone())
-            .collect();
+        s.Health = health_status_text(&state.health);
         for ip in &state.tailscale_ips {
             s.TailscaleIPs.push(*ip);
         }
@@ -3444,8 +3611,7 @@ fn build_metrics_text(state: &LocalApiState) -> String {
 
 /// Build health JSON — an array of active warnings (same shape as C2N).
 fn build_health_json(state: &LocalApiState) -> serde_json::Value {
-    let warnings = state.health.current_warnings();
-    serde_json::to_value(&warnings).unwrap_or(serde_json::json!([]))
+    health_json(&state.health)
 }
 
 // ---------------------------------------------------------------------------
@@ -3824,10 +3990,9 @@ async fn handle_watch_ipn_bus<W: AsyncRead + AsyncWrite + Unpin>(
     conn.flush().await?;
 
     if let Some(notify) = initial_notify {
-        let line = serde_json::to_vec(&notify).unwrap_or_default();
-        conn.write_all(&line).await?;
-        conn.write_all(b"\n").await?;
-        conn.flush().await?;
+        if !write_watch_notification(conn, state, &notify).await? {
+            return Ok(());
+        }
     }
 
     // `read_request` has consumed exactly the declared request body before
@@ -3857,10 +4022,9 @@ async fn handle_watch_ipn_bus<W: AsyncRead + AsyncWrite + Unpin>(
             },
             message = rx.recv() => match message {
                 Some(Ok(notify)) => {
-                    let line = serde_json::to_vec(&notify).unwrap_or_default();
-                    conn.write_all(&line).await?;
-                    conn.write_all(b"\n").await?;
-                    conn.flush().await?;
+                    if !write_watch_notification(conn, state, &notify).await? {
+                        break;
+                    }
                 }
                 Some(Err(_)) => {
                     // Subscriber fell behind (Lagged); skip and continue.
@@ -3875,6 +4039,25 @@ async fn handle_watch_ipn_bus<W: AsyncRead + AsyncWrite + Unpin>(
     }
 
     Ok(())
+}
+
+/// Publish one watch notification only while its listener generation remains
+/// current. Holding the gate through the flush makes the generation check and
+/// externally visible notification one transaction; a stale stream ends
+/// rather than reporting its replacement's readiness.
+async fn write_watch_notification<W: AsyncWrite + Unpin>(
+    conn: &mut W,
+    state: &LocalApiState,
+    notify: &rustscale_ipn::Notify,
+) -> Result<bool, std::io::Error> {
+    let Some(_publication) = admit_current_listener(state).await else {
+        return Ok(false);
+    };
+    let line = serde_json::to_vec(notify).unwrap_or_default();
+    conn.write_all(&line).await?;
+    conn.write_all(b"\n").await?;
+    conn.flush().await?;
+    Ok(true)
 }
 
 /// Generate a random hex session ID (16 bytes = 32 hex chars), matching
@@ -4484,7 +4667,14 @@ async fn handle_debug<W: AsyncWrite + Unpin>(
             return Ok(());
         }
     };
-    write_json_response(conn, 200, "OK", &result).await?;
+    if result["backend_state"] == "Running" {
+        let Some(_publication) = admit_readiness(conn, state).await? else {
+            return Ok(());
+        };
+        write_json_response(conn, 200, "OK", &result).await?;
+    } else {
+        write_json_response(conn, 200, "OK", &result).await?;
+    }
     Ok(())
 }
 
@@ -5504,6 +5694,8 @@ mod tests {
         Arc::new(LocalApiState {
             mutation_generation: mutation_fence.generation(),
             mutation_fence,
+            #[cfg(test)]
+            status_build_hook: None,
             peers,
             routecheck: None,
             user_profiles: Arc::new(RwLock::new(profiles)),
@@ -7274,7 +7466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_listener_generation_fences_every_mutating_route_but_allows_reads() {
+    async fn stale_listener_generation_cannot_publish_readiness() {
         let state = make_test_state().await;
         let old_prefs = state.prefs.read().await.clone();
         let handoff = state
@@ -7321,13 +7513,133 @@ mod tests {
 
         for request in [
             &b"GET /localapi/v0/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"[..],
-            &b"POST /localapi/v0/check-prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..],
+            &b"GET /localapi/v0/watch-ipn-bus?mask=2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"[..],
+            &b"GET /localapi/v0/debug?action=status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"[..],
         ] {
             let response = send_request_to_state(request, &state).await;
-            assert!(!response.contains("409 Conflict"), "read was fenced: {response}");
+            assert!(
+                response.contains("409 Conflict"),
+                "stale listener published readiness: {response}"
+            );
         }
+        let response = send_request_to_state(
+            b"POST /localapi/v0/check-prefs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            &state,
+        )
+        .await;
+        assert!(
+            !response.contains("409 Conflict"),
+            "non-readiness diagnostic was fenced: {response}"
+        );
         assert_eq!(*state.prefs.read().await, old_prefs);
         assert!(!state.ipn_backend.logged_out());
+    }
+
+    #[tokio::test]
+    async fn stale_status_is_rejected_when_handoff_wins_during_snapshot() {
+        let mut state = make_test_state().await;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        Arc::get_mut(&mut state)
+            .expect("test state must be unique before the request starts")
+            .status_build_hook = Some((Arc::clone(&entered), Arc::clone(&release)));
+
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let request = HttpRequest {
+            method: "GET".into(),
+            path: "/localapi/v0/status".into(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let request_state = Arc::clone(&state);
+        let response = tokio::spawn(async move {
+            dispatch(&mut server, &request, &request_state, &test_rw_identity()).await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.wait())
+            .await
+            .expect("status construction did not reach its test hook");
+        let handoff = state
+            .mutation_fence
+            .advance(state.mutation_generation)
+            .await
+            .expect("handoff should advance the current generation");
+        handoff.commit();
+        release.wait().await;
+        response
+            .await
+            .expect("status task panicked")
+            .expect("status task failed");
+
+        let mut output = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut output),
+        )
+        .await
+        .expect("status client did not observe the completed response")
+        .expect("status client failed");
+        let output = String::from_utf8(output).expect("status response is UTF-8");
+        assert!(output.contains("409 Conflict"), "response: {output}");
+        assert!(
+            !output.contains("\"BackendState\":\"Running\""),
+            "stale status published Running: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_watch_terminates_before_replacement_running_notification() {
+        let state = make_test_state().await;
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let watch_state = Arc::clone(&state);
+        let watch =
+            tokio::spawn(async move { handle_watch_ipn_bus(&mut server, "", &watch_state).await });
+
+        let mut header = [0_u8; 256];
+        let header_len = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client, &mut header),
+        )
+        .await
+        .expect("watch did not open")
+        .expect("watch header read failed");
+        assert!(
+            String::from_utf8_lossy(&header[..header_len]).starts_with("HTTP/1.1 200 OK"),
+            "watch did not subscribe before handoff"
+        );
+
+        let handoff = state
+            .mutation_fence
+            .advance(state.mutation_generation)
+            .await
+            .expect("handoff should advance the current generation");
+        handoff.commit();
+        assert!(
+            state
+                .ipn_backend
+                .bus()
+                .send(rustscale_ipn::Notify::state(rustscale_ipn::State::Running)),
+            "opened watch was not subscribed"
+        );
+        watch
+            .await
+            .expect("watch task panicked")
+            .expect("watch task failed");
+
+        let mut output = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut output),
+        )
+        .await
+        .expect("stale watch did not close")
+        .expect("watch client read failed");
+        let output = String::from_utf8(output).expect("watch response is UTF-8");
+        assert!(
+            !output.contains("\"State\":6"),
+            "stale watch published replacement Running: {output}"
+        );
     }
 
     #[cfg(unix)]
@@ -7840,6 +8152,8 @@ mod tests {
         let state2 = Arc::new(LocalApiState {
             mutation_fence: Arc::clone(&state.mutation_fence),
             mutation_generation: state.mutation_generation,
+            #[cfg(test)]
+            status_build_hook: None,
             peers: state.peers.clone(),
             routecheck: state.routecheck.clone(),
             user_profiles: state.user_profiles.clone(),
@@ -8082,6 +8396,8 @@ mod tests {
         Arc::new(LocalApiState {
             mutation_fence: Arc::clone(&base.mutation_fence),
             mutation_generation: base.mutation_generation,
+            #[cfg(test)]
+            status_build_hook: None,
             peers: base.peers.clone(),
             routecheck: base.routecheck.clone(),
             user_profiles: base.user_profiles.clone(),
@@ -8878,6 +9194,74 @@ mod tests {
             assert!(response.contains("503 Service Unavailable"), "{response}");
             assert!(response.contains("daemon command owner stopped"), "{response}");
         }
+    }
+
+    #[tokio::test]
+    async fn down_pref_commit_notifies_daemon_after_durable_update() {
+        let mut state = make_test_state().await;
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        Arc::get_mut(&mut state).unwrap().command_tx = Some(command_tx);
+        let request = serde_json::to_vec(&MaskedPrefs {
+            Prefs: Prefs {
+                WantRunning: false,
+                ..Default::default()
+            },
+            WantRunningSet: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let (mut conn, _peer) = tokio::io::duplex(4096);
+        let state_for_request = Arc::clone(&state);
+        let request_task = tokio::spawn(async move {
+            handle_patch_prefs(&mut conn, &request, &state_for_request).await
+        });
+
+        let Some(DaemonCommand::Down { completion }) = command_rx.recv().await else {
+            panic!("down request did not notify the daemon");
+        };
+        assert!(!state.prefs.read().await.WantRunning);
+        assert!(
+            !request_task.is_finished(),
+            "down request returned before daemon-owned teardown completed"
+        );
+        completion.complete(Ok(()));
+        request_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn down_fails_when_no_daemon_lifecycle_owner_exists() {
+        let state = make_test_state().await;
+        let request = serde_json::to_vec(&MaskedPrefs {
+            Prefs: Prefs {
+                WantRunning: false,
+                ..Default::default()
+            },
+            WantRunningSet: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let state_for_request = Arc::clone(&state);
+
+        let response = tokio::spawn(async move {
+            handle_patch_prefs(&mut server, &request, &state_for_request)
+                .await
+                .unwrap();
+        });
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        response.await.unwrap();
+        let response = String::from_utf8(bytes).unwrap();
+
+        assert!(response.contains("503 Service Unavailable"), "{response}");
+        assert!(
+            response.contains("daemon lifecycle owner is unavailable"),
+            "{response}"
+        );
+        assert!(
+            state.prefs.read().await.WantRunning,
+            "rejected down mutated durable lifecycle intent"
+        );
     }
 
     #[test]

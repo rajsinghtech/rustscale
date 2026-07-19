@@ -87,4 +87,19 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn audit_log_request_accepts_go_compatible_omitted_timestamp() {
+        let request: AuditLogRequest = serde_json::from_str(concat!(
+            r#"{"Version":141,"NodeKey":"nodekey:"#,
+            "0808080808080808080808080808080808080808080808080808080808080808",
+            r#"","Action":"DISCONNECT_NODE","Details":"cli"}"#,
+        ))
+        .unwrap();
+
+        assert_eq!(request.Timestamp, chrono::DateTime::UNIX_EPOCH);
+        assert!(!serde_json::to_string(&request)
+            .unwrap()
+            .contains("Timestamp"));
+    }
 }

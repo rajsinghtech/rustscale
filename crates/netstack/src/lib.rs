@@ -77,7 +77,7 @@ const LISTEN_BACKLOG: usize = 32;
 /// This stays below the passive listener pool so bulk setup cannot create a
 /// SYN burst larger than a peer can admit and leaves room while established
 /// passive sockets are replenished.
-pub const TCP_DIAL_WINDOW: usize = LISTEN_BACKLOG / 8;
+pub const TCP_DIAL_WINDOW: usize = LISTEN_BACKLOG / 16;
 
 /// Depth of the accept channel between the poll loop and the application's
 /// `Listener::accept()` call. Large enough to buffer a burst of accepted

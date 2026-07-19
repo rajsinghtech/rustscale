@@ -25,6 +25,39 @@ timestamp() {
   date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
+# `is-system-running --wait` is systemd's native bounded readiness primitive.
+# Do not replace this with an instantaneous state probe or a polling loop: a
+# fresh GitHub runner can still be `starting` while systemd is fully usable.
+wait_for_systemd_manager() {
+  local seconds=$1 scope=$2 state status
+  shift 2
+  echo "$LABEL $(timestamp) wait: systemd manager ($scope, deadline=${seconds}s)" >&2
+  if state=$("$@" timeout --signal=KILL "${seconds}s" \
+      systemctl is-system-running --wait 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  state=$(printf '%s' "$state" | tr -d '\r\n')
+  case "$state" in
+    running)
+      if [[ "$status" == 0 ]]; then
+        return 0
+      fi
+      ;;
+    degraded)
+      echo "$LABEL $(timestamp) systemd manager is degraded; collecting bounded failed-unit diagnostics" >&2
+      if ! "$@" timeout --signal=KILL 8s systemctl --failed --no-pager >&2; then
+        echo "$LABEL $(timestamp) systemd failed-unit diagnostics were unavailable" >&2
+      fi
+      echo "$LABEL $(timestamp) accepting degraded systemd manager as an operational final state" >&2
+      return 0
+      ;;
+  esac
+  echo "$LABEL ERROR: systemd manager did not reach an acceptable final state (scope=$scope state=${state:-unknown} status=$status)" >&2
+  return 1
+}
+
 CURRENT_PHASE=starting
 record_phase() {
   local phase=$1 now
@@ -133,12 +166,9 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
       || { echo "$LABEL ERROR: $value_name must be positive" >&2; exit 2; }
   done
 
-  manager_state=$(sudo -n timeout --signal=KILL 10s \
-    systemctl is-system-running 2>/dev/null || true)
-  case "$manager_state" in
-    running|degraded) ;;
-    *) skip "systemd manager is unavailable for privileged cgroup supervision (state=${manager_state:-unknown})" ;;
-  esac
+  if ! wait_for_systemd_manager 60 supervisor sudo -n; then
+    skip "systemd manager is unavailable for privileged cgroup supervision"
+  fi
 
   unit="rustscale-linux-replacement-$(id -u)-$$.service"
   stop_supervised_unit() {
@@ -193,7 +223,7 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
 fi
 
 record_phase preflight
-for command_name in awk curl date find getconf go grep id install ip journalctl \
+for command_name in awk cmp cp curl date find getconf go grep id install ip journalctl \
   mktemp ps python3 readlink sed setpriv sha256sum sudo systemctl systemd-run tail tar \
   tee timeout tr wc; do
   command -v "$command_name" >/dev/null 2>&1 \
@@ -203,20 +233,9 @@ done
 if ! sudo -n true 2>/dev/null; then
   skip "passwordless sudo is unavailable"
 fi
-systemd_state=unknown
-echo "$LABEL $(timestamp) wait: systemd ready (deadline=60s)" >&2
-for ((systemd_attempt = 0; systemd_attempt < 60; systemd_attempt++)); do
-  systemd_state=$(timeout --signal=KILL 2s systemctl is-system-running 2>/dev/null || true)
-  case "$systemd_state" in
-    running|degraded) break ;;
-    starting|initializing) sleep 1 ;;
-    *) break ;;
-  esac
-done
-case "$systemd_state" in
-  running|degraded) ;;
-  *) skip "systemd manager did not become ready (state=${systemd_state:-unknown})" ;;
-esac
+if ! wait_for_systemd_manager 60 journey; then
+  skip "systemd manager did not become ready for the installed journey"
+fi
 [[ -c /dev/net/tun ]] || skip "/dev/net/tun is not a character device"
 if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
   skip "the installed service journey requires the GNU/Linux release artifact"
@@ -299,6 +318,8 @@ JOURNEY_ENV=/etc/default/rustscaled-install-journey
 PREFIX=/usr/local
 DEFAULT_SOCKET=/var/run/rustscaled.sock
 TUN_NAME=tun0
+DNS_BASELINE_TARGET=$(readlink -f /etc/resolv.conf)
+cp -L /etc/resolv.conf "$TMP/resolv.conf.baseline"
 
 stop_pid() {
   local pid=$1 label=$2
@@ -481,13 +502,13 @@ capture_failure_diagnostics() {
 }
 
 cleanup() {
-  local status=$? cleanup_failed=0 alias target
+  local primary_status=$? cleanup_failed=0 alias target
   trap - EXIT INT TERM
   set +e
 
-  # Capture the live service, LocalAPI, kernel, process, and fixture evidence
-  # before any teardown mutates it.
-  if [[ "$status" != 0 ]]; then
+  # Preserve the original failure while every cleanup stage runs. A successful
+  # later stage must never mask either that failure or an earlier cleanup leak.
+  if [[ "$primary_status" != 0 ]]; then
     capture_failure_diagnostics
   fi
   echo "$LABEL $(timestamp) cleanup: begin (deadline=${RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT:-90}s)" >&2
@@ -532,7 +553,7 @@ cleanup() {
 
   if ! assert_kernel_clean; then
     cleanup_failed=1
-    [[ "$INSTALL_STARTED" == 1 ]] && emergency_kernel_cleanup
+    emergency_kernel_cleanup || cleanup_failed=1
     assert_kernel_clean || cleanup_failed=1
   fi
   if [[ "$INSTALL_STARTED" == 1 ]]; then
@@ -560,11 +581,14 @@ cleanup() {
   run_bounded 5 cleanup-temporary-files rm -rf "$TMP" || cleanup_failed=1
   if [[ "$cleanup_failed" != 0 ]]; then
     echo "$LABEL $(timestamp) ERROR: bounded cleanup did not restore the isolated host" >&2
-    [[ "$status" != 0 ]] || status=1
   elif [[ "$JOURNEY_FINISHED" == 1 ]]; then
     echo "$LABEL $(timestamp) cleanup: service, processes, fixture state, and sentinels removed" >&2
   fi
-  exit "$status"
+  if [[ "$primary_status" != 0 ]]; then
+    exit "$primary_status"
+  fi
+  [[ "$cleanup_failed" == 0 ]] || exit 1
+  exit 0
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -620,14 +644,18 @@ assert_cli_contract() {
 }
 
 wait_backend() {
-  local expected=$1 seconds=${2:-60} output state deadline
+  local expected=$1 seconds=${2:-60} expected_ipv4=${3:-} output state observed_ipv4 deadline
   deadline=$((SECONDS + seconds))
-  echo "$LABEL $(timestamp) wait: LocalAPI BackendState=$expected (deadline=${seconds}s)" >&2
+  echo "$LABEL $(timestamp) wait: LocalAPI BackendState=$expected${expected_ipv4:+ IPv4=$expected_ipv4} (deadline=${seconds}s)" >&2
   while (( SECONDS < deadline )); do
     if output=$(timeout --signal=KILL 3s \
         /usr/local/bin/tailscale status --json 2>/dev/null); then
       state=$(printf '%s' "$output" | backend_state 2>/dev/null || true)
-      if [[ "$state" == "$expected" ]]; then
+      observed_ipv4=$(printf '%s' "$output" | status_ip 2>/dev/null || true)
+      # A Running answer is readiness evidence only when this one LocalAPI
+      # snapshot also carries the expected current-generation tailnet IP.
+      if [[ "$state" == "$expected" \
+        && ( -z "$expected_ipv4" || "$observed_ipv4" == "$expected_ipv4" ) ]]; then
         printf '%s' "$output"
         return 0
       fi
@@ -638,7 +666,7 @@ wait_backend() {
     timeout --signal=KILL 3s systemctl is-active --quiet rustscaled.service || true
     sleep 0.25
   done
-  echo "$LABEL $(timestamp) ERROR: timed out waiting for LocalAPI BackendState=$expected" >&2
+  echo "$LABEL $(timestamp) ERROR: timed out waiting for LocalAPI BackendState=$expected${expected_ipv4:+ IPv4=$expected_ipv4}" >&2
   timeout --signal=KILL 5s systemctl status rustscaled.service --no-pager >&2 || true
   return 1
 }
@@ -994,12 +1022,19 @@ sudo -n timeout --signal=KILL 5s cat /var/lib/rustscale/prefs.json \
 PID_BEFORE=$(timeout --signal=KILL 5s \
   systemctl show -p MainPID --value rustscaled.service)
 run_root_bounded 45 restart-without-key systemctl restart rustscaled.service
-persisted_status=$(wait_backend Running 80)
+# Require one current-generation LocalAPI snapshot to prove both Running
+# and the original IPv4 identity after restart; a stale handoff listener or
+# cache may not satisfy this readiness boundary.
+persisted_status=$(wait_backend Running 80 "$RUST_IP")
 PID_AFTER=$(timeout --signal=KILL 5s \
   systemctl show -p MainPID --value rustscaled.service)
-[[ "$PID_BEFORE" =~ ^[1-9][0-9]*$ && "$PID_AFTER" =~ ^[1-9][0-9]*$ ]]
-[[ "$PID_BEFORE" != "$PID_AFTER" ]]
-[[ "$(printf '%s' "$persisted_status" | status_ip)" == "$RUST_IP" ]]
+[[ "$PID_BEFORE" =~ ^[1-9][0-9]*$ && "$PID_AFTER" =~ ^[1-9][0-9]*$ ]] \
+  || { echo "$LABEL ERROR: invalid restart PIDs before='$PID_BEFORE' after='$PID_AFTER'" >&2; exit 1; }
+[[ "$PID_BEFORE" != "$PID_AFTER" ]] \
+  || { echo "$LABEL ERROR: systemd restart retained daemon PID $PID_BEFORE" >&2; exit 1; }
+persisted_ip=$(printf '%s' "$persisted_status" | status_ip)
+[[ "$persisted_ip" == "$RUST_IP" ]] \
+  || { echo "$LABEL ERROR: restart changed tailnet IP from '$RUST_IP' to '$persisted_ip'" >&2; exit 1; }
 [[ "$(wait_node_count 2)" -ge 2 ]]
 
 run_bounded 120 restart-persistence-roundtrip \
@@ -1027,6 +1062,133 @@ for _ in range(40):
         last = error
         time.sleep(0.5)
 raise SystemExit(f"post-restart Go peer echo failed: {last}")
+PY
+
+# Prove public down/up is an in-process lifecycle transition rather than a
+# daemon restart. Both commands must return only after their kernel and LocalAPI
+# state is immediately truthful, while persisted identity remains unchanged.
+record_phase public-down-up-lifecycle
+run_bounded 15 enable-lifecycle-dns \
+  /usr/local/bin/tailscale set --accept-dns=true
+PID_LIFECYCLE=$(timeout --signal=KILL 5s \
+  systemctl show -p MainPID --value rustscaled.service)
+[[ "$PID_LIFECYCLE" =~ ^[1-9][0-9]*$ ]]
+NODE_COUNT_BEFORE=$(node_count)
+NODE_IDENTITY_BEFORE=$(curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
+  | python3 -c 'import json,sys; wanted=sys.argv[1]; nodes=json.load(sys.stdin)["nodes"]; matches=[node for node in nodes if (node.get("ip") or "").split("/",1)[0] == wanted]; assert len(matches) == 1; node=matches[0]; print("{}|{}|{}".format(node["key"], node["id"], node["ip"]))' "$RUST_IP")
+DNS_ACTIVE_TARGET=$(readlink -f /etc/resolv.conf)
+cp -L /etc/resolv.conf "$TMP/resolv.conf.active"
+
+run_bounded 45 public-down /usr/local/bin/tailscale down
+DOWN_STATUS=$(run_bounded 10 immediate-down-status \
+  /usr/local/bin/tailscale status --json)
+[[ "$(printf '%s' "$DOWN_STATUS" | backend_state)" == Stopped ]]
+run_bounded 10 immediate-down-prefs \
+  /usr/local/bin/tailscale get --json \
+  | python3 -c 'import json,sys; prefs=json.load(sys.stdin); assert isinstance(prefs, dict); assert prefs.get("WantRunning", False) is False; assert prefs.get("LoggedOut", False) is False; assert prefs.get("CorpDNS") is True'
+[[ "$(timeout --signal=KILL 5s systemctl show -p MainPID --value rustscaled.service)" \
+   == "$PID_LIFECYCLE" ]]
+[[ ! -e "/sys/class/net/$TUN_NAME" ]]
+for family in -4 -6; do
+  rules=$(timeout --signal=KILL 5s ip "$family" -details rule show)
+  if grep -Eq 'proto 201([[:space:]]|$)' <<<"$rules"; then
+    echo "$LABEL ERROR: protocol-201 rule remained after public down ($family)" >&2
+    exit 1
+  fi
+  routes=$(timeout --signal=KILL 5s ip "$family" route show table 52)
+  if grep -Fq "dev $TUN_NAME" <<<"$routes"; then
+    echo "$LABEL ERROR: table-52 route remained after public down ($family)" >&2
+    exit 1
+  fi
+done
+[[ "$(readlink -f /etc/resolv.conf)" == "$DNS_BASELINE_TARGET" ]]
+cmp -s "$TMP/resolv.conf.baseline" /etc/resolv.conf
+run_bounded 15 peer-withdrawal python3 - "$GO_IP" "$PEER_PORT" <<'PY'
+import socket
+import sys
+host, port = sys.argv[1], int(sys.argv[2])
+for _ in range(4):
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            raise SystemExit("peer remained reachable after public down")
+    except OSError:
+        pass
+print("peer reachability withdrawn: ok")
+PY
+
+# Down flushes its disconnect audit before returning. Prove the control server
+# is still alive and that exactly one strictly validated inner-Noise audit event
+# was accepted before public-up can mask a control-plane failure.
+run_bounded 10 audit-log-after-public-down \
+  python3 - "$CONTROL_URL" <<'PY'
+import json
+import re
+import sys
+import urllib.request
+base = sys.argv[1]
+with urllib.request.urlopen(base + "/testapi/health", timeout=2) as response:
+    assert response.status == 200
+    assert json.load(response) == {"ok": True}
+with urllib.request.urlopen(base + "/testapi/audit-log", timeout=2) as response:
+    assert response.status == 200
+    stats = json.load(response)
+assert stats["accepted"] == 1, stats
+assert stats["rejected"] == 0, stats
+assert stats["action"] == "DISCONNECT_NODE", stats
+assert stats["detailsLen"] > 0, stats
+assert stats["timestampSet"] is True, stats
+assert re.fullmatch(r"[0-9a-f]{64}", stats["bodySHA256"]), stats
+assert stats["lastError"] == "", stats
+PY
+
+run_bounded 90 public-up \
+  /usr/local/bin/tailscale up --accept-dns=true --timeout=60
+UP_STATUS=$(run_bounded 10 immediate-up-status \
+  /usr/local/bin/tailscale status --json)
+[[ "$(printf '%s' "$UP_STATUS" | backend_state)" == Running ]]
+[[ "$(printf '%s' "$UP_STATUS" | status_ip)" == "$RUST_IP" ]]
+run_bounded 10 immediate-up-prefs \
+  /usr/local/bin/tailscale get --json \
+  | python3 -c 'import json,sys; prefs=json.load(sys.stdin); assert prefs["WantRunning"] is True; assert prefs.get("LoggedOut", False) is False; assert prefs["CorpDNS"] is True'
+[[ "$(timeout --signal=KILL 5s systemctl show -p MainPID --value rustscaled.service)" \
+   == "$PID_LIFECYCLE" ]]
+[[ -d "/sys/class/net/$TUN_NAME" ]]
+ifindex=$(<"/sys/class/net/$TUN_NAME/ifindex")
+[[ "$ifindex" =~ ^[1-9][0-9]*$ ]]
+RULE_BASE=$((5000 + (ifindex % 200) * 100))
+rules=$(timeout --signal=KILL 5s ip -4 -details rule show)
+for expectation in \
+  "$((RULE_BASE + 10)):lookup main" \
+  "$((RULE_BASE + 30)):lookup default" \
+  "$((RULE_BASE + 50)):unreachable" \
+  "$((RULE_BASE + 70)):lookup 52"; do
+  preference=${expectation%%:*}
+  target=${expectation#*:}
+  rule=$(printf '%s\n' "$rules" \
+    | grep -E "^[[:space:]]*${preference}:.*proto 201([[:space:]]|$)" || true)
+  [[ -n "$rule" && "$rule" == *"$target"* ]]
+done
+timeout --signal=KILL 5s ip -4 route show table 52 \
+  | grep -E "^100[.]64[.]0[.]0/10 .*dev $TUN_NAME([[:space:]]|$)" >/dev/null
+[[ "$(readlink -f /etc/resolv.conf)" == "$DNS_ACTIVE_TARGET" ]]
+cmp -s "$TMP/resolv.conf.active" /etc/resolv.conf
+[[ "$(node_count)" == "$NODE_COUNT_BEFORE" ]]
+NODE_IDENTITY_AFTER=$(curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
+  | python3 -c 'import json,sys; wanted=sys.argv[1]; nodes=json.load(sys.stdin)["nodes"]; matches=[node for node in nodes if (node.get("ip") or "").split("/",1)[0] == wanted]; assert len(matches) == 1; node=matches[0]; print("{}|{}|{}".format(node["key"], node["id"], node["ip"]))' "$RUST_IP")
+[[ "$NODE_IDENTITY_AFTER" == "$NODE_IDENTITY_BEFORE" ]]
+# `tailscale up` returned Running only after this generation committed every
+# public resource above; one immediate roundtrip is therefore the assertion.
+run_bounded 5 lifecycle-restored-roundtrip \
+  python3 - "$GO_IP" "$PEER_PORT" <<'PY'
+import socket
+import sys
+payload = b"public-down-up-roundtrip\n"
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2) as connection:
+    connection.settimeout(2)
+    connection.sendall(payload)
+    received = connection.recv(len(payload))
+    if received != payload:
+        raise SystemExit(f"post-up Go peer echo mismatch: {received!r}")
 PY
 
 # Logout is durable before the LocalAPI call returns. Restart=always then starts

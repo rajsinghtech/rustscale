@@ -91,6 +91,15 @@ grep -q 'exact production archive and SHA256SUMS are required' tools/packaging/t
 grep -q 'assert_cli_contract' tools/packaging/test-linux-replacement.sh
 grep -q 'KillMode=control-group' tools/packaging/test-linux-replacement.sh
 grep -q 'RuntimeMaxSec=' tools/packaging/test-linux-replacement.sh
+# The protected replacement job carries the credential-free real-TUN contract;
+# no new workflow context may replace or hide that required journey.
+grep -q 'name: Installed Linux replacement journey' .github/workflows/ci.yml
+grep -Fq 'needs: [check, cross, msrv, testcontrol, linux-release-candidate, linux-replacement, ignore-guard]' .github/workflows/ci.yml
+grep -Fq 'systemctl is-system-running --wait' tools/packaging/test-linux-replacement.sh
+if grep -Fq 'systemd_attempt' tools/packaging/test-linux-replacement.sh; then
+    echo "systemd readiness must use native --wait, not a polling loop" >&2
+    exit 1
+fi
 grep -q 'timeout-minutes: 50' .github/workflows/ci.yml
 grep -q 'TESTCONTROL_GO_CLIENT_DIR' tools/testcontrol/build.sh
 
@@ -109,11 +118,47 @@ test "$preflight_line" -lt "$token_line"
 grep -Fq -- 'cargo test -p rustscale-tsnet --lib --no-run' tools/interop-tun.sh
 grep -Fq -- "target.get('name') == 'rustscale_tsnet'" tools/interop-tun.sh
 grep -Fq -- "'lib' in target.get('kind', [])" tools/interop-tun.sh
-grep -Fq -- "if ! \"\$TEST_BIN\" --ignored --list" tools/interop-tun.sh
-grep -Fq -- "grep -Fx 'tests::interop_tun_rust_dials_go: test' >/dev/null" tools/interop-tun.sh
+grep -Fq -- "selected_count=\$(\"\$TEST_BIN\" --ignored --list" tools/interop-tun.sh
+grep -Fq -- "grep -Fxc 'tests::interop_tun_rust_dials_go: test'" tools/interop-tun.sh
+grep -Fq -- "if [[ \"\$selected_count\" != 1 ]]; then" tools/interop-tun.sh
+grep -Fq -- "exact TUN selector matched \$selected_count tests (expected 1)" tools/interop-tun.sh
 grep -Fq -- 'sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_NAME,TS_INTEROP_GO_ECHO_PORT,TS_INTEROP_SOCKS' tools/interop-tun.sh
+grep -Fq -- 'set -eu' tools/interop-tun.sh
 grep -Fq -- 'sudo did not preserve the required interop environment' tools/interop-tun.sh
 grep -Fq -- 'export RUSTSCALE_REQUIRE_TUN_INTEROP=1' tools/interop-tun.sh
+# The producer and consumer form one exact, build-free artifact journey.
+# The candidate must use the release assembler, retain full-SHA identity, and
+# send the same named archive/checksum tree to the protected consumer.
+grep -Fq 'Attest producer checkout' .github/workflows/ci.yml
+# shellcheck disable=SC2016 # Literal GitHub expression contract.
+grep -Fq 'RUSTSCALE_VERSION_LONG="${version}-g${candidate_sha:0:7}"' .github/workflows/ci.yml
+grep -Fq 'tools/packaging/assemble-linux-release.sh' .github/workflows/ci.yml
+# shellcheck disable=SC2016 # Literal GitHub expression contract.
+grep -Fq 'linux-release-candidate-${{ steps.candidate.outputs.sha }}' .github/workflows/ci.yml
+grep -Fq 'RUSTSCALE_BUILD_SHA' tools/packaging/assemble-linux-release.sh
+grep -Fq 'SHA256SUMS' tools/packaging/assemble-linux-release.sh
+grep -Fq 'Attest consumer checkout' .github/workflows/ci.yml
+grep -Fq 'BUILD_FREE_CONSUMER' .github/workflows/ci.yml
+grep -Fq 'for tool in cargo rustc rustup' .github/workflows/ci.yml
+grep -Fq 'exact production archive and SHA256SUMS are required' tools/packaging/test-linux-replacement.sh
+grep -Fq 'archive build identity' tools/packaging/test-linux-replacement.sh
+consumer_job=$(awk '
+    /^  linux-replacement:/ { job = 1 }
+    job && /^  [A-Za-z0-9_-]+:/ && $1 != "linux-replacement:" { exit }
+    job { print }
+' .github/workflows/ci.yml)
+printf '%s\n' "$consumer_job" | grep -Fq 'needs: [linux-release-candidate]'
+printf '%s\n' "$consumer_job" | grep -Fq 'actions/download-artifact'
+printf '%s\n' "$consumer_job" | grep -Fq 'RUSTSCALE_RELEASE_SHA'
+if printf '%s\n' "$consumer_job" | grep -Eq 'rust-toolchain|rust-cache|^[[:space:]]*(cargo|rustc|rustup)[[:space:]]'; then
+    echo "artifact consumer configures or invokes a Rust build tool" >&2
+    exit 1
+fi
+if grep -Eqi '\b(cargo|rustc|rustup)\b' tools/packaging/test-linux-replacement.sh; then
+    echo "artifact consumer journey invokes a Rust build tool" >&2
+    exit 1
+fi
+
 # Match exact source text retaining the escaped child argv.
 # shellcheck disable=SC2016
 grep -Fq -- 'exec \"\$@\"' tools/interop-tun.sh

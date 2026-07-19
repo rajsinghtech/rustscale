@@ -401,16 +401,32 @@ async fn wait_router_cleanup(router: &SharedRouter) -> Result<(), TsnetError> {
     }
 }
 
-async fn shutdown_magicsock(magicsock: &Magicsock) -> Result<(), String> {
-    let portmapper = magicsock
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PortmapperCleanup {
+    Confirmed,
+    ExternalReleaseUnconfirmed,
+}
+
+async fn shutdown_magicsock(magicsock: &Magicsock) -> Result<PortmapperCleanup, String> {
+    let portmapper = match magicsock
         .shutdown_portmapper(COMPONENT_SHUTDOWN_TIMEOUT)
         .await
-        .map_err(|error| format!("portmapper cleanup incomplete: {error}"));
+    {
+        Ok(()) => Ok(PortmapperCleanup::Confirmed),
+        Err(rustscale_portmapper::PortMapError::ExternalReleaseUnconfirmed) => {
+            Ok(PortmapperCleanup::ExternalReleaseUnconfirmed)
+        }
+        Err(error) => Err(format!("portmapper cleanup incomplete: {error}")),
+    };
     let runtime = magicsock
         .shutdown(COMPONENT_SHUTDOWN_TIMEOUT)
         .await
         .map_err(|error| format!("magicsock cleanup incomplete: {error}"));
-    portmapper.and(runtime)
+    match (portmapper, runtime) {
+        (_, Err(error)) => Err(error),
+        (Ok(cleanup), Ok(())) => Ok(cleanup),
+        (Err(error), Ok(())) => Err(error),
+    }
 }
 
 struct PrestartedMagicsockRollback {
@@ -769,8 +785,10 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     for control in &in_memory_clients {
         control.invalidate();
     }
-    if let Some(path) = inner.localapi_socket.take() {
-        let _ = std::fs::remove_file(path);
+    if !preserve_localapi {
+        if let Some(path) = inner.localapi_socket.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
     crate::capture::clear(&inner.capture);
     if let Ok(mut handles) = inner.capture_handles.lock() {
@@ -815,6 +833,68 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     }
 }
 
+fn close_os_dns_configurator(
+    configurator: &mut Option<Box<dyn OsConfigurator + Send>>,
+) -> Result<(), String> {
+    let Some(owner) = configurator.as_mut() else {
+        return Ok(());
+    };
+    owner.close().map_err(|error| error.to_string())?;
+    configurator.take();
+    Ok(())
+}
+
+/// Return whether this persisted map is sufficient to admit an explicitly
+/// degraded offline generation. Any missing, expired, or mismatched identity
+/// material is rejected before it can affect readiness.
+pub(crate) fn cached_netmap_is_usable(
+    state: &PersistedState,
+    node_pub: &NodePublic,
+    cached: &crate::state::NetMapCacheData,
+) -> bool {
+    state.is_enrolled()
+        && !state.tailnet_identity.is_empty()
+        && cached.node_key == *node_pub
+        && cached.map_response.Domain == state.tailnet_identity
+        && cached.map_response.Peers.is_some()
+        && cached.map_response.Node.as_ref().is_some_and(|node| {
+            node.Key == *node_pub
+                && node
+                    .KeyExpiry
+                    .is_none_or(|expiry| expiry > chrono::Utc::now())
+        })
+        && !extract_tailscale_ips(&cached.map_response).is_empty()
+}
+
+/// Configure requested OS DNS without letting a setup failure masquerade as
+/// healthy. The owner is retained even after a failed setup because a platform
+/// configurator may have made a partial change which must be cleaned up during
+/// `down`/`close`.
+pub(crate) fn configure_requested_os_dns(
+    mut configurator: Box<dyn OsConfigurator + Send>,
+    config: &OsConfig,
+    health: &Tracker,
+) -> Box<dyn OsConfigurator + Send> {
+    match configurator.set_dns(config) {
+        Ok(()) => {
+            health.set_healthy(WARN_OS_DNS);
+            log::info!(
+                "tsnet: OS DNS configured ({} match domains, {} search domains)",
+                config.match_domains.len(),
+                config.search_domains.len()
+            );
+        }
+        Err(error) => {
+            health.set_unhealthy(
+                WARN_OS_DNS,
+                format!("requested OS DNS configuration failed: {error}"),
+            );
+            log::warn!("tsnet: OS DNS configuration failed; reporting degraded health: {error}");
+        }
+    }
+    configurator
+}
+
 async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningState, String)> {
     // Extension shutdown has succeeded, so dependencies owned by the router,
     // DNS configurator, and magicsock can now be released.
@@ -824,15 +904,22 @@ async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningSta
             return Err((inner, format!("route cleanup: {error}")));
         }
     }
-    if let Some(configurator) = inner.os_dns_configurator.as_mut() {
-        if let Err(error) = configurator.close() {
-            log::warn!("tsnet: OS DNS cleanup failed (non-fatal): {error}");
-        }
+    if let Err(error) = close_os_dns_configurator(&mut inner.os_dns_configurator) {
+        log::warn!("tsnet: retaining OS DNS cleanup owner: {error}");
+        return Err((inner, format!("OS DNS cleanup: {error}")));
     }
-    inner.os_dns_configurator.take();
-    if let Err(error) = shutdown_magicsock(&inner.magicsock).await {
-        log::warn!("tsnet: retaining running cleanup owner: {error}");
-        return Err((inner, format!("magicsock cleanup: {error}")));
+    match shutdown_magicsock(&inner.magicsock).await {
+        Ok(PortmapperCleanup::Confirmed) => {}
+        Ok(PortmapperCleanup::ExternalReleaseUnconfirmed) => {
+            // All local portmapper tasks and send gates are closed. NAT lease
+            // deletion is inherently unconfirmable on some routers, so retain
+            // neither this complete running owner nor restart delay.
+            log::warn!("tsnet: external port mapping release remains unconfirmed");
+        }
+        Err(error) => {
+            log::warn!("tsnet: retaining running cleanup owner: {error}");
+            return Err((inner, format!("magicsock cleanup: {error}")));
+        }
     }
     inner.health_watchdog.stop_and_wait().await;
 
@@ -858,6 +945,46 @@ fn lifecycle_cleanup_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("build lifecycle cleanup supervisor runtime")
     })
+}
+
+/// Retire a running generation while preserving its LocalAPI listener long
+/// enough for an admitted `down` request to receive the daemon-owned result.
+/// The caller must atomically publish a stopped replacement before shutting
+/// this returned listener down.
+async fn cleanup_server_state_preserving_localapi(
+    mut owner: CleanupOwner,
+) -> Result<localapi::LocalApiHandle, (CleanupOwner, String)> {
+    if let Some(inner) = owner.inner.as_mut() {
+        quiesce_running_state(inner, true).await;
+    }
+    if let Some(pre_started) = owner.pre_started.as_mut() {
+        quiesce_pre_started(pre_started).await;
+    }
+    if let Some(host) = owner.extension_host.take() {
+        if let Err(host) = shutdown_extension_host(host).await {
+            owner.extension_host = Some(host);
+            return Err((owner, "extension shutdown remains incomplete".into()));
+        }
+    }
+
+    let localapi = owner
+        .inner
+        .as_mut()
+        .and_then(|inner| inner.localapi_handle.take());
+    let Some(localapi) = localapi else {
+        return Err((owner, "running generation has no LocalAPI listener".into()));
+    };
+    if let Some(inner) = owner.inner.take() {
+        if let Err((mut inner, reason)) = finish_running_state(inner).await {
+            inner.localapi_handle = Some(localapi);
+            owner.inner = Some(inner);
+            return Err((owner, reason));
+        }
+    }
+    if let Some(pre_started) = owner.pre_started.take() {
+        cleanup_pre_started(pre_started, true).await;
+    }
+    Ok(localapi)
 }
 
 async fn cleanup_server_state(mut owner: CleanupOwner) -> Result<(), (CleanupOwner, String)> {
@@ -1600,6 +1727,8 @@ impl Server {
             let state = localapi::LocalApiState {
                 mutation_fence: Arc::clone(&localapi_mutation_fence),
                 mutation_generation: localapi_mutation_generation,
+                #[cfg(test)]
+                status_build_hook: None,
                 peers: b.peers.clone(),
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
@@ -1847,8 +1976,12 @@ impl Server {
 
         self.inner = Some(running);
         // Publish Running only after the complete runtime generation is owned
-        // by `self.inner`; cancellation before this point retains Starting.
-        startup_backend.set_blocked(false);
+        // by `self.inner`; stale map/engine callbacks have no publication
+        // authority. Cancellation before this point remains non-Running.
+        assert!(
+            startup_backend.commit_startup_generation(b.startup_generation),
+            "startup generation was superseded before commit"
+        );
         if retire_prestarted {
             self.retire_prestarted_after_handoff();
         }
@@ -2273,6 +2406,8 @@ impl Server {
             let state = localapi::LocalApiState {
                 mutation_fence: Arc::clone(&localapi_mutation_fence),
                 mutation_generation: localapi_mutation_generation,
+                #[cfg(test)]
+                status_build_hook: None,
                 peers: b.peers.clone(),
                 user_profiles: b.user_profiles.clone(),
                 health: b.health.clone(),
@@ -2424,9 +2559,10 @@ impl Server {
         rollback.localapi_socket.clone_from(&localapi_socket);
 
         // OS DNS configuration (macOS: /etc/resolver entries pointing at
-        // 100.100.100.100). Opt-in via `configure_os_dns(true)` — requires
-        // root. Best-effort: permission errors are logged and do not prevent
-        // up_tun from completing.
+        // 100.100.100.100). A requested setup has one terminal outcome:
+        // its owner commits and status is either healthy or immediately
+        // degraded. DNS failure alone does not revoke an otherwise committed
+        // TUN data plane, matching pinned upstream semantics.
         rollback.os_dns_configurator = if self.config.configure_os_dns {
             let dns_cfg_snapshot = b.dns_config.read().await.clone();
             let os_cfg = if let Some(ref dc) = dns_cfg_snapshot {
@@ -2437,24 +2573,34 @@ impl Server {
                     ..Default::default()
                 }
             };
-            let mut configurator: Box<dyn OsConfigurator + Send> = Box::new(new_os_configurator());
-            match configurator.set_dns(&os_cfg) {
-                Ok(()) => {
-                    log::info!(
-                        "tsnet: OS DNS configured ({} match domains, {} search domains)",
-                        os_cfg.match_domains.len(),
-                        os_cfg.search_domains.len()
-                    );
-                    Some(configurator)
+            let configurator: Box<dyn OsConfigurator + Send> = {
+                #[cfg(test)]
+                {
+                    self.config
+                        .os_dns_configurator_factory
+                        .as_ref()
+                        .map(|factory| factory())
+                        .unwrap_or_else(|| Box::new(new_os_configurator()))
                 }
-                Err(e) => {
-                    log::warn!("tsnet: OS DNS configuration failed (non-fatal, needs root?): {e}");
-                    None
+                #[cfg(not(test))]
+                {
+                    Box::new(new_os_configurator())
                 }
-            }
+            };
+            Some(configure_requested_os_dns(configurator, &os_cfg, &b.health))
         } else {
             None
         };
+        #[cfg(test)]
+        if let Some((entered, release, fail)) = self.startup_localapi_test_hook.clone() {
+            entered.wait().await;
+            release.wait().await;
+            if fail {
+                return Err(TsnetError::Builder(
+                    "injected failure after TUN DNS setup".into(),
+                ));
+            }
+        }
         let extension_subscription = self
             .finish_tun_startup(b.ipn_backend.clone(), prefs.clone())
             .await?;
@@ -2530,7 +2676,13 @@ impl Server {
             extension_subscription,
         });
 
-        startup_backend.set_blocked(false);
+        // This is the sole TUN-mode Running publication point: TUN/router,
+        // DNS outcome, pump tasks, LocalAPI handoff, and cleanup ownership are
+        // now all part of `self.inner`.
+        assert!(
+            startup_backend.commit_startup_generation(b.startup_generation),
+            "startup generation was superseded before commit"
+        );
         if retire_prestarted {
             self.retire_prestarted_after_handoff();
         }
@@ -2716,6 +2868,33 @@ impl Server {
     pub async fn start_localapi_only(
         &mut self,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
+        self.start_localapi_with_state(false, None).await
+    }
+
+    /// Recreate LocalAPI after `down` without restoring the retired runtime.
+    /// The persisted node key remains available for a subsequent `up`, but
+    /// backend status is truthfully `Stopped` rather than `NeedsLogin`.
+    pub async fn start_localapi_stopped(
+        &mut self,
+    ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
+        self.start_localapi_with_state(true, None).await
+    }
+
+    /// Publish a stopped listener over a retired running listener. The old
+    /// handle remains caller-owned until it has delivered the admitted down
+    /// response, preventing LocalAPI's child drain from deadlocking teardown.
+    pub async fn start_localapi_stopped_replacing(
+        &mut self,
+        previous: &mut localapi::LocalApiHandle,
+    ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
+        self.start_localapi_with_state(true, Some(previous)).await
+    }
+
+    async fn start_localapi_with_state(
+        &mut self,
+        stopped: bool,
+        previous: Option<&mut localapi::LocalApiHandle>,
+    ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
         self.shutdown_supervisor.wait().await;
         self.startup_supervisor.wait().await;
         if self.shutdown_supervisor.has_retained_logout()
@@ -2736,11 +2915,13 @@ impl Server {
         Self::retry_pending_router_cleanup().await?;
 
         let ipn_backend = Arc::new(IpnBackend::new("rustscale"));
-        ipn_backend.set_want_running();
-        ipn_backend.set_auth_cant_continue(true);
-        // Block engine updates while waiting for auth — mirrors Go's
-        // blockEngineUpdatesLocked(true) on NeedsLogin enter.
-        ipn_backend.set_blocked(true);
+        if !stopped {
+            ipn_backend.set_want_running();
+            ipn_backend.set_auth_cant_continue(true);
+            // Block engine updates while waiting for auth — mirrors Go's
+            // blockEngineUpdatesLocked(true) on NeedsLogin enter.
+            ipn_backend.set_blocked(true);
+        }
 
         let state = self.load_startup_state()?;
         let was_fresh = state.is_zero();
@@ -2753,8 +2934,20 @@ impl Server {
         };
         ipn_backend.set_has_node_key(!state.is_zero());
 
-        let prefs = self.load_prefs().unwrap_or_default();
-        let prefs = Arc::new(RwLock::new(prefs));
+        let loaded_prefs = self.load_prefs().unwrap_or_default();
+        if stopped {
+            // A logged-out profile must remain NeedsLogin; a retained identity
+            // with WantRunning=false is the distinct Stopped state.
+            ipn_backend.set_logged_out(loaded_prefs.LoggedOut);
+            ipn_backend.update_inputs(|inputs| {
+                inputs.want_running = false;
+                inputs.auth_cant_continue = false;
+                inputs.netmap_present = false;
+                inputs.num_live = 0;
+                inputs.live_derps = 0;
+            });
+        }
+        let prefs = Arc::new(RwLock::new(loaded_prefs));
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let command_tx_clone = command_tx.clone();
@@ -2799,6 +2992,8 @@ impl Server {
         let api_state = Arc::new(localapi::LocalApiState {
             mutation_fence: Arc::clone(&mutation_fence),
             mutation_generation,
+            #[cfg(test)]
+            status_build_hook: None,
             peers: Arc::new(RwLock::new(vec![])),
             routecheck: None,
             user_profiles: Arc::new(RwLock::new(BTreeMap::new())),
@@ -2879,7 +3074,31 @@ impl Server {
             .await
             .map_err(TsnetError::Builder)?;
 
-        let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());
+        let handle = if let Some(previous) = previous {
+            let Some((mut replacement, start, mut handoff)) =
+                localapi::spawn_localapi_paused(api_state.clone(), socket_path.clone())
+            else {
+                return Err(TsnetError::Builder(format!(
+                    "failed to prepare stopped LocalAPI replacement at {}",
+                    socket_path.display()
+                )));
+            };
+            start.send(()).map_err(|()| {
+                TsnetError::Builder("stopped LocalAPI replacement failed to activate".into())
+            })?;
+            handoff.commit(&mut replacement).map_err(|error| {
+                TsnetError::Builder(format!(
+                    "failed to publish stopped LocalAPI replacement: {error}"
+                ))
+            })?;
+            // The old listener is no longer reachable by new clients. Keep
+            // its accepted down handler alive until the daemon sends its
+            // completion, then the caller drains it preserving this path.
+            previous.socket_path.clone_from(&socket_path);
+            Some(replacement)
+        } else {
+            localapi::spawn_localapi(api_state.clone(), socket_path.clone())
+        };
         if handle.is_some() {
             log::info!(
                 "tsnet: LocalAPI (needs-login) listening at {}",
@@ -3074,15 +3293,16 @@ impl Server {
         // increments with no error paths.
         let sockstats = Arc::new(rustscale_sockstats::SockStats::new());
 
-        // IPN state machine backend. Created early so state transitions
-        // are tracked from the start. Want_running is set immediately;
-        // other inputs are set as bootstrap progresses.
+        // Admit a new startup transaction before any control/map task can
+        // report telemetry. This revokes the stopped generation's stale map
+        // and engine observations and keeps public state non-Running until
+        // the final ownership + LocalAPI handoff commit below.
         let ipn_backend = if let Some(ref ps) = self.pre_started {
             ps.backend.clone()
         } else {
             Arc::new(IpnBackend::new("rustscale"))
         };
-        ipn_backend.set_want_running();
+        let startup_generation = ipn_backend.begin_startup_generation();
 
         // 1. Generate persistent key material when no state was loaded.
         let was_fresh = state.is_zero();
@@ -3115,166 +3335,212 @@ impl Server {
         let cached_netmap = state_scope.as_ref().and_then(|scope| {
             let cache = NetMapCache::new_scoped(scope, &state.tailnet_identity);
             let cached = cache.load()?;
-            if cached.node_key == node_pub
-                && cached.map_response.Node.is_some()
-                && cached.map_response.Peers.is_some()
-            {
+            if cached_netmap_is_usable(&state, &node_pub, &cached) {
                 Some(cached.map_response)
             } else {
+                log::warn!("tsnet: netmap cache is incomplete, expired, or identity-mismatched; discarding");
                 cache.clear();
                 None
             }
         });
 
-        // 2. Fetch the server's Noise public key (GET /key?v=<version>).
-        let server_pub_key = controlhttp::fetch_server_pub_key(
+        let cached_control_key = cached_netmap.as_ref().and_then(|_| {
+            state_scope.as_ref().and_then(|scope| {
+                NetMapCache::new_scoped(scope, &state.tailnet_identity).load_control_server_key()
+            })
+        });
+
+        // 2. Fetch the server's Noise public key (GET /key?v=<version>). A
+        // fully validated cache can start while control is unavailable, but
+        // only using the previously authenticated control key and with an
+        // immediately-visible degraded control health state.
+        let mut control_offline = false;
+        let server_pub_key = match controlhttp::fetch_server_pub_key(
             &self.config.control_url,
             PROTOCOL_VERSION,
             self.config.extra_root_certs.as_deref(),
         )
         .await
-        .map_err(|e| TsnetError::Register(rustscale_controlclient::RegisterError::Dial(e)))?;
+        {
+            Ok(key) => {
+                if let Some(scope) = state_scope.as_ref() {
+                    if let Err(error) = NetMapCache::new_scoped(scope, &state.tailnet_identity)
+                        .save_control_server_key(&key)
+                    {
+                        log::warn!("tsnet: failed to persist control server key for offline cache: {error}");
+                    }
+                }
+                key
+            }
+            Err(error) if cached_netmap.is_some() && state.is_enrolled() => {
+                let Some(cached_key) = cached_control_key else {
+                    return Err(TsnetError::Register(
+                        rustscale_controlclient::RegisterError::Dial(error),
+                    ));
+                };
+                control_offline = true;
+                health.set_unhealthy(
+                    WARN_CACHED_NETMAP,
+                    format!("control unavailable; using validated cached netmap: {error}"),
+                );
+                cached_key
+            }
+            Err(error) => {
+                return Err(TsnetError::Register(
+                    rustscale_controlclient::RegisterError::Dial(error),
+                ));
+            }
+        };
 
         // 3. Register with the control plane. Authentication is consumed by
         // this one request and omitted from followups and all later refreshes.
-        let mut cc = ControlClient::new(
-            self.config.control_url.clone(),
-            state.machine_key.clone(),
-            server_pub_key.clone(),
-            PROTOCOL_VERSION,
-        );
-        if let Some(certs) = self.config.extra_root_certs.clone() {
-            cc.set_extra_root_certs(certs);
-        }
-
-        let node_key_signature = initial_auth
-            .as_ref()
-            .map(|auth| auth.node_key_signature(&node_pub))
-            .transpose()?
-            .flatten();
-        let mut reg_req = RegisterRequest {
-            Version: CAPABILITY_VERSION,
-            NodeKey: node_pub.clone(),
-            Auth: take_initial_register_auth(&mut initial_auth),
-            NodeKeySignature: node_key_signature,
-            Hostinfo: Some(Hostinfo {
-                OS: std::env::consts::OS.to_string(),
-                Hostname: self.config.hostname.clone(),
-                BackendLogID: backend_log_id.clone(),
-                RoutableIPs: advertise.clone(),
-                RequestTags: self.config.advertise_tags.clone(),
-                PeerRelay: self.config.peer_relay_server,
-                ..Default::default()
-            }),
-            Ephemeral: self.config.ephemeral,
-            ..Default::default()
-        };
-
-        drop(initial_auth);
-        let register_result = cc.register(&reg_req).await;
-        clear_register_auth(&mut reg_req);
-        let reg_resp = register_result.map_err(|e| {
-            // Auth/network failure is ambiguous. The key is not retained, so
-            // a fresh WIF key is minted if the caller starts again.
-            if let Some(scope) = state_scope.as_ref() {
-                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
-                log::warn!("tsnet: cleared netmap cache after register error: {e}");
-            }
-            ipn_backend.emit_err_message(e.to_string());
-            TsnetError::Register(e)
-        })?;
-
-        // Server-side error string (e.g. "invalid auth key", "node key revoked").
-        if !reg_resp.Error.is_empty() {
-            if let Some(scope) = state_scope.as_ref() {
-                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
-                log::warn!(
-                    "tsnet: cleared netmap cache after register error: {}",
-                    reg_resp.Error
-                );
-            }
-            ipn_backend.emit_err_message(&reg_resp.Error);
-            return Err(TsnetError::Builder(format!(
-                "control register rejected: {}",
-                reg_resp.Error
-            )));
-        }
-
-        // Node key expired — the server says our key is no longer valid.
-        // Clear the cache so we don't reuse a netmap bound to the old key.
-        if reg_resp.NodeKeyExpired {
-            if let Some(scope) = state_scope.as_ref() {
-                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
-                log::info!("tsnet: cleared netmap cache: node key expired");
-            }
-            ipn_backend.set_key_expired(true);
-        }
-
-        if reg_resp.AuthURL.is_empty() {
-            ipn_backend.set_machine_authorized(reg_resp.MachineAuthorized);
-            // A pre-started daemon keeps its startup block until all runtime
-            // resources and the LocalAPI handoff commit. Authentication alone
-            // must not publish Running while Server::up is still cancellable.
+        if control_offline {
+            // The cache validation above proves a durable enrolled self node,
+            // its non-expired address, and the exact profile/control/tailnet
+            // binding. It cannot prove current peer authority, which is
+            // withdrawn below until fresh Tailnet Lock confirmation.
+            ipn_backend.set_machine_authorized(true);
             ipn_backend.emit_login_finished();
-            state.node_id = reg_resp.User.ID;
-            state.enrolled = true;
-            self.save_state(&state)?;
         } else {
-            ipn_backend.set_auth_cant_continue(true);
-            // Block engine updates while waiting for interactive auth.
-            ipn_backend.set_blocked(true);
-            ipn_backend.emit_browse_to_url(&reg_resp.AuthURL);
+            let mut cc = ControlClient::new(
+                self.config.control_url.clone(),
+                state.machine_key.clone(),
+                server_pub_key.clone(),
+                PROTOCOL_VERSION,
+            );
+            if let Some(certs) = self.config.extra_root_certs.clone() {
+                cc.set_extra_root_certs(certs);
+            }
 
-            if let Some(ref ps) = self.pre_started {
-                {
-                    let mut au = ps.auth_url.lock().unwrap();
-                    *au = Some(reg_resp.AuthURL.clone());
-                }
-                ps.login_trigger.notified().await;
-                {
-                    let mut au = ps.auth_url.lock().unwrap();
-                    *au = None;
-                }
-                ipn_backend.set_auth_cant_continue(false);
-
-                let followup_req = RegisterRequest {
-                    Version: CAPABILITY_VERSION,
-                    NodeKey: node_pub.clone(),
-                    Followup: reg_resp.AuthURL.clone(),
-                    Hostinfo: Some(Hostinfo {
-                        OS: std::env::consts::OS.to_string(),
-                        Hostname: self.config.hostname.clone(),
-                        RoutableIPs: advertise.clone(),
-                        RequestTags: self.config.advertise_tags.clone(),
-                        PeerRelay: self.config.peer_relay_server,
-                        ..Default::default()
-                    }),
-                    Ephemeral: self.config.ephemeral,
+            let node_key_signature = initial_auth
+                .as_ref()
+                .map(|auth| auth.node_key_signature(&node_pub))
+                .transpose()?
+                .flatten();
+            let mut reg_req = RegisterRequest {
+                Version: CAPABILITY_VERSION,
+                NodeKey: node_pub.clone(),
+                Auth: take_initial_register_auth(&mut initial_auth),
+                NodeKeySignature: node_key_signature,
+                Hostinfo: Some(Hostinfo {
+                    OS: std::env::consts::OS.to_string(),
+                    Hostname: self.config.hostname.clone(),
+                    BackendLogID: backend_log_id.clone(),
+                    RoutableIPs: advertise.clone(),
+                    RequestTags: self.config.advertise_tags.clone(),
+                    PeerRelay: self.config.peer_relay_server,
                     ..Default::default()
-                };
-                let followup_resp = cc.register(&followup_req).await.map_err(|e| {
-                    if let Some(scope) = state_scope.as_ref() {
-                        NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
-                    }
-                    ipn_backend.emit_err_message(e.to_string());
-                    TsnetError::Register(e)
-                })?;
+                }),
+                Ephemeral: self.config.ephemeral,
+                ..Default::default()
+            };
 
-                if followup_resp.Error.is_empty() {
-                    ipn_backend.set_machine_authorized(followup_resp.MachineAuthorized);
-                    ipn_backend.emit_login_finished();
-                    state.node_id = followup_resp.User.ID;
-                    state.enrolled = true;
-                    self.save_state(&state)?;
-                } else {
-                    ipn_backend.emit_err_message(&followup_resp.Error);
-                    return Err(TsnetError::Builder(format!(
-                        "control register (followup) rejected: {}",
-                        followup_resp.Error
-                    )));
+            drop(initial_auth);
+            let register_result = cc.register(&reg_req).await;
+            clear_register_auth(&mut reg_req);
+            let reg_resp = register_result.map_err(|e| {
+                // Auth/network failure is ambiguous. The key is not retained, so
+                // a fresh WIF key is minted if the caller starts again.
+                if let Some(scope) = state_scope.as_ref() {
+                    NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                    log::warn!("tsnet: cleared netmap cache after register error: {e}");
                 }
+                ipn_backend.emit_err_message(e.to_string());
+                TsnetError::Register(e)
+            })?;
+
+            // Server-side error string (e.g. "invalid auth key", "node key revoked").
+            if !reg_resp.Error.is_empty() {
+                if let Some(scope) = state_scope.as_ref() {
+                    NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                    log::warn!(
+                        "tsnet: cleared netmap cache after register error: {}",
+                        reg_resp.Error
+                    );
+                }
+                ipn_backend.emit_err_message(&reg_resp.Error);
+                return Err(TsnetError::Builder(format!(
+                    "control register rejected: {}",
+                    reg_resp.Error
+                )));
+            }
+
+            // Node key expired — the server says our key is no longer valid.
+            // Clear the cache so we don't reuse a netmap bound to the old key.
+            if reg_resp.NodeKeyExpired {
+                if let Some(scope) = state_scope.as_ref() {
+                    NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                    log::info!("tsnet: cleared netmap cache: node key expired");
+                }
+                ipn_backend.set_key_expired(true);
+            }
+
+            if reg_resp.AuthURL.is_empty() {
+                ipn_backend.set_machine_authorized(reg_resp.MachineAuthorized);
+                // A pre-started daemon keeps its startup block until all runtime
+                // resources and the LocalAPI handoff commit. Authentication alone
+                // must not publish Running while Server::up is still cancellable.
+                ipn_backend.emit_login_finished();
+                state.node_id = reg_resp.User.ID;
+                state.enrolled = true;
+                self.save_state(&state)?;
             } else {
-                return Err(TsnetError::AuthRequired(reg_resp.AuthURL));
+                ipn_backend.set_auth_cant_continue(true);
+                // Block engine updates while waiting for interactive auth.
+                ipn_backend.set_blocked(true);
+                ipn_backend.emit_browse_to_url(&reg_resp.AuthURL);
+
+                if let Some(ref ps) = self.pre_started {
+                    {
+                        let mut au = ps.auth_url.lock().unwrap();
+                        *au = Some(reg_resp.AuthURL.clone());
+                    }
+                    ps.login_trigger.notified().await;
+                    {
+                        let mut au = ps.auth_url.lock().unwrap();
+                        *au = None;
+                    }
+                    ipn_backend.set_auth_cant_continue(false);
+
+                    let followup_req = RegisterRequest {
+                        Version: CAPABILITY_VERSION,
+                        NodeKey: node_pub.clone(),
+                        Followup: reg_resp.AuthURL.clone(),
+                        Hostinfo: Some(Hostinfo {
+                            OS: std::env::consts::OS.to_string(),
+                            Hostname: self.config.hostname.clone(),
+                            RoutableIPs: advertise.clone(),
+                            RequestTags: self.config.advertise_tags.clone(),
+                            PeerRelay: self.config.peer_relay_server,
+                            ..Default::default()
+                        }),
+                        Ephemeral: self.config.ephemeral,
+                        ..Default::default()
+                    };
+                    let followup_resp = cc.register(&followup_req).await.map_err(|e| {
+                        if let Some(scope) = state_scope.as_ref() {
+                            NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                        }
+                        ipn_backend.emit_err_message(e.to_string());
+                        TsnetError::Register(e)
+                    })?;
+
+                    if followup_resp.Error.is_empty() {
+                        ipn_backend.set_machine_authorized(followup_resp.MachineAuthorized);
+                        ipn_backend.emit_login_finished();
+                        state.node_id = followup_resp.User.ID;
+                        state.enrolled = true;
+                        self.save_state(&state)?;
+                    } else {
+                        ipn_backend.emit_err_message(&followup_resp.Error);
+                        return Err(TsnetError::Builder(format!(
+                            "control register (followup) rejected: {}",
+                            followup_resp.Error
+                        )));
+                    }
+                } else {
+                    return Err(TsnetError::AuthRequired(reg_resp.AuthURL));
+                }
             }
         }
 
@@ -3336,9 +3602,13 @@ impl Server {
             server_pub_key.clone(),
             PROTOCOL_VERSION,
         );
-        match cc_ep.send_map_request(&endpoint_update_req).await {
-            Ok(()) => log::debug!("tsnet: endpoint update sent (DiscoKey + {local_endpoints:?})"),
-            Err(e) => log::warn!("tsnet: endpoint update failed (non-fatal): {e}"),
+        if !control_offline {
+            match cc_ep.send_map_request(&endpoint_update_req).await {
+                Ok(()) => {
+                    log::debug!("tsnet: endpoint update sent (DiscoKey + {local_endpoints:?})");
+                }
+                Err(e) => log::warn!("tsnet: endpoint update failed (non-fatal): {e}"),
+            }
         }
 
         // 4. Always prefer a fresh, authoritative non-streaming snapshot.
@@ -3361,31 +3631,51 @@ impl Server {
             }),
             ..Default::default()
         };
-        let fresh_map = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            cc_ep.fetch_map(&fetch_req),
-        )
-        .await;
-        let (map_resp, used_cached_netmap): (MapResponse, bool) = match fresh_map {
-            Ok(Ok(response)) => (response, false),
-            Ok(Err(error)) => match cached_netmap {
-                Some(cached) => {
-                    log::warn!("tsnet: fresh netmap failed; using withdrawn cache: {error}");
-                    (cached, true)
-                }
-                None => return Err(error.into()),
-            },
-            Err(_) => match cached_netmap {
-                Some(cached) => {
-                    log::warn!("tsnet: fresh netmap timed out; using withdrawn cache");
-                    (cached, true)
-                }
-                None => return Err(TsnetError::MapTimeout),
-            },
+        let (map_resp, used_cached_netmap): (MapResponse, bool) = if control_offline {
+            (
+                cached_netmap.expect("offline startup requires validated cache"),
+                true,
+            )
+        } else {
+            let fresh_map = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                cc_ep.fetch_map(&fetch_req),
+            )
+            .await;
+            match fresh_map {
+                Ok(Ok(response)) => (response, false),
+                Ok(Err(error)) => match cached_netmap {
+                    Some(cached) => {
+                        health.set_unhealthy(
+                            WARN_CACHED_NETMAP,
+                            format!(
+                                "fresh netmap unavailable; using validated cached netmap: {error}"
+                            ),
+                        );
+                        log::warn!("tsnet: fresh netmap failed; using withdrawn cache: {error}");
+                        (cached, true)
+                    }
+                    None => return Err(error.into()),
+                },
+                Err(_) => match cached_netmap {
+                    Some(cached) => {
+                        health.set_unhealthy(
+                            WARN_CACHED_NETMAP,
+                            "fresh netmap timed out; using validated cached netmap",
+                        );
+                        log::warn!("tsnet: fresh netmap timed out; using withdrawn cache");
+                        (cached, true)
+                    }
+                    None => return Err(TsnetError::MapTimeout),
+                },
+            }
         };
 
         if !map_resp.Domain.is_empty() {
             if !state.tailnet_identity.is_empty() && state.tailnet_identity != map_resp.Domain {
+                if let Some(scope) = state_scope.as_ref() {
+                    NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                }
                 return Err(TsnetError::TailnetLock(
                     "control returned a different tailnet for this durable profile identity".into(),
                 ));
@@ -3935,6 +4225,7 @@ impl Server {
             overrides: self.config.overrides.clone(),
             key_expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ipn_backend,
+            startup_generation,
             map_session,
             sockstats,
             backend_log_id,
@@ -3951,6 +4242,50 @@ impl Server {
     /// supervisor before the first await. Dropping this future or destroying
     /// its caller runtime therefore cannot strand running tasks, sockets,
     /// routes, DNS state, serve listeners, or extensions.
+    /// Retire the active data plane but retain the current LocalAPI handle for
+    /// an atomic handoff to Stopped. This is exclusively for daemon-owned
+    /// `down`; ordinary close continues to drain LocalAPI before returning.
+    pub async fn close_preserving_localapi(
+        &mut self,
+    ) -> Result<localapi::LocalApiHandle, TsnetError> {
+        if self.shutdown_supervisor.has_retained_logout() {
+            return Err(TsnetError::ShutdownIncomplete(
+                "logout transaction is incomplete; retry logout before close".into(),
+            ));
+        }
+        let owner = CleanupOwner::take_from(self);
+        if owner.is_empty() {
+            return Err(TsnetError::ShutdownIncomplete(
+                "running server owner is unavailable for down".into(),
+            ));
+        }
+        let drive = Arc::clone(&self.drive);
+        let bootstrap_supervisor = Arc::clone(&self.bootstrap_supervisor);
+        let startup_supervisor = Arc::clone(&self.startup_supervisor);
+        let shutdown_supervisor = Arc::clone(&self.shutdown_supervisor);
+        let cleanup_runtime = lifecycle_cleanup_runtime();
+        let completion = shutdown_supervisor.begin_cleanup();
+        let cleanup_supervisor = Arc::clone(&shutdown_supervisor);
+        let cleanup = cleanup_runtime.spawn(async move {
+            let _completion = completion;
+            bootstrap_supervisor.wait().await;
+            startup_supervisor.wait().await;
+            drive.disable().await;
+            match cleanup_server_state_preserving_localapi(owner).await {
+                Ok(handle) => Ok(handle),
+                Err((owner, reason)) => {
+                    cleanup_supervisor.retain_owner(owner);
+                    Err(TsnetError::ShutdownIncomplete(format!(
+                        "server cleanup is busy or failed; retry close: {reason}"
+                    )))
+                }
+            }
+        });
+        cleanup.await.map_err(|error| {
+            TsnetError::ShutdownIncomplete(format!("shutdown worker stopped: {error}"))
+        })?
+    }
+
     pub async fn close(&mut self) -> Result<(), TsnetError> {
         if self.shutdown_supervisor.has_retained_logout() {
             return Err(TsnetError::ShutdownIncomplete(

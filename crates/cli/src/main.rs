@@ -96,10 +96,27 @@ fn main() {
         return;
     }
 
-    // Handle --help / -h / help as a top-level pseudo-subcommand.
-    if matches!(args[1].as_str(), "--help" | "-h" | "help") {
+    // Help is a side-effect-free CLI contract. Support both upstream spellings
+    // (`tailscale set --help` and `tailscale help set`) before creating a
+    // runtime or attempting LocalAPI discovery.
+    if matches!(args[1].as_str(), "--help" | "-h") || (args[1] == "help" && args.len() == 2) {
         usage(&args[0]);
         return;
+    }
+    if (args[1] == "help" && args.len() == 3)
+        || (args[1] != "nc" && args.len() == 3 && matches!(args[2].as_str(), "--help" | "-h"))
+    {
+        let command = if args[1] == "help" {
+            &args[2]
+        } else {
+            &args[1]
+        };
+        command_usage(command);
+        return;
+    }
+    if args[1] == "help" {
+        eprintln!("error: help takes at most one command");
+        std::process::exit(1);
     }
 
     // Handle --version / -V as a top-level shortcut.
@@ -222,6 +239,26 @@ async fn dispatch(
             std::process::exit(1);
         }
     }
+}
+
+fn command_usage(command: &str) {
+    // Keep command help offline and deterministic. Detailed validation remains
+    // in each command implementation, but help itself never opens LocalAPI.
+    let synopsis = match command {
+        "status" => "tailscale status [--json] [--peers=true|false] [--active]",
+        "set" => "tailscale set [--hostname <name>] [--accept-routes=true|false] [--advertise-routes <prefixes>] [--operator <user>]",
+        "down" => "tailscale down",
+        "up" => "tailscale up [flags]",
+        "logout" => "tailscale logout",
+        "ping" => "tailscale ping <ip-or-hostname>",
+        "nc" => "tailscale nc <hostname-or-IP> <port>",
+        "version" => "tailscale version [--daemon]",
+        _ => {
+            eprintln!("error: unknown command '{command}'");
+            std::process::exit(1);
+        }
+    };
+    println!("usage: {synopsis}");
 }
 
 fn usage(bin: &str) {

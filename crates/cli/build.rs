@@ -5,6 +5,15 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=RUSTSCALE_VERSION_LONG");
+    if let Ok(explicit) = std::env::var("RUSTSCALE_VERSION_LONG") {
+        let explicit = explicit.trim();
+        if !explicit.is_empty() {
+            println!("cargo:rustc-env=RUSTSCALE_VERSION_LONG={explicit}");
+            return;
+        }
+    }
+
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_dir = crate_dir
         .parent()

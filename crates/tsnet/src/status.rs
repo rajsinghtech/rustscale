@@ -2,10 +2,53 @@
 
 use std::net::IpAddr;
 
+use chrono::{DateTime, Utc};
 use rustscale_health::Warning;
+use rustscale_ipnstate::PeerStatus;
 use rustscale_key::NodePublic;
-use rustscale_magicsock::PathClass;
+use rustscale_magicsock::{PathClass, PathTelemetry};
 use rustscale_tailcfg::Node;
+
+/// Copy freshness-gated magicsock evidence into the wire-compatible
+/// `ipnstate::PeerStatus` fields. A configured candidate never becomes a
+/// direct/relay claim: only a current authenticated transport observation does.
+pub(crate) fn apply_path_telemetry(status: &mut PeerStatus, telemetry: PathTelemetry) {
+    status.Active = telemetry.fresh;
+    status.LastSeen = telemetry
+        .last_rx_at
+        .map(DateTime::<Utc>::from)
+        .unwrap_or(DateTime::UNIX_EPOCH);
+    status.LastWrite = telemetry
+        .last_tx_at
+        .map(DateTime::<Utc>::from)
+        .unwrap_or(DateTime::UNIX_EPOCH);
+
+    match telemetry.class {
+        PathClass::Direct => {
+            status.CurAddr = telemetry
+                .addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_default();
+            status.LastHandshake = telemetry
+                .observed_at
+                .map(DateTime::<Utc>::from)
+                .unwrap_or(DateTime::UNIX_EPOCH);
+        }
+        PathClass::Derp => {
+            status.Relay = telemetry
+                .derp_region
+                .map(|region| format!("derp-{region}"))
+                .unwrap_or_default();
+        }
+        PathClass::Relay => {
+            status.PeerRelay = telemetry
+                .addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_default();
+        }
+        PathClass::None => {}
+    }
+}
 
 /// Build the active exit-node status shared by in-process and LocalAPI views.
 pub(crate) fn selected_exit_node_status(
@@ -90,6 +133,73 @@ pub struct WhoIsInfo {
 mod tests {
     use super::*;
     use rustscale_key::NodePrivate;
+
+    #[test]
+    fn telemetry_populates_only_the_current_path_fields() {
+        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let direct_addr = "198.51.100.7:41641".parse().unwrap();
+        let mut direct = PeerStatus::default();
+        apply_path_telemetry(
+            &mut direct,
+            PathTelemetry {
+                class: PathClass::Direct,
+                addr: Some(direct_addr),
+                observed_at: Some(at),
+                last_rx_at: Some(at),
+                fresh: true,
+                ..Default::default()
+            },
+        );
+        assert!(direct.Active);
+        assert_eq!(direct.CurAddr, "198.51.100.7:41641");
+        assert!(direct.Relay.is_empty());
+        assert!(direct.PeerRelay.is_empty());
+
+        let mut derp = PeerStatus::default();
+        apply_path_telemetry(
+            &mut derp,
+            PathTelemetry {
+                class: PathClass::Derp,
+                derp_region: Some(7),
+                observed_at: Some(at),
+                fresh: true,
+                ..Default::default()
+            },
+        );
+        assert!(derp.Active);
+        assert_eq!(derp.Relay, "derp-7");
+        assert!(derp.CurAddr.is_empty());
+
+        let mut relay = PeerStatus::default();
+        apply_path_telemetry(
+            &mut relay,
+            PathTelemetry {
+                class: PathClass::Relay,
+                addr: Some("203.0.113.7:3478".parse().unwrap()),
+                observed_at: Some(at),
+                fresh: true,
+                ..Default::default()
+            },
+        );
+        assert!(relay.Active);
+        assert_eq!(relay.PeerRelay, "203.0.113.7:3478");
+        assert!(relay.CurAddr.is_empty());
+        assert!(relay.Relay.is_empty());
+
+        let mut idle = PeerStatus::default();
+        apply_path_telemetry(
+            &mut idle,
+            PathTelemetry {
+                observed_at: Some(at),
+                fresh: false,
+                ..Default::default()
+            },
+        );
+        assert!(!idle.Active);
+        assert!(idle.CurAddr.is_empty());
+        assert!(idle.Relay.is_empty());
+        assert!(idle.PeerRelay.is_empty());
+    }
 
     #[test]
     fn exit_status_uses_stable_id_across_node_key_rotation() {

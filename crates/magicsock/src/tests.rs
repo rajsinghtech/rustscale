@@ -1804,6 +1804,14 @@ async fn cli_ping_cmm_recovers_direct_path_after_initial_netmap_drop() {
         "CLI ping should return its direct endpoint when DERP is unavailable"
     );
     assert_eq!(a.peer_path_class(&b.node_public()), PathClass::Direct);
+    let telemetry = a.peer_path_telemetry(&b.node_public());
+    assert_eq!(telemetry.class, PathClass::Direct);
+    assert!(telemetry.fresh);
+    assert_eq!(
+        telemetry.addr.map(|addr| addr.to_string()),
+        Some(direct.Endpoint),
+        "the public telemetry must be corroborated by the direct pong, not a configured candidate"
+    );
 }
 
 #[tokio::test]

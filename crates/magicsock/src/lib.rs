@@ -34,8 +34,8 @@ mod udp_batch;
 mod udp_socket_buffers;
 
 pub use endpoint::{
-    BestPath, DiscoPingPurpose, Endpoint, PathClass, PendingPing, ProbeUDPLifetime,
-    TRUST_BEST_ADDR_DURATION,
+    BestPath, DiscoPingPurpose, Endpoint, PathClass, PathTelemetry, PendingPing, ProbeUDPLifetime,
+    PATH_ACTIVITY_TIMEOUT, TRUST_BEST_ADDR_DURATION,
 };
 pub use relay::{
     decode_geneve, decode_geneve_full, encode_geneve, encode_geneve_disco,
@@ -2430,6 +2430,17 @@ impl Magicsock {
                             sent_bytes,
                             false,
                         );
+                        if sent_packets > 0 {
+                            if let Some(endpoint) = self
+                                .inner
+                                .endpoints
+                                .write()
+                                .expect("endpoints lock poisoned")
+                                .get_mut(&peer)
+                            {
+                                endpoint.note_direct_transport(addr, false);
+                            }
+                        }
                         return first_error.map_or(Ok(()), Err);
                     }
                 }
@@ -2470,6 +2481,17 @@ impl Magicsock {
                         sent_bytes,
                         false,
                     );
+                    if sent_packets > 0 {
+                        if let Some(endpoint) = self
+                            .inner
+                            .endpoints
+                            .write()
+                            .expect("endpoints lock poisoned")
+                            .get_mut(&peer)
+                        {
+                            endpoint.note_relay_transport(addr, false);
+                        }
+                    }
                     return first_error.map_or(Ok(()), Err);
                 }
                 for datagram in datagrams {
@@ -2590,6 +2612,17 @@ impl Magicsock {
         self.inner
             .connection_counter
             .record(node_addr, addr, sent_packets, sent_bytes, false);
+        if sent_packets > 0 {
+            if let Some(endpoint) = self
+                .inner
+                .endpoints
+                .write()
+                .expect("endpoints lock poisoned")
+                .get_mut(&peer)
+            {
+                endpoint.note_direct_transport(addr, false);
+            }
+        }
         first_error.map_or(Ok(()), |error| Err(MagicsockError::Io(error)))
     }
 
@@ -2604,6 +2637,31 @@ impl Magicsock {
             .get(peer)
             .map(|ep| ep.best_path(std::time::Instant::now()).class())
             .unwrap_or_default()
+    }
+
+    /// Snapshot authenticated transport evidence for a peer. Unlike
+    /// [`Self::peer_path_class`], this never promotes a configured fallback
+    /// (HomeDERP, a candidate, or an allocated relay) into an active path.
+    /// Absent or stale evidence is `PathClass::None`.
+    pub fn peer_path_telemetry(&self, peer: &NodePublic) -> PathTelemetry {
+        self.inner
+            .endpoints
+            .read()
+            .expect("endpoints lock poisoned")
+            .get(peer)
+            .map_or_else(PathTelemetry::default, Endpoint::path_telemetry)
+    }
+
+    fn note_peer_derp_transport(&self, peer: &NodePublic, region: i32, received: bool) {
+        if let Some(endpoint) = self
+            .inner
+            .endpoints
+            .write()
+            .expect("endpoints lock poisoned")
+            .get_mut(peer)
+        {
+            endpoint.note_derp_transport(region, received);
+        }
     }
 
     /// React to a major link change: re-gather local interface endpoints from
@@ -3076,6 +3134,7 @@ impl Magicsock {
                 .send_packet(region, peer.clone(), datagram.to_vec())
                 .await
             {
+                self.note_peer_derp_transport(&peer, region, false);
                 if debug_enabled() {
                     eprintln!(
                         "DBG derp_send peer={} region={} packet_len={}",
@@ -3148,6 +3207,9 @@ impl Magicsock {
                 // Attribute it once, to the first region that accepted it.
                 accounting_region = r;
             }
+        }
+        if accounting_region > 0 {
+            self.note_peer_derp_transport(&peer, accounting_region, false);
         }
         Ok(accounting_region)
     }
@@ -4202,6 +4264,7 @@ impl Inner {
                 return;
             };
             endpoint.set_last_recv_derp_region(region_id);
+            endpoint.note_derp_transport(region_id, true);
             (endpoint.node_addr(), generation)
         };
 
@@ -4298,6 +4361,7 @@ impl Inner {
                     return;
                 };
                 endpoint.note_recv_udp(std::time::Instant::now());
+                endpoint.note_direct_transport(src, true);
                 (generation, endpoint.node_addr())
             };
             self.connection_counter
@@ -4423,8 +4487,8 @@ impl Inner {
                 let Some(generation) = self.peer_authorization.generation(&peer) else {
                     return;
                 };
-                let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
-                let Some(endpoint) = endpoints.get(&peer) else {
+                let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+                let Some(endpoint) = endpoints.get_mut(&peer) else {
                     return;
                 };
                 let Some((relay_addr, relay_vni, relay_server, relay_server_generation)) =
@@ -4440,6 +4504,7 @@ impl Inner {
                 {
                     return;
                 }
+                endpoint.note_relay_transport(src, true);
                 (generation, endpoint.node_addr())
             };
             // Receive accounting includes the Geneve header, matching
@@ -4543,6 +4608,7 @@ impl Inner {
                     let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
                     if let Some(ep) = endpoints.get_mut(&peer) {
                         ep.note_recv_udp(std::time::Instant::now());
+                        ep.note_direct_transport(src, true);
                         // The packet was authenticated with this peer's disco
                         // key, so its observed source is safe to retain for
                         // future direct probing.

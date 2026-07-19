@@ -665,7 +665,9 @@ function renderPeers(st) {
     const ip = (p.TailscaleIPs || [])[0] || '-';
     const os = p.OS || '-';
     const online = p.Online ? 'yes' : 'no';
-    const path = p.Relay ? 'relay ' + p.Relay : (p.Online ? 'direct' : '-');
+    const path = !p.Online ? '-' : !p.Active ? 'idle' : p.PeerRelay ?
+      'peer-relay ' + p.PeerRelay : p.Relay ? 'relay ' + p.Relay : p.CurAddr ?
+      'direct ' + p.CurAddr : 'idle';
     tr.innerHTML = '<td>' + esc(name) + '</td><td>' + esc(ip) + '</td><td>' + esc(os) +
       '</td><td>' + online + '</td><td>' + esc(path) + '</td>';
     tbody.appendChild(tr);

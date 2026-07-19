@@ -77,14 +77,20 @@ supplying the documented disposable tailnet credentials.
 ### Installed Linux replacement journey
 
 `tools/packaging/test-linux-replacement.sh` complements the source-level TUN
-job with a credential-free, installed-service journey. It builds release-mode
-CLI and daemon binaries, packages them with the checked-in systemd files, and
-feeds that archive through `scripts/install.sh` at `/usr/local` with the
-explicit `--tailscale-compatible` option. CI runs it in the dedicated
-**Installed Linux replacement journey** job. The artifact build has a
-1200-second process-group deadline; the installed journey has a 900-second
-execution limit plus a 90-second diagnostic/teardown grace inside the job's
-50-minute outer deadline.
+job with a credential-free, installed-service journey. CI first builds one
+**exact Linux production candidate archive** and its `SHA256SUMS` in the
+separate **Assemble exact Linux release candidate** job. The journey downloads
+that exact archive through the ordinary `scripts/install.sh` path at
+`/usr/local`; it has no Cargo or source-build path. It rejects a missing
+candidate SHA/tag, missing checksum entry, checksum mismatch, archive symlink,
+missing packaged file, or an embedded CLI/daemon version that does not identify
+the candidate.
+
+On the isolated runner, the ordinary installer automatically creates the
+available `tailscale` and `tailscaled` aliases without requiring a compatibility
+flag. Existing foreign commands are never replaced. The installed journey has
+a 900-second execution limit plus a 90-second diagnostic/teardown grace inside
+the job's 50-minute outer deadline.
 
 The script refuses to mutate an occupied host. Before installation it requires
 an active systemd manager, passwordless sudo, an unused standard RustScale
@@ -95,9 +101,13 @@ that same condition a failure instead of a false pass.
 
 The journey proves all of the following on its isolated Linux runner:
 
-- the installer consumes the release archive, installs the exact binary bytes,
-  creates only relative `tailscale`/`tailscaled` aliases, and enables the
-  checked-in systemd unit;
+- the installer downloads the exact candidate archive plus `SHA256SUMS`,
+  verifies the published checksum and embedded candidate version/SHA, installs
+  the exact binary bytes, creates only relative `tailscale`/`tailscaled`
+  aliases, and enables the checked-in systemd unit;
+- the installed `tailscale` command proves top-level help, both command-help
+  spellings, invalid-command exit status, and stdout/stderr separation without
+  a LocalAPI shortcut;
 - canaries under `/var/lib/tailscale` and `/run/tailscale` remain byte-for-byte
   unchanged while RustScale uses `/var/lib/rustscale` and
   `/var/run/rustscaled.sock`;
@@ -130,10 +140,11 @@ and replays the bounded log tail on failure.
 Every owned child PID is also recorded. `TERM`, interruption, normal exit, and
 the execution limit run the same teardown, which stops the service, escalates
 stuck child processes, removes only installer-owned aliases/files, and fails if
-the TUN, protocol-201 rules, table-52 route, or socket remains. This gate tests
-a locally assembled candidate archive from the exact checkout; the release
-workflow's Linux compatibility job remains authoritative for executing the
-separately uploaded GNU archive on Debian 12.
+the TUN, protocol-201 rules, table-52 route, or socket remains. The journey
+never substitutes a source build: it consumes the separately uploaded exact
+candidate archive. The release workflow uses the same archive assembly helper,
+and its Linux compatibility job remains authoritative for executing the
+published GNU archive on Debian 12.
 
 
 ## Protected real-control smoke gate (manual only)

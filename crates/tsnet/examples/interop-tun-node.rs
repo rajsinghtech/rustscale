@@ -24,10 +24,11 @@
 //! # Usage
 //!
 //! ```sh
-//! sudo interop-tun-node server --authkey tskey-... --hostname rs-oops-s \
-//!   --state-dir /tmp/oops-s --tun-name roopss --port 18282 --udp-port 18283
-//! sudo interop-tun-node client --authkey tskey-... --hostname rs-oops-c \
-//!   --state-dir /tmp/oops-c --tun-name roopsc --peer 100.64.0.1 \
+//! sudo interop-tun-node server --authkey-file /run/oops-auth --hostname rs-oops-s \
+//!   --state-dir /tmp/oops-s --tun-name tun0 --port 18282 --udp-port 18283 \
+//!   --ready-fifo /tmp/oops-ready
+//! sudo interop-tun-node client --authkey-file /run/oops-auth --hostname rs-oops-c \
+//!   --state-dir /tmp/oops-c --tun-name tun0 --peer 100.64.0.1 \
 //!   --port 18282 --udp-port 18283
 //! ```
 
@@ -74,19 +75,41 @@ impl Role {
 
 struct Args {
     role: Role,
-    authkey: String,
+    authkey: Option<String>,
+    authkey_file: Option<String>,
     hostname: String,
     state_dir: String,
     tun_name: String,
     tcp_port: u16,
     udp_port: u16,
     peer: Option<Ipv4Addr>,
+    ready_fifo: Option<String>,
+}
+
+impl Args {
+    /// Read the auth key only from its protected file when requested, keeping
+    /// live ephemeral credentials out of process command lines and logs.
+    fn auth_key(&self) -> Result<String, Box<dyn std::error::Error>> {
+        match (&self.authkey, &self.authkey_file) {
+            (Some(_), Some(_)) => Err("--authkey and --authkey-file are mutually exclusive".into()),
+            (Some(key), None) if !key.is_empty() => Ok(key.clone()),
+            (None, Some(path)) => {
+                let key = std::fs::read_to_string(path)?.trim().to_owned();
+                if key.is_empty() {
+                    Err(format!("auth key file {path:?} is empty").into())
+                } else {
+                    Ok(key)
+                }
+            }
+            _ => Err("--authkey or --authkey-file is required".into()),
+        }
+    }
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: interop-tun-node <server|client> --authkey K --hostname H \
-         --state-dir D --tun-name N [--port P] [--udp-port U] [--peer V4]"
+        "usage: interop-tun-node <server|client> (--authkey K|--authkey-file F) --hostname H \
+         --state-dir D --tun-name N [--port P] [--udp-port U] [--peer V4] [--ready-fifo F]"
     );
     std::process::exit(2);
 }
@@ -112,18 +135,25 @@ fn parse_args() -> Args {
     };
     let mut parsed = Args {
         role,
-        authkey: String::new(),
+        authkey: None,
+        authkey_file: None,
         hostname: String::new(),
         state_dir: String::new(),
         tun_name: String::new(),
         tcp_port: 18282,
         udp_port: 18283,
         peer: None,
+        ready_fifo: None,
     };
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--authkey" => parsed.authkey = take_value(&args, &mut i, "--authkey").to_string(),
+            "--authkey" => {
+                parsed.authkey = Some(take_value(&args, &mut i, "--authkey").to_string());
+            }
+            "--authkey-file" => {
+                parsed.authkey_file = Some(take_value(&args, &mut i, "--authkey-file").to_string());
+            }
             "--hostname" => parsed.hostname = take_value(&args, &mut i, "--hostname").to_string(),
             "--state-dir" => {
                 parsed.state_dir = take_value(&args, &mut i, "--state-dir").to_string();
@@ -146,6 +176,9 @@ fn parse_args() -> Args {
                         .unwrap_or_else(|_| usage()),
                 );
             }
+            "--ready-fifo" => {
+                parsed.ready_fifo = Some(take_value(&args, &mut i, "--ready-fifo").to_string());
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 usage();
@@ -153,16 +186,24 @@ fn parse_args() -> Args {
         }
         i += 1;
     }
-    if parsed.authkey.is_empty()
-        || parsed.hostname.is_empty()
-        || parsed.state_dir.is_empty()
-        || parsed.tun_name.is_empty()
-    {
-        eprintln!("--authkey, --hostname, --state-dir, and --tun-name are required");
+    if parsed.hostname.is_empty() || parsed.state_dir.is_empty() || parsed.tun_name.is_empty() {
+        eprintln!("--hostname, --state-dir, and --tun-name are required");
+        usage();
+    }
+    if parsed.authkey.is_some() == parsed.authkey_file.is_some() {
+        eprintln!("exactly one of --authkey or --authkey-file is required");
         usage();
     }
     if parsed.role == Role::Client && parsed.peer.is_none() {
         eprintln!("client role requires --peer");
+        usage();
+    }
+    if parsed.role == Role::Server && parsed.ready_fifo.is_none() {
+        eprintln!("server role requires --ready-fifo");
+        usage();
+    }
+    if parsed.role == Role::Client && parsed.ready_fifo.is_some() {
+        eprintln!("client role must not receive --ready-fifo");
         usage();
     }
     parsed
@@ -175,6 +216,16 @@ fn line(start: Instant, role: Role, msg: &str) {
         start.elapsed().as_millis(),
         role.as_str()
     );
+}
+
+/// Notify the harness only after the server has a tailnet-bound listener.
+/// A FIFO gives a bounded blocking handoff without a readiness polling loop.
+fn signal_ready(path: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let mut fifo = std::fs::OpenOptions::new().write(true).open(path)?;
+    writeln!(fifo, "{message}")?;
+    Ok(())
 }
 
 /// Minimal stderr logger so the tsnet/magicsock internals appear in the
@@ -215,7 +266,6 @@ fn init_logger(start: Instant, role: Role) {
     log::set_max_level(level);
 }
 
-#[cfg(target_os = "linux")]
 fn command_output(program: &str, args: &[&str], assertion: &str) -> String {
     let output = std::process::Command::new(program)
         .args(args)
@@ -319,6 +369,72 @@ fn assert_kernel_state(_tun_name: &str, _expected_mtu: usize) -> u32 {
     panic!("the out-of-process TUN repro only runs on Linux");
 }
 
+#[cfg(target_os = "linux")]
+fn tun_counters(tun_name: &str) -> (u64, u64) {
+    let statistics = std::path::Path::new("/sys/class/net")
+        .join(tun_name)
+        .join("statistics");
+    let read_counter = |field: &str| {
+        std::fs::read_to_string(statistics.join(field))
+            .unwrap_or_else(|error| {
+                panic!("real TUN gate: cannot read {tun_name} {field}: {error}")
+            })
+            .trim()
+            .parse::<u64>()
+            .unwrap_or_else(|error| panic!("real TUN gate: invalid {tun_name} {field}: {error}"))
+    };
+    (read_counter("rx_bytes"), read_counter("tx_bytes"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tun_counters(_tun_name: &str) -> (u64, u64) {
+    panic!("the out-of-process TUN repro only runs on Linux");
+}
+
+/// Verify that an ordinary socket's destination lookup selects this endpoint's
+/// TUN. Kernel route existence alone is insufficient evidence of the path.
+fn assert_tun_route(tun_name: &str, peer: Ipv4Addr) -> String {
+    let destination = peer.to_string();
+    let route = command_output(
+        "ip",
+        &["-4", "route", "get", &destination],
+        "real TUN gate route lookup",
+    );
+    assert!(
+        route
+            .lines()
+            .any(|line| line.contains(&format!("dev {tun_name}"))),
+        "real TUN gate: route to {peer} does not select {tun_name}: {route}"
+    );
+    route.trim().to_owned()
+}
+
+fn assert_tun_traffic(role: Role, start: Instant, tun_name: &str, before: (u64, u64)) {
+    let after = tun_counters(tun_name);
+    assert!(
+        after.0 > before.0 && after.1 > before.1,
+        "real TUN gate: {} traffic did not cross both directions of {tun_name} \
+         (rx {}->{}, tx {}->{})",
+        role.as_str(),
+        before.0,
+        after.0,
+        before.1,
+        after.1,
+    );
+    line(
+        start,
+        role,
+        &format!(
+            "OOPS_{}_TUN_TRAFFIC dev={tun_name} rx_before={} rx_after={} tx_before={} tx_after={}",
+            role.as_str().to_uppercase(),
+            before.0,
+            after.0,
+            before.1,
+            after.1,
+        ),
+    );
+}
+
 /// Bring the node up in TUN mode with OS routes applied and assert the
 /// kernel contract. Returns the server's tailnet IPv4 address.
 async fn up_tun_node(
@@ -327,7 +443,7 @@ async fn up_tun_node(
 ) -> Result<(Server, Ipv4Addr), Box<dyn std::error::Error>> {
     let mut server = Server::builder()
         .hostname(args.hostname.clone())
-        .auth_key(args.authkey.clone())
+        .auth_key(args.auth_key()?)
         .ephemeral(true)
         .disable_portmapping(true)
         .state_dir(std::path::PathBuf::from(&args.state_dir))
@@ -354,7 +470,7 @@ async fn up_tun_node(
         start,
         args.role,
         &format!(
-            "OOPS_KERNEL_OK role={} dev={} ifindex={ifindex} mtu={MTU}",
+            "OOPS_KERNEL_OK role={} dev={} ifindex={ifindex} mtu={MTU} table=52 tailnet_route=100.64.0.0/10",
             args.role.as_str(),
             tun.name
         ),
@@ -386,6 +502,7 @@ async fn up_tun_node(
 
 async fn run_server(args: &Args, start: Instant) -> Result<(), Box<dyn std::error::Error>> {
     let (mut server, v4) = up_tun_node(args, start).await?;
+    let tun_before = tun_counters(&args.tun_name);
 
     let listener = tokio::time::timeout(
         Duration::from_secs(10),
@@ -393,14 +510,17 @@ async fn run_server(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
     )
     .await??;
     let udp = UdpSocket::bind((v4, args.udp_port)).await?;
-    line(
-        start,
-        args.role,
-        &format!(
-            "OOPS_SERVER_READY ip={v4} tcp={} udp={}",
-            args.tcp_port, args.udp_port
-        ),
+    let ready = format!(
+        "OOPS_SERVER_READY ip={v4} tcp={} udp={}",
+        args.tcp_port, args.udp_port
     );
+    line(start, args.role, &ready);
+    signal_ready(
+        args.ready_fifo
+            .as_deref()
+            .ok_or("server role requires --ready-fifo")?,
+        &ready,
+    )?;
 
     // UDP echo loop: one evidence line per datagram until aborted.
     let udp_start = start;
@@ -436,6 +556,16 @@ async fn run_server(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
         args.role,
         &format!("OOPS_SERVER_TCP_ACCEPT peer={peer}"),
     );
+    let peer_v4 = match peer.ip() {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(_) => return Err("server accepted a non-IPv4 tailnet peer".into()),
+    };
+    let route = assert_tun_route(&args.tun_name, peer_v4);
+    line(
+        start,
+        args.role,
+        &format!("OOPS_SERVER_TUN_ROUTE peer={peer_v4} route={route}"),
+    );
     let mut total = 0_u64;
     let mut buf = [0u8; 4096];
     loop {
@@ -454,6 +584,7 @@ async fn run_server(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
         args.role,
         &format!("OOPS_SERVER_TCP_DONE bytes={total}"),
     );
+    assert_tun_traffic(args.role, start, &args.tun_name, tun_before);
 
     udp_task.abort();
     server.close().await?;
@@ -499,9 +630,13 @@ async fn run_client(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
     let (mut server, _v4) = up_tun_node(args, start).await?;
 
     wait_for_peer(&server, peer, start, args.role).await?;
-    // Let the direct path and the kernel neighbor state settle before the
-    // cadence exchange, matching the in-process gate's behavior.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let tun_before = tun_counters(&args.tun_name);
+    let route = assert_tun_route(&args.tun_name, peer);
+    line(
+        start,
+        args.role,
+        &format!("OOPS_CLIENT_TUN_ROUTE peer={peer} route={route}"),
+    );
 
     // UDP cadence exchange (issue #75 traffic shape): fixed-spacing
     // datagrams, each echoed by the server process across the TUN boundary.
@@ -538,29 +673,12 @@ async fn run_client(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
         &format!("OOPS_CLIENT_UDP_ROUNDTRIP_OK count={UDP_DATAGRAMS}"),
     );
 
-    // TCP roundtrip through the kernel/TUN path.
+    // TCP roundtrip through the kernel/TUN path. The server readiness FIFO
+    // makes retries unnecessary: a failed first dial is a failed workload.
     let dial = (peer, args.tcp_port);
-    let mut stream = None;
-    for attempt in 1..=5_u32 {
-        match tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(dial)).await {
-            Ok(Ok(s)) => {
-                stream = Some(s);
-                break;
-            }
-            Ok(Err(error)) => line(
-                start,
-                args.role,
-                &format!("TCP connect attempt {attempt} failed: {error}"),
-            ),
-            Err(_) => line(
-                start,
-                args.role,
-                &format!("TCP connect attempt {attempt} timed out (15s)"),
-            ),
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    let mut stream = stream.ok_or("OS connect to server echo failed after 5 attempts")?;
+    let mut stream = tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(dial))
+        .await
+        .map_err(|_| "OS connect to server echo timed out")??;
 
     let payload = b"interop-tun-oops-tcp-payload";
     stream.write_all(payload).await?;
@@ -576,6 +694,7 @@ async fn run_client(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
         args.role,
         &format!("OOPS_CLIENT_TCP_ROUNDTRIP_OK bytes={}", payload.len()),
     );
+    assert_tun_traffic(args.role, start, &args.tun_name, tun_before);
     // EOF lets the server end its session and exit 0.
     stream.shutdown().await?;
 

@@ -54,15 +54,23 @@ impl rustscale_router::Router for OrderedRouter {
     }
 }
 
-struct CloseDns(Arc<AtomicBool>);
+struct CloseDns {
+    closed: Arc<AtomicBool>,
+    fail_setup: bool,
+}
 
 impl OsConfigurator for CloseDns {
     fn set_dns(&mut self, _: &OsConfig) -> std::io::Result<()> {
+        if self.fail_setup {
+            return Err(std::io::Error::other(
+                "injected partially-applied DNS setup failure",
+            ));
+        }
         Ok(())
     }
 
     fn close(&mut self) -> std::io::Result<()> {
-        self.0.store(true, Ordering::SeqCst);
+        self.closed.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -806,7 +814,15 @@ async fn dropped_startup_transaction_rolls_back_owned_resources() {
     let dns_closed = Arc::new(AtomicBool::new(false));
     rollback.router = Some(router);
     rollback.localapi_socket = Some(socket.clone());
-    rollback.os_dns_configurator = Some(Box::new(CloseDns(Arc::clone(&dns_closed))));
+    let (dns_owner, setup) = set_os_dns_retaining_owner(
+        Box::new(CloseDns {
+            closed: Arc::clone(&dns_closed),
+            fail_setup: true,
+        }),
+        &OsConfig::default(),
+    );
+    assert!(setup.is_err(), "injected DNS setup failure was accepted");
+    rollback.os_dns_configurator = Some(dns_owner);
     drop(rollback);
 
     assert!(cancel.is_cancelled());

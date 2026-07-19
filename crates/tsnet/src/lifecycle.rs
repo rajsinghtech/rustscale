@@ -448,6 +448,14 @@ impl Drop for PrestartedMagicsockRollback {
     }
 }
 
+fn set_os_dns_retaining_owner(
+    mut configurator: Box<dyn OsConfigurator + Send>,
+    config: &OsConfig,
+) -> (Box<dyn OsConfigurator + Send>, std::io::Result<()>) {
+    let result = configurator.set_dns(config);
+    (configurator, result)
+}
+
 struct StartupRollback {
     armed: bool,
     supervisor: Arc<BootstrapSupervisor>,
@@ -2467,27 +2475,36 @@ impl Server {
                 }
             };
             match new_os_configurator(Some(tun.name())) {
-                Ok(mut configurator) => match configurator.set_dns(&os_cfg) {
-                    Ok(()) => {
-                        if magicdns_responder_ready {
-                            b.health.set_healthy("subsystem-dns");
+                Ok(configurator) => {
+                    let (configurator, setup) = set_os_dns_retaining_owner(configurator, &os_cfg);
+                    match setup {
+                        Ok(()) => {
+                            if magicdns_responder_ready {
+                                b.health.set_healthy("subsystem-dns");
+                            }
+                            log::info!(
+                                "tsnet: OS DNS configured ({} match domains, {} search domains)",
+                                os_cfg.match_domains.len(),
+                                os_cfg.search_domains.len()
+                            );
+                            Some(configurator)
                         }
-                        log::info!(
-                            "tsnet: OS DNS configured ({} match domains, {} search domains)",
-                            os_cfg.match_domains.len(),
-                            os_cfg.search_domains.len()
-                        );
-                        Some(configurator)
+                        Err(error) => {
+                            b.health.set_unhealthy(
+                                "subsystem-dns",
+                                format!("OS DNS configuration failed: {error}"),
+                            );
+                            log::warn!(
+                                "tsnet: OS DNS configuration failed; retaining cleanup owner: {error}"
+                            );
+                            // set_dns may have changed the link and then failed
+                            // to compensate. Keep the configurator in the
+                            // generation so shutdown and startup rollback retry
+                            // RevertLink.
+                            Some(configurator)
+                        }
                     }
-                    Err(error) => {
-                        b.health.set_unhealthy(
-                            "subsystem-dns",
-                            format!("OS DNS configuration failed: {error}"),
-                        );
-                        log::warn!("tsnet: OS DNS configuration failed: {error}");
-                        None
-                    }
-                },
+                }
                 Err(error) => {
                     b.health.set_unhealthy(
                         "subsystem-dns",

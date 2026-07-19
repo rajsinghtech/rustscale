@@ -122,10 +122,19 @@ impl OsConfigurator for LinuxResolvedConfigurator {
             return self.rollback_after_failure(error);
         }
 
-        // RustScale owns only split DNS for the tailnet; it must never become
-        // the system default route and thereby replace public DNS.
-        if let Err(error) = self.run(["default-route".into(), self.interface.clone(), "no".into()])
-        {
+        // Match resolved's route selection semantics: split-DNS links are not
+        // the default route, while a configuration with no match domains must
+        // receive otherwise-unmatched DNS traffic.
+        let default_route = if cfg.match_domains.is_empty() {
+            "yes"
+        } else {
+            "no"
+        };
+        if let Err(error) = self.run([
+            "default-route".into(),
+            self.interface.clone(),
+            default_route.into(),
+        ]) {
             return self.rollback_after_failure(error);
         }
         Ok(())
@@ -209,6 +218,28 @@ mod tests {
                 args(&["default-route", "rustscale0", "no"]),
                 args(&["revert", "rustscale0"]),
             ]
+        );
+    }
+
+    #[test]
+    fn global_dns_without_match_domains_uses_link_as_default_route() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut c = LinuxResolvedConfigurator::with_runner(
+            "rustscale0",
+            Box::new(RecordingRunner {
+                calls: calls.clone(),
+                fail_calls: vec![],
+            }),
+        )
+        .unwrap();
+        let mut global = config();
+        global.match_domains.clear();
+
+        c.set_dns(&global).unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().last().unwrap(),
+            &args(&["default-route", "rustscale0", "yes"])
         );
     }
 

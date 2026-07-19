@@ -733,7 +733,7 @@
   "generator_version": 1,
   "guards": {
     "local_shape": {
-      "count": 297,
+      "count": 298,
       "ids": [
         "constant:DEFAULT_CONTROL_URL@37057fc84d9638e3e63fc7f3a94b95da2f5f82a9128fcad55d8a93cc2d54501c",
         "constant:FUNNEL_PORTS@41574d4d902320787c1667247d50b7ed334fff56c710c97b7b61c8acfbbb72bc",
@@ -750,7 +750,7 @@
         "enum:TaildropError@58118e2fdf12ba3574897b65933e329685ab31cef1360b66e83cdc4bdce003e0",
         "enum:TlsError@2b2255bf00bb33f9e91140cecec185a72a6490036343a535598b04e843958466",
         "enum:TsnetError@149434766dcf75b46feae57bba910d84228ae626a5f265072c2998b1711b8693",
-        "enum:localapi::DaemonCommand@e528b1f3f290d707f8846294025e767e4993f0657bd3327649677d8f70adf052",
+        "enum:localapi::DaemonCommand@5dcc8011e0a7d4e8ac4f5d03598623419e0eca970e0359f25d83f356c2ebdff3",
         "function:apply_runtime_fields@e7378a5ee6b47464d5581cb4911098d2fcc141a2eb4de4ef0eb4dc995ed9dd65",
         "function:check_funnel_access@87a9c7f6edce6a6ff56a3bcb9437447d3daebb7e92cd837752ffb6f7ed966443",
         "function:check_funnel_port@18058ccb6b6114b204425482db0ed9f1800b4b701edec903e4ca1e75e9d62229",
@@ -895,6 +895,7 @@
         "method:Server.set_package@50c4b55260bd83b6830274312be4652675791a6b93bd9c6d18bd8783b66324fa",
         "method:Server.set_serve_config@657250d70d4a7e7234ac112971535fd796b2f8a801320641eec28ad2ffeb0ba9",
         "method:Server.start_localapi_only@26b36436176731d37ed68a14d61cb4040d922e3332b5c74f1216cd547e76ccb8",
+        "method:Server.start_localapi_stopped@d057390663872a380a714964e34ca3ced99930604082e782c7930fc3d0863ca5",
         "method:Server.status@6d71f1df272facdd4351449c0245b1e035b32535736d935ae192311a82de1a70",
         "method:Server.switch_profile@b5dd8fed0864bfbcaaf7e2354f93eec3cd337cc3d907a702f44e0fb0d75a9914",
         "method:Server.system@11185e848e1d5e4c7a21a07f937ece8bcd4de086df056d2fa42cf0a8d17a86eb",
@@ -1033,7 +1034,7 @@
         "type:Logger@24c245d95b078ec5dc8d385afc50221d47b3c52620470f605de81c5c7b43d8be",
         "type:SharedOverrides@e36a74a2fc1c72a26e18dc9497e134c6b6dfa049ab56f229f6433c3632791123"
       ],
-      "sha256": "94122617e9f4480627b4411e2ca710c9e27fecc3f4b2c77a492245d785283d82"
+      "sha256": "4a638e303ef012ef1389f8c9f4067fe593cab9ca1475dcd14e000c3915b3f7f5"
     },
     "local_targets": {
       "count": 35,
@@ -1316,7 +1317,7 @@
         "id": "enum:localapi::DaemonCommand",
         "kind": "enum",
         "name": "localapi::DaemonCommand",
-        "signature": "pub enum DaemonCommand { Start { auth_key: Option<String>, }, LoginInteractive, Logout, Shutdown, ReloadConfig, SwitchProfile(String), }",
+        "signature": "pub enum DaemonCommand { Start { auth_key: Option<String>, }, LoginInteractive, Down, Logout, Shutdown, ReloadConfig, SwitchProfile(String), }",
         "source": "rustdoc:localapi/enum.DaemonCommand.html"
       },
       {
@@ -2456,6 +2457,14 @@
         "name": "start_localapi_only",
         "owner": "Server",
         "signature": "pub async fn start_localapi_only( &mut self, ) -> Result<UnboundedReceiver<DaemonCommand>, TsnetError>",
+        "source": "rustdoc:struct.Server.html"
+      },
+      {
+        "id": "method:Server.start_localapi_stopped",
+        "kind": "method",
+        "name": "start_localapi_stopped",
+        "owner": "Server",
+        "signature": "pub async fn start_localapi_stopped( &mut self, ) -> Result<UnboundedReceiver<DaemonCommand>, TsnetError>",
         "source": "rustdoc:struct.Server.html"
       },
       {

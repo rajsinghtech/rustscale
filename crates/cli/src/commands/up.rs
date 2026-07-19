@@ -124,8 +124,47 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         .await
         {
             Ok(Ok(Some(n))) => n,
-            Ok(Ok(None)) => return Err(CliError("connection closed".into())),
-            Ok(Err(e)) => return Err(CliError(e.to_string())),
+            Ok(Ok(None) | Err(_)) => {
+                // Starting a stopped/pre-login daemon atomically replaces its
+                // LocalAPI generation. Several already-accepted watches can
+                // close while the listener ownership transfer drains. First
+                // accept an authoritative Running status from the replacement;
+                // otherwise keep reconnecting within the caller's one deadline.
+                // A reconnect count is not a valid generation boundary.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(CliError("timeout waiting for up".into()));
+                }
+                if let Ok(Ok(status)) = tokio::time::timeout(remaining, lc.status()).await {
+                    if status.get("BackendState").and_then(|v| v.as_str()) == Some("Running") {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&status).unwrap_or_default()
+                            );
+                        } else {
+                            println!("Tailscale is running.");
+                        }
+                        return Ok(());
+                    }
+                }
+
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(CliError("timeout waiting for up".into()));
+                }
+                tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(CliError("timeout waiting for up".into()));
+                }
+                if let Ok(Ok(next_watch)) =
+                    tokio::time::timeout(remaining, lc.watch_ipn_bus(NOTIFY_INITIAL_STATE)).await
+                {
+                    watch = next_watch;
+                }
+                continue;
+            }
             Err(_) => return Err(CliError("timeout waiting for up".into())),
         };
 

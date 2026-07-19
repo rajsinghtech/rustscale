@@ -1958,6 +1958,79 @@ fn requested_os_dns_failure_is_immediately_health_degraded_and_retains_cleanup_o
     assert!(closed.load(Ordering::SeqCst));
 }
 
+/// This privileged contract test deliberately injects the platform DNS failure
+/// after the real TUN startup path has begun. It must be run by the Linux
+/// replacement/TUN harness as root; an ordinary unit test cannot create a
+/// real TUN device safely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a root-capable real TUN harness"]
+async fn up_tun_dns_failure_is_running_and_immediately_visible_in_localapi() {
+    struct FailingDns(Arc<AtomicBool>);
+
+    impl rustscale_dns::OsConfigurator for FailingDns {
+        fn set_dns(&mut self, _: &rustscale_dns::OsConfig) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected DNS failure"))
+        }
+
+        fn close(&mut self) -> std::io::Result<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn supports_split_dns(&self) -> bool {
+            true
+        }
+    }
+
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let socket = state.path().join("tun-dns-failure.sock");
+    let dns_closed = Arc::new(AtomicBool::new(false));
+    let factory_closed = Arc::clone(&dns_closed);
+    let mut server = Server::builder()
+        .hostname("tun-dns-failure")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket)
+        .configure_os_dns(true)
+        .disable_portmapping(true)
+        .test_os_dns_configurator_factory(move || Box::new(FailingDns(Arc::clone(&factory_closed))))
+        .build()
+        .unwrap();
+
+    let returned = Box::pin(server.up_tun(TunModeConfig {
+        tun: rustscale_tun::TunConfig::default(),
+        apply_routes: false,
+        exit_node: None,
+    }))
+    .await
+    .expect("injected DNS failure must not revoke committed TUN startup");
+    assert!(returned
+        .health
+        .iter()
+        .any(|warning| warning.id == rustscale_health::WARN_OS_DNS));
+    assert_eq!(
+        server.inner.as_ref().unwrap().ipn_backend.state(),
+        rustscale_ipn::State::Running
+    );
+    let local_status = rustscale_localclient::LocalClient::new(&socket)
+        .status()
+        .await
+        .unwrap();
+    assert!(local_status["Health"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| {
+            warning["WarnableCode"] == rustscale_health::WARN_OS_DNS
+                || warning.to_string().contains(rustscale_health::WARN_OS_DNS)
+        }));
+    server.close().await.unwrap();
+    assert!(dns_closed.load(Ordering::SeqCst));
+}
+
 #[test]
 fn health_warning_appears_in_status() {
     // We can't construct a full RunningState easily, so test the
@@ -3369,7 +3442,7 @@ async fn validated_cache_restart_is_degraded_offline_and_fresh_control_wins() {
     .expect("validated cache startup");
     assert_eq!(offline_status.tailscale_ips, first_status.tailscale_ips);
     assert!(offline_status.health.iter().any(|warning| {
-        warning.id == rustscale_health::WARN_CONTROL
+        warning.id == rustscale_health::WARN_CACHED_NETMAP
             && warning.text.contains("validated cached netmap")
     }));
     assert_eq!(
@@ -3377,6 +3450,177 @@ async fn validated_cache_restart_is_degraded_offline_and_fresh_control_wins() {
         rustscale_ipn::State::Running
     );
     offline.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_map_stays_degraded_through_keepalive_until_fresh_snapshot() {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    // Ensure the cached snapshot contains peer-derived authority to withdraw.
+    control.add_fake_node();
+    let state = tempfile::tempdir().unwrap();
+    let socket = tempfile::tempdir().unwrap();
+    let socket_path = socket.path().join("cached-map-authority.sock");
+
+    let mut first = Server::builder()
+        .hostname("cached-map-authority")
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket_path)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(first.up()).await.unwrap();
+    let scope = first.profile_state_scope().unwrap();
+    let durable = PersistedState::load(&scope.dir.join("tsnet-state.json")).unwrap();
+    let node_key = durable.node_key.public();
+    assert!(!first.inner.as_ref().unwrap().peers.read().await.is_empty());
+    first.close().await.unwrap();
+
+    // The control endpoint is reachable, but its one-shot authoritative map
+    // request fails. Keep the subsequent stream quiet until the test drives it.
+    control.suppress_auto_map(&node_key);
+    control.fail_next_non_stream_map_request();
+    let mut cached = Server::builder()
+        .hostname("cached-map-authority")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket_path)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    let cached_status = Box::pin(cached.up()).await.unwrap();
+    assert!(cached_status
+        .health
+        .iter()
+        .any(|warning| warning.id == rustscale_health::WARN_CACHED_NETMAP));
+    assert!(cached.inner.as_ref().unwrap().peers.read().await.is_empty());
+    control
+        .await_node_in_map_request(&node_key, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    let backend = cached.inner.as_ref().unwrap().ipn_backend.clone();
+    let mut health_events = backend.bus().subscribe();
+    assert!(control.add_raw_map_response(
+        &node_key,
+        rustscale_tailcfg::MapResponse {
+            KeepAlive: true,
+            ..Default::default()
+        },
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), health_events.recv())
+        .await
+        .expect("keepalive health notification deadline")
+        .expect("keepalive health notification channel")
+        .expect("keepalive health notification");
+    assert!(cached
+        .status()
+        .health
+        .iter()
+        .any(|warning| warning.id == rustscale_health::WARN_CACHED_NETMAP));
+    assert!(cached.inner.as_ref().unwrap().peers.read().await.is_empty());
+
+    // Generated map output is a complete snapshot. Wait for the final health
+    // publication, which occurs only after peer authority is committed.
+    control.resume_auto_map(&node_key);
+    let mut refreshed_events = backend.bus().subscribe();
+    control.add_fake_node();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = refreshed_events
+                .recv()
+                .await
+                .expect("fresh snapshot health notification channel")
+                .expect("fresh snapshot health notification");
+            if event.Health.as_ref().is_some_and(|warnings| {
+                !warnings
+                    .iter()
+                    .any(|warning| warning.contains("cached netmap"))
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("fresh snapshot health notification deadline");
+    assert!(!cached
+        .status()
+        .health
+        .iter()
+        .any(|warning| warning.id == rustscale_health::WARN_CACHED_NETMAP));
+    assert!(!cached.inner.as_ref().unwrap().peers.read().await.is_empty());
+    cached.close().await.unwrap();
+}
+
+async fn invalid_cached_map_cannot_start_offline(
+    hostname: &str,
+    invalidate: impl FnOnce(&mut rustscale_tailcfg::MapResponse),
+) {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let control_url = control.base_url();
+    let state_dir = tempfile::tempdir().unwrap();
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join(format!("{hostname}.sock"));
+    let mut server = Server::builder()
+        .hostname(hostname)
+        .auth_key("tskey-test")
+        .control_url(control_url.clone())
+        .state_dir(state_dir.path())
+        .localapi_path(&socket_path)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+    let scope = server.profile_state_scope().unwrap();
+    let durable = PersistedState::load(&scope.dir.join("tsnet-state.json")).unwrap();
+    let mut cached = NetMapCache::new_scoped(&scope, &durable.tailnet_identity)
+        .load()
+        .unwrap()
+        .map_response;
+    server.close().await.unwrap();
+
+    invalidate(&mut cached);
+    NetMapCache::new_scoped(&scope, &durable.tailnet_identity)
+        .save_if_changed(&durable.node_key.public(), &cached)
+        .unwrap();
+    control.stop();
+
+    let mut restart = Server::builder()
+        .hostname(hostname)
+        .control_url(control_url)
+        .state_dir(state_dir.path())
+        .localapi_path(&socket_path)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    assert!(Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        restart.up(),
+    ))
+    .await
+    .expect("invalid offline cache startup deadline")
+    .is_err());
+    assert!(!restart.is_up());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_cached_map_cannot_start_when_control_is_offline() {
+    invalid_cached_map_cannot_start_offline("expired-cache", |cached| {
+        cached.Node.as_mut().unwrap().KeyExpiry =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_ip_cached_map_cannot_start_when_control_is_offline() {
+    invalid_cached_map_cannot_start_offline("empty-ip-cache", |cached| {
+        cached.Node.as_mut().unwrap().Addresses.clear();
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

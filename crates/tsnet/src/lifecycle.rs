@@ -2569,11 +2569,21 @@ impl Server {
                     ..Default::default()
                 }
             };
-            Some(configure_requested_os_dns(
-                Box::new(new_os_configurator()),
-                &os_cfg,
-                &b.health,
-            ))
+            let configurator: Box<dyn OsConfigurator + Send> = {
+                #[cfg(test)]
+                {
+                    self.config
+                        .os_dns_configurator_factory
+                        .as_ref()
+                        .map(|factory| factory())
+                        .unwrap_or_else(|| Box::new(new_os_configurator()))
+                }
+                #[cfg(not(test))]
+                {
+                    Box::new(new_os_configurator())
+                }
+            };
+            Some(configure_requested_os_dns(configurator, &os_cfg, &b.health))
         } else {
             None
         };
@@ -3354,7 +3364,7 @@ impl Server {
                 };
                 control_offline = true;
                 health.set_unhealthy(
-                    WARN_CONTROL,
+                    WARN_CACHED_NETMAP,
                     format!("control unavailable; using validated cached netmap: {error}"),
                 );
                 cached_key
@@ -3621,7 +3631,7 @@ impl Server {
                 Ok(Err(error)) => match cached_netmap {
                     Some(cached) => {
                         health.set_unhealthy(
-                            WARN_CONTROL,
+                            WARN_CACHED_NETMAP,
                             format!(
                                 "fresh netmap unavailable; using validated cached netmap: {error}"
                             ),
@@ -3634,7 +3644,7 @@ impl Server {
                 Err(_) => match cached_netmap {
                     Some(cached) => {
                         health.set_unhealthy(
-                            WARN_CONTROL,
+                            WARN_CACHED_NETMAP,
                             "fresh netmap timed out; using validated cached netmap",
                         );
                         log::warn!("tsnet: fresh netmap timed out; using withdrawn cache");

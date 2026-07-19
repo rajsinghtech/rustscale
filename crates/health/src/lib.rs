@@ -25,6 +25,11 @@ use chrono::{DateTime, Utc};
 
 /// Control-plane connection (map stream). High severity.
 pub const WARN_CONTROL: &str = "control-connection";
+/// Startup is operating from a validated cached netmap until control supplies
+/// a fresh complete peer snapshot and Tailnet Lock synchronization finishes.
+/// This is independent from live stream transport: keepalives prove liveness,
+/// not current peer authority. High severity.
+pub const WARN_CACHED_NETMAP: &str = "cached-netmap";
 /// Home DERP region unreachable. Medium severity.
 pub const WARN_DERP_HOME: &str = "derp-home-unreachable";
 /// A specific DERP region is unreachable. Medium severity.
@@ -209,6 +214,12 @@ impl Tracker {
             id: WARN_CONTROL.into(),
             severity: Severity::High,
             title: "Control connection".into(),
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_CACHED_NETMAP.into(),
+            severity: Severity::High,
+            title: "Cached network map".into(),
             ..Warnable::default()
         });
         t.register(Warnable {

@@ -539,30 +539,34 @@ async fn cancelled_close_finishes_prestarted_and_extension_cleanup() {
 }
 
 #[cfg(unix)]
-async fn localapi_status_response(path: &std::path::Path) -> Vec<u8> {
+async fn localapi_status_response(path: &std::path::Path) -> Result<Vec<u8>, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut client = rustscale_safesocket::connect(path).expect("connect LocalAPI");
-    client
-        .write_all(
-            b"GET /localapi/v0/status HTTP/1.1\r\nHost: local-tailscaled.sock\r\nConnection: close\r\n\r\n",
-        )
+    let request_timeout = std::time::Duration::from_secs(1);
+    let mut client = tokio::time::timeout(request_timeout, tokio::net::UnixStream::connect(path))
         .await
-        .unwrap();
-    let mut response = Vec::new();
+        .map_err(|_| format!("LocalAPI connect timed out after {request_timeout:?}"))?
+        .map_err(|error| format!("failed to connect LocalAPI: {error}"))?;
     tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        client.read_to_end(&mut response),
+        request_timeout,
+        client.write_all(
+            b"GET /localapi/v0/status HTTP/1.1\r\nHost: local-tailscaled.sock\r\nConnection: close\r\n\r\n",
+        ),
     )
     .await
-    .expect("LocalAPI listener did not answer")
-    .unwrap();
-    response
+    .map_err(|_| format!("LocalAPI write timed out after {request_timeout:?}"))?
+    .map_err(|error| format!("failed to write LocalAPI request: {error}"))?;
+    let mut response = Vec::new();
+    tokio::time::timeout(request_timeout, client.read_to_end(&mut response))
+        .await
+        .map_err(|_| format!("LocalAPI read timed out after {request_timeout:?}"))?
+        .map_err(|error| format!("failed to read LocalAPI response: {error}"))?;
+    Ok(response)
 }
 
 #[cfg(unix)]
 async fn assert_localapi_reachable(path: &std::path::Path) {
-    let response = localapi_status_response(path).await;
+    let response = localapi_status_response(path).await.unwrap();
     assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
 }
 
@@ -595,7 +599,7 @@ async fn localapi_handoff_rolls_back_on_cancellation_and_failure_then_retries() 
             _ = entered.wait() => {}
             result = &mut up => panic!("startup finished before handoff hook: {result:?}"),
         }
-        let status = String::from_utf8(localapi_status_response(&socket).await).unwrap();
+        let status = String::from_utf8(localapi_status_response(&socket).await.unwrap()).unwrap();
         assert!(status.contains("\"BackendState\":\"Starting\""), "{status}");
         assert!(!status.contains("\"BackendState\":\"Running\""), "{status}");
         if inject_failure {
@@ -6398,18 +6402,28 @@ async fn run_required_tun_dns_failure_scenario() {
         tokio::select! {
             _ = entered.wait() => {}
             result = &mut up => return Err(format!("TUN DNS scenario finished before startup barrier: {result:?}")),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                return Err("TUN DNS scenario startup barrier timed out after 30s".into());
+            }
         }
-        let starting = String::from_utf8(localapi_status_response(&socket).await)
-            .map_err(|error| format!("Starting LocalAPI response was not UTF-8: {error}"))?;
+        let starting = String::from_utf8(
+            localapi_status_response(&socket)
+                .await
+                .map_err(|error| format!("Starting LocalAPI request failed: {error}"))?,
+        )
+        .map_err(|error| format!("Starting LocalAPI response was not UTF-8: {error}"))?;
         if !starting.contains("\"BackendState\":\"Starting\"") {
             return Err(format!("LocalAPI did not report Starting before handoff: {starting}"));
         }
         if starting.contains("\"BackendState\":\"Running\"") {
             return Err(format!("LocalAPI published Running before handoff: {starting}"));
         }
-        release.wait().await;
-        let returned = up
+        tokio::time::timeout(std::time::Duration::from_secs(30), release.wait())
             .await
+            .map_err(|_| "TUN DNS scenario startup release timed out after 30s".to_owned())?;
+        let returned = tokio::time::timeout(std::time::Duration::from_secs(30), &mut up)
+            .await
+            .map_err(|_| "TUN DNS scenario startup timed out after release".to_owned())?
             .map_err(|error| format!("injected DNS failure revoked committed TUN startup: {error}"))?;
 
         // Capture kernel identity immediately after the successful startup,
@@ -6456,10 +6470,13 @@ async fn run_required_tun_dns_failure_scenario() {
             return Err("LocalAPI socket was not retained while Running".into());
         }
 
-        let local_status = rustscale_localclient::LocalClient::new(&socket)
-            .status()
-            .await
-            .map_err(|error| format!("LocalAPI status request failed: {error}"))?;
+        let local_status = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            rustscale_localclient::LocalClient::new(&socket).status(),
+        )
+        .await
+        .map_err(|_| "LocalAPI status request timed out after 10s".to_owned())?
+        .map_err(|error| format!("LocalAPI status request failed: {error}"))?;
         if !local_status["Health"].as_array().is_some_and(|warnings| {
             warnings.iter().any(|warning| {
                 warning
@@ -6471,10 +6488,13 @@ async fn run_required_tun_dns_failure_scenario() {
                 "LocalAPI /status did not serialize OS-DNS warning text: {local_status}"
             ));
         }
-        let local_health = rustscale_localclient::LocalClient::new(&socket)
-            .health()
-            .await
-            .map_err(|error| format!("LocalAPI health request failed: {error}"))?;
+        let local_health = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            rustscale_localclient::LocalClient::new(&socket).health(),
+        )
+        .await
+        .map_err(|_| "LocalAPI health request timed out after 10s".to_owned())?
+        .map_err(|error| format!("LocalAPI health request failed: {error}"))?;
         if !local_health.as_array().is_some_and(|warnings| warnings.iter().any(|warning| {
             warning["id"] == rustscale_health::WARN_OS_DNS
                 && warning["text"]

@@ -821,6 +821,7 @@ impl ServerBuilder {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // The real-TUN contract is selected only on Linux CI.
     pub(crate) fn test_os_dns_configurator_factory(
         mut self,
         factory: impl Fn() -> Box<dyn OsConfigurator + Send> + Send + Sync + 'static,

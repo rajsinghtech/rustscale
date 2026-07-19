@@ -2587,6 +2587,16 @@ impl Server {
         } else {
             None
         };
+        #[cfg(test)]
+        if let Some((entered, release, fail)) = self.startup_localapi_test_hook.clone() {
+            entered.wait().await;
+            release.wait().await;
+            if fail {
+                return Err(TsnetError::Builder(
+                    "injected failure after TUN DNS setup".into(),
+                ));
+            }
+        }
         let extension_subscription = self
             .finish_tun_startup(b.ipn_backend.clone(), prefs.clone())
             .await?;

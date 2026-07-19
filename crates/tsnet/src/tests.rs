@@ -1958,79 +1958,6 @@ fn requested_os_dns_failure_is_immediately_health_degraded_and_retains_cleanup_o
     assert!(closed.load(Ordering::SeqCst));
 }
 
-/// This privileged contract test deliberately injects the platform DNS failure
-/// after the real TUN startup path has begun. It must be run by the Linux
-/// replacement/TUN harness as root; an ordinary unit test cannot create a
-/// real TUN device safely.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a root-capable real TUN harness"]
-async fn up_tun_dns_failure_is_running_and_immediately_visible_in_localapi() {
-    struct FailingDns(Arc<AtomicBool>);
-
-    impl rustscale_dns::OsConfigurator for FailingDns {
-        fn set_dns(&mut self, _: &rustscale_dns::OsConfig) -> std::io::Result<()> {
-            Err(std::io::Error::other("injected DNS failure"))
-        }
-
-        fn close(&mut self) -> std::io::Result<()> {
-            self.0.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn supports_split_dns(&self) -> bool {
-            true
-        }
-    }
-
-    let mut control = rustscale_testcontrol::Server::new();
-    control.start().await.unwrap();
-    let state = tempfile::tempdir().unwrap();
-    let socket = state.path().join("tun-dns-failure.sock");
-    let dns_closed = Arc::new(AtomicBool::new(false));
-    let factory_closed = Arc::clone(&dns_closed);
-    let mut server = Server::builder()
-        .hostname("tun-dns-failure")
-        .auth_key("tskey-test")
-        .control_url(control.base_url())
-        .state_dir(state.path())
-        .localapi_path(&socket)
-        .configure_os_dns(true)
-        .disable_portmapping(true)
-        .test_os_dns_configurator_factory(move || Box::new(FailingDns(Arc::clone(&factory_closed))))
-        .build()
-        .unwrap();
-
-    let returned = Box::pin(server.up_tun(TunModeConfig {
-        tun: rustscale_tun::TunConfig::default(),
-        apply_routes: false,
-        exit_node: None,
-    }))
-    .await
-    .expect("injected DNS failure must not revoke committed TUN startup");
-    assert!(returned
-        .health
-        .iter()
-        .any(|warning| warning.id == rustscale_health::WARN_OS_DNS));
-    assert_eq!(
-        server.inner.as_ref().unwrap().ipn_backend.state(),
-        rustscale_ipn::State::Running
-    );
-    let local_status = rustscale_localclient::LocalClient::new(&socket)
-        .status()
-        .await
-        .unwrap();
-    assert!(local_status["Health"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|warning| {
-            warning["WarnableCode"] == rustscale_health::WARN_OS_DNS
-                || warning.to_string().contains(rustscale_health::WARN_OS_DNS)
-        }));
-    server.close().await.unwrap();
-    assert!(dns_closed.load(Ordering::SeqCst));
-}
-
 #[test]
 fn health_warning_appears_in_status() {
     // We can't construct a full RunningState easily, so test the
@@ -6018,6 +5945,38 @@ async fn up_tun_required(server: &mut Server, test_name: &str) -> rustscale_tun:
     tun
 }
 
+/// `tools/interop-tun.sh` opts this scenario into its one reviewed exact
+/// ignored-test selector.  Reject other values so a typo cannot silently omit
+/// the contract from a required privileged run.
+fn parse_required_tun_dns_failure_mode(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some("1") => true,
+        Some(value) => {
+            panic!("RUSTSCALE_REQUIRE_TUN_DNS_FAILURE must be exactly 1 when set, got {value:?}")
+        }
+    }
+}
+
+fn required_tun_dns_failure_mode() -> bool {
+    match std::env::var("RUSTSCALE_REQUIRE_TUN_DNS_FAILURE") {
+        Err(std::env::VarError::NotPresent) => parse_required_tun_dns_failure_mode(None),
+        Ok(value) => parse_required_tun_dns_failure_mode(Some(&value)),
+        Err(error) => panic!("invalid RUSTSCALE_REQUIRE_TUN_DNS_FAILURE: {error}"),
+    }
+}
+
+#[test]
+fn required_tun_dns_failure_mode_rejects_nonzero_selector_typos() {
+    // Keep parsing independent of process environment so parallel unit tests
+    // cannot accidentally select the privileged scenario.
+    assert!(parse_required_tun_dns_failure_mode(Some("1")));
+    assert!(!parse_required_tun_dns_failure_mode(None));
+    assert!(
+        std::panic::catch_unwind(|| parse_required_tun_dns_failure_mode(Some("true"))).is_err()
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn required_command_output(program: &str, args: &[&str], assertion: &str) -> String {
     let output = std::process::Command::new(program)
@@ -6119,6 +6078,179 @@ fn assert_linux_tun_kernel_state(tun: &rustscale_tun::TunConfig) {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn assert_linux_tun_kernel_cleanup(tun: &rustscale_tun::TunConfig, ifindex: u32) {
+    assert!(
+        !std::path::Path::new("/sys/class/net")
+            .join(&tun.name)
+            .exists(),
+        "real TUN gate: {} remained after close",
+        tun.name
+    );
+    let rules = required_command_output(
+        "ip",
+        &["-4", "-details", "rule", "show"],
+        "real TUN gate policy-rule cleanup",
+    );
+    let base = 5_000 + (ifindex % 200) * 100;
+    for preference in [base + 10, base + 30, base + 50, base + 70] {
+        let prefix = format!("{preference}:");
+        assert!(
+            !rules.lines().any(|line| {
+                line.split_whitespace().next() == Some(prefix.as_str())
+                    && line.contains("proto 201")
+            }),
+            "real TUN gate: protocol-201 rule at preference {preference} leaked after close\n{rules}"
+        );
+    }
+    let routes = required_command_output(
+        "ip",
+        &["-4", "route", "show", "table", "52"],
+        "real TUN gate table-52 cleanup",
+    );
+    assert!(
+        !routes
+            .lines()
+            .any(|line| line.contains(&format!("dev {}", tun.name))),
+        "real TUN gate: table 52 still routes through {} after close\n{routes}",
+        tun.name
+    );
+}
+
+#[cfg(target_os = "linux")]
+async fn run_required_tun_dns_failure_scenario() {
+    struct FailingDns {
+        set_called: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl rustscale_dns::OsConfigurator for FailingDns {
+        fn set_dns(&mut self, _: &rustscale_dns::OsConfig) -> std::io::Result<()> {
+            self.set_called.store(true, Ordering::SeqCst);
+            Err(std::io::Error::other("injected DNS failure"))
+        }
+
+        fn close(&mut self) -> std::io::Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn supports_split_dns(&self) -> bool {
+            true
+        }
+    }
+
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let socket = state.path().join("tun-dns-failure.sock");
+    let set_called = Arc::new(AtomicBool::new(false));
+    let dns_closed = Arc::new(AtomicBool::new(false));
+    let factory_set_called = Arc::clone(&set_called);
+    let factory_closed = Arc::clone(&dns_closed);
+    let tun = rustscale_tun::TunConfig::named(format!("rsdns-{}", std::process::id()));
+    let mut server = Server::builder()
+        .hostname(format!("tun-dns-failure-{}", std::process::id()))
+        .auth_key("tskey-test")
+        .control_url(control.base_url())
+        .state_dir(state.path())
+        .localapi_path(&socket)
+        .configure_os_dns(true)
+        .disable_portmapping(true)
+        .test_os_dns_configurator_factory(move || {
+            Box::new(FailingDns {
+                set_called: Arc::clone(&factory_set_called),
+                closed: Arc::clone(&factory_closed),
+            })
+        })
+        .build()
+        .unwrap();
+
+    // Pause after DNS setup but before the one TUN Running commit. This proves
+    // LocalAPI reports Starting rather than prematurely publishing readiness.
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    server.startup_localapi_test_hook = Some((Arc::clone(&entered), Arc::clone(&release), false));
+    let mut up = Box::pin(server.up_tun(TunModeConfig {
+        tun: tun.clone(),
+        apply_routes: true,
+        exit_node: None,
+    }));
+    tokio::select! {
+        _ = entered.wait() => {}
+        result = &mut up => panic!("TUN DNS scenario finished before startup barrier: {result:?}"),
+    }
+    let starting = String::from_utf8(localapi_status_response(&socket).await).unwrap();
+    assert!(
+        starting.contains("\"BackendState\":\"Starting\""),
+        "{starting}"
+    );
+    assert!(
+        !starting.contains("\"BackendState\":\"Running\""),
+        "{starting}"
+    );
+    release.wait().await;
+    let returned = up
+        .await
+        .expect("injected DNS failure must not revoke committed TUN startup");
+    assert!(
+        set_called.load(Ordering::SeqCst),
+        "injected DNS configurator was not called"
+    );
+    assert!(returned.health.iter().any(|warning| {
+        warning.id == rustscale_health::WARN_OS_DNS && warning.text.contains("injected DNS failure")
+    }));
+    assert_eq!(
+        server.inner.as_ref().unwrap().ipn_backend.state(),
+        rustscale_ipn::State::Running
+    );
+    assert!(
+        server.inner.as_ref().unwrap().os_dns_configurator.is_some(),
+        "failed DNS configurator was not retained for cleanup"
+    );
+    assert!(
+        !dns_closed.load(Ordering::SeqCst),
+        "DNS configurator closed before server.close()"
+    );
+    assert!(
+        socket.exists(),
+        "LocalAPI socket was not retained while Running"
+    );
+    let local_status = rustscale_localclient::LocalClient::new(&socket)
+        .status()
+        .await
+        .unwrap();
+    assert!(local_status["Health"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| {
+            warning["WarnableCode"] == rustscale_health::WARN_OS_DNS
+                && warning.to_string().contains("injected DNS failure")
+        }));
+    assert_linux_tun_kernel_state(&tun);
+    let ifindex = std::fs::read_to_string(
+        std::path::Path::new("/sys/class/net")
+            .join(&tun.name)
+            .join("ifindex"),
+    )
+    .unwrap()
+    .trim()
+    .parse::<u32>()
+    .unwrap();
+
+    server.close().await.unwrap();
+    assert!(
+        dns_closed.load(Ordering::SeqCst),
+        "DNS configurator close callback did not run"
+    );
+    assert!(
+        !socket.exists(),
+        "LocalAPI socket leaked after server.close()"
+    );
+    assert_linux_tun_kernel_cleanup(&tun, ifindex);
+}
+
 /// Interop TUN: rustscale in TUN mode dials the Go node's serve echo via
 /// an OS socket. Traffic flows: OS TCP → TUN → WG → magicsock → Go netstack.
 #[tokio::test]
@@ -6127,6 +6259,12 @@ async fn interop_tun_rust_dials_go() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    let dns_failure_required = required_tun_dns_failure_mode();
+    assert!(
+        !dns_failure_required
+            || std::env::var("RUSTSCALE_REQUIRE_TUN_INTEROP").is_ok_and(|value| value == "1"),
+        "RUSTSCALE_REQUIRE_TUN_DNS_FAILURE=1 requires RUSTSCALE_REQUIRE_TUN_INTEROP=1"
+    );
     let Some(ienv) = require_tun_interop("interop_tun_rust_dials_go") else {
         return;
     };
@@ -6196,6 +6334,16 @@ async fn interop_tun_rust_dials_go() {
 
     log_go_path(&server, ienv.go_ip, "tun_rust_dials_go");
     server.close().await.unwrap();
+
+    #[cfg(target_os = "linux")]
+    if dns_failure_required {
+        run_required_tun_dns_failure_scenario().await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        !dns_failure_required,
+        "RUSTSCALE_REQUIRE_TUN_DNS_FAILURE requires the Linux privileged TUN gate"
+    );
 }
 
 /// Interop TUN: Go dials the rustscale node through its SOCKS5 proxy.

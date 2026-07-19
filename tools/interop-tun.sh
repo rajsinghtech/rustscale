@@ -238,11 +238,13 @@ if [[ -z "$TEST_BIN" || ! -x "$TEST_BIN" ]]; then
 fi
 echo "[interop-tun] test binary: $TEST_BIN" >&2
 
-# Fail closed if the selected executable does not contain the required ignored
-# test. libtest exits successfully when an exact filter matches zero tests.
-if ! "$TEST_BIN" --ignored --list \
-    | grep -Fx 'tests::interop_tun_rust_dials_go: test' >/dev/null; then
-  echo "[interop-tun] ERROR: selected binary lacks the exact TUN regression test" >&2
+# Fail closed unless the selected executable has exactly one copy of the
+# reviewed ignored test. libtest exits successfully when an exact filter matches
+# zero tests, so both list selection and its count are contract assertions.
+selected_count=$("$TEST_BIN" --ignored --list \
+  | grep -Fxc 'tests::interop_tun_rust_dials_go: test' || true)
+if [[ "$selected_count" != 1 ]]; then
+  echo "[interop-tun] ERROR: exact TUN selector matched $selected_count tests (expected 1)" >&2
   exit 1
 fi
 
@@ -253,6 +255,7 @@ fi
 echo "[interop-tun] running focused TUN regression gate under sudo..." >&2
 sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_NAME,TS_INTEROP_GO_ECHO_PORT,TS_INTEROP_SOCKS \
   sh -c "
+    set -eu
     if ! test -n \"\${TS_E2E_AUTHKEY:-}\" ||
        ! test -n \"\${TS_INTEROP_GO_IP:-}\" ||
        ! test -n \"\${TS_INTEROP_GO_NAME:-}\" ||
@@ -262,6 +265,7 @@ sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_NAME,TS_INTERO
       exit 1
     fi
     export RUSTSCALE_REQUIRE_TUN_INTEROP=1
+    export RUSTSCALE_REQUIRE_TUN_DNS_FAILURE=1
     exec \"\$@\"
   " sh "$TEST_BIN" \
   --ignored --exact tests::interop_tun_rust_dials_go \

@@ -101,11 +101,15 @@ test "$preflight_line" -lt "$token_line"
 grep -Fq -- 'cargo test -p rustscale-tsnet --lib --no-run' tools/interop-tun.sh
 grep -Fq -- "target.get('name') == 'rustscale_tsnet'" tools/interop-tun.sh
 grep -Fq -- "'lib' in target.get('kind', [])" tools/interop-tun.sh
-grep -Fq -- "if ! \"\$TEST_BIN\" --ignored --list" tools/interop-tun.sh
-grep -Fq -- "grep -Fx 'tests::interop_tun_rust_dials_go: test' >/dev/null" tools/interop-tun.sh
+grep -Fq -- "selected_count=\$(\"\$TEST_BIN\" --ignored --list" tools/interop-tun.sh
+grep -Fq -- "grep -Fxc 'tests::interop_tun_rust_dials_go: test'" tools/interop-tun.sh
+grep -Fq -- "if [[ \"\$selected_count\" != 1 ]]; then" tools/interop-tun.sh
+grep -Fq -- "exact TUN selector matched \$selected_count tests (expected 1)" tools/interop-tun.sh
 grep -Fq -- 'sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_NAME,TS_INTEROP_GO_ECHO_PORT,TS_INTEROP_SOCKS' tools/interop-tun.sh
+grep -Fq -- 'set -eu' tools/interop-tun.sh
 grep -Fq -- 'sudo did not preserve the required interop environment' tools/interop-tun.sh
 grep -Fq -- 'export RUSTSCALE_REQUIRE_TUN_INTEROP=1' tools/interop-tun.sh
+grep -Fq -- 'export RUSTSCALE_REQUIRE_TUN_DNS_FAILURE=1' tools/interop-tun.sh
 # Match exact source text retaining the escaped child argv.
 # shellcheck disable=SC2016
 grep -Fq -- 'exec \"\$@\"' tools/interop-tun.sh

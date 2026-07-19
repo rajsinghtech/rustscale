@@ -399,14 +399,16 @@ require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_DONE" server
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_KERNEL_OK role=client" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_PEER_OK" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TUN_ROUTE" client
+require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_DIRECT_PROBE_OK" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TUN_TRAFFIC" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_UDP_ROUNDTRIP_OK count=$UDP_DATAGRAMS" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TCP_ROUNDTRIP_OK" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_DONE" client
 
+require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_DIRECT_PROBE_ECHO" server
 SERVER_UDP_COUNT=$(grep -cF "OOPS_SERVER_UDP_ECHO" "$SERVER_LOG" || true)
 [[ "$SERVER_UDP_COUNT" -eq "$UDP_DATAGRAMS" ]] \
-  || fail "server echoed $SERVER_UDP_COUNT UDP datagrams, expected $UDP_DATAGRAMS"
+  || fail "server echoed $SERVER_UDP_COUNT cadenced UDP datagrams, expected $UDP_DATAGRAMS"
 
 kill -TERM "$CAPTURE_PID" 2>/dev/null
 if ! timeout --foreground --signal=TERM --kill-after=2s 10s tail --pid="$CAPTURE_PID" -f /dev/null; then

@@ -49,6 +49,11 @@ const UDP_DATAGRAMS: u32 = 10;
 const UDP_CADENCE: Duration = Duration::from_millis(200);
 /// Per-datagram echo deadline.
 const UDP_ECHO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounded number of kernel/TUN UDP probes allowed for control-plane endpoint
+/// propagation before the cadenced workload begins. A peer IP in the netmap
+/// can precede its freshly announced local UDP endpoint, so a single first
+/// application datagram is not a valid direct-path readiness signal.
+const UDP_DIRECT_PROBE_ATTEMPTS: u32 = 12;
 /// Deadline for the peer to appear in the client netmap.
 const PEER_DEADLINE: Duration = Duration::from_secs(90);
 /// Deadline for a tailnet IPv4 address after `up_tun` returns.
@@ -530,10 +535,15 @@ async fn run_server(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
             match udp.recv_from(&mut buf).await {
                 Ok((n, src)) => {
                     let payload = String::from_utf8_lossy(&buf[..n]);
+                    let marker = if payload.starts_with("interop-tun-oops-direct-probe ") {
+                        "OOPS_SERVER_DIRECT_PROBE_ECHO"
+                    } else {
+                        "OOPS_SERVER_UDP_ECHO"
+                    };
                     line(
                         udp_start,
                         Role::Server,
-                        &format!("OOPS_SERVER_UDP_ECHO src={src} bytes={n} payload={payload:?}"),
+                        &format!("{marker} src={src} bytes={n} payload={payload:?}"),
                     );
                     if udp.send_to(&buf[..n], src).await.is_err() {
                         break;
@@ -638,10 +648,53 @@ async fn run_client(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
         &format!("OOPS_CLIENT_TUN_ROUTE peer={peer} route={route}"),
     );
 
-    // UDP cadence exchange (issue #75 traffic shape): fixed-spacing
-    // datagrams, each echoed by the server process across the TUN boundary.
+    // A peer can be published to the netmap before the control plane has
+    // relayed its recently announced namespace-local UDP endpoint. Establish
+    // transport readiness with bounded real TUN probes rather than accepting a
+    // path enum or a delay as proof. Every attempt uses the same application
+    // socket and a finite echo deadline; only an echoed payload admits the
+    // subsequent fixed-cadence workload.
     let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     udp.connect((peer, args.udp_port)).await?;
+    let mut direct_ready = false;
+    for attempt in 1..=UDP_DIRECT_PROBE_ATTEMPTS {
+        let payload = format!("interop-tun-oops-direct-probe attempt={attempt}");
+        udp.send(payload.as_bytes()).await?;
+        let mut buf = [0u8; 2048];
+        match tokio::time::timeout(UDP_ECHO_TIMEOUT, udp.recv(&mut buf)).await {
+            Ok(Ok(n)) if buf[..n] == *payload.as_bytes() => {
+                line(
+                    start,
+                    args.role,
+                    &format!("OOPS_CLIENT_DIRECT_PROBE_OK attempt={attempt}"),
+                );
+                direct_ready = true;
+                break;
+            }
+            Ok(Ok(n)) => {
+                return Err(format!(
+                    "UDP direct probe mismatch attempt={attempt}: sent {payload:?}, got {:?}",
+                    String::from_utf8_lossy(&buf[..n])
+                )
+                .into());
+            }
+            Ok(Err(error)) => return Err(format!("UDP direct probe failed: {error}").into()),
+            Err(_) => line(
+                start,
+                args.role,
+                &format!("OOPS_CLIENT_DIRECT_PROBE_TIMEOUT attempt={attempt}"),
+            ),
+        }
+    }
+    if !direct_ready {
+        return Err(format!(
+            "UDP direct readiness was not established after {UDP_DIRECT_PROBE_ATTEMPTS} bounded probes"
+        )
+        .into());
+    }
+
+    // UDP cadence exchange (issue #75 traffic shape): fixed-spacing
+    // datagrams, each echoed by the server process across the TUN boundary.
     for i in 0..UDP_DATAGRAMS {
         let payload = format!("interop-tun-oops-udp seq={i}");
         let sent = Instant::now();

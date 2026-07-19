@@ -30,8 +30,12 @@ pub struct StateMachineInputs {
     pub machine_authorized: bool,
     /// Number of live WireGuard peer sessions.
     pub num_live: i32,
-    /// Number of active DERP relay connections.
+    /// Number of active DERP relay connections. This is telemetry only; it
+    /// cannot establish public readiness on its own.
     pub live_derps: i32,
+    /// Whether the lifecycle owner has committed this startup generation
+    /// after every required runtime resource is owned and published.
+    pub startup_ready: bool,
 }
 
 /// The state machine truth table, ported from Go's `nextStateLocked`.
@@ -57,6 +61,11 @@ pub fn next_state(inputs: &StateMachineInputs, current_state: State) -> State {
         // Running/Starting).
         if !inputs.want_running {
             return State::Stopped;
+        }
+        // A revoked/uncommitted generation cannot retain a prior generation's
+        // Running state while it is waiting for an authoritative map.
+        if current_state == State::Running && !inputs.startup_ready {
+            return State::Starting;
         }
         // Invariant 1: blocked prevents remaining in Running even before the
         // netmap arrives.
@@ -105,22 +114,19 @@ pub fn next_state(inputs: &StateMachineInputs, current_state: State) -> State {
         return State::Starting;
     }
 
-    // Case 7: state == Starting → Running if engine has live peers/DERPs
+    // Case 7: only the lifecycle owner's final startup commit may publish
+    // Running. Netmap, peer, and DERP observations are telemetry and can be
+    // stale, cached, or belong to a task that is being cancelled.
     if current_state == State::Starting {
-        if inputs.num_live > 0 || inputs.live_derps > 0 {
-            // Invariant 1: blocked prevents transition to Running.
-            if inputs.blocked {
-                return State::Starting;
-            }
+        if inputs.startup_ready && !inputs.blocked {
             return State::Running;
         }
         return State::Starting;
     }
 
-    // Case 8: state == Running → Running (unless blocked)
+    // Case 8: a revoked or blocked committed generation is never Running.
     if current_state == State::Running {
-        // Invariant 1: blocked prevents remaining in Running.
-        if inputs.blocked {
+        if inputs.blocked || !inputs.startup_ready {
             return State::NeedsLogin;
         }
         return State::Running;
@@ -151,6 +157,7 @@ mod tests {
             machine_authorized: true,
             num_live: 0,
             live_derps: 0,
+            startup_ready: true,
         }
     }
 
@@ -328,7 +335,7 @@ mod tests {
             ),
             // --- Case 7: state == Starting, no live peers ---
             (
-                "starting stays starting with no live peers",
+                "running from starting after lifecycle commit without peers",
                 StateMachineInputs {
                     want_running: true,
                     has_node_key: true,
@@ -336,14 +343,15 @@ mod tests {
                     machine_authorized: true,
                     num_live: 0,
                     live_derps: 0,
+                    startup_ready: true,
                     ..inputs()
                 },
                 State::Starting,
-                State::Starting,
+                State::Running,
             ),
             // --- Case 7: state == Starting, live peers ---
             (
-                "running from starting with live peers",
+                "starting remains starting with live peers before lifecycle commit",
                 StateMachineInputs {
                     want_running: true,
                     has_node_key: true,
@@ -351,14 +359,15 @@ mod tests {
                     machine_authorized: true,
                     num_live: 1,
                     live_derps: 0,
+                    startup_ready: false,
                     ..inputs()
                 },
                 State::Starting,
-                State::Running,
+                State::Starting,
             ),
             // --- Case 7: state == Starting, live DERPs ---
             (
-                "running from starting with live derps",
+                "starting remains starting with live derps before lifecycle commit",
                 StateMachineInputs {
                     want_running: true,
                     has_node_key: true,
@@ -366,10 +375,11 @@ mod tests {
                     machine_authorized: true,
                     num_live: 0,
                     live_derps: 1,
+                    startup_ready: false,
                     ..inputs()
                 },
                 State::Starting,
-                State::Running,
+                State::Starting,
             ),
             // --- Case 8: state == Running ---
             (

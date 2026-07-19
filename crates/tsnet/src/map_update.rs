@@ -772,16 +772,18 @@ pub(crate) fn spawn_map_update_task(
 
                     let tka_sync = tka_operation
                         .apply_control_info(resp.TKAInfo.as_ref(), first_non_keepalive);
-                    tokio::select! {
+                    let tka_synchronized = tokio::select! {
                         () = cancel.cancelled() => break,
-                        result = tka_sync => {
-                            if let Err(error) = result {
+                        result = tka_sync => match result {
+                            Ok(()) => true,
+                            Err(error) => {
                                 // The verifier remains in its fail-closed state;
                                 // do not retain peers using stale/partial state.
                                 log::warn!("tsnet: Tailnet Lock synchronization failed closed: {error}");
+                                false
                             }
                         }
-                    }
+                    };
                     first_non_keepalive = false;
                     map_session.set_tka_head(tailnet_lock.head());
                     if resp.Node.is_some() {
@@ -980,6 +982,13 @@ pub(crate) fn spawn_map_update_task(
                     };
                     tailnet_lock.filter_peers(&mut next_peers);
                     let authority_ready = tailnet_lock.authorization_ready();
+                    // A cached bootstrap remains degraded until this stream
+                    // supplies a complete peer snapshot and its corresponding
+                    // Tailnet Lock state has been synchronized. A keepalive or
+                    // delta can prove stream liveness, but neither can prove
+                    // that cached peer authority is current.
+                    let cache_revalidated =
+                        full_peers_present && tka_synchronized && authority_ready;
                     let peers_changed = tka_state_may_change
                         || full_peers_present
                         || invalid_peer_map
@@ -1235,6 +1244,14 @@ pub(crate) fn spawn_map_update_task(
                         ..Default::default()
                     };
                     user_dialer.set_net_map(&complete_dial_map).await;
+
+                    // This is the final peer-derived publication surface. Only
+                    // now may a cached bootstrap report that a complete fresh
+                    // snapshot has replaced its degraded authority.
+                    if cache_revalidated {
+                        health.set_healthy(WARN_CACHED_NETMAP);
+                        send_health_notify(&health, &ipn_backend);
+                    }
 
                     // Notifications, router state, resolver state, and tsdial
                     // are peer-derived publications too. Keep the TKA

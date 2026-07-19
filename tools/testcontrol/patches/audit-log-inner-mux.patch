@@ -1,0 +1,225 @@
+--- testcontrol.go
++++ testcontrol.go
+@@ -11,0 +12 @@
++	"crypto/sha256"
+@@ -19,0 +21 @@
++	"mime"
+@@ -50,0 +53,41 @@
++const maxAuditLogRequestBody = 64 << 10
++
++// AuditLogStats is the redacted audit-log state recorded by Server.
++// LastBodySHA256 is a deterministic signal for the last body without
++// retaining the body itself or its node key.
++type AuditLogStats struct {
++	Accepted       uint64
++	Rejected       uint64
++	Action         tailcfg.ClientAuditAction
++	DetailsLen     int
++	TimestampSet   bool
++	LastBodySHA256 string
++	LastError      string
++}
++
++// AuditLogStats returns a snapshot of audit-log processing state.
++func (s *Server) AuditLogStats() AuditLogStats {
++	s.auditMu.Lock()
++	defer s.auditMu.Unlock()
++	return s.auditLogStats
++}
++
++func (s *Server) recordAuditLog(body []byte, req *tailcfg.AuditLogRequest) {
++	s.auditMu.Lock()
++	defer s.auditMu.Unlock()
++	s.auditLogStats.Accepted++
++	s.auditLogStats.Action = req.Action
++	s.auditLogStats.DetailsLen = len(req.Details)
++	s.auditLogStats.TimestampSet = !req.Timestamp.IsZero()
++	s.auditLogStats.LastBodySHA256 = fmt.Sprintf("%x", sha256.Sum256(body))
++	s.auditLogStats.LastError = ""
++}
++
++func (s *Server) rejectAuditLog(body []byte, reason string) {
++	s.auditMu.Lock()
++	defer s.auditMu.Unlock()
++	s.auditLogStats.Rejected++
++	s.auditLogStats.LastBodySHA256 = fmt.Sprintf("%x", sha256.Sum256(body))
++	s.auditLogStats.LastError = reason
++}
++
+@@ -63,0 +107,5 @@
++	// auditMu protects auditLogStats. Audit events deliberately retain only
++	// redacted metadata so test diagnostics cannot expose node credentials.
++	auditMu       sync.Mutex
++	auditLogStats AuditLogStats
++
+@@ -495,4 +542,0 @@
+-	if r.Method != "POST" {
+-		http.Error(w, "POST required for serveMachine", 400)
+-		return
+-	}
+@@ -504,0 +549,8 @@
++	if r.URL.Path == "/machine/audit-log" {
++		s.serveAuditLog(w, r, mkey)
++		return
++	}
++	if r.Method != "POST" {
++		http.Error(w, "POST required for serveMachine", 400)
++		return
++	}
+@@ -516,0 +569,65 @@
++}
++
++// serveAuditLog accepts only the pinned client audit contract over an
++// authenticated Noise connection. Unknown machine paths remain fail-closed.
++func (s *Server) serveAuditLog(w http.ResponseWriter, r *http.Request, mkey key.MachinePublic) {
++	if r.Method != http.MethodPost {
++		s.rejectAuditLog(nil, "method")
++		http.Error(w, "invalid audit log request", http.StatusMethodNotAllowed)
++		return
++	}
++	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
++	if err != nil || mediaType != "application/json" {
++		s.rejectAuditLog(nil, "content-type")
++		http.Error(w, "invalid audit log request", http.StatusBadRequest)
++		return
++	}
++	if r.ContentLength > maxAuditLogRequestBody {
++		s.rejectAuditLog(nil, "body-too-large")
++		http.Error(w, "invalid audit log request", http.StatusRequestEntityTooLarge)
++		return
++	}
++	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAuditLogRequestBody))
++	if err != nil {
++		s.rejectAuditLog(body, "body-read")
++		http.Error(w, "invalid audit log request", http.StatusRequestEntityTooLarge)
++		return
++	}
++	defer r.Body.Close()
++
++	var req tailcfg.AuditLogRequest
++	dec := json.NewDecoder(bytes.NewReader(body))
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(&req); err != nil {
++		s.rejectAuditLog(body, "json")
++		http.Error(w, "invalid audit log request", http.StatusBadRequest)
++		return
++	}
++	var extra any
++	if err := dec.Decode(&extra); err != io.EOF {
++		s.rejectAuditLog(body, "trailing-json")
++		http.Error(w, "invalid audit log request", http.StatusBadRequest)
++		return
++	}
++	if req.Version != tailcfg.CurrentCapabilityVersion ||
++		req.NodeKey.IsZero() ||
++		req.Action != tailcfg.AuditNodeDisconnect ||
++		strings.TrimSpace(req.Details) == "" {
++		s.rejectAuditLog(body, "contract")
++		http.Error(w, "invalid audit log request", http.StatusBadRequest)
++		return
++	}
++
++	s.mu.Lock()
++	node := s.nodes[req.NodeKey]
++	registered := node != nil && node.Machine == mkey
++	s.mu.Unlock()
++	if !registered {
++		s.rejectAuditLog(body, "node-binding")
++		http.Error(w, "invalid audit log request", http.StatusForbidden)
++		return
++	}
++
++	s.recordAuditLog(body, &req)
++	s.logf("accepted audit log action=%s details_len=%d timestamp=%t body_sha256=%x", req.Action, len(req.Details), !req.Timestamp.IsZero(), sha256.Sum256(body))
++	w.WriteHeader(http.StatusOK)
+--- testcontrol_test.go
++++ testcontrol_test.go
+@@ -132,0 +133,88 @@
++
++func TestAuditLogContract(t *testing.T) {
++	ctrl := &testcontrol.Server{}
++	ctrl.HTTPTestServer = httptest.NewUnstartedServer(ctrl)
++	ctrl.HTTPTestServer.Start()
++	t.Cleanup(ctrl.HTTPTestServer.Close)
++	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	defer cancel()
++	baseURL := ctrl.HTTPTestServer.URL
++	serverKey := must.Get(tsp.DiscoverServerKey(ctx, baseURL))
++	nodeKey := key.NewNode()
++	machineKey := key.NewMachine()
++	tc := must.Get(tsp.NewClient(tsp.ClientOpts{ServerURL: baseURL, MachineKey: machineKey}))
++	defer tc.Close()
++	tc.SetControlPublicKey(serverKey)
++	must.Get(tc.Register(ctx, tsp.RegisterOpts{NodeKey: nodeKey, Hostinfo: &tailcfg.Hostinfo{Hostname: "audit"}}))
++
++	nc := must.Get(ts2021.NewClient(ts2021.ClientOpts{
++		ServerURL: baseURL, PrivKey: machineKey, ServerPubKey: serverKey,
++		Dialer: tsdial.NewFromFuncForDebug(t.Logf, (&net.Dialer{}).DialContext),
++	}))
++	defer nc.Close()
++	validJSON := fmt.Sprintf(`{"Version":141,"NodeKey":"%s","Action":"DISCONNECT_NODE","Details":"public down"}`, nodeKey.Public())
++	validReq := must.Get(http.NewRequestWithContext(ctx, http.MethodPost, strings.Replace(baseURL+"/machine/audit-log", "http:", "https:", 1), strings.NewReader(validJSON)))
++	validReq.Header.Set("Content-Type", "application/json")
++	// No Ts-Lb header is needed: Noise machine authentication binds the node.
++	res := must.Get(nc.Do(validReq))
++	res.Body.Close()
++	if res.StatusCode != http.StatusOK {
++		t.Fatalf("valid audit status=%d", res.StatusCode)
++	}
++	stats := ctrl.AuditLogStats()
++	if stats.Accepted != 1 || stats.Rejected != 0 || stats.Action != tailcfg.AuditNodeDisconnect || stats.DetailsLen != len("public down") || stats.TimestampSet || len(stats.LastBodySHA256) != 64 {
++		t.Fatalf("unexpected zero-timestamp audit stats: %+v", stats)
++	}
++
++	res = must.Get(nc.Post(ctx, "/machine/audit-log", nodeKey.Public(), &tailcfg.AuditLogRequest{
++		Version: tailcfg.CurrentCapabilityVersion, NodeKey: nodeKey.Public(),
++		Action: tailcfg.AuditNodeDisconnect, Details: "public down", Timestamp: time.Unix(1, 0).UTC(),
++	}))
++	res.Body.Close()
++	if res.StatusCode != http.StatusOK {
++		t.Fatalf("timestamped audit status=%d", res.StatusCode)
++	}
++	stats = ctrl.AuditLogStats()
++	if stats.Accepted != 2 || stats.Rejected != 0 || !stats.TimestampSet {
++		t.Fatalf("unexpected timestamped audit stats: %+v", stats)
++	}
++
++	invalid := []struct {
++		name   string
++		body   string
++		status int
++		reason string
++	}{
++		{"unknown-field", validJSON[:len(validJSON)-1] + `,"Unexpected":true}`, http.StatusBadRequest, "json"},
++		{"malformed-timestamp", validJSON[:len(validJSON)-1] + `,"Timestamp":"not-a-time"}`, http.StatusBadRequest, "json"},
++		{"trailing-json", validJSON + ` {}`, http.StatusBadRequest, "trailing-json"},
++		{"wrong-version", strings.Replace(validJSON, `"Version":141`, `"Version":140`, 1), http.StatusBadRequest, "contract"},
++		{"unregistered-node", strings.Replace(validJSON, nodeKey.Public().String(), key.NewNode().Public().String(), 1), http.StatusForbidden, "node-binding"},
++	}
++	for i, tt := range invalid {
++		t.Run(tt.name, func(t *testing.T) {
++			req := must.Get(http.NewRequestWithContext(ctx, http.MethodPost, strings.Replace(baseURL+"/machine/audit-log", "http:", "https:", 1), strings.NewReader(tt.body)))
++			req.Header.Set("Content-Type", "application/json")
++			res := must.Get(nc.Do(req))
++			res.Body.Close()
++			if res.StatusCode != tt.status {
++				t.Fatalf("status=%d, want %d", res.StatusCode, tt.status)
++			}
++			stats := ctrl.AuditLogStats()
++			if stats.Accepted != 2 || stats.Rejected != uint64(i+1) || stats.LastError != tt.reason || len(stats.LastBodySHA256) != 64 {
++				t.Fatalf("unexpected rejected audit stats: %+v", stats)
++			}
++		})
++	}
++
++	wrongMethod := must.Get(http.NewRequestWithContext(ctx, http.MethodGet, strings.Replace(baseURL+"/machine/audit-log", "http:", "https:", 1), nil))
++	res = must.Get(nc.Do(wrongMethod))
++	res.Body.Close()
++	if res.StatusCode != http.StatusMethodNotAllowed {
++		t.Fatalf("wrong method status=%d", res.StatusCode)
++	}
++	stats = ctrl.AuditLogStats()
++	if stats.Accepted != 2 || stats.Rejected != uint64(len(invalid)+1) || stats.LastError != "method" {
++		t.Fatalf("unexpected method stats: %+v", stats)
++	}
++}

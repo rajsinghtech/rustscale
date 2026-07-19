@@ -25,7 +25,7 @@ esac
 mkdir -p "$(dirname "$output")"
 
 go mod download
-go build -o "$output" .
+./with-audit-patch.sh build -o "$output" .
 
 echo "Built: $output"
 

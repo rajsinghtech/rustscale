@@ -574,6 +574,8 @@ impl Server {
         let state = Arc::new(LocalApiState {
             mutation_fence: Arc::clone(&inner.localapi_mutation_fence),
             mutation_generation: inner.localapi_mutation_generation,
+            #[cfg(test)]
+            status_build_hook: None,
             peers: inner.peers.clone(),
             routecheck: Some(inner.routecheck.clone()),
             user_profiles: inner.user_profiles.clone(),

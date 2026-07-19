@@ -105,6 +105,9 @@ struct ServerInner {
     /// Process the next register request but drop its response, simulating an
     /// ambiguous network failure after control may have consumed a one-use key.
     drop_next_register_response: bool,
+    /// Reject one non-streaming map request. Tests use this to prove that a
+    /// reachable control server can still require cached-map fallback.
+    fail_next_non_stream_map_request: bool,
     token_response: TokenResponse,
     last_token_request: Option<TokenRequest>,
     base_url: String,
@@ -176,6 +179,7 @@ impl Server {
                 register_auth_present: Vec::new(),
                 register_auth_fingerprints: Vec::new(),
                 drop_next_register_response: false,
+                fail_next_non_stream_map_request: false,
                 token_response: TokenResponse {
                     IDToken: "test.header.payload.signature".into(),
                 },
@@ -219,6 +223,14 @@ impl Server {
         format!("http://{}", self.addr.unwrap())
     }
 
+    /// Stop accepting new control connections while preserving test state.
+    /// Existing test clients should be closed before calling this helper.
+    pub fn stop(&mut self) {
+        if let Some(task) = self.accept_task.take() {
+            task.abort();
+        }
+    }
+
     /// The server's Noise public key (also returned by `GET /key`).
     pub fn noise_public_key(&self) -> MachinePublic {
         self.inner.lock().unwrap().noise_pub.clone()
@@ -231,6 +243,23 @@ impl Server {
     /// Process the next register request but close its response stream.
     pub fn drop_next_register_response(&self) {
         self.inner.lock().unwrap().drop_next_register_response = true;
+    }
+
+    /// Reject the next non-streaming `/machine/map` request with HTTP 503.
+    /// Streaming map polls remain available so tests can subsequently inject
+    /// keepalives, deltas, or a complete authoritative snapshot.
+    pub fn fail_next_non_stream_map_request(&self) {
+        self.inner.lock().unwrap().fail_next_non_stream_map_request = true;
+    }
+
+    /// Prevent generated map frames for one node until
+    /// [`resume_auto_map`](Self::resume_auto_map) is called.
+    pub fn suppress_auto_map(&self, node_key: &NodePublic) {
+        self.inner
+            .lock()
+            .unwrap()
+            .suppress_auto
+            .insert(node_key.clone());
     }
 
     /// Snapshot whether each valid register request carried an auth key.
@@ -1645,6 +1674,19 @@ async fn serve_map(
                 }
             }
         }
+    }
+
+    // A one-shot map request is the authoritative bootstrap snapshot. Tests
+    // can fail exactly one such request while leaving the following stream
+    // reachable, which distinguishes cache authority from transport liveness.
+    let reject_non_stream = {
+        let mut state = inner.lock().unwrap();
+        !req.Stream && std::mem::take(&mut state.fail_next_non_stream_map_request)
+    };
+    if reject_non_stream {
+        let resp = http::Response::builder().status(503).body(()).unwrap();
+        let _ = respond.send_response(resp, true);
+        return;
     }
 
     // Register the update channel for this node (only for streaming polls).

@@ -145,9 +145,9 @@ use {
     },
     rustscale_filter::Filter,
     rustscale_health::{
-        Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
-        WARN_EXIT_ROUTE_SECURITY, WARN_MAP_RESPONSE_TIMEOUT, WARN_NETMON_CHANGE,
-        WARN_NOT_IN_MAP_POLL,
+        Severity, Tracker, Watchdog, WARN_CACHED_NETMAP, WARN_CERT_FALLBACK, WARN_CONTROL,
+        WARN_DERP_HOME, WARN_EXIT_ROUTE_SECURITY, WARN_MAP_RESPONSE_TIMEOUT, WARN_NETMON_CHANGE,
+        WARN_NOT_IN_MAP_POLL, WARN_OS_DNS,
     },
     rustscale_ipn::IpnBackend,
     rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic},
@@ -367,6 +367,11 @@ pub struct ServerBuilder {
     /// **Requires root** and a supported platform DNS manager. Default
     /// `false`. Ignored in netstack mode (`up()`).
     pub(crate) configure_os_dns: bool,
+    /// Test-only factory for exercising the real TUN startup contract when
+    /// the platform DNS configurator fails after making a partial change.
+    #[cfg(test)]
+    pub(crate) os_dns_configurator_factory:
+        Option<Arc<dyn Fn() -> Box<dyn OsConfigurator + Send> + Send + Sync>>,
     /// Whether to run this node as a peer relay server. When true, a
     /// `udprelay::Server` is started in magicsock and
     /// `Hostinfo.PeerRelay = true` is advertised to the control plane.
@@ -812,6 +817,16 @@ impl ServerBuilder {
         self
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // The real-TUN contract is selected only on Linux CI.
+    pub(crate) fn test_os_dns_configurator_factory(
+        mut self,
+        factory: impl Fn() -> Box<dyn OsConfigurator + Send> + Send + Sync + 'static,
+    ) -> Self {
+        self.os_dns_configurator_factory = Some(Arc::new(factory));
+        self
+    }
+
     /// Compute the effective advertised routes: `advertise_routes` plus the
     /// exit-node default routes (`0.0.0.0/0`, `::/0`) when
     /// `advertise_exit_node` is true. Used everywhere `RoutableIPs` is sent to
@@ -1124,6 +1139,8 @@ pub(crate) struct Bootstrap {
     pub(crate) key_expired: Arc<std::sync::atomic::AtomicBool>,
     /// IPN state machine backend (shared with LocalApiState).
     pub(crate) ipn_backend: Arc<IpnBackend>,
+    /// Admission token whose owner alone may publish public Running.
+    pub(crate) startup_generation: u64,
     /// Shared map-session state for delta-tracking across reconnections.
     pub(crate) map_session: Arc<MapSessionState>,
     /// Per-label socket TX/RX counter registry (shared with magicsock,

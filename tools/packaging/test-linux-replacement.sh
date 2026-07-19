@@ -1066,9 +1066,13 @@ run_root_bounded 45 restart-without-key systemctl restart rustscaled.service
 persisted_status=$(wait_backend Running 80)
 PID_AFTER=$(timeout --signal=KILL 5s \
   systemctl show -p MainPID --value rustscaled.service)
-[[ "$PID_BEFORE" =~ ^[1-9][0-9]*$ && "$PID_AFTER" =~ ^[1-9][0-9]*$ ]]
-[[ "$PID_BEFORE" != "$PID_AFTER" ]]
-[[ "$(printf '%s' "$persisted_status" | status_ip)" == "$RUST_IP" ]]
+[[ "$PID_BEFORE" =~ ^[1-9][0-9]*$ && "$PID_AFTER" =~ ^[1-9][0-9]*$ ]] \
+  || { echo "$LABEL ERROR: invalid restart PIDs before='$PID_BEFORE' after='$PID_AFTER'" >&2; exit 1; }
+[[ "$PID_BEFORE" != "$PID_AFTER" ]] \
+  || { echo "$LABEL ERROR: systemd restart retained daemon PID $PID_BEFORE" >&2; exit 1; }
+persisted_ip=$(printf '%s' "$persisted_status" | status_ip)
+[[ "$persisted_ip" == "$RUST_IP" ]] \
+  || { echo "$LABEL ERROR: restart changed tailnet IP from '$RUST_IP' to '$persisted_ip'" >&2; exit 1; }
 [[ "$(wait_node_count 2)" -ge 2 ]]
 
 run_bounded 120 restart-persistence-roundtrip \

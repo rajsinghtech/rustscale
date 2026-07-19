@@ -6286,16 +6286,6 @@ fn linux_tun_early_cleanup_failures(tun: &rustscale_tun::TunConfig) -> Vec<Strin
 }
 
 #[cfg(target_os = "linux")]
-fn assert_linux_tun_kernel_cleanup(tun: &rustscale_tun::TunConfig, ifindex: u32) {
-    let failures = linux_tun_kernel_cleanup_failures(tun, ifindex);
-    assert!(
-        failures.is_empty(),
-        "real TUN gate cleanup failures:\n{}",
-        failures.join("\n")
-    );
-}
-
-#[cfg(target_os = "linux")]
 async fn run_required_tun_dns_failure_scenario() {
     struct FailingDns {
         set_called: Arc<AtomicBool>,
@@ -6402,7 +6392,7 @@ async fn run_required_tun_dns_failure_scenario() {
         tokio::select! {
             _ = entered.wait() => {}
             result = &mut up => return Err(format!("TUN DNS scenario finished before startup barrier: {result:?}")),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                 return Err("TUN DNS scenario startup barrier timed out after 30s".into());
             }
         }

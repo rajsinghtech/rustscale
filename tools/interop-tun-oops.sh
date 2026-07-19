@@ -31,6 +31,8 @@ VETH_SERVER="${GATE_ID}s"
 VETH_CLIENT="${GATE_ID}c"
 STATE_DIR=""
 SERVER_PID=""
+CAPTURE_PID=""
+UNDERLAY_PCAP=""
 SERVER_LOG=""
 CLIENT_LOG=""
 READY_FIFO=""
@@ -88,6 +90,13 @@ cleanup() {
   trap - EXIT INT TERM
   set +e
 
+  if [[ -n "$CAPTURE_PID" ]]; then
+    kill -TERM "$CAPTURE_PID" 2>/dev/null
+    timeout --foreground --signal=TERM --kill-after=2s 10s tail --pid="$CAPTURE_PID" -f /dev/null \
+      || { echo "[interop-tun-oops] ERROR: underlay capture did not stop" >&2; cleanup_rc=1; }
+    wait "$CAPTURE_PID" 2>/dev/null
+  fi
+
   if [[ -n "$SERVER_PID" ]]; then
     if kill -0 "$SERVER_PID" 2>/dev/null; then
       kill -TERM "$SERVER_PID" 2>/dev/null
@@ -109,13 +118,16 @@ cleanup() {
   fi
 
   if (( SERVER_NS_CREATED )); then
-    timeout 10s sudo -n ip netns del "$NS_SERVER" 2>/dev/null || cleanup_rc=1
+    timeout 10s sudo -n ip netns del "$NS_SERVER" 2>/dev/null \
+      || { echo "[interop-tun-oops] ERROR: could not delete server namespace" >&2; cleanup_rc=1; }
   fi
   if (( CLIENT_NS_CREATED )); then
-    timeout 10s sudo -n ip netns del "$NS_CLIENT" 2>/dev/null || cleanup_rc=1
+    timeout 10s sudo -n ip netns del "$NS_CLIENT" 2>/dev/null \
+      || { echo "[interop-tun-oops] ERROR: could not delete client namespace" >&2; cleanup_rc=1; }
   fi
   if (( BRIDGE_CREATED )); then
-    timeout 10s sudo -n ip link del "$BRIDGE" 2>/dev/null || cleanup_rc=1
+    timeout 10s sudo -n ip link del "$BRIDGE" 2>/dev/null \
+      || { echo "[interop-tun-oops] ERROR: could not delete bridge" >&2; cleanup_rc=1; }
   fi
 
   if (( NAT_RULE_ADDED )); then
@@ -170,7 +182,7 @@ cleanup() {
 }
 
 [[ "$(uname -s)" == Linux ]] || fail "isolated two-TUN gate requires Linux"
-for cmd in cargo curl jq ip iptables sudo tc timeout; do
+for cmd in cargo curl jq ip iptables sudo tcpdump timeout; do
   command -v "$cmd" >/dev/null 2>&1 || fail "required tool '$cmd' not found"
 done
 tools/interop-tun-preflight.sh
@@ -244,16 +256,6 @@ sudo -n ip link set "$VETH_CLIENT" master "$BRIDGE"
 sudo -n ip link set "$VETH_CLIENT" up
 sudo -n ip link set "${VETH_CLIENT}p" netns "$NS_CLIENT"
 
-# Count direct encrypted underlay datagrams independently of RustScale state.
-# Each ingress filter sees packets emitted by one endpoint toward the other's
-# isolated underlay address; both directions must increment during workload.
-sudo -n tc qdisc add dev "$VETH_SERVER" clsact
-sudo -n tc filter add dev "$VETH_SERVER" ingress protocol ip pref 49152 flower \
-  src_ip 198.18.83.2 dst_ip 198.18.83.3 ip_proto udp action pass
-sudo -n tc qdisc add dev "$VETH_CLIENT" clsact
-sudo -n tc filter add dev "$VETH_CLIENT" ingress protocol ip pref 49152 flower \
-  src_ip 198.18.83.3 dst_ip 198.18.83.2 ip_proto udp action pass
-
 for spec in "$NS_SERVER ${VETH_SERVER}p 198.18.83.2" "$NS_CLIENT ${VETH_CLIENT}p 198.18.83.3"; do
   read -r ns veth address <<<"$spec"
   sudo -n ip netns exec "$ns" ip link set lo up
@@ -288,6 +290,23 @@ CLIENT_LOG="$STATE_DIR/client.log"
 READY_FIFO="$STATE_DIR/server.ready"
 mkfifo -m 600 "$READY_FIFO"
 AUTHKEY_FILE="$STATE_DIR/authkey"
+UNDERLAY_PCAP="$STATE_DIR/underlay.pcap"
+# Capture at the bridge before host NAT. Later assertions correlate each
+# namespace source address to the other endpoint's externally discovered UDP
+# port, independent of RustScale's path enum or configured candidates.
+# Log redirection intentionally remains owned by the invoking user; tcpdump
+# alone needs privilege and writes the pcap removed by root cleanup.
+# shellcheck disable=SC2024
+sudo -n tcpdump -U -n -i "$BRIDGE" -w "$UNDERLAY_PCAP" udp >"$STATE_DIR/tcpdump.log" 2>&1 &
+CAPTURE_PID=$!
+# tcpdump signals readiness on stderr after opening the interface. Follow that
+# file event with an outer deadline rather than polling.
+set +o pipefail
+timeout 10s tail --pid="$CAPTURE_PID" -n +1 -f "$STATE_DIR/tcpdump.log" \
+  | grep -m1 -q "listening on"
+CAPTURE_READY_RC=$?
+set -o pipefail
+(( CAPTURE_READY_RC == 0 )) || fail "underlay packet capture did not become ready"
 AUTHKEY=$(bench_mint_authkey)
 printf '%s' "$AUTHKEY" > "$AUTHKEY_FILE"
 chmod 600 "$AUTHKEY_FILE"
@@ -361,15 +380,25 @@ SERVER_UDP_COUNT=$(grep -cF "OOPS_SERVER_UDP_ECHO" "$SERVER_LOG" || true)
 [[ "$SERVER_UDP_COUNT" -eq "$UDP_DATAGRAMS" ]] \
   || fail "server echoed $SERVER_UDP_COUNT UDP datagrams, expected $UDP_DATAGRAMS"
 
-SERVER_DIRECT_PACKETS=$(sudo -n tc -s filter show dev "$VETH_SERVER" ingress pref 49152 \
-  | awk '/ Sent / {print $4; exit}')
-CLIENT_DIRECT_PACKETS=$(sudo -n tc -s filter show dev "$VETH_CLIENT" ingress pref 49152 \
-  | awk '/ Sent / {print $4; exit}')
+kill -TERM "$CAPTURE_PID" 2>/dev/null
+if ! timeout --foreground --signal=TERM --kill-after=2s 10s tail --pid="$CAPTURE_PID" -f /dev/null; then
+  fail "underlay packet capture did not stop"
+fi
+wait "$CAPTURE_PID" || fail "underlay packet capture failed"
+CAPTURE_PID=""
+SERVER_PUBLIC_PORT=$(sed -n 's/.*STUN endpoint: [^: ]*:\([0-9][0-9]*\).*/\1/p' "$SERVER_LOG" | tail -n 1)
+CLIENT_PUBLIC_PORT=$(sed -n 's/.*STUN endpoint: [^: ]*:\([0-9][0-9]*\).*/\1/p' "$CLIENT_LOG" | tail -n 1)
+[[ "$SERVER_PUBLIC_PORT" =~ ^[1-9][0-9]*$ && "$CLIENT_PUBLIC_PORT" =~ ^[1-9][0-9]*$ ]] \
+  || fail "could not identify both externally discovered endpoint ports"
+CLIENT_DIRECT_PACKETS=$(sudo -n tcpdump -n -r "$UNDERLAY_PCAP" \
+  "src host 198.18.83.3 and udp dst port $SERVER_PUBLIC_PORT" 2>/dev/null | wc -l | tr -d ' ')
+SERVER_DIRECT_PACKETS=$(sudo -n tcpdump -n -r "$UNDERLAY_PCAP" \
+  "src host 198.18.83.2 and udp dst port $CLIENT_PUBLIC_PORT" 2>/dev/null | wc -l | tr -d ' ')
 [[ "$SERVER_DIRECT_PACKETS" =~ ^[1-9][0-9]*$ ]] \
-  || fail "no externally counted direct UDP underlay packets from server to client"
+  || fail "no externally captured direct UDP underlay packets from server to client"
 [[ "$CLIENT_DIRECT_PACKETS" =~ ^[1-9][0-9]*$ ]] \
-  || fail "no externally counted direct UDP underlay packets from client to server"
-echo "[interop-tun-oops] OOPS_DIRECT_UNDERLAY_EVIDENCE server_to_client_packets=$SERVER_DIRECT_PACKETS client_to_server_packets=$CLIENT_DIRECT_PACKETS src_server=198.18.83.2 src_client=198.18.83.3" >&2
+  || fail "no externally captured direct UDP underlay packets from client to server"
+echo "[interop-tun-oops] OOPS_DIRECT_UNDERLAY_EVIDENCE server_to_client_packets=$SERVER_DIRECT_PACKETS client_to_server_packets=$CLIENT_DIRECT_PACKETS server_port=$SERVER_PUBLIC_PORT client_port=$CLIENT_PUBLIC_PORT src_server=198.18.83.2 src_client=198.18.83.3" >&2
 
 # `OOPS_KERNEL_OK` is emitted only after each live endpoint has verified its
 # own namespace-local table-52 route. Routes are intentionally retired by

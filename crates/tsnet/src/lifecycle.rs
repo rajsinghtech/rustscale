@@ -844,6 +844,57 @@ fn close_os_dns_configurator(
     Ok(())
 }
 
+/// Return whether this persisted map is sufficient to admit an explicitly
+/// degraded offline generation. Any missing, expired, or mismatched identity
+/// material is rejected before it can affect readiness.
+pub(crate) fn cached_netmap_is_usable(
+    state: &PersistedState,
+    node_pub: &NodePublic,
+    cached: &crate::state::NetMapCacheData,
+) -> bool {
+    state.is_enrolled()
+        && !state.tailnet_identity.is_empty()
+        && cached.node_key == *node_pub
+        && cached.map_response.Domain == state.tailnet_identity
+        && cached.map_response.Peers.is_some()
+        && cached.map_response.Node.as_ref().is_some_and(|node| {
+            node.Key == *node_pub
+                && node
+                    .KeyExpiry
+                    .is_none_or(|expiry| expiry > chrono::Utc::now())
+        })
+        && !extract_tailscale_ips(&cached.map_response).is_empty()
+}
+
+/// Configure requested OS DNS without letting a setup failure masquerade as
+/// healthy. The owner is retained even after a failed setup because a platform
+/// configurator may have made a partial change which must be cleaned up during
+/// `down`/`close`.
+pub(crate) fn configure_requested_os_dns(
+    mut configurator: Box<dyn OsConfigurator + Send>,
+    config: &OsConfig,
+    health: &Tracker,
+) -> Box<dyn OsConfigurator + Send> {
+    match configurator.set_dns(config) {
+        Ok(()) => {
+            health.set_healthy(WARN_OS_DNS);
+            log::info!(
+                "tsnet: OS DNS configured ({} match domains, {} search domains)",
+                config.match_domains.len(),
+                config.search_domains.len()
+            );
+        }
+        Err(error) => {
+            health.set_unhealthy(
+                WARN_OS_DNS,
+                format!("requested OS DNS configuration failed: {error}"),
+            );
+            log::warn!("tsnet: OS DNS configuration failed; reporting degraded health: {error}");
+        }
+    }
+    configurator
+}
+
 async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningState, String)> {
     // Extension shutdown has succeeded, so dependencies owned by the router,
     // DNS configurator, and magicsock can now be released.
@@ -2504,9 +2555,10 @@ impl Server {
         rollback.localapi_socket.clone_from(&localapi_socket);
 
         // OS DNS configuration (macOS: /etc/resolver entries pointing at
-        // 100.100.100.100). Opt-in via `configure_os_dns(true)` — requires
-        // root. Best-effort: permission errors are logged and do not prevent
-        // up_tun from completing.
+        // 100.100.100.100). A requested setup has one terminal outcome:
+        // its owner commits and status is either healthy or immediately
+        // degraded. DNS failure alone does not revoke an otherwise committed
+        // TUN data plane, matching pinned upstream semantics.
         rollback.os_dns_configurator = if self.config.configure_os_dns {
             let dns_cfg_snapshot = b.dns_config.read().await.clone();
             let os_cfg = if let Some(ref dc) = dns_cfg_snapshot {
@@ -2517,21 +2569,11 @@ impl Server {
                     ..Default::default()
                 }
             };
-            let mut configurator: Box<dyn OsConfigurator + Send> = Box::new(new_os_configurator());
-            match configurator.set_dns(&os_cfg) {
-                Ok(()) => {
-                    log::info!(
-                        "tsnet: OS DNS configured ({} match domains, {} search domains)",
-                        os_cfg.match_domains.len(),
-                        os_cfg.search_domains.len()
-                    );
-                    Some(configurator)
-                }
-                Err(e) => {
-                    log::warn!("tsnet: OS DNS configuration failed (non-fatal, needs root?): {e}");
-                    None
-                }
-            }
+            Some(configure_requested_os_dns(
+                Box::new(new_os_configurator()),
+                &os_cfg,
+                &b.health,
+            ))
         } else {
             None
         };
@@ -3267,166 +3309,212 @@ impl Server {
         let cached_netmap = state_scope.as_ref().and_then(|scope| {
             let cache = NetMapCache::new_scoped(scope, &state.tailnet_identity);
             let cached = cache.load()?;
-            if cached.node_key == node_pub
-                && cached.map_response.Node.is_some()
-                && cached.map_response.Peers.is_some()
-            {
+            if cached_netmap_is_usable(&state, &node_pub, &cached) {
                 Some(cached.map_response)
             } else {
+                log::warn!("tsnet: netmap cache is incomplete, expired, or identity-mismatched; discarding");
                 cache.clear();
                 None
             }
         });
 
-        // 2. Fetch the server's Noise public key (GET /key?v=<version>).
-        let server_pub_key = controlhttp::fetch_server_pub_key(
+        let cached_control_key = cached_netmap.as_ref().and_then(|_| {
+            state_scope.as_ref().and_then(|scope| {
+                NetMapCache::new_scoped(scope, &state.tailnet_identity).load_control_server_key()
+            })
+        });
+
+        // 2. Fetch the server's Noise public key (GET /key?v=<version>). A
+        // fully validated cache can start while control is unavailable, but
+        // only using the previously authenticated control key and with an
+        // immediately-visible degraded control health state.
+        let mut control_offline = false;
+        let server_pub_key = match controlhttp::fetch_server_pub_key(
             &self.config.control_url,
             PROTOCOL_VERSION,
             self.config.extra_root_certs.as_deref(),
         )
         .await
-        .map_err(|e| TsnetError::Register(rustscale_controlclient::RegisterError::Dial(e)))?;
+        {
+            Ok(key) => {
+                if let Some(scope) = state_scope.as_ref() {
+                    if let Err(error) = NetMapCache::new_scoped(scope, &state.tailnet_identity)
+                        .save_control_server_key(&key)
+                    {
+                        log::warn!("tsnet: failed to persist control server key for offline cache: {error}");
+                    }
+                }
+                key
+            }
+            Err(error) if cached_netmap.is_some() && state.is_enrolled() => {
+                let Some(cached_key) = cached_control_key else {
+                    return Err(TsnetError::Register(
+                        rustscale_controlclient::RegisterError::Dial(error),
+                    ));
+                };
+                control_offline = true;
+                health.set_unhealthy(
+                    WARN_CONTROL,
+                    format!("control unavailable; using validated cached netmap: {error}"),
+                );
+                cached_key
+            }
+            Err(error) => {
+                return Err(TsnetError::Register(
+                    rustscale_controlclient::RegisterError::Dial(error),
+                ));
+            }
+        };
 
         // 3. Register with the control plane. Authentication is consumed by
         // this one request and omitted from followups and all later refreshes.
-        let mut cc = ControlClient::new(
-            self.config.control_url.clone(),
-            state.machine_key.clone(),
-            server_pub_key.clone(),
-            PROTOCOL_VERSION,
-        );
-        if let Some(certs) = self.config.extra_root_certs.clone() {
-            cc.set_extra_root_certs(certs);
-        }
-
-        let node_key_signature = initial_auth
-            .as_ref()
-            .map(|auth| auth.node_key_signature(&node_pub))
-            .transpose()?
-            .flatten();
-        let mut reg_req = RegisterRequest {
-            Version: CAPABILITY_VERSION,
-            NodeKey: node_pub.clone(),
-            Auth: take_initial_register_auth(&mut initial_auth),
-            NodeKeySignature: node_key_signature,
-            Hostinfo: Some(Hostinfo {
-                OS: std::env::consts::OS.to_string(),
-                Hostname: self.config.hostname.clone(),
-                BackendLogID: backend_log_id.clone(),
-                RoutableIPs: advertise.clone(),
-                RequestTags: self.config.advertise_tags.clone(),
-                PeerRelay: self.config.peer_relay_server,
-                ..Default::default()
-            }),
-            Ephemeral: self.config.ephemeral,
-            ..Default::default()
-        };
-
-        drop(initial_auth);
-        let register_result = cc.register(&reg_req).await;
-        clear_register_auth(&mut reg_req);
-        let reg_resp = register_result.map_err(|e| {
-            // Auth/network failure is ambiguous. The key is not retained, so
-            // a fresh WIF key is minted if the caller starts again.
-            if let Some(scope) = state_scope.as_ref() {
-                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
-                log::warn!("tsnet: cleared netmap cache after register error: {e}");
-            }
-            ipn_backend.emit_err_message(e.to_string());
-            TsnetError::Register(e)
-        })?;
-
-        // Server-side error string (e.g. "invalid auth key", "node key revoked").
-        if !reg_resp.Error.is_empty() {
-            if let Some(scope) = state_scope.as_ref() {
-                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
-                log::warn!(
-                    "tsnet: cleared netmap cache after register error: {}",
-                    reg_resp.Error
-                );
-            }
-            ipn_backend.emit_err_message(&reg_resp.Error);
-            return Err(TsnetError::Builder(format!(
-                "control register rejected: {}",
-                reg_resp.Error
-            )));
-        }
-
-        // Node key expired — the server says our key is no longer valid.
-        // Clear the cache so we don't reuse a netmap bound to the old key.
-        if reg_resp.NodeKeyExpired {
-            if let Some(scope) = state_scope.as_ref() {
-                NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
-                log::info!("tsnet: cleared netmap cache: node key expired");
-            }
-            ipn_backend.set_key_expired(true);
-        }
-
-        if reg_resp.AuthURL.is_empty() {
-            ipn_backend.set_machine_authorized(reg_resp.MachineAuthorized);
-            // A pre-started daemon keeps its startup block until all runtime
-            // resources and the LocalAPI handoff commit. Authentication alone
-            // must not publish Running while Server::up is still cancellable.
+        if control_offline {
+            // The cache validation above proves a durable enrolled self node,
+            // its non-expired address, and the exact profile/control/tailnet
+            // binding. It cannot prove current peer authority, which is
+            // withdrawn below until fresh Tailnet Lock confirmation.
+            ipn_backend.set_machine_authorized(true);
             ipn_backend.emit_login_finished();
-            state.node_id = reg_resp.User.ID;
-            state.enrolled = true;
-            self.save_state(&state)?;
         } else {
-            ipn_backend.set_auth_cant_continue(true);
-            // Block engine updates while waiting for interactive auth.
-            ipn_backend.set_blocked(true);
-            ipn_backend.emit_browse_to_url(&reg_resp.AuthURL);
+            let mut cc = ControlClient::new(
+                self.config.control_url.clone(),
+                state.machine_key.clone(),
+                server_pub_key.clone(),
+                PROTOCOL_VERSION,
+            );
+            if let Some(certs) = self.config.extra_root_certs.clone() {
+                cc.set_extra_root_certs(certs);
+            }
 
-            if let Some(ref ps) = self.pre_started {
-                {
-                    let mut au = ps.auth_url.lock().unwrap();
-                    *au = Some(reg_resp.AuthURL.clone());
-                }
-                ps.login_trigger.notified().await;
-                {
-                    let mut au = ps.auth_url.lock().unwrap();
-                    *au = None;
-                }
-                ipn_backend.set_auth_cant_continue(false);
-
-                let followup_req = RegisterRequest {
-                    Version: CAPABILITY_VERSION,
-                    NodeKey: node_pub.clone(),
-                    Followup: reg_resp.AuthURL.clone(),
-                    Hostinfo: Some(Hostinfo {
-                        OS: std::env::consts::OS.to_string(),
-                        Hostname: self.config.hostname.clone(),
-                        RoutableIPs: advertise.clone(),
-                        RequestTags: self.config.advertise_tags.clone(),
-                        PeerRelay: self.config.peer_relay_server,
-                        ..Default::default()
-                    }),
-                    Ephemeral: self.config.ephemeral,
+            let node_key_signature = initial_auth
+                .as_ref()
+                .map(|auth| auth.node_key_signature(&node_pub))
+                .transpose()?
+                .flatten();
+            let mut reg_req = RegisterRequest {
+                Version: CAPABILITY_VERSION,
+                NodeKey: node_pub.clone(),
+                Auth: take_initial_register_auth(&mut initial_auth),
+                NodeKeySignature: node_key_signature,
+                Hostinfo: Some(Hostinfo {
+                    OS: std::env::consts::OS.to_string(),
+                    Hostname: self.config.hostname.clone(),
+                    BackendLogID: backend_log_id.clone(),
+                    RoutableIPs: advertise.clone(),
+                    RequestTags: self.config.advertise_tags.clone(),
+                    PeerRelay: self.config.peer_relay_server,
                     ..Default::default()
-                };
-                let followup_resp = cc.register(&followup_req).await.map_err(|e| {
-                    if let Some(scope) = state_scope.as_ref() {
-                        NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
-                    }
-                    ipn_backend.emit_err_message(e.to_string());
-                    TsnetError::Register(e)
-                })?;
+                }),
+                Ephemeral: self.config.ephemeral,
+                ..Default::default()
+            };
 
-                if followup_resp.Error.is_empty() {
-                    ipn_backend.set_machine_authorized(followup_resp.MachineAuthorized);
-                    ipn_backend.emit_login_finished();
-                    state.node_id = followup_resp.User.ID;
-                    state.enrolled = true;
-                    self.save_state(&state)?;
-                } else {
-                    ipn_backend.emit_err_message(&followup_resp.Error);
-                    return Err(TsnetError::Builder(format!(
-                        "control register (followup) rejected: {}",
-                        followup_resp.Error
-                    )));
+            drop(initial_auth);
+            let register_result = cc.register(&reg_req).await;
+            clear_register_auth(&mut reg_req);
+            let reg_resp = register_result.map_err(|e| {
+                // Auth/network failure is ambiguous. The key is not retained, so
+                // a fresh WIF key is minted if the caller starts again.
+                if let Some(scope) = state_scope.as_ref() {
+                    NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                    log::warn!("tsnet: cleared netmap cache after register error: {e}");
                 }
+                ipn_backend.emit_err_message(e.to_string());
+                TsnetError::Register(e)
+            })?;
+
+            // Server-side error string (e.g. "invalid auth key", "node key revoked").
+            if !reg_resp.Error.is_empty() {
+                if let Some(scope) = state_scope.as_ref() {
+                    NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                    log::warn!(
+                        "tsnet: cleared netmap cache after register error: {}",
+                        reg_resp.Error
+                    );
+                }
+                ipn_backend.emit_err_message(&reg_resp.Error);
+                return Err(TsnetError::Builder(format!(
+                    "control register rejected: {}",
+                    reg_resp.Error
+                )));
+            }
+
+            // Node key expired — the server says our key is no longer valid.
+            // Clear the cache so we don't reuse a netmap bound to the old key.
+            if reg_resp.NodeKeyExpired {
+                if let Some(scope) = state_scope.as_ref() {
+                    NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                    log::info!("tsnet: cleared netmap cache: node key expired");
+                }
+                ipn_backend.set_key_expired(true);
+            }
+
+            if reg_resp.AuthURL.is_empty() {
+                ipn_backend.set_machine_authorized(reg_resp.MachineAuthorized);
+                // A pre-started daemon keeps its startup block until all runtime
+                // resources and the LocalAPI handoff commit. Authentication alone
+                // must not publish Running while Server::up is still cancellable.
+                ipn_backend.emit_login_finished();
+                state.node_id = reg_resp.User.ID;
+                state.enrolled = true;
+                self.save_state(&state)?;
             } else {
-                return Err(TsnetError::AuthRequired(reg_resp.AuthURL));
+                ipn_backend.set_auth_cant_continue(true);
+                // Block engine updates while waiting for interactive auth.
+                ipn_backend.set_blocked(true);
+                ipn_backend.emit_browse_to_url(&reg_resp.AuthURL);
+
+                if let Some(ref ps) = self.pre_started {
+                    {
+                        let mut au = ps.auth_url.lock().unwrap();
+                        *au = Some(reg_resp.AuthURL.clone());
+                    }
+                    ps.login_trigger.notified().await;
+                    {
+                        let mut au = ps.auth_url.lock().unwrap();
+                        *au = None;
+                    }
+                    ipn_backend.set_auth_cant_continue(false);
+
+                    let followup_req = RegisterRequest {
+                        Version: CAPABILITY_VERSION,
+                        NodeKey: node_pub.clone(),
+                        Followup: reg_resp.AuthURL.clone(),
+                        Hostinfo: Some(Hostinfo {
+                            OS: std::env::consts::OS.to_string(),
+                            Hostname: self.config.hostname.clone(),
+                            RoutableIPs: advertise.clone(),
+                            RequestTags: self.config.advertise_tags.clone(),
+                            PeerRelay: self.config.peer_relay_server,
+                            ..Default::default()
+                        }),
+                        Ephemeral: self.config.ephemeral,
+                        ..Default::default()
+                    };
+                    let followup_resp = cc.register(&followup_req).await.map_err(|e| {
+                        if let Some(scope) = state_scope.as_ref() {
+                            NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                        }
+                        ipn_backend.emit_err_message(e.to_string());
+                        TsnetError::Register(e)
+                    })?;
+
+                    if followup_resp.Error.is_empty() {
+                        ipn_backend.set_machine_authorized(followup_resp.MachineAuthorized);
+                        ipn_backend.emit_login_finished();
+                        state.node_id = followup_resp.User.ID;
+                        state.enrolled = true;
+                        self.save_state(&state)?;
+                    } else {
+                        ipn_backend.emit_err_message(&followup_resp.Error);
+                        return Err(TsnetError::Builder(format!(
+                            "control register (followup) rejected: {}",
+                            followup_resp.Error
+                        )));
+                    }
+                } else {
+                    return Err(TsnetError::AuthRequired(reg_resp.AuthURL));
+                }
             }
         }
 
@@ -3488,9 +3576,13 @@ impl Server {
             server_pub_key.clone(),
             PROTOCOL_VERSION,
         );
-        match cc_ep.send_map_request(&endpoint_update_req).await {
-            Ok(()) => log::debug!("tsnet: endpoint update sent (DiscoKey + {local_endpoints:?})"),
-            Err(e) => log::warn!("tsnet: endpoint update failed (non-fatal): {e}"),
+        if !control_offline {
+            match cc_ep.send_map_request(&endpoint_update_req).await {
+                Ok(()) => {
+                    log::debug!("tsnet: endpoint update sent (DiscoKey + {local_endpoints:?})");
+                }
+                Err(e) => log::warn!("tsnet: endpoint update failed (non-fatal): {e}"),
+            }
         }
 
         // 4. Always prefer a fresh, authoritative non-streaming snapshot.
@@ -3513,31 +3605,51 @@ impl Server {
             }),
             ..Default::default()
         };
-        let fresh_map = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            cc_ep.fetch_map(&fetch_req),
-        )
-        .await;
-        let (map_resp, used_cached_netmap): (MapResponse, bool) = match fresh_map {
-            Ok(Ok(response)) => (response, false),
-            Ok(Err(error)) => match cached_netmap {
-                Some(cached) => {
-                    log::warn!("tsnet: fresh netmap failed; using withdrawn cache: {error}");
-                    (cached, true)
-                }
-                None => return Err(error.into()),
-            },
-            Err(_) => match cached_netmap {
-                Some(cached) => {
-                    log::warn!("tsnet: fresh netmap timed out; using withdrawn cache");
-                    (cached, true)
-                }
-                None => return Err(TsnetError::MapTimeout),
-            },
+        let (map_resp, used_cached_netmap): (MapResponse, bool) = if control_offline {
+            (
+                cached_netmap.expect("offline startup requires validated cache"),
+                true,
+            )
+        } else {
+            let fresh_map = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                cc_ep.fetch_map(&fetch_req),
+            )
+            .await;
+            match fresh_map {
+                Ok(Ok(response)) => (response, false),
+                Ok(Err(error)) => match cached_netmap {
+                    Some(cached) => {
+                        health.set_unhealthy(
+                            WARN_CONTROL,
+                            format!(
+                                "fresh netmap unavailable; using validated cached netmap: {error}"
+                            ),
+                        );
+                        log::warn!("tsnet: fresh netmap failed; using withdrawn cache: {error}");
+                        (cached, true)
+                    }
+                    None => return Err(error.into()),
+                },
+                Err(_) => match cached_netmap {
+                    Some(cached) => {
+                        health.set_unhealthy(
+                            WARN_CONTROL,
+                            "fresh netmap timed out; using validated cached netmap",
+                        );
+                        log::warn!("tsnet: fresh netmap timed out; using withdrawn cache");
+                        (cached, true)
+                    }
+                    None => return Err(TsnetError::MapTimeout),
+                },
+            }
         };
 
         if !map_resp.Domain.is_empty() {
             if !state.tailnet_identity.is_empty() && state.tailnet_identity != map_resp.Domain {
+                if let Some(scope) = state_scope.as_ref() {
+                    NetMapCache::new_scoped(scope, &state.tailnet_identity).clear();
+                }
                 return Err(TsnetError::TailnetLock(
                     "control returned a different tailnet for this durable profile identity".into(),
                 ));

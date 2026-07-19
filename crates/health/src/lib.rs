@@ -90,6 +90,10 @@ pub const WARN_TLS_CERT_PENDING: &str = "tls-cert-pending";
 /// Prefix for subsystem warnables (`"subsystem-dns"`, `"subsystem-tailnet-lock"`, etc.).
 /// Go creates these dynamically for `SysRouter`, `SysDNS`, `SysDNSManager`, `SysTKA`.
 pub const WARN_SUBSYSTEM_PREFIX: &str = "subsystem-";
+/// Requested OS DNS configuration could not be committed. Medium severity.
+/// This is deliberately independent from data-plane readiness: callers may
+/// be Running while status truthfully reports that CorpDNS is degraded.
+pub const WARN_OS_DNS: &str = "subsystem-dns";
 
 // --- Arg key constants used in Go's `health.Args` for dynamic text ---
 
@@ -322,6 +326,12 @@ impl Tracker {
             id: WARN_TLS_CERT_PENDING.into(),
             severity: Severity::Low,
             title: "Fetching TLS certificate".into(),
+            ..Warnable::default()
+        });
+        t.register(Warnable {
+            id: WARN_OS_DNS.into(),
+            severity: Severity::Medium,
+            title: "DNS configuration".into(),
             ..Warnable::default()
         });
         t.register(Warnable {

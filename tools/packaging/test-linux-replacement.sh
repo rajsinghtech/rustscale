@@ -1077,26 +1077,19 @@ cmp -s "$TMP/resolv.conf.active" /etc/resolv.conf
 NODE_IDENTITY_AFTER=$(curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
   | python3 -c 'import json,sys; wanted=sys.argv[1]; nodes=json.load(sys.stdin)["nodes"]; matches=[node for node in nodes if (node.get("ip") or "").split("/",1)[0] == wanted]; assert len(matches) == 1; node=matches[0]; print("{}|{}|{}".format(node["key"], node["id"], node["ip"]))' "$RUST_IP")
 [[ "$NODE_IDENTITY_AFTER" == "$NODE_IDENTITY_BEFORE" ]]
-run_bounded 120 lifecycle-restored-roundtrip \
+# `tailscale up` returned Running only after this generation committed every
+# public resource above; one immediate roundtrip is therefore the assertion.
+run_bounded 5 lifecycle-restored-roundtrip \
   python3 - "$GO_IP" "$PEER_PORT" <<'PY'
 import socket
 import sys
-import time
 payload = b"public-down-up-roundtrip\n"
-last = None
-for _ in range(40):
-    try:
-        with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2) as connection:
-            connection.settimeout(2)
-            connection.sendall(payload)
-            received = connection.recv(len(payload))
-            if received == payload:
-                raise SystemExit(0)
-            raise RuntimeError(f"echo mismatch: {received!r}")
-    except (OSError, RuntimeError) as error:
-        last = error
-        time.sleep(0.5)
-raise SystemExit(f"post-up Go peer echo failed: {last}")
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2) as connection:
+    connection.settimeout(2)
+    connection.sendall(payload)
+    received = connection.recv(len(payload))
+    if received != payload:
+        raise SystemExit(f"post-up Go peer echo mismatch: {received!r}")
 PY
 
 # Logout is durable before the LocalAPI call returns. Restart=always then starts

@@ -1926,6 +1926,39 @@ fn status_empty_health_when_not_up() {
 }
 
 #[test]
+fn requested_os_dns_failure_is_immediately_health_degraded_and_retains_cleanup_owner() {
+    struct FailingDns(Arc<AtomicBool>);
+
+    impl rustscale_dns::OsConfigurator for FailingDns {
+        fn set_dns(&mut self, _: &rustscale_dns::OsConfig) -> std::io::Result<()> {
+            Err(std::io::Error::other("permission denied"))
+        }
+
+        fn close(&mut self) -> std::io::Result<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn supports_split_dns(&self) -> bool {
+            true
+        }
+    }
+
+    let health = Tracker::new();
+    let closed = Arc::new(AtomicBool::new(false));
+    let mut owner = crate::lifecycle::configure_requested_os_dns(
+        Box::new(FailingDns(Arc::clone(&closed))),
+        &OsConfig::default(),
+        &health,
+    );
+    assert!(health.current_warnings().iter().any(|warning| {
+        warning.id == rustscale_health::WARN_OS_DNS && warning.text.contains("permission denied")
+    }));
+    owner.close().unwrap();
+    assert!(closed.load(Ordering::SeqCst));
+}
+
+#[test]
 fn health_warning_appears_in_status() {
     // We can't construct a full RunningState easily, so test the
     // health→status wiring directly: a Tracker's current_warnings()
@@ -3272,6 +3305,160 @@ fn whois_lookup_from_fake_netmap() {
     // Unknown IP → None.
     let unknown: IpAddr = "100.64.0.99".parse().unwrap();
     assert!(whois_lookup(&peers, &ups, unknown).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Cache restart readiness: fresh control wins; offline fallback is explicit.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validated_cache_restart_is_degraded_offline_and_fresh_control_wins() {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let control_url = control.base_url();
+    let state = tempfile::tempdir().unwrap();
+    let socket = tempfile::tempdir().unwrap();
+    let socket_path = socket.path().join("cache-restart.sock");
+
+    let mut first = Server::builder()
+        .hostname("cache-restart")
+        .auth_key("tskey-test")
+        .control_url(control_url.clone())
+        .state_dir(state.path())
+        .localapi_path(&socket_path)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    let first_status = Box::pin(first.up()).await.unwrap();
+    assert!(!first_status.tailscale_ips.is_empty());
+    first.close().await.unwrap();
+
+    // A reachable control response is authoritative and must clear any cache
+    // degradation before the new generation reports Running.
+    let mut fresh = Server::builder()
+        .hostname("cache-restart")
+        .control_url(control_url.clone())
+        .state_dir(state.path())
+        .localapi_path(&socket_path)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    let fresh_status = Box::pin(fresh.up()).await.unwrap();
+    assert_eq!(fresh_status.tailscale_ips, first_status.tailscale_ips);
+    assert!(!fresh_status
+        .health
+        .iter()
+        .any(|warning| warning.id == rustscale_health::WARN_CONTROL));
+    fresh.close().await.unwrap();
+
+    control.stop();
+    let mut offline = Server::builder()
+        .hostname("cache-restart")
+        .control_url(control_url)
+        .state_dir(state.path())
+        .localapi_path(&socket_path)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    let offline_status = Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        offline.up(),
+    ))
+    .await
+    .expect("offline cache startup deadline")
+    .expect("validated cache startup");
+    assert_eq!(offline_status.tailscale_ips, first_status.tailscale_ips);
+    assert!(offline_status.health.iter().any(|warning| {
+        warning.id == rustscale_health::WARN_CONTROL
+            && warning.text.contains("validated cached netmap")
+    }));
+    assert_eq!(
+        offline.inner.as_ref().unwrap().ipn_backend.state(),
+        rustscale_ipn::State::Running
+    );
+    offline.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_cache_cannot_start_when_control_is_offline() {
+    let mut control = rustscale_testcontrol::Server::new();
+    control.start().await.unwrap();
+    let control_url = control.base_url();
+    let state_dir = tempfile::tempdir().unwrap();
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("stale-cache.sock");
+    let mut server = Server::builder()
+        .hostname("stale-cache")
+        .auth_key("tskey-test")
+        .control_url(control_url.clone())
+        .state_dir(state_dir.path())
+        .localapi_path(&socket_path)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    Box::pin(server.up()).await.unwrap();
+    let scope = server.profile_state_scope().unwrap();
+    let durable = PersistedState::load(&scope.dir.join("tsnet-state.json")).unwrap();
+    let cached_data = NetMapCache::new_scoped(&scope, &durable.tailnet_identity)
+        .load()
+        .unwrap();
+    assert!(crate::lifecycle::cached_netmap_is_usable(
+        &durable,
+        &durable.node_key.public(),
+        &cached_data,
+    ));
+    let mut expired = cached_data.clone();
+    expired.map_response.Node.as_mut().unwrap().KeyExpiry =
+        Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    assert!(!crate::lifecycle::cached_netmap_is_usable(
+        &durable,
+        &durable.node_key.public(),
+        &expired,
+    ));
+    let mut empty_ip = cached_data.clone();
+    empty_ip
+        .map_response
+        .Node
+        .as_mut()
+        .unwrap()
+        .Addresses
+        .clear();
+    assert!(!crate::lifecycle::cached_netmap_is_usable(
+        &durable,
+        &durable.node_key.public(),
+        &empty_ip,
+    ));
+    let mut mismatched = cached_data.clone();
+    mismatched.node_key = NodePrivate::generate().public();
+    assert!(!crate::lifecycle::cached_netmap_is_usable(
+        &durable,
+        &durable.node_key.public(),
+        &mismatched,
+    ));
+    let cached = cached_data.map_response;
+    server.close().await.unwrap();
+
+    NetMapCache::new_scoped(&scope, &durable.tailnet_identity)
+        .save_if_changed(&NodePrivate::generate().public(), &cached)
+        .unwrap();
+    control.stop();
+
+    let mut stale = Server::builder()
+        .hostname("stale-cache")
+        .control_url(control_url)
+        .state_dir(state_dir.path())
+        .localapi_path(&socket_path)
+        .disable_portmapping(true)
+        .build()
+        .unwrap();
+    assert!(Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stale.up(),
+    ))
+    .await
+    .expect("stale cache startup deadline")
+    .is_err());
+    assert!(!stale.is_up());
 }
 
 // ---------------------------------------------------------------------------

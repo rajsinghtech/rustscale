@@ -219,6 +219,14 @@ impl Server {
         format!("http://{}", self.addr.unwrap())
     }
 
+    /// Stop accepting new control connections while preserving test state.
+    /// Existing test clients should be closed before calling this helper.
+    pub fn stop(&mut self) {
+        if let Some(task) = self.accept_task.take() {
+            task.abort();
+        }
+    }
+
     /// The server's Noise public key (also returned by `GET /key`).
     pub fn noise_public_key(&self) -> MachinePublic {
         self.inner.lock().unwrap().noise_pub.clone()

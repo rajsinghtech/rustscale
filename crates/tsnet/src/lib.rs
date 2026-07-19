@@ -146,7 +146,7 @@ use {
     rustscale_health::{
         Severity, Tracker, Watchdog, WARN_CERT_FALLBACK, WARN_CONTROL, WARN_DERP_HOME,
         WARN_EXIT_ROUTE_SECURITY, WARN_MAP_RESPONSE_TIMEOUT, WARN_NETMON_CHANGE,
-        WARN_NOT_IN_MAP_POLL,
+        WARN_NOT_IN_MAP_POLL, WARN_OS_DNS,
     },
     rustscale_ipn::IpnBackend,
     rustscale_key::{DiscoPrivate, MachinePrivate, MachinePublic, NodePrivate, NodePublic},
@@ -804,9 +804,10 @@ impl ServerBuilder {
     /// also installed.
     ///
     /// **Requires root** — writing `/etc/resolver` needs privileged access.
-    /// Permission failures are logged as warnings and do not prevent `up_tun`
-    /// from completing; the TUN data plane and MagicDNS responder still
-    /// operate.
+    /// A setup failure leaves `up_tun` usable only when its independent TUN
+    /// data plane commits; status immediately reports the DNS degradation and
+    /// retains the configurator for cleanup rather than silently looking
+    /// healthy.
     ///
     /// Ignored in netstack mode ([`Server::up`]).
     pub fn configure_os_dns(mut self, on: bool) -> Self {

@@ -2204,7 +2204,11 @@ impl Server {
             b.domain.clone(),
             b.health.clone(),
             magicdns_responder_ready,
-            prefs.read().await.CorpDNS,
+            // The builder's explicit TUN DNS setting is the initial
+            // preference for embedding callers. The daemon synchronizes this
+            // field from persisted `Prefs.CorpDNS` before startup; subsequent
+            // LocalAPI preference changes transact through the manager.
+            self.config.configure_os_dns,
             dns_cfg_snapshot,
         );
         rollback.dns_manager = Some(Arc::clone(&dns_manager));

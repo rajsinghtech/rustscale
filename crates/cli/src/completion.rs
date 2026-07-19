@@ -181,6 +181,7 @@ const COMMANDS: &[CommandSpec] = &[
         &[
             flag("--hostname", FlagValue::Value),
             flag("--accept-routes", FlagValue::Bool),
+            flag("--accept-dns", FlagValue::Bool),
             flag("--shields-up", FlagValue::Bool),
             flag("--advertise-routes", FlagValue::Value),
             flag("--advertise-exit-node", FlagValue::Bool),

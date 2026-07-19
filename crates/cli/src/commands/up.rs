@@ -116,6 +116,7 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
 
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
     let mut last_url: Option<String> = None;
+    let mut handoff_reconnects = 0_u8;
     loop {
         let msg = match tokio::time::timeout(
             deadline.saturating_duration_since(std::time::Instant::now()),
@@ -124,8 +125,24 @@ pub async fn run(args: Vec<String>, socket: &Path, json: bool) -> Result<(), Cli
         .await
         {
             Ok(Ok(Some(n))) => n,
-            Ok(Ok(None)) => return Err(CliError("connection closed".into())),
-            Ok(Err(e)) => return Err(CliError(e.to_string())),
+            Ok(Ok(None) | Err(_)) => {
+                // Starting a stopped/pre-login daemon atomically replaces its
+                // LocalAPI generation. The old watch closes only after the new
+                // socket is published, so reconnect and consume that
+                // generation's initial state instead of treating the expected
+                // handoff as a failed `up`.
+                handoff_reconnects = handoff_reconnects.saturating_add(1);
+                if handoff_reconnects > 4 {
+                    return Err(CliError(
+                        "daemon LocalAPI repeatedly closed while waiting for up".into(),
+                    ));
+                }
+                watch = lc
+                    .watch_ipn_bus(NOTIFY_INITIAL_STATE)
+                    .await
+                    .map_err(|e| CliError(format!("reconnect after LocalAPI handoff: {e}")))?;
+                continue;
+            }
             Err(_) => return Err(CliError("timeout waiting for up".into())),
         };
 

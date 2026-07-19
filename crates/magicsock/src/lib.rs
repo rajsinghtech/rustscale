@@ -4361,8 +4361,10 @@ impl Inner {
                 let Some(endpoint) = endpoints.get_mut(&peer) else {
                     return;
                 };
+                // The reverse map identifies the candidate peer, but the WG
+                // ciphertext is authenticated later by the WireGuard engine.
+                // Do not publish path evidence before that authentication.
                 endpoint.note_recv_udp(std::time::Instant::now());
-                endpoint.note_direct_transport(src, true);
                 (generation, endpoint.node_addr())
             };
             self.connection_counter
@@ -4439,6 +4441,30 @@ impl Inner {
                 else {
                     return;
                 };
+                // `disco.open` authenticated the sender. Corroborate the
+                // physical relay address/VNI against the current allocation
+                // before publishing peer-relay status evidence.
+                {
+                    let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+                    if let Some(endpoint) = endpoints.get_mut(&sender_key) {
+                        if let Some((
+                            relay_addr,
+                            relay_vni,
+                            relay_server,
+                            relay_server_generation,
+                        )) = endpoint.current_relay()
+                        {
+                            if relay_addr == src
+                                && relay_vni == vni
+                                && self
+                                    .peer_authorization
+                                    .is_current(relay_server, relay_server_generation)
+                            {
+                                endpoint.note_relay_transport(src, true);
+                            }
+                        }
+                    }
+                }
                 rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
                     msg,
                     disco: sender_disco,
@@ -4505,7 +4531,9 @@ impl Inner {
                 {
                     return;
                 }
-                endpoint.note_relay_transport(src, true);
+                // As with direct UDP, this payload is not authenticated until
+                // the WireGuard engine consumes it. Authenticated relay disco
+                // traffic records the public path observation instead.
                 (generation, endpoint.node_addr())
             };
             // Receive accounting includes the Geneve header, matching

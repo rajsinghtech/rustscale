@@ -1,16 +1,12 @@
 name: Audit
 
 # Security advisory + license/ban checks.
-# Runs weekly, on PRs touching Cargo.lock or deny.toml, and on manual trigger.
+# Runs weekly, on every PR, and on manual trigger.
 
 on:
   schedule:
     - cron: '0 0 * * 0' # weekly Sunday 00:00 UTC
   pull_request:
-    paths:
-      - 'Cargo.lock'
-      - 'deny.toml'
-      - '.github/workflows/audit.yml'
   workflow_dispatch:
 
 concurrency:

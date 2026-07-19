@@ -209,34 +209,61 @@ sleep 3
 # toolchain. Instead: compile as the current user, find the test binary, and
 # run THAT under sudo with env passed through.
 # ---------------------------------------------------------------------------
-echo "[interop-tun] building test binary (unprivileged)..." >&2
-cargo test -p rustscale-tsnet --no-run 2>&1 || {
+echo "[interop-tun] building library test binary (unprivileged)..." >&2
+cargo test -p rustscale-tsnet --lib --no-run 2>&1 || {
   echo "[interop-tun] ERROR: build failed" >&2
   exit 1
 }
 
-# Find the test binary path.
-TEST_BIN=$(cargo test -p rustscale-tsnet --no-run --message-format=json 2>/dev/null \
+# Find the library unit-test binary. Restricting Cargo to --lib prevents an
+# integration-test executable from being selected merely because it appeared
+# first in Cargo's JSON stream.
+TEST_BIN=$(cargo test -p rustscale-tsnet --lib --no-run --message-format=json 2>/dev/null \
   | python3 -c "
 import json, sys
 for line in sys.stdin:
     try:
         d = json.loads(line)
-        if d.get('profile', {}).get('test'):
+        target = d.get('target', {})
+        if (d.get('profile', {}).get('test')
+                and target.get('name') == 'rustscale_tsnet'
+                and 'lib' in target.get('kind', [])):
             print(d['executable'])
             break
     except: pass
 " 2>/dev/null || echo "")
 if [[ -z "$TEST_BIN" || ! -x "$TEST_BIN" ]]; then
-  echo "[interop-tun] ERROR: could not find test binary" >&2
+  echo "[interop-tun] ERROR: could not find library test binary" >&2
   exit 1
 fi
 echo "[interop-tun] test binary: $TEST_BIN" >&2
 
-# Run one exact, serial regression gate under sudo with env passed through.
-# It asserts the kernel interface/rules/routes and completes an echo roundtrip.
+# Fail closed if the selected executable does not contain the required ignored
+# test. libtest exits successfully when an exact filter matches zero tests.
+if ! "$TEST_BIN" --ignored --list \
+    | grep -Fx 'tests::interop_tun_rust_dials_go: test' >/dev/null; then
+  echo "[interop-tun] ERROR: selected binary lacks the exact TUN regression test" >&2
+  exit 1
+fi
+
+# Validate the required interop environment and exec the test within the same
+# privileged process. Otherwise a second sudo policy decision could drop the
+# variables, causing the ignored test to return early while libtest reports a
+# passing test. Preserve only the variables this exact gate consumes.
 echo "[interop-tun] running focused TUN regression gate under sudo..." >&2
-sudo -E "$TEST_BIN" \
+sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_NAME,TS_INTEROP_GO_ECHO_PORT,TS_INTEROP_SOCKS \
+  sh -c "
+    if ! test -n \"\${TS_E2E_AUTHKEY:-}\" ||
+       ! test -n \"\${TS_INTEROP_GO_IP:-}\" ||
+       ! test -n \"\${TS_INTEROP_GO_NAME:-}\" ||
+       ! test -n \"\${TS_INTEROP_GO_ECHO_PORT:-}\" ||
+       ! test -n \"\${TS_INTEROP_SOCKS:-}\"; then
+      echo '[interop-tun] ERROR: sudo did not preserve the required interop environment' >&2
+      exit 1
+    fi
+    export RUSTSCALE_REQUIRE_TUN_INTEROP=1
+    exec \"\$@\"
+  " sh "$TEST_BIN" \
   --ignored --exact tests::interop_tun_rust_dials_go \
   --nocapture --test-threads=1
 TEST_RC=$?

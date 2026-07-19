@@ -195,8 +195,6 @@ jobs:
         id: candidate
         run: |
           set -euo pipefail
-          cargo build --release --locked \
-            -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
           version=$(awk '
             /^\[workspace.package\]/ { workspace = 1; next }
             workspace && /^version = / { gsub(/[" ]/, "", $3); print $3; exit }
@@ -204,6 +202,9 @@ jobs:
           test -n "$version"
           candidate_sha=$(git rev-parse HEAD)
           test "$candidate_sha" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          RUSTSCALE_VERSION_LONG="${version}-g${candidate_sha:0:7}" \
+            cargo build --release --locked \
+              -p rustscale-cli -p rustscale-rustscaled -p rustscale-ffi
           tag="v${version}-candidate-${candidate_sha}"
           release_dir="$RUNNER_TEMP/release-candidate/releases/download/$tag"
           tools/packaging/assemble-linux-release.sh \

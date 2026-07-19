@@ -114,10 +114,12 @@ with `PREFIX=...`, pin a version with `--version v0.1.4`, skip system service
 setup with `--no-service`, or uninstall with `--uninstall`. Downloads are
 verified against the release's `SHA256SUMS` before extraction.
 
-For scripts that invoke the upstream command names, pass
-`--tailscale-compatible` to install `tailscale` and `tailscaled` aliases. This
-mode conflicts with an existing official Tailscale installation and is never
-enabled implicitly on a host.
+When the `tailscale` and `tailscaled` names are available, the installer also
+creates aliases to RustScale so replacement scripts work unchanged. Existing
+commands are never replaced: automatic alias installation is skipped if either
+name belongs to another installation. Pass `--tailscale-compatible` to require
+the aliases and fail on a collision, or `--no-tailscale-compatible` to disable
+them explicitly.
 
 ### Windows (one-liner)
 

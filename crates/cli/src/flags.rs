@@ -35,6 +35,19 @@ pub fn parse_str_flag(args: &[String], name: &str) -> Option<String> {
     None
 }
 
+/// Parse a comma-separated string flag. An explicitly empty value clears the
+/// list instead of producing a single empty element.
+pub fn parse_csv_flag(args: &[String], name: &str) -> Option<Vec<String>> {
+    parse_str_flag(args, name).map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+}
+
 /// A parsed u16 flag that takes a value: `--name value` or `--name=value`.
 pub fn parse_u16_flag(args: &[String], name: &str) -> Option<u16> {
     parse_str_flag(args, name).and_then(|s| s.parse::<u16>().ok())
@@ -96,6 +109,19 @@ mod tests {
         assert_eq!(
             parse_str_flag(&args, "socket"),
             Some("/tmp/test.sock".to_string())
+        );
+    }
+
+    #[test]
+    fn csv_flag_trims_values_and_empty_clears_the_list() {
+        let values = vec!["--routes=10.0.0.0/8, 192.168.0.0/16".to_string()];
+        assert_eq!(
+            parse_csv_flag(&values, "routes"),
+            Some(vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()])
+        );
+        assert_eq!(
+            parse_csv_flag(&["--routes=".to_string()], "routes"),
+            Some(Vec::new())
         );
     }
 

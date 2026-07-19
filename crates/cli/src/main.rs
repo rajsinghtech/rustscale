@@ -291,7 +291,7 @@ fn usage(bin: &str) {
     eprintln!("  metrics                             print Prometheus-format metrics");
     eprintln!("  health                              print active health warnings");
     eprintln!("  cert [flags] <domain>               get TLS certs for a domain");
-    eprintln!("  ping <ip>                           ping a peer (not yet supported)");
+    eprintln!("  ping <hostname-or-IP>               ping a peer and attempt a direct path");
     eprintln!("  speedtest [-host ...] [-s] [-r] [-t <duration>]");
     eprintln!("  file cp <files...> <target>:        send file(s) to a host");
     eprintln!("  file get [--wait] [--conflict=...] <dir>  receive files from the inbox");

@@ -1213,7 +1213,7 @@ impl Server {
         self.apply_persisted_startup_prefs();
 
         ensure_ring_provider();
-        let state = self.load_or_create_state()?;
+        let state = self.load_startup_state()?;
         let initial_auth = self.initial_registration_auth(&state).await?;
 
         let b = self.bootstrap(state, initial_auth).await?;
@@ -1876,7 +1876,7 @@ impl Server {
         self.apply_persisted_startup_prefs();
 
         ensure_ring_provider();
-        let state = self.load_or_create_state()?;
+        let state = self.load_startup_state()?;
         let initial_auth = self.initial_registration_auth(&state).await?;
 
         let b = self.bootstrap(state, initial_auth).await?;
@@ -2742,7 +2742,7 @@ impl Server {
         // blockEngineUpdatesLocked(true) on NeedsLogin enter.
         ipn_backend.set_blocked(true);
 
-        let state = self.load_or_create_state()?;
+        let state = self.load_startup_state()?;
         let was_fresh = state.is_zero();
         let state = if was_fresh {
             let s = PersistedState::generate();
@@ -3109,14 +3109,21 @@ impl Server {
         // We have a node key (generated or loaded from state).
         ipn_backend.set_has_node_key(!state.is_zero());
 
-        // Try to load a cached netmap from the state directory. On a restart
-        // with an existing state dir, this lets us skip the blocking first
-        // MapResponse fetch (2-5s) and use the cached peers immediately —
-        // the streaming long-poll delivers fresh updates in the background.
+        // Load only a materialized full snapshot as an offline fallback. A
+        // raw streaming delta is not a netmap: using one after restart can
+        // erase unchanged peers and leave the node online with no routes.
         let cached_netmap = state_scope.as_ref().and_then(|scope| {
             let cache = NetMapCache::new_scoped(scope, &state.tailnet_identity);
             let cached = cache.load()?;
-            (cached.version == 2 && cached.node_key == node_pub).then_some(cached.map_response)
+            if cached.node_key == node_pub
+                && cached.map_response.Node.is_some()
+                && cached.map_response.Peers.is_some()
+            {
+                Some(cached.map_response)
+            } else {
+                cache.clear();
+                None
+            }
         });
 
         // 2. Fetch the server's Noise public key (GET /key?v=<version>).
@@ -3334,40 +3341,47 @@ impl Server {
             Err(e) => log::warn!("tsnet: endpoint update failed (non-fatal): {e}"),
         }
 
-        // 4. Fetch the first MapResponse. If we have a cached netmap, skip
-        // the blocking fetch and use the cached data — the streaming
-        // long-poll (started below) will deliver fresh updates in the
-        // background. This eliminates the 2-5s startup delay on restarts.
-        let used_cached_netmap = cached_netmap.is_some();
-        let map_resp: MapResponse = if let Some(ref cached) = cached_netmap {
-            let peer_count = cached.Peers.as_ref().map_or(0, Vec::len);
-            log::debug!(
-                "tsnet: using cached netmap ({peer_count} peers); streaming poll will refresh in background"
-            );
-            cached.clone()
-        } else {
-            let fetch_req = MapRequest {
-                Version: CAPABILITY_VERSION,
-                KeepAlive: false,
-                NodeKey: node_pub.clone(),
-                DiscoKey: disco_pub.clone(),
-                Stream: false,
-                Endpoints: local_endpoints.clone(),
-                Hostinfo: Some(Hostinfo {
-                    OS: std::env::consts::OS.to_string(),
-                    Hostname: self.config.hostname.clone(),
-                    RoutableIPs: advertise.clone(),
-                    PeerRelay: self.config.peer_relay_server,
-                    ..Default::default()
-                }),
+        // 4. Always prefer a fresh, authoritative non-streaming snapshot.
+        // Cached state is an offline fallback only: a resumed streaming map
+        // can begin with deltas, which cannot prove the absence of peers from
+        // a prior process's cache.
+        let fetch_req = MapRequest {
+            Version: CAPABILITY_VERSION,
+            KeepAlive: false,
+            NodeKey: node_pub.clone(),
+            DiscoKey: disco_pub.clone(),
+            Stream: false,
+            Endpoints: local_endpoints.clone(),
+            Hostinfo: Some(Hostinfo {
+                OS: std::env::consts::OS.to_string(),
+                Hostname: self.config.hostname.clone(),
+                RoutableIPs: advertise.clone(),
+                PeerRelay: self.config.peer_relay_server,
                 ..Default::default()
-            };
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                cc_ep.fetch_map(&fetch_req),
-            )
-            .await
-            .map_err(|_| TsnetError::MapTimeout)??
+            }),
+            ..Default::default()
+        };
+        let fresh_map = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cc_ep.fetch_map(&fetch_req),
+        )
+        .await;
+        let (map_resp, used_cached_netmap): (MapResponse, bool) = match fresh_map {
+            Ok(Ok(response)) => (response, false),
+            Ok(Err(error)) => match cached_netmap {
+                Some(cached) => {
+                    log::warn!("tsnet: fresh netmap failed; using withdrawn cache: {error}");
+                    (cached, true)
+                }
+                None => return Err(error.into()),
+            },
+            Err(_) => match cached_netmap {
+                Some(cached) => {
+                    log::warn!("tsnet: fresh netmap timed out; using withdrawn cache");
+                    (cached, true)
+                }
+                None => return Err(TsnetError::MapTimeout),
+            },
         };
 
         if !map_resp.Domain.is_empty() {
@@ -3660,13 +3674,27 @@ impl Server {
         // `all_endpoints()` calls and published to the control plane.
         magicsock.start_portmap();
 
-        // The server may send peers via Peers (full list) or PeersChanged
-        // (delta). The first response often uses PeersChanged.
-        let peers = map_resp
+        // The authoritative one-shot response may encode its initial complete
+        // peer set in PeersChanged. Materialize it before caching so a later
+        // restart never mistakes a raw delta for a full netmap.
+        let raw_initial_peers = map_resp
             .Peers
             .clone()
             .unwrap_or_else(|| map_resp.PeersChanged.clone());
-        let mut peers = peers;
+        if !used_cached_netmap {
+            if let Some(scope) = state_scope.as_ref() {
+                let mut snapshot = map_resp.clone();
+                snapshot.Peers = Some(raw_initial_peers.clone());
+                snapshot.PeersChanged.clear();
+                snapshot.PeersRemoved.clear();
+                if let Err(error) = NetMapCache::new_scoped(scope, &state.tailnet_identity)
+                    .save_if_changed(&node_pub, &snapshot)
+                {
+                    log::warn!("tsnet: initial netmap cache save failed (non-fatal): {error}");
+                }
+            }
+        }
+        let mut peers = raw_initial_peers;
         // Keep the stable-ID-reconciled control view separate from the TKA
         // verified intersection. Authority changes may reauthorize a raw peer
         // without control repeating it, but only verified peers own addresses,
@@ -4219,6 +4247,19 @@ impl Server {
             }
         }
         Ok(PersistedState::default())
+    }
+
+    /// Load durable enrollment identity for one engine start while replacing
+    /// the discovery key with process-local material. Node and machine keys
+    /// survive restart; disco keys intentionally do not. Upstream magicsock
+    /// generates a new disco key for every Tailscale start so peers can drop
+    /// trusted endpoint state from the previous UDP socket immediately.
+    fn load_startup_state(&self) -> Result<PersistedState, TsnetError> {
+        let mut state = self.load_or_create_state()?;
+        if !state.is_zero() {
+            state.disco_key = rustscale_key::DiscoPrivate::generate();
+        }
+        Ok(state)
     }
 
     pub(crate) fn save_state(&self, state: &PersistedState) -> Result<(), TsnetError> {

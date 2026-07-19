@@ -53,6 +53,16 @@ table 52 through `tun0`. A TCP echo roundtrip to Go tailscaled then proves an OS
 socket packet traverses the kernel TUN, RustScale's packet pump and WireGuard
 path, and returns.
 
+The same job then runs the corrected out-of-process parity gate,
+`tools/interop-tun-oops.sh`. The in-process repro above can pass while a
+failure mode only appears when the endpoints live in separate processes, like
+the benchmark harness. The split harness starts two independent rustscale TUN
+nodes as separate OS processes under sudo — each with its own TUN device,
+state directory, the same Linux kernel-state assertions, and a full captured
+log — then drives the issue-#75-shaped cadenced UDP exchange and a TCP echo
+roundtrip across the process boundary. The gate requires both processes to
+exit 0 with the complete structured evidence in both logs.
+
 This credentialed job is deliberately not part of ordinary local or pull
 request validation. It uses only short-lived OIDC and an ephemeral tailnet with
 unconditional teardown; run it locally only when explicitly supplying the
@@ -62,19 +72,19 @@ documented disposable tailnet credentials.
 
 `tools/packaging/test-linux-replacement.sh` complements the source-level TUN
 job with a credential-free, installed-service journey. CI first builds one
-**exact Linux production candidate archive** and its `SHA256SUMS` in a separate
-`Assemble exact Linux release candidate` job. The journey downloads that exact
-archive through `scripts/install.sh` at `/usr/local`; it has no Cargo/source
-build path. It rejects a missing candidate SHA/tag, missing checksum entry,
-checksum mismatch, archive symlink, missing packaged file, or an embedded CLI
-or daemon version that does not identify the candidate version and SHA.
+**exact Linux production candidate archive** and its `SHA256SUMS` in the
+separate **Assemble exact Linux release candidate** job. The journey downloads
+that exact archive through the ordinary `scripts/install.sh` path at
+`/usr/local`; it has no Cargo or source-build path. It rejects a missing
+candidate SHA/tag, missing checksum entry, checksum mismatch, archive symlink,
+missing packaged file, or an embedded CLI/daemon version that does not identify
+the candidate.
 
-The ordinary documented installer behavior provides `tailscale` and
-`tailscaled` aliases by default. It refuses a collision before mutating any
-RustScale file; `--no-tailscale-compatible` is only an explicit portable
-opt-out and is not used by this journey. The installed journey has a 900-second
-execution limit plus a 90-second diagnostic/teardown grace inside the job's
-50-minute outer deadline.
+On the isolated runner, the ordinary installer automatically creates the
+available `tailscale` and `tailscaled` aliases without requiring a compatibility
+flag. Existing foreign commands are never replaced. The installed journey has
+a 900-second execution limit plus a 90-second diagnostic/teardown grace inside
+the job's 50-minute outer deadline.
 
 The script refuses to mutate an occupied host. Before installation it requires
 an active systemd manager, passwordless sudo, an unused standard RustScale
@@ -87,8 +97,8 @@ The journey proves all of the following on its isolated Linux runner:
 
 - the installer downloads the exact candidate archive plus `SHA256SUMS`,
   verifies the published checksum and embedded candidate version/SHA, installs
-  the exact binary bytes, creates only relative default `tailscale`/
-  `tailscaled` aliases, and enables the checked-in systemd unit;
+  the exact binary bytes, creates only relative `tailscale`/`tailscaled`
+  aliases, and enables the checked-in systemd unit;
 - the installed `tailscale` command proves top-level help, both command-help
   spellings, invalid-command exit status, and stdout/stderr separation without
   a LocalAPI shortcut;
@@ -129,16 +139,6 @@ never substitutes a source build: it consumes the separately uploaded exact
 candidate archive. The release workflow uses the same archive assembly helper,
 and its Linux compatibility job remains authoritative for executing the
 published GNU archive on Debian 12.
-
-### Branch protection integration
-
-After an exact-artifact run has passed on the target repository, configure the
-protected release branch to require the `Installed Linux replacement journey`
-context (and keep `All green` required if that aggregate is the existing merge
-gate). Do not change branch protection merely because this workflow definition
-exists: first retain a passing run proving the exact candidate archive,
-`SHA256SUMS`, default aliases, and cleanup journey. This repository does not
-mutate protection from CI or from a pull request.
 
 
 ## Protected real-control smoke gate (manual only)

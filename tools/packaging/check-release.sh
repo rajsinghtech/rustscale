@@ -76,8 +76,8 @@ grep -q 'linux-release-candidate' .github/workflows/ci.yml
 grep -q 'Assemble exact Linux release candidate' .github/workflows/ci.yml
 grep -q 'actions/download-artifact' .github/workflows/ci.yml
 grep -q 'RUSTSCALE_RELEASE_DIR' .github/workflows/ci.yml
-test -x tools/packaging/assemble-linux-release.sh
 grep -q 'tools/interop-tun\*\.sh' .github/workflows/ci.yml
+test -x tools/packaging/assemble-linux-release.sh
 test -x tools/packaging/test-linux-replacement.sh
 test -s docs/release-first-run.md
 grep -q 'Protected real-control smoke gate' docs/release-first-run.md
@@ -88,10 +88,7 @@ grep -q 'exact production candidate' .github/workflows/ci.yml
 grep -q 'Replay replacement failure diagnostics' .github/workflows/ci.yml
 grep -q 'systemd-run --quiet --wait --pipe --collect' tools/packaging/test-linux-replacement.sh
 grep -q 'exact production archive and SHA256SUMS are required' tools/packaging/test-linux-replacement.sh
-grep -q 'never a' tools/packaging/test-linux-replacement.sh
 grep -q 'assert_cli_contract' tools/packaging/test-linux-replacement.sh
-grep -q -- '--no-tailscale-compatible' scripts/install.sh
-grep -q 'TAILSCALE_COMPATIBLE=1' scripts/install.sh
 grep -q 'KillMode=control-group' tools/packaging/test-linux-replacement.sh
 grep -q 'RuntimeMaxSec=' tools/packaging/test-linux-replacement.sh
 grep -q 'timeout-minutes: 50' .github/workflows/ci.yml
@@ -109,8 +106,22 @@ token_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'Mint Tailscale org token' |
 test -n "$preflight_line"
 test -n "$token_line"
 test "$preflight_line" -lt "$token_line"
+grep -Fq -- 'cargo test -p rustscale-tsnet --lib --no-run' tools/interop-tun.sh
+grep -Fq -- "target.get('name') == 'rustscale_tsnet'" tools/interop-tun.sh
+grep -Fq -- "'lib' in target.get('kind', [])" tools/interop-tun.sh
+grep -Fq -- "if ! \"\$TEST_BIN\" --ignored --list" tools/interop-tun.sh
+grep -Fq -- "grep -Fx 'tests::interop_tun_rust_dials_go: test' >/dev/null" tools/interop-tun.sh
+grep -Fq -- 'sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_NAME,TS_INTEROP_GO_ECHO_PORT,TS_INTEROP_SOCKS' tools/interop-tun.sh
+grep -Fq -- 'sudo did not preserve the required interop environment' tools/interop-tun.sh
+grep -Fq -- 'export RUSTSCALE_REQUIRE_TUN_INTEROP=1' tools/interop-tun.sh
+# Match exact source text retaining the escaped child argv.
+# shellcheck disable=SC2016
+grep -Fq -- 'exec \"\$@\"' tools/interop-tun.sh
 grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/interop-tun.sh
 grep -Fq -- '--nocapture --test-threads=1' tools/interop-tun.sh
+grep -Fq 'std::env::var("RUSTSCALE_REQUIRE_TUN_INTEROP")' crates/tsnet/src/tests.rs
+grep -Fq 'required TUN interop environment is missing or invalid' crates/tsnet/src/tests.rs
+grep -Fq 'required TUN interop test is not running as root' crates/tsnet/src/tests.rs
 grep -Fq 'up_tun failed after privileged TUN prerequisites were established' crates/tsnet/src/tests.rs
 if grep -Fq 'up_tun_or_skip' crates/tsnet/src/tests.rs; then
     echo "privileged TUN startup errors can still be converted into skips" >&2

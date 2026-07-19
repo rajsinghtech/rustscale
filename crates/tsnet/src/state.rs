@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 /// Cache file format version. Bumped on breaking changes to the envelope
 /// structure; mismatched versions are rejected on load so a stale cache
 /// from an older format is discarded cleanly rather than partially parsed.
-const NETMAP_CACHE_VERSION: u32 = 2;
+const NETMAP_CACHE_VERSION: u32 = 3;
 
 /// Durable profile/control namespace for identity, netmap, and TKA state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,8 +59,11 @@ pub enum StateError {
     Json(#[from] serde_json::Error),
 }
 
-/// The persistent state of a tsnet server: node, machine, and disco keys.
+/// The persistent state of a tsnet server.
 ///
+/// Node and machine keys are durable identity. The serialized disco key is
+/// retained for state-file compatibility but is replaced before every engine
+/// start; discovery identity is process-local, matching upstream magicsock.
 /// Serialized as JSON in `state_dir/tsnet-state.json`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedState {
@@ -78,7 +81,8 @@ pub struct PersistedState {
     pub node_key: NodePrivate,
     /// The machine private key (control plane).
     pub machine_key: MachinePrivate,
-    /// The disco private key (NAT traversal).
+    /// The last disco private key. Lifecycle startup always replaces it before
+    /// use so a restarted UDP socket cannot inherit peer path trust.
     pub disco_key: DiscoPrivate,
     /// The node ID assigned by the control plane (0 until registered).
     #[serde(default)]
@@ -182,15 +186,6 @@ impl PersistedState {
     /// re-keyed and the cache is stale).
     pub fn load_netmap(dir: &Path, expected_node_key: &NodePublic) -> Option<MapResponse> {
         let cache = NetMapCache::new(dir).load()?;
-        if cache.version != NETMAP_CACHE_VERSION {
-            log::debug!(
-                "tsnet: netmap cache version mismatch ({} != {}); discarding",
-                cache.version,
-                NETMAP_CACHE_VERSION
-            );
-            NetMapCache::new(dir).clear();
-            return None;
-        }
         if &cache.node_key != expected_node_key {
             log::warn!("tsnet: netmap cache stale (node key mismatch); discarding");
             return None;
@@ -277,6 +272,15 @@ impl NetMapCache {
     pub fn load(&self) -> Option<NetMapCacheData> {
         let data = std::fs::read(&self.path).ok()?;
         match serde_json::from_slice::<NetMapCacheData>(&data) {
+            Ok(c) if c.version != NETMAP_CACHE_VERSION => {
+                log::debug!(
+                    "tsnet: netmap cache version mismatch ({} != {}); discarding",
+                    c.version,
+                    NETMAP_CACHE_VERSION
+                );
+                self.clear();
+                None
+            }
             Ok(c)
                 if (self.profile_id.is_empty() || c.profile_id == self.profile_id)
                     && (self.control_identity.is_empty()
@@ -640,38 +644,40 @@ mod tests {
     }
 
     #[test]
-    fn netmap_cache_version_mismatch_rejected() {
-        let dir = std::env::temp_dir().join("tsnet-netmap-cache-version");
+    fn legacy_full_looking_stream_cache_is_rejected() {
+        let dir = std::env::temp_dir().join("tsnet-netmap-cache-legacy-stream");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let node_key = rustscale_key::NodePrivate::generate();
         let node_pub = node_key.public();
         let resp = MapResponse {
+            Node: Some(rustscale_tailcfg::Node::default()),
+            Peers: Some(Vec::new()),
             Domain: "version.tailnet.ts.net".into(),
+            // Version 2 could persist a streaming response with this shape
+            // while omitting independently optional bootstrap state.
             ..Default::default()
         };
 
-        // Write a cache with a wrong version directly.
-        let bad = NetMapCacheData {
-            version: 999,
+        let legacy = NetMapCacheData {
+            version: 2,
             node_key: node_pub.clone(),
             profile_id: String::new(),
             control_identity: String::new(),
             tailnet_identity: resp.Domain.clone(),
-            map_response: resp.clone(),
+            map_response: resp,
         };
-        let data = serde_json::to_vec(&bad).expect("serialize");
+        let data = serde_json::to_vec(&legacy).expect("serialize");
         std::fs::write(dir.join("netmap-cache.json"), data).expect("write");
 
-        // load_netmap should reject it and remove the file.
         assert!(
             PersistedState::load_netmap(&dir, &node_pub).is_none(),
-            "version mismatch should be rejected"
+            "pre-normalization cache version should be rejected"
         );
         assert!(
             !dir.join("netmap-cache.json").exists(),
-            "stale cache file should be removed on version mismatch"
+            "legacy cache file should be removed on version mismatch"
         );
 
         std::fs::remove_dir_all(&dir).ok();

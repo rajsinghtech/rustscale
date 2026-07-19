@@ -138,7 +138,7 @@ real JSON).
 | ICMP ping (`net/ping/`) | ✅ `crates/netcheck/src/icmp.rs`: public `Pinger` (unprivileged DGRAM+IPPROTO_ICMP → SOCK_RAW fallback); integrated as netcheck fallback when STUN probes fail; CLI `ping --icmp` dispatches via LocalAPI to the same pinger |
 | DNS cache + fallback (`net/dnscache/`, `net/dnsfallback/`) | ✅ `crates/dnscache` (TTL, singleflight-inline, UseLastGood stale fallback, happy-eyeballs dialer); `crates/dnsfallback` (bootstrap-dns over DERP IPs, static + cached DERP map); wired into controlclient dial |
 | C2N debug endpoints | ✅ 10+ handlers (echo, prefs, netmap, health, metrics, dns, goroutines, component-logging, sockstats, logtail/flush); only /debug/pprof/* remains 501 |
-| Netmap disk cache | ✅ versioned envelope (v1), SHA-256 write dedup, save per MapResponse (`map_update.rs`), clear on auth failure/key expiry/logout (`lifecycle.rs`); `load_netmap` before register skips blocking first fetch (streaming poll in parallel); single-blob design; 8 tests (roundtrip, wrong-node-key, version mismatch, corrupt file, dedup, clear) verified 2026-07-13 |
+| Netmap disk cache | ✅ profile/control/tailnet-bound versioned envelope (v3) with SHA-256 write dedup; startup always prefers a fresh one-shot map, normalizes its complete peer set, and uses only that materialized snapshot as an offline fallback. Independently optional streaming deltas never replace the restart cache; pre-normalization versions, invalid structure, auth failure, key expiry, and logout clear it. Hermetic restart coverage verifies fresh-map preference and cache immutability across a full-looking stream delta. |
 | Web client UI | ✅ `rustscale web` with embedded HTML/JS, /api/status/up/down/logout handlers, explicit loopback default with post-bind enforcement, per-run CSRF and Host/Origin validation, --readonly, --unsafe-any-addr |
 | Control knobs (`control/controlknobs/`) | ✅ HashMap<String,String> behind RwLock, typed accessors (get_bool/float/string), change-detection merge, on_change callbacks |
 | PeerAPI (`ipn/ipnlocal/peerapi.go`) | ✅ DoH /dns-query (GET + POST), /v0/* endpoints (goroutines, env, metrics, magicsock, dnsfwd, interfaces, sockstats), WhoIs auth, CRC32 port [32768, 65535], Taildrop PUT handler, capability-authorized bounded Taildrive `/v0/drive`, netstack + TUN spawners |
@@ -225,8 +225,15 @@ resolution, WhoIs identity, direct path (disco vs Go magicsock), pinned-DERP
 relay, DERP→direct upgrade without byte loss, and subnet route accept. The
 separate `tools/interop-tun.sh` CI path runs one exact serial Linux privileged
 regression test: fail-closed `up_tun`, real interface/rule/table-52 assertions,
-and an OS-socket echo roundtrip through the packet pump. Additional ignored TUN
-tests retain inbound and subnet-forwarding coverage for explicit manual runs.
+and an OS-socket echo roundtrip through the packet pump. The corrected
+out-of-process parity gate `tools/interop-tun-oops.sh` then runs the
+bench-style split: two independent rustscale TUN nodes as separate OS
+processes under sudo, each with the same kernel-state assertions and full
+captured logs, exchanging the issue-#75-shaped cadenced UDP traffic and a
+TCP echo roundtrip across the process boundary (the in-process repro can
+pass while the separated failure mode appears only across processes).
+Additional ignored TUN tests retain inbound and subnet-forwarding coverage
+for explicit manual runs.
 CI: interop + interop-tun jobs in e2e.yml. The separate required
 `linux-replacement` job installs a locally assembled release archive with the
 shipped systemd unit and completes a kernel-TUN echo roundtrip to a pinned

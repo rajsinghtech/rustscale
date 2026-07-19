@@ -698,19 +698,6 @@ async fn run_client(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
     // EOF lets the server end its session and exit 0.
     stream.shutdown().await?;
 
-    let status = server.status();
-    let path = status
-        .peers
-        .iter()
-        .find(|p| p.ips.contains(&IpAddr::V4(peer)))
-        .map(|p| format!("{:?}", p.path_class))
-        .unwrap_or_else(|| "unknown".to_string());
-    line(
-        start,
-        args.role,
-        &format!("OOPS_CLIENT_PATH peer={peer} class={path}"),
-    );
-
     server.close().await?;
     line(start, args.role, "OOPS_CLIENT_DONE");
     Ok(())

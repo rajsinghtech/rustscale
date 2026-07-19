@@ -80,74 +80,106 @@ dump_logs() {
   echo "===== END client full log ====="
 }
 
-# Cleanup is fail-closed: it removes only this invocation's uniquely named
-# namespaces/bridge/iptables rules/state, restores the prior forwarding value,
-# and turns any incomplete teardown into a failing gate.
+# Cleanup is fail-closed. Every potentially blocking operation has its own
+# deadline, the server wrapper is terminated and reaped before namespace
+# removal, and success is published only after absence checks pass.
 cleanup() {
-  local original_rc=$? cleanup_rc=0
+  local original_rc=$? cleanup_rc=0 tailnet_pid=""
   trap - EXIT INT TERM
   set +e
 
-  if (( SERVER_NS_CREATED )); then
-    sudo -n ip netns del "$NS_SERVER" 2>/dev/null
-    if sudo -n ip netns list | awk '{print $1}' | grep -Fxq "$NS_SERVER"; then
-      echo "[interop-tun-oops] ERROR: leaked server namespace $NS_SERVER" >&2
-      cleanup_rc=1
+  if [[ -n "$SERVER_PID" ]]; then
+    if kill -0 "$SERVER_PID" 2>/dev/null; then
+      kill -TERM "$SERVER_PID" 2>/dev/null
+      if ! timeout --foreground --signal=TERM --kill-after=2s 20s tail --pid="$SERVER_PID" -f /dev/null; then
+        kill -KILL "$SERVER_PID" 2>/dev/null
+        timeout --foreground --signal=TERM --kill-after=2s 5s tail --pid="$SERVER_PID" -f /dev/null || cleanup_rc=1
+      fi
     fi
+    wait "$SERVER_PID" 2>/dev/null
+    kill -0 "$SERVER_PID" 2>/dev/null && cleanup_rc=1
+  fi
+  if [[ -n "$STATE_DIR" ]] && timeout 5s sudo -n pgrep -f -- "[i]nterop-tun-node.*--state-dir $STATE_DIR/server-state" >/dev/null 2>&1; then
+    timeout 5s sudo -n pkill -TERM -f -- "[i]nterop-tun-node.*--state-dir $STATE_DIR/server-state" >/dev/null 2>&1
+    timeout 5s sudo -n pkill -KILL -f -- "[i]nterop-tun-node.*--state-dir $STATE_DIR/server-state" >/dev/null 2>&1
+  fi
+  if [[ -n "$STATE_DIR" ]] && timeout 5s sudo -n pgrep -f -- "[i]nterop-tun-node.*--state-dir $STATE_DIR/server-state" >/dev/null 2>&1; then
+    echo "[interop-tun-oops] ERROR: leaked server child process" >&2
+    cleanup_rc=1
+  fi
+
+  if (( SERVER_NS_CREATED )); then
+    timeout 10s sudo -n ip netns del "$NS_SERVER" 2>/dev/null || cleanup_rc=1
   fi
   if (( CLIENT_NS_CREATED )); then
-    sudo -n ip netns del "$NS_CLIENT" 2>/dev/null
-    if sudo -n ip netns list | awk '{print $1}' | grep -Fxq "$NS_CLIENT"; then
-      echo "[interop-tun-oops] ERROR: leaked client namespace $NS_CLIENT" >&2
-      cleanup_rc=1
-    fi
+    timeout 10s sudo -n ip netns del "$NS_CLIENT" 2>/dev/null || cleanup_rc=1
   fi
   if (( BRIDGE_CREATED )); then
-    sudo -n ip link del "$BRIDGE" 2>/dev/null
-    if sudo -n ip link show dev "$BRIDGE" >/dev/null 2>&1; then
-      echo "[interop-tun-oops] ERROR: leaked bridge $BRIDGE" >&2
-      cleanup_rc=1
-    fi
+    timeout 10s sudo -n ip link del "$BRIDGE" 2>/dev/null || cleanup_rc=1
   fi
 
   if (( NAT_RULE_ADDED )); then
-    sudo -n iptables -w -t nat -D POSTROUTING -s "$SUBNET" -o "$EGRESS" \
+    timeout 10s sudo -n iptables -w 5 -t nat -D POSTROUTING -s "$SUBNET" -o "$EGRESS" \
       -m comment --comment "${GATE_ID}-nat" -j MASQUERADE 2>/dev/null || cleanup_rc=1
   fi
   if (( FORWARD_OUT_RULE_ADDED )); then
-    sudo -n iptables -w -D FORWARD -i "$BRIDGE" -o "$EGRESS" \
+    timeout 10s sudo -n iptables -w 5 -D FORWARD -i "$BRIDGE" -o "$EGRESS" \
       -m comment --comment "${GATE_ID}-out" -j ACCEPT 2>/dev/null || cleanup_rc=1
   fi
   if (( FORWARD_IN_RULE_ADDED )); then
-    sudo -n iptables -w -D FORWARD -i "$EGRESS" -o "$BRIDGE" \
+    timeout 10s sudo -n iptables -w 5 -D FORWARD -i "$EGRESS" -o "$BRIDGE" \
       -m conntrack --ctstate ESTABLISHED,RELATED \
       -m comment --comment "${GATE_ID}-in" -j ACCEPT 2>/dev/null || cleanup_rc=1
   fi
   if (( IP_FORWARD_CHANGED )); then
-    sudo -n sysctl -q -w "net.ipv4.ip_forward=$IP_FORWARD_ORIGINAL" >/dev/null 2>&1 || cleanup_rc=1
+    timeout 10s sudo -n sysctl -q -w "net.ipv4.ip_forward=$IP_FORWARD_ORIGINAL" >/dev/null 2>&1 || cleanup_rc=1
   fi
 
   if [[ -n "$STATE_DIR" ]]; then
-    sudo -n rm -rf "$STATE_DIR" 2>/dev/null || cleanup_rc=1
-    [[ ! -e "$STATE_DIR" ]] || { echo "[interop-tun-oops] ERROR: leaked state $STATE_DIR" >&2; cleanup_rc=1; }
+    timeout 10s sudo -n rm -rf "$STATE_DIR" 2>/dev/null || cleanup_rc=1
   fi
 
-  # bench_cleanup_tailnet preserves its credential record on failure, which is
-  # the correct recovery behavior; make that failure visible to this gate.
-  bench_cleanup_tailnet || cleanup_rc=1
+  # Run API cleanup in a subshell so its complete retry sequence also has an
+  # outer deadline. The credential record remains preserved if this fails.
+  bench_cleanup_tailnet &
+  tailnet_pid=$!
+  if ! timeout --foreground --signal=TERM --kill-after=2s 45s tail --pid="$tailnet_pid" -f /dev/null; then
+    kill -TERM "$tailnet_pid" 2>/dev/null
+    kill -KILL "$tailnet_pid" 2>/dev/null
+    cleanup_rc=1
+  fi
+  wait "$tailnet_pid" || cleanup_rc=1
+
+  timeout 5s sudo -n ip netns list | awk '{print $1}' | grep -Eq "^(${NS_SERVER}|${NS_CLIENT})$" && cleanup_rc=1
+  for link in "$BRIDGE" "$VETH_SERVER" "${VETH_SERVER}p" "$VETH_CLIENT" "${VETH_CLIENT}p"; do
+    timeout 5s sudo -n ip link show dev "$link" >/dev/null 2>&1 && cleanup_rc=1
+  done
+  if timeout 5s sudo -n iptables -w 3 -S | grep -Fq -- "--comment ${GATE_ID}-" \
+    || timeout 5s sudo -n iptables -w 3 -t nat -S | grep -Fq -- "--comment ${GATE_ID}-"; then
+    echo "[interop-tun-oops] ERROR: leaked tagged firewall rule" >&2
+    cleanup_rc=1
+  fi
+  [[ -z "$STATE_DIR" || ! -e "$STATE_DIR" ]] || cleanup_rc=1
 
   if (( cleanup_rc )); then
     echo "[interop-tun-oops] ERROR: cleanup was incomplete" >&2
     exit 1
   fi
+  echo "[interop-tun-oops] OOPS_CLEANUP_COMPLETE gate=$GATE_ID" >&2
   exit "$original_rc"
 }
 
 [[ "$(uname -s)" == Linux ]] || fail "isolated two-TUN gate requires Linux"
-for cmd in cargo curl jq ip iptables sudo timeout; do
+for cmd in cargo curl jq ip iptables sudo tc timeout; do
   command -v "$cmd" >/dev/null 2>&1 || fail "required tool '$cmd' not found"
 done
 tools/interop-tun-preflight.sh
+
+WORKLOAD_HEAD_SHA=$(git rev-parse HEAD)
+if [[ -n "${OOPS_EXPECTED_HEAD_SHA:-}" && "$WORKLOAD_HEAD_SHA" != "$OOPS_EXPECTED_HEAD_SHA" ]]; then
+  fail "workload HEAD $WORKLOAD_HEAD_SHA does not match expected $OOPS_EXPECTED_HEAD_SHA"
+fi
+echo "[interop-tun-oops] OOPS_WORKLOAD_HEAD_SHA=$WORKLOAD_HEAD_SHA" >&2
 
 # The namespace bridge needs a real host egress route. Do not guess an
 # interface or modify a host that already routes the reserved test subnet.
@@ -211,6 +243,16 @@ sudo -n ip link add "$VETH_CLIENT" type veth peer name "${VETH_CLIENT}p"
 sudo -n ip link set "$VETH_CLIENT" master "$BRIDGE"
 sudo -n ip link set "$VETH_CLIENT" up
 sudo -n ip link set "${VETH_CLIENT}p" netns "$NS_CLIENT"
+
+# Count direct encrypted underlay datagrams independently of RustScale state.
+# Each ingress filter sees packets emitted by one endpoint toward the other's
+# isolated underlay address; both directions must increment during workload.
+sudo -n tc qdisc add dev "$VETH_SERVER" clsact
+sudo -n tc filter add dev "$VETH_SERVER" ingress protocol ip pref 49152 flower \
+  src_ip 198.18.83.2 dst_ip 198.18.83.3 ip_proto udp action pass
+sudo -n tc qdisc add dev "$VETH_CLIENT" clsact
+sudo -n tc filter add dev "$VETH_CLIENT" ingress protocol ip pref 49152 flower \
+  src_ip 198.18.83.3 dst_ip 198.18.83.2 ip_proto udp action pass
 
 for spec in "$NS_SERVER ${VETH_SERVER}p 198.18.83.2" "$NS_CLIENT ${VETH_CLIENT}p 198.18.83.3"; do
   read -r ns veth address <<<"$spec"
@@ -318,6 +360,16 @@ require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_DONE" client
 SERVER_UDP_COUNT=$(grep -cF "OOPS_SERVER_UDP_ECHO" "$SERVER_LOG" || true)
 [[ "$SERVER_UDP_COUNT" -eq "$UDP_DATAGRAMS" ]] \
   || fail "server echoed $SERVER_UDP_COUNT UDP datagrams, expected $UDP_DATAGRAMS"
+
+SERVER_DIRECT_PACKETS=$(sudo -n tc -s filter show dev "$VETH_SERVER" ingress pref 49152 \
+  | awk '/ Sent / {print $4; exit}')
+CLIENT_DIRECT_PACKETS=$(sudo -n tc -s filter show dev "$VETH_CLIENT" ingress pref 49152 \
+  | awk '/ Sent / {print $4; exit}')
+[[ "$SERVER_DIRECT_PACKETS" =~ ^[1-9][0-9]*$ ]] \
+  || fail "no externally counted direct UDP underlay packets from server to client"
+[[ "$CLIENT_DIRECT_PACKETS" =~ ^[1-9][0-9]*$ ]] \
+  || fail "no externally counted direct UDP underlay packets from client to server"
+echo "[interop-tun-oops] OOPS_DIRECT_UNDERLAY_EVIDENCE server_to_client_packets=$SERVER_DIRECT_PACKETS client_to_server_packets=$CLIENT_DIRECT_PACKETS src_server=198.18.83.2 src_client=198.18.83.3" >&2
 
 # `OOPS_KERNEL_OK` is emitted only after each live endpoint has verified its
 # own namespace-local table-52 route. Routes are intentionally retired by

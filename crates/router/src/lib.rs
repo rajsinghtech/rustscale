@@ -3192,7 +3192,7 @@ mod tests {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         let platform = LinuxPlatform::new_with_interface_index("stale-owner0", 177);
         let base = platform.rule_base.unwrap();
-        let dir = linux_rule_owner_dir();
+        let dir = linux_rule_owner_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join(base.to_string());

@@ -5945,31 +5945,29 @@ async fn up_tun_required(server: &mut Server, test_name: &str) -> rustscale_tun:
     tun
 }
 
-/// `tools/interop-tun.sh` opts this scenario into its one reviewed exact
-/// ignored-test selector.  Reject other values so a typo cannot silently omit
-/// the contract from a required privileged run.
+/// The existing ignored interop selector also has a dedicated, credential-free
+/// required mode. Keeping one ignored selector preserves the reviewed ignore
+/// baseline while making the protected journey unable to enter tailnet interop.
 fn parse_required_tun_dns_failure_mode(value: Option<&str>) -> bool {
     match value {
         None => false,
         Some("1") => true,
         Some(value) => {
-            panic!("RUSTSCALE_REQUIRE_TUN_DNS_FAILURE must be exactly 1 when set, got {value:?}")
+            panic!("RUSTSCALE_REQUIRED_TUN_DNS_FAILURE must be exactly 1 when set, got {value:?}")
         }
     }
 }
 
 fn required_tun_dns_failure_mode() -> bool {
-    match std::env::var("RUSTSCALE_REQUIRE_TUN_DNS_FAILURE") {
+    match std::env::var("RUSTSCALE_REQUIRED_TUN_DNS_FAILURE") {
         Err(std::env::VarError::NotPresent) => parse_required_tun_dns_failure_mode(None),
         Ok(value) => parse_required_tun_dns_failure_mode(Some(&value)),
-        Err(error) => panic!("invalid RUSTSCALE_REQUIRE_TUN_DNS_FAILURE: {error}"),
+        Err(error) => panic!("invalid RUSTSCALE_REQUIRED_TUN_DNS_FAILURE: {error}"),
     }
 }
 
 #[test]
-fn required_tun_dns_failure_mode_rejects_nonzero_selector_typos() {
-    // Keep parsing independent of process environment so parallel unit tests
-    // cannot accidentally select the privileged scenario.
+fn required_tun_dns_failure_mode_rejects_selector_typos() {
     assert!(parse_required_tun_dns_failure_mode(Some("1")));
     assert!(!parse_required_tun_dns_failure_mode(None));
     assert!(
@@ -6143,12 +6141,51 @@ async fn run_required_tun_dns_failure_scenario() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();
     let state = tempfile::tempdir().unwrap();
-    let socket = state.path().join("tun-dns-failure.sock");
+    let tun_name = std::env::var("RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME")
+        .expect("required TUN DNS gate did not provide RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME");
+    assert!(
+        tun_name.starts_with("rsdns-")
+            && tun_name.len() <= 15
+            && tun_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "required TUN DNS gate supplied an unsafe interface name: {tun_name:?}"
+    );
+    let socket = std::path::PathBuf::from(
+        std::env::var("RUSTSCALE_REQUIRED_TUN_DNS_SOCKET")
+            .expect("required TUN DNS gate did not provide RUSTSCALE_REQUIRED_TUN_DNS_SOCKET"),
+    );
+    assert!(
+        socket.is_absolute(),
+        "required TUN DNS socket must be absolute: {socket:?}"
+    );
+    assert!(
+        !std::path::Path::new("/sys/class/net")
+            .join(&tun_name)
+            .exists(),
+        "required TUN DNS interface already exists: {tun_name}"
+    );
+    assert!(
+        !socket.exists(),
+        "required TUN DNS LocalAPI socket already exists: {socket:?}"
+    );
+    for family in ["-4", "-6"] {
+        let rules = required_command_output(
+            "ip",
+            &[family, "-details", "rule", "show"],
+            "required TUN DNS gate protocol-201 ownership preflight",
+        );
+        assert!(
+            !rules.lines().any(|line| line.contains("proto 201")),
+            "required TUN DNS gate refuses pre-existing IPv{} protocol-201 rules\n{rules}",
+            &family[1..]
+        );
+    }
     let set_called = Arc::new(AtomicBool::new(false));
     let dns_closed = Arc::new(AtomicBool::new(false));
     let factory_set_called = Arc::clone(&set_called);
     let factory_closed = Arc::clone(&dns_closed);
-    let tun = rustscale_tun::TunConfig::named(format!("rsdns-{}", std::process::id()));
+    let tun = rustscale_tun::TunConfig::named(tun_name);
     let mut server = Server::builder()
         .hostname(format!("tun-dns-failure-{}", std::process::id()))
         .auth_key("tskey-test")
@@ -6259,12 +6296,20 @@ async fn interop_tun_rust_dials_go() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let dns_failure_required = required_tun_dns_failure_mode();
+    // The protected replacement journey selects this existing ignored test in
+    // dedicated mode. Do this before reading the interop environment so it
+    // cannot silently pass through the normal secret-backed test path.
+    #[cfg(target_os = "linux")]
+    if required_tun_dns_failure_mode() {
+        run_required_tun_dns_failure_scenario().await;
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
     assert!(
-        !dns_failure_required
-            || std::env::var("RUSTSCALE_REQUIRE_TUN_INTEROP").is_ok_and(|value| value == "1"),
-        "RUSTSCALE_REQUIRE_TUN_DNS_FAILURE=1 requires RUSTSCALE_REQUIRE_TUN_INTEROP=1"
+        !required_tun_dns_failure_mode(),
+        "RUSTSCALE_REQUIRED_TUN_DNS_FAILURE requires Linux"
     );
+
     let Some(ienv) = require_tun_interop("interop_tun_rust_dials_go") else {
         return;
     };
@@ -6334,16 +6379,6 @@ async fn interop_tun_rust_dials_go() {
 
     log_go_path(&server, ienv.go_ip, "tun_rust_dials_go");
     server.close().await.unwrap();
-
-    #[cfg(target_os = "linux")]
-    if dns_failure_required {
-        run_required_tun_dns_failure_scenario().await;
-    }
-    #[cfg(not(target_os = "linux"))]
-    assert!(
-        !dns_failure_required,
-        "RUSTSCALE_REQUIRE_TUN_DNS_FAILURE requires the Linux privileged TUN gate"
-    );
 }
 
 /// Interop TUN: Go dials the rustscale node through its SOCKS5 proxy.

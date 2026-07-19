@@ -83,6 +83,15 @@ grep -q 'Replay replacement failure diagnostics' .github/workflows/ci.yml
 grep -q 'systemd-run --quiet --wait --pipe --collect' tools/packaging/test-linux-replacement.sh
 grep -q 'KillMode=control-group' tools/packaging/test-linux-replacement.sh
 grep -q 'RuntimeMaxSec=' tools/packaging/test-linux-replacement.sh
+# The protected replacement job carries the credential-free real-TUN contract;
+# no new workflow context may replace or hide that required journey.
+grep -q 'name: Installed Linux replacement journey' .github/workflows/ci.yml
+grep -q 'needs: \[check, cross, msrv, testcontrol, linux-replacement, ignore-guard\]' .github/workflows/ci.yml
+grep -Fq 'systemctl is-system-running --wait' tools/packaging/test-linux-replacement.sh
+if grep -Fq 'systemd_attempt' tools/packaging/test-linux-replacement.sh; then
+    echo "systemd readiness must use native --wait, not a polling loop" >&2
+    exit 1
+fi
 grep -q 'timeout-minutes: 50' .github/workflows/ci.yml
 grep -q 'TESTCONTROL_GO_CLIENT_DIR' tools/testcontrol/build.sh
 
@@ -109,7 +118,28 @@ grep -Fq -- 'sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_N
 grep -Fq -- 'set -eu' tools/interop-tun.sh
 grep -Fq -- 'sudo did not preserve the required interop environment' tools/interop-tun.sh
 grep -Fq -- 'export RUSTSCALE_REQUIRE_TUN_INTEROP=1' tools/interop-tun.sh
-grep -Fq -- 'export RUSTSCALE_REQUIRE_TUN_DNS_FAILURE=1' tools/interop-tun.sh
+if grep -R -Fq -- 'RUSTSCALE_REQUIRE_TUN_DNS_FAILURE' tools/interop-tun.sh crates/tsnet/src/tests.rs; then
+    echo "DNS readiness must not be coupled to secret-backed interop" >&2
+    exit 1
+fi
+# The installed replacement journey is the required credential-free TUN/DNS
+# contract. It must build one libtest runner, count one existing ignored
+# selector, enter dedicated mode under root, and never accept a zero match.
+grep -Fq -- 'record_phase required-tun-dns-readiness' tools/packaging/test-linux-replacement.sh
+grep -Fq -- 'cargo test -p rustscale-tsnet --lib --no-run --message-format=json' tools/packaging/test-linux-replacement.sh
+grep -Fq -- 'target.get("name") == "rustscale_tsnet"' tools/packaging/test-linux-replacement.sh
+grep -Fq -- 'expected one rustscale_tsnet libtest executable' tools/packaging/test-linux-replacement.sh
+grep -Fq -- "grep -Fxc 'tests::interop_tun_rust_dials_go: test'" tools/packaging/test-linux-replacement.sh
+grep -Fq -- "required TUN DNS exact selector matched \$selected_count tests (expected 1)" tools/packaging/test-linux-replacement.sh
+grep -Fq -- 'RUSTSCALE_REQUIRED_TUN_DNS_FAILURE=1' tools/packaging/test-linux-replacement.sh
+grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/packaging/test-linux-replacement.sh
+grep -Fq -- '--nocapture --test-threads=1' tools/packaging/test-linux-replacement.sh
+grep -Fq -- "test \"\$(id -u)\" -eq 0" tools/packaging/test-linux-replacement.sh
+grep -Fq -- 'test -c /dev/net/tun' tools/packaging/test-linux-replacement.sh
+grep -Fq -- 'command -v ip' tools/packaging/test-linux-replacement.sh
+grep -Fq -- 'RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME' crates/tsnet/src/tests.rs
+grep -Fq -- 'if required_tun_dns_failure_mode()' crates/tsnet/src/tests.rs
+grep -Fq -- 'run_required_tun_dns_failure_scenario().await' crates/tsnet/src/tests.rs
 # Match exact source text retaining the escaped child argv.
 # shellcheck disable=SC2016
 grep -Fq -- 'exec \"\$@\"' tools/interop-tun.sh

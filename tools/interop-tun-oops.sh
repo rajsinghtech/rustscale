@@ -43,6 +43,8 @@ NAT_RULE_ADDED=0
 FORWARD_OUT_RULE_ADDED=0
 FORWARD_IN_RULE_ADDED=0
 BRIDGE_CREATED=0
+VETH_SERVER_CREATED=0
+VETH_CLIENT_CREATED=0
 SERVER_NS_CREATED=0
 CLIENT_NS_CREATED=0
 
@@ -124,6 +126,14 @@ cleanup() {
   if (( CLIENT_NS_CREATED )); then
     timeout 10s sudo -n ip netns del "$NS_CLIENT" 2>/dev/null \
       || { echo "[interop-tun-oops] ERROR: could not delete client namespace" >&2; cleanup_rc=1; }
+  fi
+  if (( VETH_SERVER_CREATED )) && timeout 5s sudo -n ip link show dev "$VETH_SERVER" >/dev/null 2>&1; then
+    timeout 10s sudo -n ip link del "$VETH_SERVER" 2>/dev/null \
+      || { echo "[interop-tun-oops] ERROR: could not delete server veth" >&2; cleanup_rc=1; }
+  fi
+  if (( VETH_CLIENT_CREATED )) && timeout 5s sudo -n ip link show dev "$VETH_CLIENT" >/dev/null 2>&1; then
+    timeout 10s sudo -n ip link del "$VETH_CLIENT" 2>/dev/null \
+      || { echo "[interop-tun-oops] ERROR: could not delete client veth" >&2; cleanup_rc=1; }
   fi
   if (( BRIDGE_CREATED )); then
     timeout 10s sudo -n ip link del "$BRIDGE" 2>/dev/null \
@@ -263,10 +273,12 @@ SERVER_NS_CREATED=1
 sudo -n ip netns add "$NS_CLIENT"
 CLIENT_NS_CREATED=1
 sudo -n ip link add "$VETH_SERVER" type veth peer name "${VETH_SERVER}p"
+VETH_SERVER_CREATED=1
 sudo -n ip link set "$VETH_SERVER" master "$BRIDGE"
 sudo -n ip link set "$VETH_SERVER" up
 sudo -n ip link set "${VETH_SERVER}p" netns "$NS_SERVER"
 sudo -n ip link add "$VETH_CLIENT" type veth peer name "${VETH_CLIENT}p"
+VETH_CLIENT_CREATED=1
 sudo -n ip link set "$VETH_CLIENT" master "$BRIDGE"
 sudo -n ip link set "$VETH_CLIENT" up
 sudo -n ip link set "${VETH_CLIENT}p" netns "$NS_CLIENT"

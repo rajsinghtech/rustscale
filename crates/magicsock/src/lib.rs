@@ -2619,7 +2619,7 @@ impl Magicsock {
                 .endpoints
                 .write()
                 .expect("endpoints lock poisoned")
-                .get_mut(&peer)
+                .get_mut(peer)
             {
                 endpoint.note_direct_transport(addr, false);
             }

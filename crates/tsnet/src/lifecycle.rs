@@ -464,6 +464,14 @@ impl Drop for PrestartedMagicsockRollback {
     }
 }
 
+fn set_os_dns_retaining_owner(
+    mut configurator: Box<dyn OsConfigurator + Send>,
+    config: &OsConfig,
+) -> (Box<dyn OsConfigurator + Send>, std::io::Result<()>) {
+    let result = configurator.set_dns(config);
+    (configurator, result)
+}
+
 struct StartupRollback {
     armed: bool,
     supervisor: Arc<BootstrapSupervisor>,
@@ -640,13 +648,15 @@ impl Drop for StartupRollback {
             if let Some(mut monitor) = monitor {
                 monitor.shutdown_and_wait().await;
             }
-            // Every route-mutating owner is now joined. Router teardown is
-            // deliberately last so no map/local/link callback can reinstall.
+            // Every route-mutating owner is now joined. Clear DNS while the
+            // router/VIP is still retained, then release routes last.
+            if let Some(configurator) = configurator.as_mut() {
+                if let Err(error) = configurator.close() {
+                    log::warn!("tsnet: startup rollback DNS cleanup failed: {error}");
+                }
+            }
             if let Some(router) = router {
                 let _ = Server::cleanup_or_supervise(router).await;
-            }
-            if let Some(configurator) = configurator.as_mut() {
-                let _ = configurator.close();
             }
             if let Some(magicsock) = magicsock {
                 if let Err(error) = shutdown_magicsock(&magicsock).await {
@@ -845,17 +855,18 @@ fn close_os_dns_configurator(
 }
 
 async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningState, String)> {
-    // Extension shutdown has succeeded, so dependencies owned by the router,
-    // DNS configurator, and magicsock can now be released.
+    // Revert DNS while the complete TUN generation is retained. A failed
+    // RevertLink must leave the router/VIP generation available to its retry.
+    if let Err(error) = close_os_dns_configurator(&mut inner.os_dns_configurator) {
+        log::warn!("tsnet: retaining OS DNS cleanup owner: {error}");
+        return Err((inner, format!("OS DNS cleanup: {error}")));
+    }
+    // DNS is confirmed clear; route teardown can no longer strand its owner.
     if let Some(router) = inner.router.take() {
         if let Err(error) = Server::cleanup_or_supervise(router).await {
             log::warn!("tsnet: retaining route cleanup owner: {error}");
             return Err((inner, format!("route cleanup: {error}")));
         }
-    }
-    if let Err(error) = close_os_dns_configurator(&mut inner.os_dns_configurator) {
-        log::warn!("tsnet: retaining OS DNS cleanup owner: {error}");
-        return Err((inner, format!("OS DNS cleanup: {error}")));
     }
     match shutdown_magicsock(&inner.magicsock).await {
         Ok(PortmapperCleanup::Confirmed) => {}
@@ -2087,6 +2098,31 @@ impl Server {
         ));
         rollback.track(pump);
 
+        // MagicDNS must be reachable from the host resolver in TUN mode. The
+        // responder owns exactly the service VIP on both UDP and TCP; a bind
+        // failure is not masked by a localhost/ephemeral fallback.
+        let dns_cfg_snapshot = b.dns_config.read().await.clone();
+        let forwarder = Arc::new(Forwarder::from_dns_config(dns_cfg_snapshot.as_ref()));
+        let responder = DnsResponder::with_forwarder(
+            b.resolver.clone(),
+            SocketAddr::new(IpAddr::V4(MAGICDNS_VIP), 53),
+            forwarder,
+        );
+        let magicdns_responder_ready = match responder.spawn().await {
+            Ok(handle) => {
+                rollback.track(handle.into_join_handle());
+                true
+            }
+            Err(error) => {
+                b.health.set_unhealthy(
+                    "subsystem-dns",
+                    format!("MagicDNS responder is not reachable at {MAGICDNS_VIP}:53: {error}"),
+                );
+                log::warn!("tsnet: MagicDNS responder not started: {error}");
+                false
+            }
+        };
+
         // Periodic endpoint update (Bug 4).
         let periodic_ep = spawn_periodic_endpoint_updates(
             b.magicsock.clone(),
@@ -2499,10 +2535,10 @@ impl Server {
         };
         rollback.localapi_socket.clone_from(&localapi_socket);
 
-        // OS DNS configuration (macOS: /etc/resolver entries pointing at
-        // 100.100.100.100). Opt-in via `configure_os_dns(true)` — requires
-        // root. Best-effort: permission errors are logged and do not prevent
-        // up_tun from completing.
+        // Configure DNS only through the TUN link. Linux uses
+        // systemd-resolved's RevertLink-backed per-link API, so public and
+        // foreign resolver state are never overwritten. Keep the configurator
+        // owner until shutdown/rollback so cleanup is retried if necessary.
         rollback.os_dns_configurator = if self.config.configure_os_dns {
             let dns_cfg_snapshot = b.dns_config.read().await.clone();
             let os_cfg = if let Some(ref dc) = dns_cfg_snapshot {
@@ -2513,22 +2549,56 @@ impl Server {
                     ..Default::default()
                 }
             };
-            let mut configurator: Box<dyn OsConfigurator + Send> = Box::new(new_os_configurator());
-            match configurator.set_dns(&os_cfg) {
-                Ok(()) => {
-                    log::info!(
-                        "tsnet: OS DNS configured ({} match domains, {} search domains)",
-                        os_cfg.match_domains.len(),
-                        os_cfg.search_domains.len()
-                    );
-                    Some(configurator)
+            match new_os_configurator(Some(tun.name())) {
+                Ok(configurator) => {
+                    let (configurator, setup) = set_os_dns_retaining_owner(configurator, &os_cfg);
+                    match setup {
+                        Ok(()) => {
+                            if magicdns_responder_ready {
+                                b.health.set_healthy("subsystem-dns");
+                            }
+                            log::info!(
+                                "tsnet: OS DNS configured ({} match domains, {} search domains)",
+                                os_cfg.match_domains.len(),
+                                os_cfg.search_domains.len()
+                            );
+                            Some(configurator)
+                        }
+                        Err(error) => {
+                            b.health.set_unhealthy(
+                                "subsystem-dns",
+                                format!("OS DNS configuration failed: {error}"),
+                            );
+                            log::warn!(
+                                "tsnet: OS DNS configuration failed; retaining cleanup owner: {error}"
+                            );
+                            // set_dns may have changed the link and then failed
+                            // to compensate. Keep the configurator in the
+                            // generation so shutdown and startup rollback retry
+                            // RevertLink.
+                            Some(configurator)
+                        }
+                    }
                 }
-                Err(e) => {
-                    log::warn!("tsnet: OS DNS configuration failed (non-fatal, needs root?): {e}");
+                Err(error) => {
+                    b.health.set_unhealthy(
+                        "subsystem-dns",
+                        format!("OS DNS configurator unavailable: {error}"),
+                    );
+                    log::warn!("tsnet: OS DNS configurator unavailable: {error}");
                     None
                 }
             }
         } else {
+            if dns_cfg_snapshot
+                .as_ref()
+                .is_some_and(|config| config.Proxied)
+            {
+                b.health.set_unhealthy(
+                    "subsystem-dns",
+                    "MagicDNS is disabled because OS DNS configuration is disabled",
+                );
+            }
             None
         };
         let extension_subscription = self

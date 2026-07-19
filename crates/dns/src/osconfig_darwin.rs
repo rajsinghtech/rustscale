@@ -124,6 +124,12 @@ impl OsConfigurator for DarwinConfigurator {
         // shared nameserver content.
         for d in &cfg.match_domains {
             let file_base = d.trim_end_matches('.');
+            // `~.` is meaningful to systemd-resolved but macOS resolver
+            // files have no safe global-route equivalent. In particular, do
+            // not attempt to write the resolver directory itself for `.`.
+            if file_base.is_empty() {
+                continue;
+            }
             keep.push(file_base.to_string());
 
             if !is_valid_resolver_file_name(file_base) {
@@ -356,8 +362,8 @@ mod tests {
             expected
         );
         assert!(
-            !os.match_domains.iter().any(|domain| domain == "."),
-            "the default route is not a platform match suffix"
+            os.match_domains.iter().any(|domain| domain == "."),
+            "the shared plan preserves Linux's explicit global route"
         );
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
 

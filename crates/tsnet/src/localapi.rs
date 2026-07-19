@@ -469,8 +469,11 @@ pub enum DaemonCommand {
     },
     LoginInteractive,
     /// Retire the live data-plane generation while retaining a stopped
-    /// LocalAPI generation for a later `up`.
-    Down,
+    /// LocalAPI generation for a later `up`. The daemon owns the sender, so
+    /// a disconnected HTTP client cannot cancel an admitted teardown.
+    Down {
+        completion: Arc<DownCompletion>,
+    },
     Logout,
     Shutdown,
     /// Re-read the config file and apply the resulting prefs. Fired by
@@ -491,7 +494,7 @@ impl std::fmt::Debug for DaemonCommand {
                 .field("auth_key", &auth_key.as_ref().map(|_| "<redacted>"))
                 .finish(),
             Self::LoginInteractive => formatter.write_str("LoginInteractive"),
-            Self::Down => formatter.write_str("Down"),
+            Self::Down { .. } => formatter.write_str("Down"),
             Self::Logout => formatter.write_str("Logout"),
             Self::Shutdown => formatter.write_str("Shutdown"),
             Self::ReloadConfig => formatter.write_str("ReloadConfig"),
@@ -499,6 +502,38 @@ impl std::fmt::Debug for DaemonCommand {
                 .debug_tuple("SwitchProfile")
                 .field(profile)
                 .finish(),
+        }
+    }
+}
+
+/// Completion of a daemon-owned LocalAPI down flight. Only the daemon can
+/// resolve it; request cancellation only drops a receiver.
+pub struct DownCompletion {
+    sender: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>,
+}
+
+impl DownCompletion {
+    pub fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<Result<(), String>>,
+    ) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                sender: std::sync::Mutex::new(Some(sender)),
+            }),
+            receiver,
+        )
+    }
+
+    pub fn complete(&self, result: Result<(), String>) {
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .expect("down completion lock poisoned")
+            .take()
+        {
+            let _ = sender.send(result);
         }
     }
 }
@@ -1006,7 +1041,7 @@ impl LocalApiHandle {
 
     /// Join this listener without unlinking its recorded path. Used only when
     /// an atomic handoff has already republished another listener there.
-    pub(crate) async fn shutdown_preserving_path(mut self) {
+    pub async fn shutdown_preserving_path(mut self) {
         self.unlink_on_drop = false;
         self.shutdown().await;
     }
@@ -1943,6 +1978,18 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
     let exit_node_changed =
         masked.ExitNodeIDSet || masked.ExitNodeIPSet || masked.ExitNodeAllowLANAccessSet;
     let disconnect_requested = masked.WantRunningSet && !masked.Prefs.WantRunning;
+    // Admission precedes durable mutation. A failed owner must not report a
+    // rejected down while silently persisting WantRunning=false.
+    if disconnect_requested
+        && state
+            .command_tx
+            .as_ref()
+            .is_none_or(tokio::sync::mpsc::UnboundedSender::is_closed)
+    {
+        let error = serde_json::json!({"error": "daemon lifecycle owner is unavailable"});
+        write_json_response(conn, 503, "Service Unavailable", &error).await?;
+        return Ok(());
+    }
     let authorization_changed = exit_node_changed || masked.ShieldsUpSet;
     let exit_map_guard = if exit_node_changed {
         Some(state.exit_map_gate.lock().await)
@@ -2041,10 +2088,38 @@ async fn handle_patch_prefs<W: AsyncWrite + Unpin>(
             write_json_response(conn, 503, "Service Unavailable", &error).await?;
             return Ok(());
         };
-        if command_tx.send(DaemonCommand::Down).is_err() {
+        let (completion, completion_rx) = DownCompletion::new();
+        if command_tx.send(DaemonCommand::Down { completion }).is_err() {
             let error = serde_json::json!({"error": "daemon lifecycle loop is unavailable"});
             write_json_response(conn, 503, "Service Unavailable", &error).await?;
             return Ok(());
+        }
+        // Success certifies that the daemon has withdrawn the running
+        // generation and published the stopped LocalAPI replacement. The
+        // completion sender is daemon-owned; dropping this request only drops
+        // its waiter, never the teardown flight.
+        match completion_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                write_json_response(
+                    conn,
+                    500,
+                    "Internal Server Error",
+                    &serde_json::json!({"error": format!("down lifecycle failed: {error}")}),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                write_json_response(
+                    conn,
+                    503,
+                    "Service Unavailable",
+                    &serde_json::json!({"error": "daemon lifecycle completion is unavailable"}),
+                )
+                .await?;
+                return Ok(());
+            }
         }
     }
 
@@ -3184,11 +3259,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
                 Some((_, d)) => d,
                 None => suffix,
             };
-            (
-                suffix.to_string(),
-                suffix.to_string(),
-                dns.Proxied && (!state.tun_mode || !state.health.is_unhealthy("subsystem-dns")),
-            )
+            (suffix.to_string(), suffix.to_string(), dns.Proxied)
         } else {
             (String::new(), String::new(), false)
         };
@@ -5044,9 +5115,7 @@ async fn handle_dns_query<W: AsyncWrite + Unpin>(
     }
 
     // Check if MagicDNS is enabled and provide context.
-    let magicdns_enabled = dns_config.as_ref().is_some_and(|c| {
-        c.Proxied && (!state.tun_mode || !state.health.is_unhealthy("subsystem-dns"))
-    });
+    let magicdns_enabled = dns_config.as_ref().is_some_and(|c| c.Proxied);
 
     let response = serde_json::json!({
         "name": name,
@@ -8902,12 +8971,21 @@ mod tests {
         })
         .unwrap();
         let (mut conn, _peer) = tokio::io::duplex(4096);
-        handle_patch_prefs(&mut conn, &request, &state)
-            .await
-            .unwrap();
+        let state_for_request = Arc::clone(&state);
+        let request_task = tokio::spawn(async move {
+            handle_patch_prefs(&mut conn, &request, &state_for_request).await
+        });
 
+        let Some(DaemonCommand::Down { completion }) = command_rx.recv().await else {
+            panic!("down request did not notify the daemon");
+        };
         assert!(!state.prefs.read().await.WantRunning);
-        assert!(matches!(command_rx.recv().await, Some(DaemonCommand::Down)));
+        assert!(
+            !request_task.is_finished(),
+            "down request returned before daemon-owned teardown completed"
+        );
+        completion.complete(Ok(()));
+        request_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -8923,9 +9001,10 @@ mod tests {
         })
         .unwrap();
         let (mut client, mut server) = tokio::io::duplex(4096);
+        let state_for_request = Arc::clone(&state);
 
         let response = tokio::spawn(async move {
-            handle_patch_prefs(&mut server, &request, &state)
+            handle_patch_prefs(&mut server, &request, &state_for_request)
                 .await
                 .unwrap();
         });
@@ -8938,6 +9017,10 @@ mod tests {
         assert!(
             response.contains("daemon lifecycle owner is unavailable"),
             "{response}"
+        );
+        assert!(
+            state.prefs.read().await.WantRunning,
+            "rejected down mutated durable lifecycle intent"
         );
     }
 

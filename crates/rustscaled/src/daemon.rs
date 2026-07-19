@@ -140,69 +140,41 @@ pub async fn run(
     result
 }
 
-trait CloseRunner {
-    type Error: std::fmt::Display;
-
-    fn attempt_close(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
-}
-
-impl CloseRunner for Server {
-    type Error = TsnetError;
-
-    async fn attempt_close(&mut self) -> Result<(), Self::Error> {
-        Server::close(self).await
-    }
-}
-
-/// Server cleanup deliberately retains uncertain ownership for retry. Give
-/// daemon shutdown a bounded retry window so transient port-mapper or task
-/// cleanup uncertainty does not turn an otherwise successful service stop
-/// into a permanent failure.
-async fn retry_close<R: CloseRunner>(runner: &mut R) -> Result<(), R::Error> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut delay = std::time::Duration::from_millis(25);
-    loop {
-        match runner.attempt_close().await {
-            Ok(()) => return Ok(()),
-            Err(error) if tokio::time::Instant::now() < deadline => {
-                log::warn!("rustscaled: shutdown cleanup incomplete; retrying: {error}");
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(std::time::Duration::from_millis(500));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-const UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE: &str = "server cleanup is busy or failed; retry close: magicsock cleanup: portmapper cleanup incomplete: protocol error: portmapper cleanup remains uncertain";
-const UNCONFIRMED_LOGOUT_PORTMAP_RELEASE: &str = "logout cleanup requires retry: magicsock cleanup: portmapper cleanup incomplete: protocol error: portmapper cleanup remains uncertain";
-
-fn is_only_unconfirmed_external_portmap_release(error: &TsnetError) -> bool {
-    matches!(
-        error,
-        TsnetError::ShutdownIncomplete(detail)
-            if detail == UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE
-                || detail == UNCONFIRMED_LOGOUT_PORTMAP_RELEASE
-    )
-}
-
+/// Close once: `Server` owns cancellation-safe cleanup and retains only
+/// genuine local cleanup failures. Unconfirmed external NAT lease deletion is
+/// classified by the portmapper and never causes a daemon retry loop.
 async fn close_server(server: &mut Server) -> Result<(), TsnetError> {
-    match retry_close(server).await {
-        Ok(()) => Ok(()),
-        Err(error) if is_only_unconfirmed_external_portmap_release(&error) => {
-            // NAT-PMP/PCP/UPnP deletion has no reliable acknowledgement on
-            // every router. After bounded retries all local tasks and send
-            // ownership are already closed; an external lease can only age
-            // out. Do not make systemd treat that sole uncertainty as a crash.
-            log::warn!(
-                "rustscaled: shutdown complete with unconfirmed external port mapping release"
-            );
-            Ok(())
+    server.close().await
+}
+
+/// Complete a LocalAPI `down` only after the active generation has withdrawn
+/// all local data-plane ownership and a stopped replacement is published.
+/// The accepted old handler remains alive solely to write this completion;
+/// draining it before sending would deadlock on LocalAPI child joining.
+async fn down_to_stopped(
+    server: &mut Server,
+    completion: std::sync::Arc<rustscale_tsnet::localapi::DownCompletion>,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>, TsnetError> {
+    let mut old_localapi = match server.close_preserving_localapi().await {
+        Ok(handle) => handle,
+        Err(error) => {
+            completion.complete(Err(error.to_string()));
+            return Err(error);
         }
-        Err(error) => Err(error),
-    }
+    };
+    let commands = match server
+        .start_localapi_stopped_replacing(&mut old_localapi)
+        .await
+    {
+        Ok(commands) => commands,
+        Err(error) => {
+            completion.complete(Err(error.to_string()));
+            return Err(error);
+        }
+    };
+    completion.complete(Ok(()));
+    old_localapi.shutdown_preserving_path().await;
+    Ok(commands)
 }
 
 trait LogoutRunner {
@@ -289,18 +261,6 @@ where
         LogoutRetryOutcome::Shutdown => {
             server.fail_pending_logout_requests("daemon shutdown interrupted logout completion");
             log::info!("rustscaled: shutdown interrupted logout; Drop retained its transaction");
-            Ok(DaemonLogoutDisposition::StopNow)
-        }
-        LogoutRetryOutcome::Exhausted(error)
-            if is_only_unconfirmed_external_portmap_release(&error) =>
-        {
-            // Durable logout state and all local packet ownership committed
-            // before this external NAT lease uncertainty. Process exit closes
-            // the socket; the unconfirmed remote lease can only age out.
-            server.complete_pending_logout_requests();
-            log::warn!(
-                "rustscaled: logout complete with unconfirmed external port mapping release"
-            );
             Ok(DaemonLogoutDisposition::StopNow)
         }
         LogoutRetryOutcome::Exhausted(error) => {
@@ -431,10 +391,9 @@ async fn run_with_auth_key(
                 break;
             }
             Some(command) = command_rx.recv() => match command {
-                DaemonCommand::Down => {
+                DaemonCommand::Down { completion } => {
                     log::info!("rustscaled: down requested via LocalAPI");
-                    close_server(&mut server).await?;
-                    command_rx = server.start_localapi_stopped().await?;
+                    command_rx = down_to_stopped(&mut server, completion).await?;
                     match drive_login_until_running(
                         &mut server,
                         &mut command_rx,
@@ -589,9 +548,10 @@ where
             DaemonCommand::LoginInteractive => {
                 server.clear_auth_key();
             }
-            DaemonCommand::Down => {
+            DaemonCommand::Down { completion } => {
                 // Already stopped: preserve the LocalAPI listener and durable
                 // identity, so repeated `down` is idempotent.
+                completion.complete(Ok(()));
                 continue;
             }
             DaemonCommand::Logout => {
@@ -755,15 +715,13 @@ async fn run_interactive(
             }
             Some(cmd) = command_rx.recv() => {
                 match cmd {
-                    DaemonCommand::Down => {
+                    DaemonCommand::Down { completion } => {
                         // `PATCH /prefs {WantRunning:false}` committed before
                         // this command was sent. Retire every generation-owned
-                        // data-plane resource, then re-admit only LocalAPI in
-                        // Stopped state so `up` can resume with the same node
-                        // identity without a daemon restart.
+                        // data-plane resource, then publish Stopped LocalAPI
+                        // before acknowledging the request.
                         log::info!("rustscaled: down requested via LocalAPI");
-                        close_server(&mut server).await?;
-                        command_rx = server.start_localapi_stopped().await?;
+                        command_rx = down_to_stopped(&mut server, completion).await?;
                         match drive_login_until_running(
                             &mut server,
                             &mut command_rx,
@@ -1064,11 +1022,13 @@ mod tests {
     use rustscale_tsnet::PreferencePolicy;
 
     #[cfg(unix)]
-    use super::{drive_login_until_running, persist_direct_auth_running_intent, LoginLoopOutcome};
     use super::{
-        is_only_unconfirmed_external_portmap_release, retry_close, retry_logout_until_shutdown,
-        should_resume_persisted_node, CloseRunner, InstallUpdatesPolicy, LogoutRetryOutcome,
-        LogoutRunner, UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE, UNCONFIRMED_LOGOUT_PORTMAP_RELEASE,
+        down_to_stopped, drive_login_until_running, persist_direct_auth_running_intent,
+        LoginLoopOutcome,
+    };
+    use super::{
+        retry_logout_until_shutdown, should_resume_persisted_node, InstallUpdatesPolicy,
+        LogoutRetryOutcome, LogoutRunner,
     };
 
     #[cfg(unix)]
@@ -1168,25 +1128,30 @@ mod tests {
         Box::pin(server.up()).await.unwrap();
         let original_node_key = control.all_nodes()[0].Key.clone();
         let client = rustscale_localclient::LocalClient::new(&socket);
-
-        client
-            .edit_prefs(&rustscale_ipn::MaskedPrefs {
-                Prefs: rustscale_ipn::Prefs {
-                    WantRunning: false,
+        let down_socket = socket.clone();
+        let down_request = tokio::spawn(async move {
+            rustscale_localclient::LocalClient::new(&down_socket)
+                .edit_prefs(&rustscale_ipn::MaskedPrefs {
+                    Prefs: rustscale_ipn::Prefs {
+                        WantRunning: false,
+                        ..Default::default()
+                    },
+                    WantRunningSet: true,
                     ..Default::default()
-                },
-                WantRunningSet: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            commands.recv().await,
-            Some(rustscale_tsnet::localapi::DaemonCommand::Down)
-        ));
-
-        server.close().await.unwrap();
-        commands = server.start_localapi_stopped().await.unwrap();
+                })
+                .await
+        });
+        let Some(rustscale_tsnet::localapi::DaemonCommand::Down { completion }) =
+            commands.recv().await
+        else {
+            panic!("LocalAPI down did not reach the daemon");
+        };
+        assert!(
+            !down_request.is_finished(),
+            "down returned before the daemon withdrew the running generation"
+        );
+        commands = down_to_stopped(&mut server, completion).await.unwrap();
+        down_request.await.unwrap().unwrap();
         let stopped = client.status().await.unwrap();
         assert_eq!(stopped["BackendState"], "Stopped");
 
@@ -1281,52 +1246,6 @@ mod tests {
             "test did not retain the abandoned generation's intent"
         );
         server.close().await.unwrap();
-    }
-
-    struct TransientClose {
-        remaining_failures: usize,
-        calls: usize,
-    }
-
-    impl CloseRunner for TransientClose {
-        type Error = std::io::Error;
-
-        async fn attempt_close(&mut self) -> Result<(), Self::Error> {
-            self.calls += 1;
-            if self.remaining_failures > 0 {
-                self.remaining_failures -= 1;
-                Err(std::io::Error::other("injected cleanup uncertainty"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    #[test]
-    fn daemon_accepts_only_exact_external_portmap_release_uncertainty() {
-        let accepted = rustscale_tsnet::TsnetError::ShutdownIncomplete(
-            UNCONFIRMED_EXTERNAL_PORTMAP_RELEASE.into(),
-        );
-        assert!(is_only_unconfirmed_external_portmap_release(&accepted));
-        let accepted_logout = rustscale_tsnet::TsnetError::ShutdownIncomplete(
-            UNCONFIRMED_LOGOUT_PORTMAP_RELEASE.into(),
-        );
-        assert!(is_only_unconfirmed_external_portmap_release(
-            &accepted_logout
-        ));
-        let rejected =
-            rustscale_tsnet::TsnetError::ShutdownIncomplete("router cleanup incomplete".into());
-        assert!(!is_only_unconfirmed_external_portmap_release(&rejected));
-    }
-
-    #[tokio::test]
-    async fn daemon_retries_retained_close_ownership() {
-        let mut close = TransientClose {
-            remaining_failures: 2,
-            calls: 0,
-        };
-        retry_close(&mut close).await.unwrap();
-        assert_eq!(close.calls, 3);
     }
 
     #[test]

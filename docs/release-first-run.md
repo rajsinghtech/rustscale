@@ -53,6 +53,16 @@ table 52 through `tun0`. A TCP echo roundtrip to Go tailscaled then proves an OS
 socket packet traverses the kernel TUN, RustScale's packet pump and WireGuard
 path, and returns.
 
+The same job then runs the corrected out-of-process parity gate,
+`tools/interop-tun-oops.sh`. The in-process repro above can pass while a
+failure mode only appears when the endpoints live in separate processes, like
+the benchmark harness. The split harness starts two independent rustscale TUN
+nodes as separate OS processes under sudo — each with its own TUN device,
+state directory, the same Linux kernel-state assertions, and a full captured
+log — then drives the issue-#75-shaped cadenced UDP exchange and a TCP echo
+roundtrip across the process boundary. The gate requires both processes to
+exit 0 with the complete structured evidence in both logs.
+
 This credentialed job is deliberately not part of ordinary local or pull
 request validation. It uses only short-lived OIDC and an ephemeral tailnet with
 unconditional teardown; run it locally only when explicitly supplying the

@@ -401,16 +401,32 @@ async fn wait_router_cleanup(router: &SharedRouter) -> Result<(), TsnetError> {
     }
 }
 
-async fn shutdown_magicsock(magicsock: &Magicsock) -> Result<(), String> {
-    let portmapper = magicsock
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PortmapperCleanup {
+    Confirmed,
+    ExternalReleaseUnconfirmed,
+}
+
+async fn shutdown_magicsock(magicsock: &Magicsock) -> Result<PortmapperCleanup, String> {
+    let portmapper = match magicsock
         .shutdown_portmapper(COMPONENT_SHUTDOWN_TIMEOUT)
         .await
-        .map_err(|error| format!("portmapper cleanup incomplete: {error}"));
+    {
+        Ok(()) => Ok(PortmapperCleanup::Confirmed),
+        Err(rustscale_portmapper::PortMapError::ExternalReleaseUnconfirmed) => {
+            Ok(PortmapperCleanup::ExternalReleaseUnconfirmed)
+        }
+        Err(error) => Err(format!("portmapper cleanup incomplete: {error}")),
+    };
     let runtime = magicsock
         .shutdown(COMPONENT_SHUTDOWN_TIMEOUT)
         .await
         .map_err(|error| format!("magicsock cleanup incomplete: {error}"));
-    portmapper.and(runtime)
+    match (portmapper, runtime) {
+        (_, Err(error)) => Err(error),
+        (Ok(cleanup), Ok(())) => Ok(cleanup),
+        (Err(error), Ok(())) => Err(error),
+    }
 }
 
 struct PrestartedMagicsockRollback {
@@ -446,14 +462,6 @@ impl Drop for PrestartedMagicsockRollback {
             }
         });
     }
-}
-
-fn set_os_dns_retaining_owner(
-    mut configurator: Box<dyn OsConfigurator + Send>,
-    config: &OsConfig,
-) -> (Box<dyn OsConfigurator + Send>, std::io::Result<()>) {
-    let result = configurator.set_dns(config);
-    (configurator, result)
 }
 
 struct StartupRollback {
@@ -777,8 +785,10 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     for control in &in_memory_clients {
         control.invalidate();
     }
-    if let Some(path) = inner.localapi_socket.take() {
-        let _ = std::fs::remove_file(path);
+    if !preserve_localapi {
+        if let Some(path) = inner.localapi_socket.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
     crate::capture::clear(&inner.capture);
     if let Ok(mut handles) = inner.capture_handles.lock() {
@@ -823,6 +833,17 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     }
 }
 
+fn close_os_dns_configurator(
+    configurator: &mut Option<Box<dyn OsConfigurator + Send>>,
+) -> Result<(), String> {
+    let Some(owner) = configurator.as_mut() else {
+        return Ok(());
+    };
+    owner.close().map_err(|error| error.to_string())?;
+    configurator.take();
+    Ok(())
+}
+
 async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningState, String)> {
     // Extension shutdown has succeeded, so dependencies owned by the router,
     // DNS configurator, and magicsock can now be released.
@@ -832,19 +853,22 @@ async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningSta
             return Err((inner, format!("route cleanup: {error}")));
         }
     }
-    if let Some(configurator) = inner.os_dns_configurator.as_mut() {
-        if let Err(error) = configurator.close() {
-            // Keep the configurator in the retained running state. Its next
-            // close attempt issues RevertLink again, rather than abandoning a
-            // partially-owned per-link resolver configuration.
-            log::warn!("tsnet: retaining OS DNS cleanup owner: {error}");
-            return Err((inner, format!("OS DNS cleanup: {error}")));
-        }
+    if let Err(error) = close_os_dns_configurator(&mut inner.os_dns_configurator) {
+        log::warn!("tsnet: retaining OS DNS cleanup owner: {error}");
+        return Err((inner, format!("OS DNS cleanup: {error}")));
     }
-    inner.os_dns_configurator.take();
-    if let Err(error) = shutdown_magicsock(&inner.magicsock).await {
-        log::warn!("tsnet: retaining running cleanup owner: {error}");
-        return Err((inner, format!("magicsock cleanup: {error}")));
+    match shutdown_magicsock(&inner.magicsock).await {
+        Ok(PortmapperCleanup::Confirmed) => {}
+        Ok(PortmapperCleanup::ExternalReleaseUnconfirmed) => {
+            // All local portmapper tasks and send gates are closed. NAT lease
+            // deletion is inherently unconfirmable on some routers, so retain
+            // neither this complete running owner nor restart delay.
+            log::warn!("tsnet: external port mapping release remains unconfirmed");
+        }
+        Err(error) => {
+            log::warn!("tsnet: retaining running cleanup owner: {error}");
+            return Err((inner, format!("magicsock cleanup: {error}")));
+        }
     }
     inner.health_watchdog.stop_and_wait().await;
 
@@ -870,6 +894,46 @@ fn lifecycle_cleanup_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("build lifecycle cleanup supervisor runtime")
     })
+}
+
+/// Retire a running generation while preserving its LocalAPI listener long
+/// enough for an admitted `down` request to receive the daemon-owned result.
+/// The caller must atomically publish a stopped replacement before shutting
+/// this returned listener down.
+async fn cleanup_server_state_preserving_localapi(
+    mut owner: CleanupOwner,
+) -> Result<localapi::LocalApiHandle, (CleanupOwner, String)> {
+    if let Some(inner) = owner.inner.as_mut() {
+        quiesce_running_state(inner, true).await;
+    }
+    if let Some(pre_started) = owner.pre_started.as_mut() {
+        quiesce_pre_started(pre_started).await;
+    }
+    if let Some(host) = owner.extension_host.take() {
+        if let Err(host) = shutdown_extension_host(host).await {
+            owner.extension_host = Some(host);
+            return Err((owner, "extension shutdown remains incomplete".into()));
+        }
+    }
+
+    let localapi = owner
+        .inner
+        .as_mut()
+        .and_then(|inner| inner.localapi_handle.take());
+    let Some(localapi) = localapi else {
+        return Err((owner, "running generation has no LocalAPI listener".into()));
+    };
+    if let Some(inner) = owner.inner.take() {
+        if let Err((mut inner, reason)) = finish_running_state(inner).await {
+            inner.localapi_handle = Some(localapi);
+            owner.inner = Some(inner);
+            return Err((owner, reason));
+        }
+    }
+    if let Some(pre_started) = owner.pre_started.take() {
+        cleanup_pre_started(pre_started, true).await;
+    }
+    Ok(localapi)
 }
 
 async fn cleanup_server_state(mut owner: CleanupOwner) -> Result<(), (CleanupOwner, String)> {
@@ -2023,31 +2087,6 @@ impl Server {
         ));
         rollback.track(pump);
 
-        // MagicDNS must be reachable from the host resolver in TUN mode. The
-        // responder owns exactly the service VIP on both UDP and TCP; a bind
-        // failure is not masked by a localhost/ephemeral fallback.
-        let dns_cfg_snapshot = b.dns_config.read().await.clone();
-        let forwarder = Arc::new(Forwarder::from_dns_config(dns_cfg_snapshot.as_ref()));
-        let responder = DnsResponder::with_forwarder(
-            b.resolver.clone(),
-            SocketAddr::new(IpAddr::V4(MAGICDNS_VIP), 53),
-            forwarder,
-        );
-        let magicdns_responder_ready = match responder.spawn().await {
-            Ok(handle) => {
-                rollback.track(handle.into_join_handle());
-                true
-            }
-            Err(error) => {
-                b.health.set_unhealthy(
-                    "subsystem-dns",
-                    format!("MagicDNS responder is not reachable at {MAGICDNS_VIP}:53: {error}"),
-                );
-                log::warn!("tsnet: MagicDNS responder not started: {error}");
-                false
-            }
-        };
-
         // Periodic endpoint update (Bug 4).
         let periodic_ep = spawn_periodic_endpoint_updates(
             b.magicsock.clone(),
@@ -2460,10 +2499,10 @@ impl Server {
         };
         rollback.localapi_socket.clone_from(&localapi_socket);
 
-        // Configure DNS only through the TUN link. Linux uses
-        // systemd-resolved's RevertLink-backed per-link API, so public and
-        // foreign resolver state are never overwritten. Keep the configurator
-        // owner until shutdown/rollback so cleanup is retried if necessary.
+        // OS DNS configuration (macOS: /etc/resolver entries pointing at
+        // 100.100.100.100). Opt-in via `configure_os_dns(true)` — requires
+        // root. Best-effort: permission errors are logged and do not prevent
+        // up_tun from completing.
         rollback.os_dns_configurator = if self.config.configure_os_dns {
             let dns_cfg_snapshot = b.dns_config.read().await.clone();
             let os_cfg = if let Some(ref dc) = dns_cfg_snapshot {
@@ -2474,56 +2513,22 @@ impl Server {
                     ..Default::default()
                 }
             };
-            match new_os_configurator(Some(tun.name())) {
-                Ok(configurator) => {
-                    let (configurator, setup) = set_os_dns_retaining_owner(configurator, &os_cfg);
-                    match setup {
-                        Ok(()) => {
-                            if magicdns_responder_ready {
-                                b.health.set_healthy("subsystem-dns");
-                            }
-                            log::info!(
-                                "tsnet: OS DNS configured ({} match domains, {} search domains)",
-                                os_cfg.match_domains.len(),
-                                os_cfg.search_domains.len()
-                            );
-                            Some(configurator)
-                        }
-                        Err(error) => {
-                            b.health.set_unhealthy(
-                                "subsystem-dns",
-                                format!("OS DNS configuration failed: {error}"),
-                            );
-                            log::warn!(
-                                "tsnet: OS DNS configuration failed; retaining cleanup owner: {error}"
-                            );
-                            // set_dns may have changed the link and then failed
-                            // to compensate. Keep the configurator in the
-                            // generation so shutdown and startup rollback retry
-                            // RevertLink.
-                            Some(configurator)
-                        }
-                    }
-                }
-                Err(error) => {
-                    b.health.set_unhealthy(
-                        "subsystem-dns",
-                        format!("OS DNS configurator unavailable: {error}"),
+            let mut configurator: Box<dyn OsConfigurator + Send> = Box::new(new_os_configurator());
+            match configurator.set_dns(&os_cfg) {
+                Ok(()) => {
+                    log::info!(
+                        "tsnet: OS DNS configured ({} match domains, {} search domains)",
+                        os_cfg.match_domains.len(),
+                        os_cfg.search_domains.len()
                     );
-                    log::warn!("tsnet: OS DNS configurator unavailable: {error}");
+                    Some(configurator)
+                }
+                Err(e) => {
+                    log::warn!("tsnet: OS DNS configuration failed (non-fatal, needs root?): {e}");
                     None
                 }
             }
         } else {
-            if dns_cfg_snapshot
-                .as_ref()
-                .is_some_and(|config| config.Proxied)
-            {
-                b.health.set_unhealthy(
-                    "subsystem-dns",
-                    "MagicDNS is disabled because OS DNS configuration is disabled",
-                );
-            }
             None
         };
         let extension_subscription = self
@@ -2787,7 +2792,7 @@ impl Server {
     pub async fn start_localapi_only(
         &mut self,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
-        self.start_localapi_with_state(false).await
+        self.start_localapi_with_state(false, None).await
     }
 
     /// Recreate LocalAPI after `down` without restoring the retired runtime.
@@ -2796,12 +2801,23 @@ impl Server {
     pub async fn start_localapi_stopped(
         &mut self,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
-        self.start_localapi_with_state(true).await
+        self.start_localapi_with_state(true, None).await
+    }
+
+    /// Publish a stopped listener over a retired running listener. The old
+    /// handle remains caller-owned until it has delivered the admitted down
+    /// response, preventing LocalAPI's child drain from deadlocking teardown.
+    pub async fn start_localapi_stopped_replacing(
+        &mut self,
+        previous: &mut localapi::LocalApiHandle,
+    ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
+        self.start_localapi_with_state(true, Some(previous)).await
     }
 
     async fn start_localapi_with_state(
         &mut self,
         stopped: bool,
+        previous: Option<&mut localapi::LocalApiHandle>,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
         self.shutdown_supervisor.wait().await;
         self.startup_supervisor.wait().await;
@@ -2980,7 +2996,31 @@ impl Server {
             .await
             .map_err(TsnetError::Builder)?;
 
-        let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());
+        let handle = if let Some(previous) = previous {
+            let Some((mut replacement, start, mut handoff)) =
+                localapi::spawn_localapi_paused(api_state.clone(), socket_path.clone())
+            else {
+                return Err(TsnetError::Builder(format!(
+                    "failed to prepare stopped LocalAPI replacement at {}",
+                    socket_path.display()
+                )));
+            };
+            start.send(()).map_err(|()| {
+                TsnetError::Builder("stopped LocalAPI replacement failed to activate".into())
+            })?;
+            handoff.commit(&mut replacement).map_err(|error| {
+                TsnetError::Builder(format!(
+                    "failed to publish stopped LocalAPI replacement: {error}"
+                ))
+            })?;
+            // The old listener is no longer reachable by new clients. Keep
+            // its accepted down handler alive until the daemon sends its
+            // completion, then the caller drains it preserving this path.
+            previous.socket_path.clone_from(&socket_path);
+            Some(replacement)
+        } else {
+            localapi::spawn_localapi(api_state.clone(), socket_path.clone())
+        };
         if handle.is_some() {
             log::info!(
                 "tsnet: LocalAPI (needs-login) listening at {}",
@@ -4052,6 +4092,50 @@ impl Server {
     /// supervisor before the first await. Dropping this future or destroying
     /// its caller runtime therefore cannot strand running tasks, sockets,
     /// routes, DNS state, serve listeners, or extensions.
+    /// Retire the active data plane but retain the current LocalAPI handle for
+    /// an atomic handoff to Stopped. This is exclusively for daemon-owned
+    /// `down`; ordinary close continues to drain LocalAPI before returning.
+    pub async fn close_preserving_localapi(
+        &mut self,
+    ) -> Result<localapi::LocalApiHandle, TsnetError> {
+        if self.shutdown_supervisor.has_retained_logout() {
+            return Err(TsnetError::ShutdownIncomplete(
+                "logout transaction is incomplete; retry logout before close".into(),
+            ));
+        }
+        let owner = CleanupOwner::take_from(self);
+        if owner.is_empty() {
+            return Err(TsnetError::ShutdownIncomplete(
+                "running server owner is unavailable for down".into(),
+            ));
+        }
+        let drive = Arc::clone(&self.drive);
+        let bootstrap_supervisor = Arc::clone(&self.bootstrap_supervisor);
+        let startup_supervisor = Arc::clone(&self.startup_supervisor);
+        let shutdown_supervisor = Arc::clone(&self.shutdown_supervisor);
+        let cleanup_runtime = lifecycle_cleanup_runtime();
+        let completion = shutdown_supervisor.begin_cleanup();
+        let cleanup_supervisor = Arc::clone(&shutdown_supervisor);
+        let cleanup = cleanup_runtime.spawn(async move {
+            let _completion = completion;
+            bootstrap_supervisor.wait().await;
+            startup_supervisor.wait().await;
+            drive.disable().await;
+            match cleanup_server_state_preserving_localapi(owner).await {
+                Ok(handle) => Ok(handle),
+                Err((owner, reason)) => {
+                    cleanup_supervisor.retain_owner(owner);
+                    Err(TsnetError::ShutdownIncomplete(format!(
+                        "server cleanup is busy or failed; retry close: {reason}"
+                    )))
+                }
+            }
+        });
+        cleanup.await.map_err(|error| {
+            TsnetError::ShutdownIncomplete(format!("shutdown worker stopped: {error}"))
+        })?
+    }
+
     pub async fn close(&mut self) -> Result<(), TsnetError> {
         if self.shutdown_supervisor.has_retained_logout() {
             return Err(TsnetError::ShutdownIncomplete(

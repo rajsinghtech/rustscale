@@ -3135,20 +3135,22 @@ impl Magicsock {
             return Err(MagicsockError::NoPath);
         }
 
-        let mut accounting_region = 0;
-        for r in all_regions {
-            if self
-                .inner
+        // Do not serialize lazy region connects here. The caller's netstack
+        // pump also drains inbound WG responses; waiting on every region in
+        // sequence can strand the first valid handshake response behind tens
+        // of seconds of unrelated connects. Send the bootstrap copies in
+        // parallel, then return in bounded single-connect time.
+        let sends = all_regions.iter().map(|&region| {
+            self.inner
                 .derp
-                .send_packet(r, peer.clone(), datagram.to_vec())
-                .await
-                && accounting_region == 0
-            {
-                // Fanout is bootstrap duplication of one logical packet.
-                // Attribute it once, to the first region that accepted it.
-                accounting_region = r;
-            }
-        }
+                .send_packet(region, peer.clone(), datagram.to_vec())
+        });
+        let results = futures_util::future::join_all(sends).await;
+        let accounting_region = all_regions
+            .into_iter()
+            .zip(results)
+            .find_map(|(region, sent)| sent.then_some(region))
+            .unwrap_or(0);
         Ok(accounting_region)
     }
 }

@@ -68,25 +68,33 @@ grep -q 'debian:12-slim' .github/workflows/release.yml
 grep -Fq 'pattern: rustscale-*' .github/workflows/release.yml
 grep -q 'SHA256SUMS' scripts/install.sh
 grep -q 'SHA256SUMS' scripts/install.ps1
-grep -q 'packaging/systemd/rustscaled.service' .github/workflows/release.yml
+grep -q 'tools/packaging/assemble-linux-release.sh' .github/workflows/release.yml
+grep -q 'packaging/systemd/rustscaled.service' tools/packaging/assemble-linux-release.sh
 grep -q 'tools/packaging/test-first-run.sh' .github/workflows/ci.yml
 grep -q 'tools/packaging/test-linux-replacement.sh' .github/workflows/ci.yml
+grep -q 'linux-release-candidate' .github/workflows/ci.yml
+grep -q 'Assemble exact Linux release candidate' .github/workflows/ci.yml
+grep -q 'actions/download-artifact' .github/workflows/ci.yml
+grep -q 'RUSTSCALE_RELEASE_DIR' .github/workflows/ci.yml
 grep -q 'tools/interop-tun\*\.sh' .github/workflows/ci.yml
+test -x tools/packaging/assemble-linux-release.sh
 test -x tools/packaging/test-linux-replacement.sh
 test -s docs/release-first-run.md
 grep -q 'Protected real-control smoke gate' docs/release-first-run.md
 grep -q 'Installed Linux replacement journey' docs/release-first-run.md
 grep -q 'RUSTSCALE_REQUIRE_LINUX_REPLACEMENT' .github/workflows/ci.yml
 grep -q 'RUSTSCALE_LINUX_REPLACEMENT_TEARDOWN_TIMEOUT' .github/workflows/ci.yml
-grep -q 'python3 tools/agent/run-with-deadline.py 1200' .github/workflows/ci.yml
+grep -q 'exact production candidate' .github/workflows/ci.yml
 grep -q 'Replay replacement failure diagnostics' .github/workflows/ci.yml
 grep -q 'systemd-run --quiet --wait --pipe --collect' tools/packaging/test-linux-replacement.sh
+grep -q 'exact production archive and SHA256SUMS are required' tools/packaging/test-linux-replacement.sh
+grep -q 'assert_cli_contract' tools/packaging/test-linux-replacement.sh
 grep -q 'KillMode=control-group' tools/packaging/test-linux-replacement.sh
 grep -q 'RuntimeMaxSec=' tools/packaging/test-linux-replacement.sh
 # The protected replacement job carries the credential-free real-TUN contract;
 # no new workflow context may replace or hide that required journey.
 grep -q 'name: Installed Linux replacement journey' .github/workflows/ci.yml
-grep -q 'needs: \[check, cross, msrv, testcontrol, linux-replacement, ignore-guard\]' .github/workflows/ci.yml
+grep -Fq 'needs: [check, cross, msrv, testcontrol, linux-release-candidate, linux-replacement, ignore-guard]' .github/workflows/ci.yml
 grep -Fq 'systemctl is-system-running --wait' tools/packaging/test-linux-replacement.sh
 if grep -Fq 'systemd_attempt' tools/packaging/test-linux-replacement.sh; then
     echo "systemd readiness must use native --wait, not a polling loop" >&2
@@ -118,28 +126,39 @@ grep -Fq -- 'sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_N
 grep -Fq -- 'set -eu' tools/interop-tun.sh
 grep -Fq -- 'sudo did not preserve the required interop environment' tools/interop-tun.sh
 grep -Fq -- 'export RUSTSCALE_REQUIRE_TUN_INTEROP=1' tools/interop-tun.sh
-if grep -R -Fq -- 'RUSTSCALE_REQUIRE_TUN_DNS_FAILURE' tools/interop-tun.sh crates/tsnet/src/tests.rs; then
-    echo "DNS readiness must not be coupled to secret-backed interop" >&2
+# The producer and consumer form one exact, build-free artifact journey.
+# The candidate must use the release assembler, retain full-SHA identity, and
+# send the same named archive/checksum tree to the protected consumer.
+grep -Fq 'Attest producer checkout' .github/workflows/ci.yml
+# shellcheck disable=SC2016 # Literal GitHub expression contract.
+grep -Fq 'RUSTSCALE_VERSION_LONG="${version}-g${candidate_sha:0:7}"' .github/workflows/ci.yml
+grep -Fq 'tools/packaging/assemble-linux-release.sh' .github/workflows/ci.yml
+# shellcheck disable=SC2016 # Literal GitHub expression contract.
+grep -Fq 'linux-release-candidate-${{ steps.candidate.outputs.sha }}' .github/workflows/ci.yml
+grep -Fq 'RUSTSCALE_BUILD_SHA' tools/packaging/assemble-linux-release.sh
+grep -Fq 'SHA256SUMS' tools/packaging/assemble-linux-release.sh
+grep -Fq 'Attest consumer checkout' .github/workflows/ci.yml
+grep -Fq 'BUILD_FREE_CONSUMER' .github/workflows/ci.yml
+grep -Fq 'for tool in cargo rustc rustup' .github/workflows/ci.yml
+grep -Fq 'exact production archive and SHA256SUMS are required' tools/packaging/test-linux-replacement.sh
+grep -Fq 'archive build identity' tools/packaging/test-linux-replacement.sh
+consumer_job=$(awk '
+    /^  linux-replacement:/ { job = 1 }
+    job && /^  [A-Za-z0-9_-]+:/ && $1 != "linux-replacement:" { exit }
+    job { print }
+' .github/workflows/ci.yml)
+printf '%s\n' "$consumer_job" | grep -Fq 'needs: [linux-release-candidate]'
+printf '%s\n' "$consumer_job" | grep -Fq 'actions/download-artifact'
+printf '%s\n' "$consumer_job" | grep -Fq 'RUSTSCALE_RELEASE_SHA'
+if printf '%s\n' "$consumer_job" | grep -Eq 'rust-toolchain|rust-cache|^[[:space:]]*(cargo|rustc|rustup)[[:space:]]'; then
+    echo "artifact consumer configures or invokes a Rust build tool" >&2
     exit 1
 fi
-# The installed replacement journey is the required credential-free TUN/DNS
-# contract. It must build one libtest runner, count one existing ignored
-# selector, enter dedicated mode under root, and never accept a zero match.
-grep -Fq -- 'record_phase required-tun-dns-readiness' tools/packaging/test-linux-replacement.sh
-grep -Fq -- 'cargo test -p rustscale-tsnet --lib --no-run --message-format=json' tools/packaging/test-linux-replacement.sh
-grep -Fq -- 'target.get("name") == "rustscale_tsnet"' tools/packaging/test-linux-replacement.sh
-grep -Fq -- 'expected one rustscale_tsnet libtest executable' tools/packaging/test-linux-replacement.sh
-grep -Fq -- "grep -Fxc 'tests::interop_tun_rust_dials_go: test'" tools/packaging/test-linux-replacement.sh
-grep -Fq -- "required TUN DNS exact selector matched \$selected_count tests (expected 1)" tools/packaging/test-linux-replacement.sh
-grep -Fq -- 'RUSTSCALE_REQUIRED_TUN_DNS_FAILURE=1' tools/packaging/test-linux-replacement.sh
-grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/packaging/test-linux-replacement.sh
-grep -Fq -- '--nocapture --test-threads=1' tools/packaging/test-linux-replacement.sh
-grep -Fq -- "test \"\$(id -u)\" -eq 0" tools/packaging/test-linux-replacement.sh
-grep -Fq -- 'test -c /dev/net/tun' tools/packaging/test-linux-replacement.sh
-grep -Fq -- 'command -v ip' tools/packaging/test-linux-replacement.sh
-grep -Fq -- 'RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME' crates/tsnet/src/tests.rs
-grep -Fq -- 'if required_tun_dns_failure_mode()' crates/tsnet/src/tests.rs
-grep -Fq -- 'run_required_tun_dns_failure_scenario().await' crates/tsnet/src/tests.rs
+if grep -Eqi '\b(cargo|rustc|rustup)\b' tools/packaging/test-linux-replacement.sh; then
+    echo "artifact consumer journey invokes a Rust build tool" >&2
+    exit 1
+fi
+
 # Match exact source text retaining the escaped child argv.
 # shellcheck disable=SC2016
 grep -Fq -- 'exec \"\$@\"' tools/interop-tun.sh

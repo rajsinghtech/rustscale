@@ -37,5 +37,9 @@ install -m 644 "$root/include/rustscale.h" "$stage/rustscale.h"
 install -m 644 "$root/LICENSE" "$stage/LICENSE"
 install -m 644 "$root/packaging/systemd/rustscaled.service" "$stage/rustscaled.service"
 install -m 644 "$root/packaging/systemd/rustscaled.default" "$stage/rustscaled.default"
+build_sha=$(git -C "$root" rev-parse HEAD)
+[[ "$build_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid full build SHA: $build_sha" >&2; exit 1; }
+printf '%s\n' "$build_sha" > "$stage/RUSTSCALE_BUILD_SHA"
+chmod 644 "$stage/RUSTSCALE_BUILD_SHA"
 tar --format=ustar -czf "$output_dir/$archive" -C "$stage" .
 sha256sum "$output_dir/$archive" | sed 's|  .*/|  |' > "$output_dir/SHA256SUMS"

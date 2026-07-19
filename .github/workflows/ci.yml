@@ -178,9 +178,15 @@ jobs:
       version: ${{ steps.candidate.outputs.version }}
       sha: ${{ steps.candidate.outputs.sha }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out literal candidate head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+      - name: Attest producer checkout
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -196,7 +202,9 @@ jobs:
             workspace && /^version = / { gsub(/[" ]/, "", $3); print $3; exit }
           ' Cargo.toml)
           test -n "$version"
-          tag="v${version}-candidate-${GITHUB_SHA}"
+          candidate_sha=$(git rev-parse HEAD)
+          test "$candidate_sha" = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          tag="v${version}-candidate-${candidate_sha}"
           release_dir="$RUNNER_TEMP/release-candidate/releases/download/$tag"
           tools/packaging/assemble-linux-release.sh \
             x86_64-unknown-linux-gnu target/release "$release_dir"
@@ -205,11 +213,11 @@ jobs:
           {
             echo "tag=$tag"
             echo "version=$version"
-            echo "sha=$GITHUB_SHA"
+            echo "sha=$candidate_sha"
           } >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: linux-release-candidate
+          name: linux-release-candidate-${{ steps.candidate.outputs.sha }}
           path: ${{ runner.temp }}/release-candidate
           if-no-files-found: error
           retention-days: 7
@@ -220,14 +228,17 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Check out literal consumer harness head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          key: linux-replacement
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Attest consumer checkout
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.linux-release-candidate.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: linux-release-candidate
+          name: linux-release-candidate-${{ needs.linux-release-candidate.outputs.sha }}
           path: ${{ runner.temp }}/release-candidate
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -244,6 +255,17 @@ jobs:
           RUSTSCALE_RELEASE_SHA: ${{ needs.linux-release-candidate.outputs.sha }}
           RUSTSCALE_RELEASE_VERSION: ${{ needs.linux-release-candidate.outputs.version }}
         run: |
+          # Fail closed if this consumer tries to invoke a Rust build tool.
+          # Candidate creation belongs only to linux-release-candidate.
+          mkdir -p "$RUNNER_TEMP/build-free-bin"
+          for tool in cargo rustc rustup; do
+            printf '#!/bin/sh\necho "Rust build tool prohibited in artifact consumer: %s" >&2\nexit 97\n' "$tool" \
+              > "$RUNNER_TEMP/build-free-bin/$tool"
+            chmod +x "$RUNNER_TEMP/build-free-bin/$tool"
+          done
+          export PATH="$RUNNER_TEMP/build-free-bin:$PATH"
+          test ! -e target
+          echo "[linux-replacement] BUILD_FREE_CONSUMER head=${RUSTSCALE_RELEASE_SHA}"
           # The script runs as the runner uid inside a root-manager-owned
           # transient cgroup. Its 900-second execution limit plus 90-second
           # diagnostic/teardown grace can kill root descendants and closes

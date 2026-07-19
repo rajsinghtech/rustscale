@@ -163,7 +163,9 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
   for variable in CARGO_HOME CARGO_TARGET_DIR CI GITHUB_ACTIONS \
     RUSTUP_HOME RUSTFLAGS TMPDIR \
     CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS \
-    CARGO_PROFILE_RELEASE_OPT_LEVEL RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE; do
+    CARGO_PROFILE_RELEASE_OPT_LEVEL RUSTSCALE_LINUX_REPLACEMENT_PHASE_FILE \
+    RUSTSCALE_RELEASE_DIR RUSTSCALE_RELEASE_TAG RUSTSCALE_RELEASE_SHA \
+    RUSTSCALE_RELEASE_VERSION; do
     if [[ -n "${!variable:-}" ]]; then
       environment+=("$variable=${!variable}")
     fi
@@ -711,10 +713,13 @@ actual_archive_sha=$(sha256sum "$RELEASE_DIR/$ARCHIVE" | awk '{print $1}')
 ARTIFACT_STAGE=$(mktemp -d "$TMP/artifact-stage.XXXXXX")
 run_bounded 30 verify-production-archive \
   tar --format=ustar -xzf "$RELEASE_DIR/$ARCHIVE" -C "$ARTIFACT_STAGE"
-for candidate_file in rustscale rustscaled librustscale.so librustscale.a rustscale.h rustscaled.service rustscaled.default LICENSE; do
+for candidate_file in rustscale rustscaled librustscale.so librustscale.a rustscale.h rustscaled.service rustscaled.default LICENSE RUSTSCALE_BUILD_SHA; do
   [[ -f "$ARTIFACT_STAGE/$candidate_file" && ! -L "$ARTIFACT_STAGE/$candidate_file" ]] \
     || { echo "$LABEL ERROR: production archive is missing $candidate_file" >&2; exit 1; }
 done
+ARTIFACT_BUILD_SHA=$(tr -d '\r\n' < "$ARTIFACT_STAGE/RUSTSCALE_BUILD_SHA")
+[[ "$ARTIFACT_BUILD_SHA" == "$RELEASE_SHA" ]] \
+  || { echo "$LABEL ERROR: archive build identity $ARTIFACT_BUILD_SHA does not match $RELEASE_SHA" >&2; exit 1; }
 CLI_VERSION=$(timeout --signal=KILL 10s "$ARTIFACT_STAGE/rustscale" --version)
 DAEMON_VERSION=$(timeout --signal=KILL 10s "$ARTIFACT_STAGE/rustscaled" --version)
 [[ "$CLI_VERSION" == *"$RELEASE_VERSION"* && "$CLI_VERSION" == *"${RELEASE_SHA:0:7}"* ]] \

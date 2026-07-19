@@ -1143,6 +1143,16 @@
     },
     {
       "classification": "shimmed",
+      "denominator_id": "method:Server.close_preserving_localapi",
+      "id": "stability:method:Server.close_preserving_localapi",
+      "local_ids": [
+        "method:Server.close_preserving_localapi"
+      ],
+      "note": "rustscale-specific public extension; retained by the local API denominator",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
       "denominator_id": "method:Server.complete_pending_logout_requests",
       "id": "stability:method:Server.complete_pending_logout_requests",
       "local_ids": [
@@ -1607,6 +1617,16 @@
       "id": "stability:method:Server.start_localapi_stopped",
       "local_ids": [
         "method:Server.start_localapi_stopped"
+      ],
+      "note": "rustscale-specific public extension; retained by the local API denominator",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:Server.start_localapi_stopped_replacing",
+      "id": "stability:method:Server.start_localapi_stopped_replacing",
+      "local_ids": [
+        "method:Server.start_localapi_stopped_replacing"
       ],
       "note": "rustscale-specific public extension; retained by the local API denominator",
       "upstream_ids": []
@@ -2483,10 +2503,40 @@
     },
     {
       "classification": "shimmed",
+      "denominator_id": "method:localapi::DownCompletion.complete",
+      "id": "stability:method:localapi::DownCompletion.complete",
+      "local_ids": [
+        "method:localapi::DownCompletion.complete"
+      ],
+      "note": "rustscale-specific public extension; retained by the local API denominator",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:localapi::DownCompletion.new",
+      "id": "stability:method:localapi::DownCompletion.new",
+      "local_ids": [
+        "method:localapi::DownCompletion.new"
+      ],
+      "note": "rustscale-specific public extension; retained by the local API denominator",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
       "denominator_id": "method:localapi::LocalApiHandle.shutdown",
       "id": "stability:method:localapi::LocalApiHandle.shutdown",
       "local_ids": [
         "method:localapi::LocalApiHandle.shutdown"
+      ],
+      "note": "rustscale-specific public extension; retained by the local API denominator",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
+      "denominator_id": "method:localapi::LocalApiHandle.shutdown_preserving_path",
+      "id": "stability:method:localapi::LocalApiHandle.shutdown_preserving_path",
+      "local_ids": [
+        "method:localapi::LocalApiHandle.shutdown_preserving_path"
       ],
       "note": "rustscale-specific public extension; retained by the local API denominator",
       "upstream_ids": []
@@ -2863,6 +2913,16 @@
     },
     {
       "classification": "shimmed",
+      "denominator_id": "struct:localapi::DownCompletion",
+      "id": "stability:struct:localapi::DownCompletion",
+      "local_ids": [
+        "struct:localapi::DownCompletion"
+      ],
+      "note": "rustscale-specific public extension; retained by the local API denominator",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
       "denominator_id": "struct:localapi::LocalApiHandle",
       "id": "stability:struct:localapi::LocalApiHandle",
       "local_ids": [
@@ -2984,7 +3044,7 @@
   ],
   "contract_version": 1,
   "denominator": {
-    "count": 298,
+    "count": 304,
     "ids": [
       "constant:DEFAULT_CONTROL_URL",
       "constant:FUNNEL_PORTS",
@@ -3100,6 +3160,7 @@
       "method:Server.clear_auth_key",
       "method:Server.clear_exit_node",
       "method:Server.close",
+      "method:Server.close_preserving_localapi",
       "method:Server.complete_pending_logout_requests",
       "method:Server.control_cert_provider",
       "method:Server.control_knobs",
@@ -3147,6 +3208,7 @@
       "method:Server.set_serve_config",
       "method:Server.start_localapi_only",
       "method:Server.start_localapi_stopped",
+      "method:Server.start_localapi_stopped_replacing",
       "method:Server.status",
       "method:Server.switch_profile",
       "method:Server.system",
@@ -3234,7 +3296,10 @@
       "method:TlsListener.accept",
       "method:TsnetRouteAdvertiser.new",
       "method:TsnetRouteAdvertiser.routes",
+      "method:localapi::DownCompletion.complete",
+      "method:localapi::DownCompletion.new",
       "method:localapi::LocalApiHandle.shutdown",
+      "method:localapi::LocalApiHandle.shutdown_preserving_path",
       "module:localapi",
       "reexport:rustscale_ipnstate",
       "struct:AcmeCertFetcher",
@@ -3272,6 +3337,7 @@
       "struct:Warning",
       "struct:WebServerConfig",
       "struct:WhoIsInfo",
+      "struct:localapi::DownCompletion",
       "struct:localapi::LocalApiHandle",
       "trait:CertFetcher",
       "trait:CertProvider",
@@ -3285,13 +3351,13 @@
       "type:Logger",
       "type:SharedOverrides"
     ],
-    "sha256": "f4af81887e12b3498fa38ba8ab492dd7e8c19018be6273267a4cdb27023c3a8f",
+    "sha256": "1476317e00dfd7368a60e647e63c310318450f8679fd9c173fa7649e09eb8d02",
     "source": "local-public-api"
   },
   "generator_version": 1,
   "guards": {
     "local": {
-      "count": 298,
+      "count": 304,
       "ids": [
         "constant:DEFAULT_CONTROL_URL",
         "constant:FUNNEL_PORTS",
@@ -3407,6 +3473,7 @@
         "method:Server.clear_auth_key",
         "method:Server.clear_exit_node",
         "method:Server.close",
+        "method:Server.close_preserving_localapi",
         "method:Server.complete_pending_logout_requests",
         "method:Server.control_cert_provider",
         "method:Server.control_knobs",
@@ -3454,6 +3521,7 @@
         "method:Server.set_serve_config",
         "method:Server.start_localapi_only",
         "method:Server.start_localapi_stopped",
+        "method:Server.start_localapi_stopped_replacing",
         "method:Server.status",
         "method:Server.switch_profile",
         "method:Server.system",
@@ -3541,7 +3609,10 @@
         "method:TlsListener.accept",
         "method:TsnetRouteAdvertiser.new",
         "method:TsnetRouteAdvertiser.routes",
+        "method:localapi::DownCompletion.complete",
+        "method:localapi::DownCompletion.new",
         "method:localapi::LocalApiHandle.shutdown",
+        "method:localapi::LocalApiHandle.shutdown_preserving_path",
         "module:localapi",
         "reexport:rustscale_ipnstate",
         "struct:AcmeCertFetcher",
@@ -3579,6 +3650,7 @@
         "struct:Warning",
         "struct:WebServerConfig",
         "struct:WhoIsInfo",
+        "struct:localapi::DownCompletion",
         "struct:localapi::LocalApiHandle",
         "trait:CertFetcher",
         "trait:CertProvider",
@@ -3592,10 +3664,10 @@
         "type:Logger",
         "type:SharedOverrides"
       ],
-      "sha256": "f4af81887e12b3498fa38ba8ab492dd7e8c19018be6273267a4cdb27023c3a8f"
+      "sha256": "1476317e00dfd7368a60e647e63c310318450f8679fd9c173fa7649e09eb8d02"
     },
     "local_shape": {
-      "count": 298,
+      "count": 304,
       "ids": [
         "constant:DEFAULT_CONTROL_URL@37057fc84d9638e3e63fc7f3a94b95da2f5f82a9128fcad55d8a93cc2d54501c",
         "constant:FUNNEL_PORTS@41574d4d902320787c1667247d50b7ed334fff56c710c97b7b61c8acfbbb72bc",
@@ -3612,7 +3684,7 @@
         "enum:TaildropError@58118e2fdf12ba3574897b65933e329685ab31cef1360b66e83cdc4bdce003e0",
         "enum:TlsError@2b2255bf00bb33f9e91140cecec185a72a6490036343a535598b04e843958466",
         "enum:TsnetError@149434766dcf75b46feae57bba910d84228ae626a5f265072c2998b1711b8693",
-        "enum:localapi::DaemonCommand@5dcc8011e0a7d4e8ac4f5d03598623419e0eca970e0359f25d83f356c2ebdff3",
+        "enum:localapi::DaemonCommand@6bd0572240e5073553a826cea6784de51154b8eaca7389f9bd0d025b6f2ddd95",
         "function:apply_runtime_fields@e7378a5ee6b47464d5581cb4911098d2fcc141a2eb4de4ef0eb4dc995ed9dd65",
         "function:check_funnel_access@87a9c7f6edce6a6ff56a3bcb9437447d3daebb7e92cd837752ffb6f7ed966443",
         "function:check_funnel_port@18058ccb6b6114b204425482db0ed9f1800b4b701edec903e4ca1e75e9d62229",
@@ -3711,6 +3783,7 @@
         "method:Server.clear_auth_key@3277fd84fcae3e26d3bf3ce71dd6b744b82ef2f0ed72880368e4a63a3474da55",
         "method:Server.clear_exit_node@5687c55b6ab9a0387fff91c22fc387786902339728abe3827dbeda8fd3381dc0",
         "method:Server.close@511897a9dc1240c5221e2907d5bb338a4e5f1c7491c5f53a1f0672e4beede4fa",
+        "method:Server.close_preserving_localapi@8f02b1a52bf6bcb76139278d32539e1419835c9cf0707c7ab96ad58f32651f6e",
         "method:Server.complete_pending_logout_requests@2974678d95d36aa6452be6d2cc8bf44f32429469ac51371223a5d9924f2020d2",
         "method:Server.control_cert_provider@3cf119e4b66d904afc1f0546bff55f9d1b7b49b5fd6377eb14f29ad65cd7d967",
         "method:Server.control_knobs@195f87b39f82dc4d23da0d5a529ae53f313db4de94851a5bb15f6e3301867469",
@@ -3758,6 +3831,7 @@
         "method:Server.set_serve_config@657250d70d4a7e7234ac112971535fd796b2f8a801320641eec28ad2ffeb0ba9",
         "method:Server.start_localapi_only@26b36436176731d37ed68a14d61cb4040d922e3332b5c74f1216cd547e76ccb8",
         "method:Server.start_localapi_stopped@d057390663872a380a714964e34ca3ced99930604082e782c7930fc3d0863ca5",
+        "method:Server.start_localapi_stopped_replacing@3a5caee532ae738d0a10c226d5d56f83c23112bc1166f360d29d0ce2a976fd3e",
         "method:Server.status@6d71f1df272facdd4351449c0245b1e035b32535736d935ae192311a82de1a70",
         "method:Server.switch_profile@b5dd8fed0864bfbcaaf7e2354f93eec3cd337cc3d907a702f44e0fb0d75a9914",
         "method:Server.system@11185e848e1d5e4c7a21a07f937ece8bcd4de086df056d2fa42cf0a8d17a86eb",
@@ -3845,7 +3919,10 @@
         "method:TlsListener.accept@6476b0533781ce6056252fff2e8aad68b7d1ff372ca3631c962156a126e2dce1",
         "method:TsnetRouteAdvertiser.new@cc7420def716805116d842c29dd7945ba2b2aca8a7e3ba676de485fc844a1ba4",
         "method:TsnetRouteAdvertiser.routes@3ca83d30d6100868fb08e2c4b14ad4d3457058aaf8cff521c4c78d57fc34e348",
+        "method:localapi::DownCompletion.complete@990408d6317ce7ab7a14775c824926f36b5bbb26929c42b3382ef90472185885",
+        "method:localapi::DownCompletion.new@3fecb8262db471a714d67489970f2396a96ca79fb7293328b2d847e5991bb6ab",
         "method:localapi::LocalApiHandle.shutdown@7d1e54ef7b324250b3c5fc91433aadf75c5f2ca56c62abae72ee0a34c0bb1bc3",
+        "method:localapi::LocalApiHandle.shutdown_preserving_path@ade8d7e5502ceea234685fb1cfaa5128ac0fa00409c24bef5140f666fd3a7c36",
         "module:localapi@a8fdc9cf36b918e0fc0ccd68ae8f3a5b56595bf55b92fbe45d8a4c996e2c7b86",
         "reexport:rustscale_ipnstate@7f9bebadf938b5347fd54d89419fc57efbe417b174811ef7804d07be5a7d2750",
         "struct:AcmeCertFetcher@b49414d47fe1bb641231b111a203261c680f95b59c5f89619c48ca120215f3b3",
@@ -3883,6 +3960,7 @@
         "struct:Warning@168c208078813d33227129e8a0a2210d8d3f50fc188bf03fa5957a7aedb362e3",
         "struct:WebServerConfig@06884d79c4f30532dcdb53a76ee17652daaea48d588418ce10342e494f26124c",
         "struct:WhoIsInfo@28d5b3cef5f70a475a2d97359de281cbcb8f9e32bf928e5b20039b6fd5850043",
+        "struct:localapi::DownCompletion@539ba6184c7e75dfbc7c177a84b0a37253fae6e83e1d0d6c970c1eb4054d3789",
         "struct:localapi::LocalApiHandle@1c2b9be2131f10912fc500d2a802f3fec1482e2171ed9b8ee16bf8850b9c3645",
         "trait:CertFetcher@dfc60e75dcb33167d9f7ffcb545540fca796f683aef78ff0d9bf26b8053faa00",
         "trait:CertProvider@025ce992d572212fafa5c8f2ba45246bbf1a0af1f7f777593974fdb7877dddb4",
@@ -3896,7 +3974,7 @@
         "type:Logger@24c245d95b078ec5dc8d385afc50221d47b3c52620470f605de81c5c7b43d8be",
         "type:SharedOverrides@e36a74a2fc1c72a26e18dc9497e134c6b6dfa049ab56f229f6433c3632791123"
       ],
-      "sha256": "4a638e303ef012ef1389f8c9f4067fe593cab9ca1475dcd14e000c3915b3f7f5"
+      "sha256": "a1e3093a00ccc93f267fa84a72d55652398a4e474d978796e7e32fc9908e5221"
     }
   },
   "inventory": {
@@ -4010,7 +4088,7 @@
         "id": "enum:localapi::DaemonCommand",
         "kind": "enum",
         "name": "localapi::DaemonCommand",
-        "signature": "pub enum DaemonCommand { Start { auth_key: Option<String>, }, LoginInteractive, Down, Logout, Shutdown, ReloadConfig, SwitchProfile(String), }",
+        "signature": "pub enum DaemonCommand { Start { auth_key: Option<String>, }, LoginInteractive, Down { completion: Arc<DownCompletion>, }, Logout, Shutdown, ReloadConfig, SwitchProfile(String), }",
         "source": "rustdoc:localapi/enum.DaemonCommand.html"
       },
       {
@@ -4785,6 +4863,14 @@
         "source": "rustdoc:struct.Server.html"
       },
       {
+        "id": "method:Server.close_preserving_localapi",
+        "kind": "method",
+        "name": "close_preserving_localapi",
+        "owner": "Server",
+        "signature": "pub async fn close_preserving_localapi( &mut self, ) -> Result<LocalApiHandle, TsnetError>",
+        "source": "rustdoc:struct.Server.html"
+      },
+      {
         "id": "method:Server.complete_pending_logout_requests",
         "kind": "method",
         "name": "complete_pending_logout_requests",
@@ -5158,6 +5244,14 @@
         "name": "start_localapi_stopped",
         "owner": "Server",
         "signature": "pub async fn start_localapi_stopped( &mut self, ) -> Result<UnboundedReceiver<DaemonCommand>, TsnetError>",
+        "source": "rustdoc:struct.Server.html"
+      },
+      {
+        "id": "method:Server.start_localapi_stopped_replacing",
+        "kind": "method",
+        "name": "start_localapi_stopped_replacing",
+        "owner": "Server",
+        "signature": "pub async fn start_localapi_stopped_replacing( &mut self, previous: &mut LocalApiHandle, ) -> Result<UnboundedReceiver<DaemonCommand>, TsnetError>",
         "source": "rustdoc:struct.Server.html"
       },
       {
@@ -5857,11 +5951,35 @@
         "source": "rustdoc:struct.TsnetRouteAdvertiser.html"
       },
       {
+        "id": "method:localapi::DownCompletion.complete",
+        "kind": "method",
+        "name": "complete",
+        "owner": "localapi::DownCompletion",
+        "signature": "pub fn complete(&self, result: Result<(), String>)",
+        "source": "rustdoc:localapi/struct.DownCompletion.html"
+      },
+      {
+        "id": "method:localapi::DownCompletion.new",
+        "kind": "method",
+        "name": "new",
+        "owner": "localapi::DownCompletion",
+        "signature": "pub fn new() -> (Arc<Self>, Receiver<Result<(), String>>)",
+        "source": "rustdoc:localapi/struct.DownCompletion.html"
+      },
+      {
         "id": "method:localapi::LocalApiHandle.shutdown",
         "kind": "method",
         "name": "shutdown",
         "owner": "localapi::LocalApiHandle",
         "signature": "pub async fn shutdown(self)",
+        "source": "rustdoc:localapi/struct.LocalApiHandle.html"
+      },
+      {
+        "id": "method:localapi::LocalApiHandle.shutdown_preserving_path",
+        "kind": "method",
+        "name": "shutdown_preserving_path",
+        "owner": "localapi::LocalApiHandle",
+        "signature": "pub async fn shutdown_preserving_path(self)",
         "source": "rustdoc:localapi/struct.LocalApiHandle.html"
       },
       {
@@ -6122,6 +6240,13 @@
         "name": "WhoIsInfo",
         "signature": "pub struct WhoIsInfo { pub found: bool, pub node_name: String, pub tailscale_ips: Vec<IpAddr>, pub user_id: i64, pub login_name: String, pub display_name: String, }",
         "source": "rustdoc:struct.WhoIsInfo.html"
+      },
+      {
+        "id": "struct:localapi::DownCompletion",
+        "kind": "struct",
+        "name": "localapi::DownCompletion",
+        "signature": "pub struct DownCompletion { /* private fields */ }",
+        "source": "rustdoc:localapi/struct.DownCompletion.html"
       },
       {
         "id": "struct:localapi::LocalApiHandle",

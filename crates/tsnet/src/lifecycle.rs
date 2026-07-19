@@ -401,16 +401,32 @@ async fn wait_router_cleanup(router: &SharedRouter) -> Result<(), TsnetError> {
     }
 }
 
-async fn shutdown_magicsock(magicsock: &Magicsock) -> Result<(), String> {
-    let portmapper = magicsock
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PortmapperCleanup {
+    Confirmed,
+    ExternalReleaseUnconfirmed,
+}
+
+async fn shutdown_magicsock(magicsock: &Magicsock) -> Result<PortmapperCleanup, String> {
+    let portmapper = match magicsock
         .shutdown_portmapper(COMPONENT_SHUTDOWN_TIMEOUT)
         .await
-        .map_err(|error| format!("portmapper cleanup incomplete: {error}"));
+    {
+        Ok(()) => Ok(PortmapperCleanup::Confirmed),
+        Err(rustscale_portmapper::PortMapError::ExternalReleaseUnconfirmed) => {
+            Ok(PortmapperCleanup::ExternalReleaseUnconfirmed)
+        }
+        Err(error) => Err(format!("portmapper cleanup incomplete: {error}")),
+    };
     let runtime = magicsock
         .shutdown(COMPONENT_SHUTDOWN_TIMEOUT)
         .await
         .map_err(|error| format!("magicsock cleanup incomplete: {error}"));
-    portmapper.and(runtime)
+    match (portmapper, runtime) {
+        (_, Err(error)) => Err(error),
+        (Ok(cleanup), Ok(())) => Ok(cleanup),
+        (Err(error), Ok(())) => Err(error),
+    }
 }
 
 struct PrestartedMagicsockRollback {
@@ -769,8 +785,10 @@ async fn quiesce_running_state(inner: &mut RunningState, preserve_localapi: bool
     for control in &in_memory_clients {
         control.invalidate();
     }
-    if let Some(path) = inner.localapi_socket.take() {
-        let _ = std::fs::remove_file(path);
+    if !preserve_localapi {
+        if let Some(path) = inner.localapi_socket.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
     crate::capture::clear(&inner.capture);
     if let Ok(mut handles) = inner.capture_handles.lock() {
@@ -830,9 +848,18 @@ async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningSta
         }
     }
     inner.os_dns_configurator.take();
-    if let Err(error) = shutdown_magicsock(&inner.magicsock).await {
-        log::warn!("tsnet: retaining running cleanup owner: {error}");
-        return Err((inner, format!("magicsock cleanup: {error}")));
+    match shutdown_magicsock(&inner.magicsock).await {
+        Ok(PortmapperCleanup::Confirmed) => {}
+        Ok(PortmapperCleanup::ExternalReleaseUnconfirmed) => {
+            // All local portmapper tasks and send gates are closed. NAT lease
+            // deletion is inherently unconfirmable on some routers, so retain
+            // neither this complete running owner nor restart delay.
+            log::warn!("tsnet: external port mapping release remains unconfirmed");
+        }
+        Err(error) => {
+            log::warn!("tsnet: retaining running cleanup owner: {error}");
+            return Err((inner, format!("magicsock cleanup: {error}")));
+        }
     }
     inner.health_watchdog.stop_and_wait().await;
 
@@ -858,6 +885,46 @@ fn lifecycle_cleanup_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("build lifecycle cleanup supervisor runtime")
     })
+}
+
+/// Retire a running generation while preserving its LocalAPI listener long
+/// enough for an admitted `down` request to receive the daemon-owned result.
+/// The caller must atomically publish a stopped replacement before shutting
+/// this returned listener down.
+async fn cleanup_server_state_preserving_localapi(
+    mut owner: CleanupOwner,
+) -> Result<localapi::LocalApiHandle, (CleanupOwner, String)> {
+    if let Some(inner) = owner.inner.as_mut() {
+        quiesce_running_state(inner, true).await;
+    }
+    if let Some(pre_started) = owner.pre_started.as_mut() {
+        quiesce_pre_started(pre_started).await;
+    }
+    if let Some(host) = owner.extension_host.take() {
+        if let Err(host) = shutdown_extension_host(host).await {
+            owner.extension_host = Some(host);
+            return Err((owner, "extension shutdown remains incomplete".into()));
+        }
+    }
+
+    let localapi = owner
+        .inner
+        .as_mut()
+        .and_then(|inner| inner.localapi_handle.take());
+    let Some(localapi) = localapi else {
+        return Err((owner, "running generation has no LocalAPI listener".into()));
+    };
+    if let Some(inner) = owner.inner.take() {
+        if let Err((mut inner, reason)) = finish_running_state(inner).await {
+            inner.localapi_handle = Some(localapi);
+            owner.inner = Some(inner);
+            return Err((owner, reason));
+        }
+    }
+    if let Some(pre_started) = owner.pre_started.take() {
+        cleanup_pre_started(pre_started, true).await;
+    }
+    Ok(localapi)
 }
 
 async fn cleanup_server_state(mut owner: CleanupOwner) -> Result<(), (CleanupOwner, String)> {
@@ -2716,7 +2783,7 @@ impl Server {
     pub async fn start_localapi_only(
         &mut self,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
-        self.start_localapi_with_state(false).await
+        self.start_localapi_with_state(false, None).await
     }
 
     /// Recreate LocalAPI after `down` without restoring the retired runtime.
@@ -2725,12 +2792,23 @@ impl Server {
     pub async fn start_localapi_stopped(
         &mut self,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
-        self.start_localapi_with_state(true).await
+        self.start_localapi_with_state(true, None).await
+    }
+
+    /// Publish a stopped listener over a retired running listener. The old
+    /// handle remains caller-owned until it has delivered the admitted down
+    /// response, preventing LocalAPI's child drain from deadlocking teardown.
+    pub async fn start_localapi_stopped_replacing(
+        &mut self,
+        previous: &mut localapi::LocalApiHandle,
+    ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
+        self.start_localapi_with_state(true, Some(previous)).await
     }
 
     async fn start_localapi_with_state(
         &mut self,
         stopped: bool,
+        previous: Option<&mut localapi::LocalApiHandle>,
     ) -> Result<mpsc::UnboundedReceiver<localapi::DaemonCommand>, TsnetError> {
         self.shutdown_supervisor.wait().await;
         self.startup_supervisor.wait().await;
@@ -2909,7 +2987,31 @@ impl Server {
             .await
             .map_err(TsnetError::Builder)?;
 
-        let handle = localapi::spawn_localapi(api_state.clone(), socket_path.clone());
+        let handle = if let Some(previous) = previous {
+            let Some((mut replacement, start, mut handoff)) =
+                localapi::spawn_localapi_paused(api_state.clone(), socket_path.clone())
+            else {
+                return Err(TsnetError::Builder(format!(
+                    "failed to prepare stopped LocalAPI replacement at {}",
+                    socket_path.display()
+                )));
+            };
+            start.send(()).map_err(|()| {
+                TsnetError::Builder("stopped LocalAPI replacement failed to activate".into())
+            })?;
+            handoff.commit(&mut replacement).map_err(|error| {
+                TsnetError::Builder(format!(
+                    "failed to publish stopped LocalAPI replacement: {error}"
+                ))
+            })?;
+            // The old listener is no longer reachable by new clients. Keep
+            // its accepted down handler alive until the daemon sends its
+            // completion, then the caller drains it preserving this path.
+            previous.socket_path.clone_from(&socket_path);
+            Some(replacement)
+        } else {
+            localapi::spawn_localapi(api_state.clone(), socket_path.clone())
+        };
         if handle.is_some() {
             log::info!(
                 "tsnet: LocalAPI (needs-login) listening at {}",
@@ -3981,6 +4083,50 @@ impl Server {
     /// supervisor before the first await. Dropping this future or destroying
     /// its caller runtime therefore cannot strand running tasks, sockets,
     /// routes, DNS state, serve listeners, or extensions.
+    /// Retire the active data plane but retain the current LocalAPI handle for
+    /// an atomic handoff to Stopped. This is exclusively for daemon-owned
+    /// `down`; ordinary close continues to drain LocalAPI before returning.
+    pub async fn close_preserving_localapi(
+        &mut self,
+    ) -> Result<localapi::LocalApiHandle, TsnetError> {
+        if self.shutdown_supervisor.has_retained_logout() {
+            return Err(TsnetError::ShutdownIncomplete(
+                "logout transaction is incomplete; retry logout before close".into(),
+            ));
+        }
+        let owner = CleanupOwner::take_from(self);
+        if owner.is_empty() {
+            return Err(TsnetError::ShutdownIncomplete(
+                "running server owner is unavailable for down".into(),
+            ));
+        }
+        let drive = Arc::clone(&self.drive);
+        let bootstrap_supervisor = Arc::clone(&self.bootstrap_supervisor);
+        let startup_supervisor = Arc::clone(&self.startup_supervisor);
+        let shutdown_supervisor = Arc::clone(&self.shutdown_supervisor);
+        let cleanup_runtime = lifecycle_cleanup_runtime();
+        let completion = shutdown_supervisor.begin_cleanup();
+        let cleanup_supervisor = Arc::clone(&shutdown_supervisor);
+        let cleanup = cleanup_runtime.spawn(async move {
+            let _completion = completion;
+            bootstrap_supervisor.wait().await;
+            startup_supervisor.wait().await;
+            drive.disable().await;
+            match cleanup_server_state_preserving_localapi(owner).await {
+                Ok(handle) => Ok(handle),
+                Err((owner, reason)) => {
+                    cleanup_supervisor.retain_owner(owner);
+                    Err(TsnetError::ShutdownIncomplete(format!(
+                        "server cleanup is busy or failed; retry close: {reason}"
+                    )))
+                }
+            }
+        });
+        cleanup.await.map_err(|error| {
+            TsnetError::ShutdownIncomplete(format!("shutdown worker stopped: {error}"))
+        })?
+    }
+
     pub async fn close(&mut self) -> Result<(), TsnetError> {
         if self.shutdown_supervisor.has_retained_logout() {
             return Err(TsnetError::ShutdownIncomplete(

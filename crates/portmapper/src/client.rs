@@ -906,7 +906,6 @@ impl Client {
         if let Some(error) = shutdown_error {
             return Err(error);
         }
-
         let uncertain = self
             .inner
             .state
@@ -932,9 +931,11 @@ impl Client {
             .uncertain_releases
             .is_empty()
         {
-            return Err(crate::PortMapError::Protocol(
-                "portmapper cleanup remains uncertain".into(),
-            ));
+            // Local send ownership is part of daemon teardown, unlike a
+            // remote NAT deletion acknowledgement. Drain it before reporting
+            // uncertainty so callers can release the running generation.
+            self.finish_send_gate(deadline).await?;
+            return Err(crate::PortMapError::ExternalReleaseUnconfirmed);
         }
         self.finish_send_gate(deadline).await?;
         Ok(())

@@ -896,6 +896,7 @@ pub(crate) fn cached_netmap_is_usable(
 /// Configure a supplied owner for the health serialization contract tests.
 /// Production TUN generations use `DnsManager`, which owns equivalent live
 /// transactions and cleanup retries.
+#[cfg(test)]
 pub(crate) fn configure_requested_os_dns(
     mut configurator: Box<dyn OsConfigurator + Send>,
     config: &OsConfig,

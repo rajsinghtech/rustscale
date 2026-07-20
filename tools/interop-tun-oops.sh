@@ -38,6 +38,7 @@ UNDERLAY_PCAP=""
 SERVER_LOG=""
 CLIENT_LOG=""
 READY_FIFO=""
+PEER_READY_FIFO=""
 PHASE_FIFO=""
 EGRESS=""
 IP_FORWARD_ORIGINAL=""
@@ -339,8 +340,9 @@ chmod 700 "$STATE_DIR"
 SERVER_LOG="$STATE_DIR/server.log"
 CLIENT_LOG="$STATE_DIR/client.log"
 READY_FIFO="$STATE_DIR/server.ready"
+PEER_READY_FIFO="$STATE_DIR/server-peer.ready"
 PHASE_FIFO="$STATE_DIR/client.phase"
-mkfifo -m 600 "$READY_FIFO" "$PHASE_FIFO"
+mkfifo -m 600 "$READY_FIFO" "$PEER_READY_FIFO" "$PHASE_FIFO"
 AUTHKEY_FILE="$STATE_DIR/authkey"
 UNDERLAY_PCAP="$STATE_DIR/underlay.pcap"
 # Capture at the bridge before host NAT. Later assertions correlate each
@@ -389,6 +391,7 @@ timeout --foreground --signal=TERM --kill-after=15s 300s \
     --port "$TCP_PORT" \
     --udp-port "$UDP_PORT" \
     --ready-fifo "$READY_FIFO" \
+    --peer-ready-fifo "$PEER_READY_FIFO" \
   >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 READY_LINE=$(timeout 150s head -n 1 "$READY_FIFO") || fail "server did not signal readiness"
@@ -408,6 +411,7 @@ timeout --foreground --signal=TERM --kill-after=15s 300s \
     --peer "$SERVER_IP" \
     --port "$TCP_PORT" \
     --udp-port "$UDP_PORT" \
+    --peer-ready-fifo "$PEER_READY_FIFO" \
     --phase-fifo "$PHASE_FIFO" \
   >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
@@ -574,6 +578,7 @@ set -e
 
 require_exactly_one_marker "$SERVER_LOG" "OOPS_KERNEL_OK role=server" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_READY" server
+require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_PEER_OK" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TUN_ROUTE" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TUN_TRAFFIC" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TCP_ACCEPT" server
@@ -581,6 +586,7 @@ require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TCP_DONE" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_DONE" server
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_KERNEL_OK role=client" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_PEER_OK" client
+require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_REVERSE_PEER_READY" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TUN_ROUTE" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_DIRECT_PROBE_OK" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TUN_TRAFFIC" client

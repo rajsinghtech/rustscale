@@ -1664,18 +1664,42 @@ fn linux_direct_block_line_exact(line: &str, pref: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_rule_owner_dir() -> std::path::PathBuf {
+fn linux_network_namespace_name(target: &std::path::Path) -> Result<String, RouterError> {
+    let target = target.to_str().ok_or_else(|| {
+        RouterError::InvalidConfig("Linux network namespace identity is not UTF-8".into())
+    })?;
+    let inode = target
+        .strip_prefix("net:[")
+        .and_then(|value| value.strip_suffix(']'))
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|inode| *inode != 0)
+        .ok_or_else(|| {
+            RouterError::InvalidConfig(format!(
+                "invalid Linux network namespace identity {target:?}"
+            ))
+        })?;
+    Ok(format!("net-{inode}"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_rule_owner_dir() -> Result<std::path::PathBuf, RouterError> {
+    let namespace = std::fs::read_link("/proc/self/ns/net")
+        .map_err(RouterError::Io)
+        .and_then(|target| linux_network_namespace_name(&target))?;
     #[cfg(test)]
-    return std::env::temp_dir().join(format!("rustscale-rule-owners-{}", std::process::id()));
+    return Ok(std::env::temp_dir()
+        .join(format!("rustscale-rule-owners-{}", std::process::id()))
+        .join(namespace));
     #[cfg(not(test))]
-    return std::path::PathBuf::from("/run/rustscale/rule-owners");
+    return Ok(std::path::PathBuf::from("/run/rustscale/rule-owners").join(namespace));
 }
 
 #[cfg(target_os = "linux")]
 fn claim_linux_rule_owner_file(base: u32, tun_name: &str) -> Result<bool, RouterError> {
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    let dir = linux_rule_owner_dir();
+    let dir = linux_rule_owner_dir()?;
     std::fs::create_dir_all(&dir).map_err(RouterError::Io)?;
     let dir_metadata = std::fs::symlink_metadata(&dir).map_err(RouterError::Io)?;
     if !dir_metadata.file_type().is_dir() || dir_metadata.file_type().is_symlink() {
@@ -1816,7 +1840,10 @@ impl Platform for LinuxPlatform {
                 *refs -= 1;
             } else if owner == &self.tun_name {
                 owners.remove(&base);
-                let path = linux_rule_owner_dir().join(base.to_string());
+                let Ok(dir) = linux_rule_owner_dir() else {
+                    return;
+                };
+                let path = dir.join(base.to_string());
                 let identity = format!("{} {}\n", std::process::id(), self.tun_name);
                 if std::fs::read_to_string(&path).ok().as_deref() == Some(identity.as_str()) {
                     let _ = std::fs::remove_file(path);
@@ -3165,7 +3192,7 @@ mod tests {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         let platform = LinuxPlatform::new_with_interface_index("stale-owner0", 177);
         let base = platform.rule_base.unwrap();
-        let dir = linux_rule_owner_dir();
+        let dir = linux_rule_owner_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join(base.to_string());
@@ -3573,6 +3600,28 @@ mod tests {
         first.release_ownership();
         colliding.claim_ownership().unwrap();
         colliding.release_ownership();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rule_owner_registry_is_namespaced_by_network_namespace() {
+        assert_eq!(
+            linux_network_namespace_name(std::path::Path::new("net:[4026532000]")).unwrap(),
+            "net-4026532000"
+        );
+        for invalid in [
+            "net:[]",
+            "net:[0]",
+            "net:[not-a-number]",
+            "mnt:[4026532000]",
+        ] {
+            assert!(linux_network_namespace_name(std::path::Path::new(invalid)).is_err());
+        }
+        let owner_dir = linux_rule_owner_dir().unwrap();
+        assert!(owner_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("net-")));
     }
 
     #[cfg(target_os = "linux")]

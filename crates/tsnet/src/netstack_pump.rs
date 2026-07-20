@@ -20,6 +20,11 @@ struct NetstackPumpStats {
     tcp_retransmit: u64,
     rx_queue_high_water: usize,
     tx_queue_high_water: usize,
+    live_connections: usize,
+    pending_closes: usize,
+    close_requests: usize,
+    close_completions: usize,
+    duplicate_close_requests: usize,
     next_snapshot_packets: u64,
     seen_segments: std::collections::HashSet<TcpSegmentSignature>,
     segment_order: std::collections::VecDeque<TcpSegmentSignature>,
@@ -35,6 +40,14 @@ impl NetstackPumpStats {
 
     fn note_batch(&mut self) {
         self.inbound_batches = self.inbound_batches.saturating_add(1);
+    }
+
+    fn note_connections(&mut self, stats: rustscale_netstack::ConnectionStats) {
+        self.live_connections = stats.live_connections;
+        self.pending_closes = stats.pending_closes;
+        self.close_requests = stats.close_requests;
+        self.close_completions = stats.close_completions;
+        self.duplicate_close_requests = stats.duplicate_close_requests;
     }
 
     fn note_packet(&mut self, inbound: bool, packet: &[u8], queues: (usize, usize)) {
@@ -110,7 +123,7 @@ impl NetstackPumpStats {
 
     fn emit(&self, event: &str) {
         eprintln!(
-            "rustscale: netstack_pump_stats event={event} inbound_batches={} inbound_packets={} outbound_packets={} tcp_syn={} tcp_syn_ack={} tcp_ack={} tcp_retransmit={} tcp_fin={} tcp_rst={} rx_queue_high_water={} tx_queue_high_water={}",
+            "rustscale: netstack_pump_stats event={event} inbound_batches={} inbound_packets={} outbound_packets={} tcp_syn={} tcp_syn_ack={} tcp_ack={} tcp_retransmit={} tcp_fin={} tcp_rst={} rx_queue_high_water={} tx_queue_high_water={} live_connections={} pending_closes={} close_requests={} close_completions={} duplicate_close_requests={}",
             self.inbound_batches,
             self.inbound_packets,
             self.outbound_packets,
@@ -122,6 +135,11 @@ impl NetstackPumpStats {
             self.tcp_rst,
             self.rx_queue_high_water,
             self.tx_queue_high_water,
+            self.live_connections,
+            self.pending_closes,
+            self.close_requests,
+            self.close_completions,
+            self.duplicate_close_requests,
         );
     }
 }
@@ -152,6 +170,7 @@ pub(crate) async fn run_netstack_pump(
         if cancel.is_cancelled() {
             break;
         }
+        pump_stats.note_connections(netstack.connection_stats());
 
         let mut handled_inbound = false;
         // A Notify retains at most one permit. After a bounded outbound

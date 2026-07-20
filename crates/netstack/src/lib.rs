@@ -144,6 +144,7 @@ pub struct Netstack {
     tx_notify: Arc<Notify>,
     next_dial_id: AtomicU64,
     dial_stats: Arc<DialStatsInner>,
+    connection_stats: Arc<ConnectionStatsInner>,
 }
 
 /// Live resource counts for pending userspace TCP dials.
@@ -159,6 +160,89 @@ pub struct DialStats {
 struct DialStatsInner {
     pending_dials: std::sync::atomic::AtomicUsize,
     pending_buffer_bytes: std::sync::atomic::AtomicUsize,
+}
+
+/// TCP connection lifecycle counters from the netstack poll loop.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectionStats {
+    /// Established sockets currently owned by the poll loop.
+    pub live_connections: usize,
+    /// Durable local close requests not yet applied to smoltcp.
+    pub pending_closes: usize,
+    /// First close requests published by shutdown or drop.
+    pub close_requests: usize,
+    /// Close requests applied to smoltcp or resolved by socket teardown.
+    pub close_completions: usize,
+    /// Idempotent shutdown/drop requests after the first request.
+    pub duplicate_close_requests: usize,
+}
+
+#[derive(Default)]
+struct ConnectionStatsInner {
+    live_connections: std::sync::atomic::AtomicUsize,
+    pending_closes: std::sync::atomic::AtomicUsize,
+    close_requests: std::sync::atomic::AtomicUsize,
+    close_completions: std::sync::atomic::AtomicUsize,
+    duplicate_close_requests: std::sync::atomic::AtomicUsize,
+}
+
+struct ConnectionLifecycle {
+    close_requested: std::sync::atomic::AtomicBool,
+    close_completed: std::sync::atomic::AtomicBool,
+    retired: std::sync::atomic::AtomicBool,
+    remote_closed: std::sync::atomic::AtomicBool,
+    read_waker: std::sync::Mutex<Option<std::task::Waker>>,
+    notify: Arc<Notify>,
+    stats: Arc<ConnectionStatsInner>,
+}
+
+impl ConnectionLifecycle {
+    fn request_close(&self) {
+        if self
+            .close_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.stats.close_requests.fetch_add(1, Ordering::Relaxed);
+            self.stats.pending_closes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats
+                .duplicate_close_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self.retired.load(Ordering::Acquire) {
+            self.complete_close();
+        } else {
+            self.notify.notify_one();
+        }
+    }
+
+    fn complete_close(&self) {
+        if self.close_requested.load(Ordering::Acquire)
+            && self
+                .close_completed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.stats.pending_closes.fetch_sub(1, Ordering::Relaxed);
+            self.stats.close_completions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.complete_close();
+    }
+
+    fn publish_remote_close(&self) {
+        if !self.remote_closed.swap(true, Ordering::AcqRel) {
+            if let Ok(mut waker) = self.read_waker.lock() {
+                if let Some(waker) = waker.take() {
+                    waker.wake();
+                }
+            }
+        }
+    }
 }
 
 struct PendingDialGuard {
@@ -187,6 +271,7 @@ impl Drop for PendingDialGuard {
 pub struct Listener {
     accept_rx: mpsc::Receiver<Result<NetstackStream, NetstackError>>,
     cmd_tx: mpsc::Sender<Command>,
+    notify: Arc<Notify>,
     key: (IpAddr, u16),
     close_on_drop: bool,
 }
@@ -214,6 +299,9 @@ impl Drop for Listener {
     fn drop(&mut self) {
         if self.close_on_drop {
             let _ = self.cmd_tx.try_send(Command::CloseTcp { key: self.key });
+            // Channel closure is the durable fallback if the command queue is
+            // full; wake the poll loop so it observes that ownership change.
+            self.notify.notify_one();
         }
     }
 }
@@ -282,6 +370,8 @@ impl UdpListener {
 impl Drop for UdpListener {
     fn drop(&mut self) {
         let _ = self.cmd_tx.try_send(Command::CloseUdp { key: self.key });
+        // recv_tx closure is the durable fallback for a full command queue.
+        self.notify.notify_one();
     }
 }
 
@@ -291,7 +381,7 @@ pub struct NetstackStream {
     rx: mpsc::Receiver<Bytes>,
     tx: PollSender<Bytes>,
     read_buf: Bytes,
-    remote_closed: bool,
+    lifecycle: Arc<ConnectionLifecycle>,
     notify: Arc<Notify>,
     remote_addr: Option<SocketAddr>,
     peer_node_key: Option<NodePublic>,
@@ -301,6 +391,7 @@ impl NetstackStream {
     fn new(
         rx: mpsc::Receiver<Bytes>,
         tx: PollSender<Bytes>,
+        lifecycle: Arc<ConnectionLifecycle>,
         notify: Arc<Notify>,
         remote_addr: Option<SocketAddr>,
         peer_node_key: Option<NodePublic>,
@@ -309,7 +400,7 @@ impl NetstackStream {
             rx,
             tx,
             read_buf: Bytes::new(),
-            remote_closed: false,
+            lifecycle,
             notify,
             remote_addr,
             peer_node_key,
@@ -342,15 +433,11 @@ impl AsyncRead for NetstackStream {
             self.read_buf = self.read_buf.slice(n..);
             return std::task::Poll::Ready(Ok(()));
         }
-        if self.remote_closed {
+        if self.lifecycle.remote_closed.load(Ordering::Acquire) && self.rx.is_empty() {
             return std::task::Poll::Ready(Ok(()));
         }
         match self.rx.poll_recv(cx) {
             std::task::Poll::Ready(Some(data)) => {
-                if data.is_empty() {
-                    self.remote_closed = true;
-                    return std::task::Poll::Ready(Ok(()));
-                }
                 let n = data.len().min(buf.remaining());
                 buf.put_slice(&data[..n]);
                 if n < data.len() {
@@ -359,11 +446,17 @@ impl AsyncRead for NetstackStream {
                 self.notify.notify_one();
                 std::task::Poll::Ready(Ok(()))
             }
-            std::task::Poll::Ready(None) => {
-                self.remote_closed = true;
-                std::task::Poll::Ready(Ok(()))
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Pending => {
+                if let Ok(mut waker) = self.lifecycle.read_waker.lock() {
+                    *waker = Some(cx.waker().clone());
+                }
+                if self.lifecycle.remote_closed.load(Ordering::Acquire) {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Pending
+                }
             }
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -374,6 +467,12 @@ impl AsyncWrite for NetstackStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.lifecycle.close_requested.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "connection is shutting down",
+            )));
+        }
         if buf.is_empty() {
             return std::task::Poll::Ready(Ok(0));
         }
@@ -409,18 +508,14 @@ impl AsyncWrite for NetstackStream {
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if let Some(sender) = self.tx.get_ref() {
-            let _ = sender.try_send(Bytes::new());
-        }
+        self.lifecycle.request_close();
         std::task::Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for NetstackStream {
     fn drop(&mut self) {
-        if let Some(sender) = self.tx.get_ref() {
-            let _ = sender.try_send(Bytes::new());
-        }
+        self.lifecycle.request_close();
     }
 }
 
@@ -446,6 +541,7 @@ impl Netstack {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let inbound_flows = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let dial_stats = Arc::new(DialStatsInner::default());
+        let connection_stats = Arc::new(ConnectionStatsInner::default());
         let tcp_ephemeral_start = rand::thread_rng().gen_range(49152..=u16::MAX);
 
         let device =
@@ -457,6 +553,7 @@ impl Netstack {
             notify.clone(),
             inbound_flows.clone(),
             Arc::clone(&dial_stats),
+            Arc::clone(&connection_stats),
             tcp_ephemeral_start,
         ));
 
@@ -470,6 +567,7 @@ impl Netstack {
             tx_notify,
             next_dial_id: AtomicU64::new(1),
             dial_stats,
+            connection_stats,
         })
     }
 
@@ -553,6 +651,7 @@ impl Netstack {
         Ok(Listener {
             accept_rx,
             cmd_tx: self.cmd_tx.clone(),
+            notify: Arc::clone(&self.notify),
             key: (IpAddr::V4(self.addr), port),
             close_on_drop: true,
         })
@@ -576,6 +675,7 @@ impl Netstack {
         Ok(Listener {
             accept_rx,
             cmd_tx: self.cmd_tx.clone(),
+            notify: Arc::clone(&self.notify),
             key: (addr, port),
             close_on_drop: true,
         })
@@ -699,6 +799,26 @@ impl Netstack {
         }
     }
 
+    /// Return established-connection close ownership counters.
+    pub fn connection_stats(&self) -> ConnectionStats {
+        ConnectionStats {
+            live_connections: self
+                .connection_stats
+                .live_connections
+                .load(Ordering::Acquire),
+            pending_closes: self.connection_stats.pending_closes.load(Ordering::Acquire),
+            close_requests: self.connection_stats.close_requests.load(Ordering::Acquire),
+            close_completions: self
+                .connection_stats
+                .close_completions
+                .load(Ordering::Acquire),
+            duplicate_close_requests: self
+                .connection_stats
+                .duplicate_close_requests
+                .load(Ordering::Acquire),
+        }
+    }
+
     /// Start listening for UDP datagrams on `addr:port`.
     ///
     /// If `port` is 0, an ephemeral port is allocated from the range
@@ -790,6 +910,7 @@ struct ConnState {
     app_tx: mpsc::Sender<Bytes>,
     app_rx: mpsc::Receiver<Bytes>,
     pending_write: Vec<u8>,
+    lifecycle: Arc<ConnectionLifecycle>,
     /// Client-side ephemeral port owned until this socket is removed.
     local_port: Option<u16>,
 }
@@ -910,6 +1031,7 @@ fn to_smoltcp_v4(addr: Ipv4Addr) -> IpAddress {
 /// Returns (stream, ConnState).
 fn make_stream_and_conn(
     notify: Arc<Notify>,
+    stats: Arc<ConnectionStatsInner>,
     remote_addr: Option<SocketAddr>,
     peer_node_key: Option<NodePublic>,
     local_port: Option<u16>,
@@ -917,11 +1039,29 @@ fn make_stream_and_conn(
     let (app_tx, stream_rx) = mpsc::channel(64);
     let (stream_tx, app_rx) = mpsc::channel(64);
     let poll_sender = PollSender::new(stream_tx);
-    let stream = NetstackStream::new(stream_rx, poll_sender, notify, remote_addr, peer_node_key);
+    let lifecycle = Arc::new(ConnectionLifecycle {
+        close_requested: std::sync::atomic::AtomicBool::new(false),
+        close_completed: std::sync::atomic::AtomicBool::new(false),
+        retired: std::sync::atomic::AtomicBool::new(false),
+        remote_closed: std::sync::atomic::AtomicBool::new(false),
+        read_waker: std::sync::Mutex::new(None),
+        notify: Arc::clone(&notify),
+        stats: Arc::clone(&stats),
+    });
+    stats.live_connections.fetch_add(1, Ordering::Relaxed);
+    let stream = NetstackStream::new(
+        stream_rx,
+        poll_sender,
+        Arc::clone(&lifecycle),
+        notify,
+        remote_addr,
+        peer_node_key,
+    );
     let conn = ConnState {
         app_tx,
         app_rx,
         pending_write: Vec::new(),
+        lifecycle,
         local_port,
     };
     (stream, conn)
@@ -935,6 +1075,7 @@ async fn poll_loop(
     notify: Arc<Notify>,
     inbound_flows: Arc<std::sync::Mutex<HashMap<TcpFlow, NodePublic>>>,
     dial_stats: Arc<DialStatsInner>,
+    connection_stats: Arc<ConnectionStatsInner>,
     mut next_tcp_port: u16,
 ) {
     let start = std::time::Instant::now();
@@ -1119,8 +1260,13 @@ async fn poll_loop(
                             local: SocketAddr::new(listen_ip, port),
                         })
                     });
-                    let (stream, conn) =
-                        make_stream_and_conn(notify.clone(), remote_addr, peer_node_key, None);
+                    let (stream, conn) = make_stream_and_conn(
+                        notify.clone(),
+                        Arc::clone(&connection_stats),
+                        remote_addr,
+                        peer_node_key,
+                        None,
+                    );
                     conns.insert(conn_handle, conn);
 
                     if let Some(entry) = listeners.get(&key) {
@@ -1187,13 +1333,20 @@ async fn poll_loop(
                         let local_port = pd.local_port;
                         let (stream, conn) = make_stream_and_conn(
                             notify.clone(),
+                            Arc::clone(&connection_stats),
                             Some(pd.remote),
                             None,
                             Some(local_port),
                         );
                         conns.insert(handle, conn);
                         if pd.reply.send(Ok(stream)).is_err() {
-                            conns.remove(&handle);
+                            if let Some(conn) = conns.remove(&handle) {
+                                conn.lifecycle.retire();
+                                conn.lifecycle
+                                    .stats
+                                    .live_connections
+                                    .fetch_sub(1, Ordering::Relaxed);
+                            }
                             tcp_allocated_ports.remove(&local_port);
                             let _ = sockets.remove(handle);
                         }
@@ -1532,7 +1685,7 @@ fn pump_connection(
     let may_recv = socket.may_recv();
     if !may_recv && !can_recv {
         if let Some(conn) = conns.get(&handle) {
-            let _ = conn.app_tx.try_send(Bytes::new());
+            conn.lifecycle.publish_remote_close();
         }
     }
 
@@ -1561,14 +1714,10 @@ fn pump_connection(
                 }
             }
 
-            // 2. Drain newly-arrived app data.
+            // 2. Drain newly-arrived app data. Close ownership is out of band:
+            // a full channel cannot discard shutdown, while data accepted
+            // before shutdown remains ordered ahead of the FIN.
             while let Ok(data) = conn.app_rx.try_recv() {
-                if data.is_empty() {
-                    // App signaled close.
-                    let socket = sockets.get_mut::<tcp::Socket>(handle);
-                    socket.close();
-                    break;
-                }
                 let socket = sockets.get_mut::<tcp::Socket>(handle);
                 let written = socket.send_slice(&data).unwrap_or(0);
                 if written > 0 {
@@ -1580,6 +1729,15 @@ fn pump_connection(
                     conn.pending_write = data[written..].to_vec();
                     break;
                 }
+            }
+
+            if conn.pending_write.is_empty()
+                && conn.app_rx.is_empty()
+                && conn.lifecycle.close_requested.load(Ordering::Acquire)
+            {
+                sockets.get_mut::<tcp::Socket>(handle).close();
+                conn.lifecycle.complete_close();
+                did_work = true;
             }
         }
     }
@@ -1604,6 +1762,11 @@ fn cleanup_closed(
         .collect();
     for h in dead {
         if let Some(conn) = conns.remove(&h) {
+            conn.lifecycle.retire();
+            conn.lifecycle
+                .stats
+                .live_connections
+                .fetch_sub(1, Ordering::Relaxed);
             if let Some(port) = conn.local_port {
                 tcp_allocated_ports.remove(&port);
             }

@@ -13,6 +13,83 @@ use rustscale_wg::WgTunn;
 
 use crate::{DialStats, Netstack, DEFAULT_MTU, TCP_BUF, TCP_DIAL_TIMEOUT};
 
+#[tokio::test]
+async fn full_app_channel_cannot_lose_close_ownership() {
+    use tokio::io::AsyncWriteExt;
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let stats = Arc::new(crate::ConnectionStatsInner::default());
+    let (mut stream, mut conn) =
+        crate::make_stream_and_conn(notify, Arc::clone(&stats), None, None, None);
+
+    // Fill the exact bounded app->smoltcp channel without running a poll loop.
+    // The former in-band empty marker was lost at this boundary.
+    for _ in 0..64 {
+        stream.write_all(&[7]).await.expect("fill app channel");
+    }
+    assert_eq!(conn.app_rx.len(), 64);
+
+    stream.shutdown().await.expect("publish durable close");
+    assert!(conn
+        .lifecycle
+        .close_requested
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        conn.app_rx.len(),
+        64,
+        "close must not consume channel capacity"
+    );
+    assert_eq!(
+        stats
+            .pending_closes
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        stats
+            .close_requests
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        stream
+            .write(&[8])
+            .await
+            .expect_err("write after shutdown")
+            .kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+
+    let mut drained = 0;
+    while conn.app_rx.try_recv().is_ok() {
+        drained += 1;
+    }
+    assert_eq!(
+        drained, 64,
+        "all accepted data remains ordered before close"
+    );
+    conn.lifecycle.complete_close();
+    assert_eq!(
+        stats
+            .pending_closes
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(
+        stats
+            .close_completions
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    conn.lifecycle.complete_close();
+    assert_eq!(
+        stats
+            .close_completions
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+}
+
 #[test]
 fn tcp_ephemeral_allocator_wraps_skips_live_ports_and_exhausts() {
     let mut allocated = std::collections::HashSet::from([u16::MAX, 49152]);
@@ -621,7 +698,7 @@ async fn concurrent_connections_all_succeed() {
 /// Exercise the production netstack and WireGuard data path at an explicit
 /// setup scale. The in-memory link is credential-free; it only replaces the
 /// UDP underlay, not dial admission, packet ownership, TCP, or WireGuard.
-async fn assert_bounded_bulk_dial_setup(streams: usize) {
+async fn assert_bounded_bulk_dial_phases(phases: &[usize]) {
     let a_priv = NodePrivate::generate();
     let b_priv = NodePrivate::generate();
     let a_pub = a_priv.public();
@@ -658,48 +735,73 @@ async fn assert_bounded_bulk_dial_setup(streams: usize) {
     };
 
     let mut listener = b_net.listen(41000).await.expect("listen");
-    let accept = tokio::spawn(async move {
-        let mut accepted = Vec::with_capacity(streams);
-        for _ in 0..streams {
-            accepted.push(listener.accept().await.expect("accept"));
+    let mut expected_closes = 0;
+    for &streams in phases {
+        let accept = tokio::spawn(async move {
+            let mut accepted = Vec::with_capacity(streams);
+            for _ in 0..streams {
+                accepted.push(listener.accept().await.expect("accept"));
+            }
+            (accepted, listener)
+        });
+        let dial = {
+            let a_net = a_net.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    a_net.dial_many(
+                        SocketAddr::new(b_addr.into(), 41000),
+                        streams,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(25),
+                    ),
+                )
+                .await
+            })
+        };
+        let mut maximum = 0;
+        while !dial.is_finished() {
+            maximum = maximum.max(a_net.dial_stats().pending_dials);
+            tokio::task::yield_now().await;
         }
-        accepted
-    });
-    let dial = {
-        let a_net = a_net.clone();
-        tokio::spawn(async move {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                a_net.dial_many(
-                    SocketAddr::new(b_addr.into(), 41000),
-                    streams,
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(25),
-                ),
-            )
+        let client_streams = dial
             .await
-        })
-    };
-    let mut maximum = 0;
-    while !dial.is_finished() {
-        maximum = maximum.max(a_net.dial_stats().pending_dials);
-        tokio::task::yield_now().await;
-    }
-    let client_streams = dial
-        .await
-        .expect("dial worker")
-        .expect("bulk setup outer deadline")
-        .expect("bulk dial");
-    let server_streams = accept.await.expect("accept worker");
+            .expect("dial worker")
+            .expect("bulk setup outer deadline")
+            .expect("bulk dial");
+        let (server_streams, returned_listener) = accept.await.expect("accept worker");
+        listener = returned_listener;
 
-    assert_eq!(client_streams.len(), streams);
-    assert_eq!(server_streams.len(), streams);
-    assert!(
-        maximum <= crate::TCP_DIAL_WINDOW,
-        "maximum in flight: {maximum}"
-    );
-    assert_eq!(a_net.dial_stats(), DialStats::default());
-    drop(client_streams);
-    drop(server_streams);
+        assert_eq!(client_streams.len(), streams);
+        assert_eq!(server_streams.len(), streams);
+        assert!(
+            maximum <= crate::TCP_DIAL_WINDOW,
+            "maximum in flight: {maximum}"
+        );
+        assert_eq!(a_net.dial_stats(), DialStats::default());
+        drop(client_streams);
+        drop(server_streams);
+        expected_closes += streams;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let a = a_net.connection_stats();
+                let b = b_net.connection_stats();
+                if a.live_connections == 0
+                    && b.live_connections == 0
+                    && a.pending_closes == 0
+                    && b.pending_closes == 0
+                {
+                    assert_eq!(a.close_requests, expected_closes);
+                    assert_eq!(a.close_completions, expected_closes);
+                    assert_eq!(b.close_requests, expected_closes);
+                    assert_eq!(b.close_completions, expected_closes);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bulk teardown leaked a connection or close request");
+    }
     pump.abort();
 }
 
@@ -707,14 +809,22 @@ async fn assert_bounded_bulk_dial_setup(streams: usize) {
 /// the peer's listener-sized admission window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounded_bulk_dial_establishes_and_retains_p500() {
-    assert_bounded_bulk_dial_setup(500).await;
+    assert_bounded_bulk_dial_phases(&[500]).await;
 }
 
 /// P1000 setup takes the same production bounded path as P500: all streams
 /// must remain established without widening the handshake window or deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounded_bulk_dial_establishes_and_retains_p1000() {
-    assert_bounded_bulk_dial_setup(1000).await;
+    assert_bounded_bulk_dial_phases(&[1000]).await;
+}
+
+/// Reproduce the benchmark's long-lived-server boundary: P500 must retire
+/// bilaterally before an unchanged P1000 setup starts on the same stacks,
+/// tunnels, listener, channel limits, and four-dial admission window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p500_teardown_then_p1000_has_no_stale_connections() {
+    assert_bounded_bulk_dial_phases(&[500, 1000]).await;
 }
 
 /// A P1000 request that cannot connect still owns at most one bounded window,

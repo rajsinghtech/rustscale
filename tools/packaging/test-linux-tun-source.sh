@@ -13,8 +13,12 @@ MAGIC=100.100.100.100
 PEER=100.88.2.90
 
 assert_absent() {
+  local routes
   ! ip -4 -o addr show | grep -Fq "$MAGIC/32"
-  ! ip -4 route show table 52 | grep -Eq '(^| )100\.64\.0\.0/10( |$)|(^| )100\.100\.100\.100( |/32 |$)'
+  # iproute2 reports a missing non-main table as an error; after teardown that
+  # is the expected empty-table state, so normalize it before asserting.
+  routes=$(ip -4 route show table 52 2>/dev/null || true)
+  ! grep -Eq '(^| )100\.64\.0\.0/10( |$)|(^| )100\.100\.100\.100( |/32 |$)' <<<"$routes"
 }
 
 configure() {
@@ -31,7 +35,7 @@ configure() {
   ip -4 -o addr show dev tun0 | grep -Fq "inet $node/32"
   ! ip -4 -o addr show dev tun0 | grep -Fq "$MAGIC/32"
   ip -4 -o addr show dev lo | grep -Fq "inet $MAGIC/32"
-  ip -4 route show table 52 exact "$MAGIC/32" | grep -Fq "dev tun0"
+  ip -4 route show exact "$MAGIC/32" table 52 | grep -Fq "dev tun0"
   route=$(ip -4 route get "$PEER" table 52)
   grep -Fq "dev tun0" <<<"$route"
   grep -Fq "src $node" <<<"$route"

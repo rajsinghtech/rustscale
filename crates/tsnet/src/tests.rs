@@ -3449,7 +3449,10 @@ async fn validated_cache_restart_is_degraded_offline_and_fresh_control_wins() {
     offline.close().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// This exercises ordered control-stream state transitions, not scheduler
+// parallelism. A current-thread runtime also avoids racing Tokio's I/O-driver
+// registration initialization with a freshly spawned worker under TSan.
+#[tokio::test]
 async fn cached_map_stays_degraded_through_keepalive_until_fresh_snapshot() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();

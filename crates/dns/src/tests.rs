@@ -1021,13 +1021,30 @@ async fn spawn_hanging_dual_upstream() -> (
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind hanging upstream TCP");
-    let address = tcp.local_addr().unwrap();
-    let udp = tokio::net::UdpSocket::bind(address)
-        .await
-        .expect("bind hanging upstream UDP");
+    // Binding one protocol to port zero does not reserve the same port for the
+    // other protocol. Another test or process can claim the UDP port between
+    // these calls, particularly on macOS, so retry the complete pair.
+    let (tcp, udp, address) = {
+        let mut pair = None;
+        for _ in 0..32 {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind hanging upstream TCP");
+            let address = tcp.local_addr().unwrap();
+            match tokio::net::UdpSocket::bind(address).await {
+                Ok(udp) => {
+                    pair = Some((tcp, udp, address));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    drop(tcp);
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("bind hanging upstream UDP: {error}"),
+            }
+        }
+        pair.expect("bind hanging upstream TCP/UDP pair after retries")
+    };
     let (started_tx, started_rx) = mpsc::unbounded_channel();
     let udp_started = started_tx.clone();
     let udp_task = tokio::spawn(async move {

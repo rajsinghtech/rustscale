@@ -227,12 +227,15 @@ relay, DERP→direct upgrade without byte loss, and subnet route accept. The
 separate `tools/interop-tun.sh` CI path runs one exact serial Linux privileged
 regression test: fail-closed `up_tun`, real interface/rule/table-52 assertions,
 and an OS-socket echo roundtrip through the packet pump. The corrected
-out-of-process parity gate `tools/interop-tun-oops.sh` then runs the
-bench-style split: two independent rustscale TUN nodes as separate OS
-processes under sudo, each with the same kernel-state assertions and full
-captured logs, exchanging the issue-#75-shaped cadenced UDP traffic and a
-TCP echo roundtrip across the process boundary (the in-process repro can
-pass while the separated failure mode appears only across processes).
+out-of-process parity gate `tools/interop-tun-oops.sh` then runs an isolated
+TUN-vs-TUN split: two independent rustscale TUN nodes in separate Linux
+network namespaces, each with its own loopback, underlay veth, TUN device,
+policy rules, and table 52. It requires namespace-local route lookup and
+bidirectional TUN counters as well as full captured logs, the issue-#75-shaped
+cadenced UDP traffic, and a TCP echo roundtrip. This is deliberately distinct
+from embedded, proxy, and RustScale-TUN-to-Go-userspace coverage; the
+in-process repro can pass while this isolated process/namespace topology
+fails.
 Additional ignored TUN tests retain inbound and subnet-forwarding coverage
 for explicit manual runs.
 CI: interop + interop-tun jobs in e2e.yml. The separate required

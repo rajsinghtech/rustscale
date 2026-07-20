@@ -1345,11 +1345,13 @@ impl DerpManager {
             rustscale_derp::CertificatePolicy::from_derp_cert_name(&node.CertName);
         let connect_result = match certificate_policy {
             Ok(policy) => {
+                // DERP transport remains TLS for test nodes. As in Go,
+                // InsecureForTests only disables certificate verification.
                 DerpClient::connect_with_upgrade_dial_policy(
                     &dial_addr,
                     &tls_host,
                     port,
-                    !node.InsecureForTests,
+                    true,
                     node.InsecureForTests,
                     policy,
                     self.node_private.clone(),

@@ -3808,6 +3808,8 @@ dependencies = [
  "h2",
  "http",
  "rand 0.8.7",
+ "rcgen",
+ "rustls",
  "rustscale-controlclient",
  "rustscale-derp",
  "rustscale-key",
@@ -3821,6 +3823,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "zstd",
 ]
 

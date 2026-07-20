@@ -54,6 +54,17 @@ grep -Fq 'run --quiet --wait --collect' "$PROBE_LOG" \
 grep -Fq 'systemctl stop rustscale-systemd-probe-' "$PROBE_LOG" \
   || { echo 'probe did not execute deterministic cleanup' >&2; exit 1; }
 
+# Both outer readiness and the inner journey run the operational probe through
+# passwordless sudo. The inner script is deliberately launched as the runner
+# user by systemd, so omitting this prefix reproduces hosted runners' exact
+# "Interactive authentication required" terminal failure.
+grep -Fq 'probe_systemd_supervisor 30 supervisor sudo -n' \
+  "$ROOT/tools/packaging/test-linux-replacement.sh" \
+  || { echo 'outer supervisor probe lost its noninteractive privilege' >&2; exit 1; }
+grep -Fq 'probe_systemd_supervisor 30 journey sudo -n' \
+  "$ROOT/tools/packaging/test-linux-replacement.sh" \
+  || { echo 'inner journey probe lost its noninteractive privilege' >&2; exit 1; }
+
 : >"$PROBE_LOG"
 if PROBE_SCENARIO=killed "$PROBE" 5 regression sudo -n; then
   echo 'exit-137 transient-service failure was accepted' >&2

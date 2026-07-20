@@ -95,6 +95,15 @@ cleanup() {
   trap - EXIT INT TERM
   set +e
 
+  # Preserve the complete endpoint evidence for every unexpected shell exit,
+  # not only failures routed through fail(). This makes a failed bounded CLI,
+  # namespace, or lifecycle operation diagnosable before owned state is
+  # removed, while cleanup and its absence checks still run deterministically.
+  if (( original_rc != 0 )) && [[ -n "$SERVER_LOG$CLIENT_LOG" ]]; then
+    echo "[interop-tun-oops] ERROR: workload exited unexpectedly (status=$original_rc)" >&2
+    dump_logs
+  fi
+
   if [[ -n "$CAPTURE_PID" ]]; then
     kill -TERM "$CAPTURE_PID" 2>/dev/null
     timeout --foreground --signal=TERM --kill-after=2s 10s tail --pid="$CAPTURE_PID" -f /dev/null \
@@ -429,7 +438,13 @@ WEB_LOG="$STATE_DIR/web.log"
 WEB_JSON="$STATE_DIR/web-status.json"
 
 run_client_cli() {
-  timeout 20s sudo -n ip netns exec "$NS_CLIENT" "$CLI_BIN" --socket "$CLIENT_SOCKET" "$@"
+  local status
+  if timeout 20s sudo -n ip netns exec "$NS_CLIENT" "$CLI_BIN" --socket "$CLIENT_SOCKET" "$@"; then
+    return 0
+  else
+    status=$?
+    fail "client CLI command failed (status=$status): $*"
+  fi
 }
 peer_for_server() {
   jq -c --arg ip "$SERVER_IP"     '[.Peer[] | select((.TailscaleIPs // []) | index($ip))] | if length == 1 then .[0] else error("server peer cardinality") end' "$1"
@@ -446,9 +461,11 @@ assert_public_web_status() {
   local ready_rc=$?
   set -o pipefail
   (( ready_rc == 0 )) || fail "$phase web output did not become ready"
-  timeout 10s sudo -n ip netns exec "$NS_CLIENT" curl -fsS \
-    -H 'Host: 127.0.0.1:18088' -H 'Origin: http://127.0.0.1:18088' \
-    http://127.0.0.1:18088/api/status >"$WEB_JSON"
+  if ! timeout 10s sudo -n ip netns exec "$NS_CLIENT" curl -fsS \
+      -H 'Host: 127.0.0.1:18088' -H 'Origin: http://127.0.0.1:18088' \
+      http://127.0.0.1:18088/api/status >"$WEB_JSON"; then
+    fail "$phase web status request failed"
+  fi
   kill -TERM "$WEB_PID" 2>/dev/null
   wait "$WEB_PID" 2>/dev/null || true
   WEB_PID=""

@@ -207,7 +207,12 @@ done
 if ! sudo -n true 2>/dev/null; then
   skip "passwordless sudo is unavailable"
 fi
-if ! probe_systemd_supervisor 30 journey; then
+# The inner journey intentionally runs as the invoking user inside the
+# root-owned supervisor unit. Starting a second transient service still needs
+# the same passwordless privilege proved by preflight; without this prefix,
+# systemd-run asks for interactive authorization inside the noninteractive
+# unit even though the manager is operational.
+if ! probe_systemd_supervisor 30 journey sudo -n; then
   skip "systemd manager cannot supervise and collect the installed journey"
 fi
 [[ -c /dev/net/tun ]] || skip "/dev/net/tun is not a character device"

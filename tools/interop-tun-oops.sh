@@ -468,13 +468,24 @@ DIRECT_PEER=$(peer_for_server "$DIRECT_JSON") || fail "direct LocalAPI output la
 jq -e --arg addr "$SERVER_DIRECT_ADDR" \
   '.Active == true and .CurAddr == $addr and ((.Relay // "") == "") and ((.PeerRelay // "") == "") and .LastSeen != "1970-01-01T00:00:00Z" and .LastHandshake != "1970-01-01T00:00:00Z"' \
   <<<"$DIRECT_PEER" >/dev/null || fail "direct LocalAPI fields are inconsistent: $DIRECT_PEER"
+# Suppress only the client's established public TLS transports while asking
+# CLI ping to certify direct. Otherwise its intentionally concurrent DERP pong
+# can arrive after the direct pong and truthfully change the later status view.
+# Direct namespace UDP and the already delivered TUN workload remain intact.
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -I OUTPUT -p tcp --dport 443 -j DROP
+run_client_cli ping "$SERVER_IP" --count=3 --timeout=5s >"$DIRECT_PING"
+grep -Fq "via $SERVER_DIRECT_ADDR" "$DIRECT_PING" || fail "CLI ping did not agree with the direct status address"
+run_client_cli status --json >"$DIRECT_JSON"
+DIRECT_PEER=$(peer_for_server "$DIRECT_JSON") || fail "post-ping direct LocalAPI output lacks exactly one server peer"
+jq -e --arg addr "$SERVER_DIRECT_ADDR" \
+  '.Active == true and .CurAddr == $addr and ((.Relay // "") == "") and ((.PeerRelay // "") == "")' \
+  <<<"$DIRECT_PEER" >/dev/null || fail "post-ping direct fields are inconsistent: $DIRECT_PEER"
 run_client_cli status >"$DIRECT_TABLE"
 grep -Fq "active; direct $SERVER_DIRECT_ADDR" "$DIRECT_TABLE" || fail "CLI direct label does not match CurAddr"
 run_client_cli status --active >"$DIRECT_ACTIVE"
 grep -Fq "rs-oops-server-$$" "$DIRECT_ACTIVE" || fail "status --active omitted the active direct peer"
-run_client_cli ping "$SERVER_IP" --count=3 --timeout=5s >"$DIRECT_PING"
-grep -Fq "via $SERVER_DIRECT_ADDR" "$DIRECT_PING" || fail "CLI ping did not agree with the direct status address"
 assert_public_web_status "$DIRECT_JSON" direct
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -D OUTPUT -p tcp --dport 443 -j DROP
 
 echo "[interop-tun-oops] OOPS_PUBLIC_DIRECT_EVIDENCE cur_addr=$SERVER_DIRECT_ADDR delivered_udp=$UDP_DATAGRAMS" >&2
 

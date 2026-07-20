@@ -79,6 +79,9 @@ grep -q 'RUSTSCALE_RELEASE_DIR' .github/workflows/ci.yml
 grep -q 'tools/interop-tun\*\.sh' .github/workflows/ci.yml
 test -x tools/packaging/assemble-linux-release.sh
 test -x tools/packaging/test-linux-replacement.sh
+test -x tools/packaging/probe-systemd-supervisor.sh
+test -x tools/packaging/test-systemd-supervisor-probe.sh
+tools/packaging/test-systemd-supervisor-probe.sh
 test -s docs/release-first-run.md
 grep -q 'Protected real-control smoke gate' docs/release-first-run.md
 grep -q 'Installed Linux replacement journey' docs/release-first-run.md
@@ -95,9 +98,10 @@ grep -q 'RuntimeMaxSec=' tools/packaging/test-linux-replacement.sh
 # no new workflow context may replace or hide that required journey.
 grep -q 'name: Installed Linux replacement journey' .github/workflows/ci.yml
 grep -Fq 'needs: [check, cross, msrv, testcontrol, linux-release-candidate, linux-replacement, ignore-guard]' .github/workflows/ci.yml
-grep -Fq 'systemctl is-system-running --wait' tools/packaging/test-linux-replacement.sh
-if grep -Fq 'systemd_attempt' tools/packaging/test-linux-replacement.sh; then
-    echo "systemd readiness must use native --wait, not a polling loop" >&2
+grep -Fq 'probe-systemd-supervisor.sh' tools/packaging/test-linux-replacement.sh
+grep -Fq 'systemd-run --quiet --wait --collect' tools/packaging/probe-systemd-supervisor.sh
+if grep -Fq 'systemctl is-system-running --wait' tools/packaging/test-linux-replacement.sh; then
+    echo "manager-wide systemd state must not block an operational transient-service probe" >&2
     exit 1
 fi
 grep -q 'timeout-minutes: 50' .github/workflows/ci.yml

@@ -31,11 +31,14 @@ VETH_SERVER="${GATE_ID}s"
 VETH_CLIENT="${GATE_ID}c"
 STATE_DIR=""
 SERVER_PID=""
+CLIENT_PID=""
+WEB_PID=""
 CAPTURE_PID=""
 UNDERLAY_PCAP=""
 SERVER_LOG=""
 CLIENT_LOG=""
 READY_FIFO=""
+PHASE_FIFO=""
 EGRESS=""
 IP_FORWARD_ORIGINAL=""
 IP_FORWARD_CHANGED=0
@@ -97,6 +100,18 @@ cleanup() {
     timeout --foreground --signal=TERM --kill-after=2s 10s tail --pid="$CAPTURE_PID" -f /dev/null \
       || { echo "[interop-tun-oops] ERROR: underlay capture did not stop" >&2; cleanup_rc=1; }
     wait "$CAPTURE_PID" 2>/dev/null
+  fi
+
+  if [[ -n "$WEB_PID" ]]; then
+    kill -TERM "$WEB_PID" 2>/dev/null
+    wait "$WEB_PID" 2>/dev/null
+  fi
+  if [[ -n "$CLIENT_PID" ]]; then
+    if kill -0 "$CLIENT_PID" 2>/dev/null; then
+      kill -TERM "$CLIENT_PID" 2>/dev/null
+      timeout --foreground --signal=TERM --kill-after=2s 10s tail --pid="$CLIENT_PID" -f /dev/null >/dev/null 2>&1 || true
+    fi
+    wait "$CLIENT_PID" 2>/dev/null
   fi
 
   if [[ -n "$SERVER_PID" ]]; then
@@ -315,7 +330,8 @@ chmod 700 "$STATE_DIR"
 SERVER_LOG="$STATE_DIR/server.log"
 CLIENT_LOG="$STATE_DIR/client.log"
 READY_FIFO="$STATE_DIR/server.ready"
-mkfifo -m 600 "$READY_FIFO"
+PHASE_FIFO="$STATE_DIR/client.phase"
+mkfifo -m 600 "$READY_FIFO" "$PHASE_FIFO"
 AUTHKEY_FILE="$STATE_DIR/authkey"
 UNDERLAY_PCAP="$STATE_DIR/underlay.pcap"
 # Capture at the bridge before host NAT. Later assertions correlate each
@@ -342,12 +358,15 @@ unset AUTHKEY
 
 BUILD_LOG="$STATE_DIR/build.log"
 echo "[interop-tun-oops] building isolated TUN node (unprivileged)" >&2
-if ! cargo build -p rustscale-tsnet --example interop-tun-node >"$BUILD_LOG" 2>&1; then
+if ! cargo build -p rustscale-tsnet --example interop-tun-node >"$BUILD_LOG" 2>&1 \
+  || ! cargo build -p rustscale-cli --bin rustscale >>"$BUILD_LOG" 2>&1; then
   tail -n 80 "$BUILD_LOG" >&2
-  fail "interop-tun-node build failed"
+  fail "interop TUN node or CLI build failed"
 fi
 NODE_BIN="$(pwd)/target/debug/examples/interop-tun-node"
+CLI_BIN="$(pwd)/target/debug/rustscale"
 [[ -x "$NODE_BIN" ]] || fail "expected node binary is missing: $NODE_BIN"
+[[ -x "$CLI_BIN" ]] || fail "expected CLI binary is missing: $CLI_BIN"
 
 # Exact marker cardinality prevents a renamed/missing workload from silently
 # succeeding. The FIFO is a blocking readiness handoff, not a polling loop.
@@ -371,7 +390,6 @@ READY_LINE=$(timeout 150s head -n 1 "$READY_FIFO") || fail "server did not signa
 SERVER_IP=$(sed -n 's/.*ip=\([0-9.]*\).*/\1/p' "$SERVER_LOG" | head -n 1)
 [[ -n "$SERVER_IP" ]] || fail "could not parse server tailnet IP"
 echo "[interop-tun-oops] starting isolated client in $NS_CLIENT" >&2
-set +e
 timeout --foreground --signal=TERM --kill-after=15s 300s \
   sudo -n ip netns exec "$NS_CLIENT" "$NODE_BIN" client \
     --authkey-file "$AUTHKEY_FILE" \
@@ -381,8 +399,156 @@ timeout --foreground --signal=TERM --kill-after=15s 300s \
     --peer "$SERVER_IP" \
     --port "$TCP_PORT" \
     --udp-port "$UDP_PORT" \
-  >"$CLIENT_LOG" 2>&1
+    --phase-fifo "$PHASE_FIFO" \
+  >"$CLIENT_LOG" 2>&1 &
+CLIENT_PID=$!
+
+# Wait for delivered TUN traffic to establish a direct path before reading any
+# public status. This follows the log event and exits if the child dies; it is
+# not status polling and cannot manufacture path evidence.
+set +o pipefail
+timeout 180s tail --pid="$CLIENT_PID" -n +1 -f "$CLIENT_LOG" \
+  | grep -m1 -q "OOPS_CLIENT_PATH_EVIDENCE_READY"
+PATH_READY_RC=$?
+set -o pipefail
+(( PATH_READY_RC == 0 )) || fail "client did not reach the public path evidence phase"
+
+CLIENT_SOCKET="$STATE_DIR/client-state/localapi.sock"
+DIRECT_JSON="$STATE_DIR/status-direct.json"
+DIRECT_TABLE="$STATE_DIR/status-direct.txt"
+DIRECT_ACTIVE="$STATE_DIR/status-direct-active.txt"
+DIRECT_PING="$STATE_DIR/ping-direct.txt"
+DERP_JSON="$STATE_DIR/status-derp.json"
+DERP_TABLE="$STATE_DIR/status-derp.txt"
+DERP_PING="$STATE_DIR/ping-derp.txt"
+IDLE_JSON="$STATE_DIR/status-idle.json"
+IDLE_CONFIRM_JSON="$STATE_DIR/status-idle-confirm.json"
+IDLE_TABLE="$STATE_DIR/status-idle.txt"
+IDLE_ACTIVE="$STATE_DIR/status-idle-active.txt"
+WEB_LOG="$STATE_DIR/web.log"
+WEB_JSON="$STATE_DIR/web-status.json"
+
+run_client_cli() {
+  timeout 20s sudo -n ip netns exec "$NS_CLIENT" "$CLI_BIN" --socket "$CLIENT_SOCKET" "$@"
+}
+peer_for_server() {
+  jq -c --arg ip "$SERVER_IP"     '[.Peer[] | select((.TailscaleIPs // []) | index($ip))] | if length == 1 then .[0] else error("server peer cardinality") end' "$1"
+}
+assert_public_web_status() {
+  local expected_json="$1" phase="$2"
+  : >"$WEB_LOG"
+  timeout --foreground --signal=TERM --kill-after=2s 30s \
+    sudo -n ip netns exec "$NS_CLIENT" "$CLI_BIN" --socket "$CLIENT_SOCKET" web \
+      --listen=127.0.0.1:18088 --browser=false --readonly=true >"$WEB_LOG" 2>&1 &
+  WEB_PID=$!
+  set +o pipefail
+  timeout 10s tail --pid="$WEB_PID" -n +1 -f "$WEB_LOG" | grep -m1 -q "http://127.0.0.1:18088/"
+  local ready_rc=$?
+  set -o pipefail
+  (( ready_rc == 0 )) || fail "$phase web output did not become ready"
+  timeout 10s sudo -n ip netns exec "$NS_CLIENT" curl -fsS \
+    -H 'Host: 127.0.0.1:18088' -H 'Origin: http://127.0.0.1:18088' \
+    http://127.0.0.1:18088/api/status >"$WEB_JSON"
+  kill -TERM "$WEB_PID" 2>/dev/null
+  wait "$WEB_PID" 2>/dev/null || true
+  WEB_PID=""
+  local expected_peer web_peer
+  expected_peer=$(peer_for_server "$expected_json")
+  web_peer=$(peer_for_server "$WEB_JSON")
+  diff -u \
+    <(jq -S '{Active, CurAddr, Relay, PeerRelay}' <<<"$expected_peer") \
+    <(jq -S '{Active, CurAddr, Relay, PeerRelay}' <<<"$web_peer") \
+    || fail "$phase web and CLI/LocalAPI current path fields disagree"
+}
+
+SERVER_DIRECT_PORT=$(sed -n 's/.*local UDP endpoints: .*198\.18\.83\.2:\([0-9][0-9]*\).*/\1/p' "$SERVER_LOG" | tail -n 1)
+[[ "$SERVER_DIRECT_PORT" =~ ^[1-9][0-9]*$ ]] || fail "could not identify server direct endpoint before status gate"
+SERVER_DIRECT_ADDR="198.18.83.2:$SERVER_DIRECT_PORT"
+run_client_cli status --json >"$DIRECT_JSON"
+DIRECT_PEER=$(peer_for_server "$DIRECT_JSON") || fail "direct LocalAPI output lacks exactly one server peer"
+jq -e --arg addr "$SERVER_DIRECT_ADDR" \
+  '.Active == true and .CurAddr == $addr and ((.Relay // "") == "") and ((.PeerRelay // "") == "") and .LastSeen != "1970-01-01T00:00:00Z" and .LastHandshake != "1970-01-01T00:00:00Z"' \
+  <<<"$DIRECT_PEER" >/dev/null || fail "direct LocalAPI fields are inconsistent: $DIRECT_PEER"
+# Suppress only the client's established public TLS transports while asking
+# CLI ping to certify direct. Otherwise its intentionally concurrent DERP pong
+# can arrive after the direct pong and truthfully change the later status view.
+# Direct namespace UDP and the already delivered TUN workload remain intact.
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -I OUTPUT -p tcp --dport 443 -j DROP
+run_client_cli ping "$SERVER_IP" --count=3 --timeout=5s >"$DIRECT_PING"
+grep -Fq "via $SERVER_DIRECT_ADDR" "$DIRECT_PING" || fail "CLI ping did not agree with the direct status address"
+run_client_cli status --json >"$DIRECT_JSON"
+DIRECT_PEER=$(peer_for_server "$DIRECT_JSON") || fail "post-ping direct LocalAPI output lacks exactly one server peer"
+jq -e --arg addr "$SERVER_DIRECT_ADDR" \
+  '.Active == true and .CurAddr == $addr and ((.Relay // "") == "") and ((.PeerRelay // "") == "")' \
+  <<<"$DIRECT_PEER" >/dev/null || fail "post-ping direct fields are inconsistent: $DIRECT_PEER"
+run_client_cli status >"$DIRECT_TABLE"
+grep -Fq "active; direct $SERVER_DIRECT_ADDR" "$DIRECT_TABLE" || fail "CLI direct label does not match CurAddr"
+run_client_cli status --active >"$DIRECT_ACTIVE"
+grep -Fq "rs-oops-server-$$" "$DIRECT_ACTIVE" || fail "status --active omitted the active direct peer"
+assert_public_web_status "$DIRECT_JSON" direct
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -D OUTPUT -p tcp --dport 443 -j DROP
+
+echo "[interop-tun-oops] OOPS_PUBLIC_DIRECT_EVIDENCE cur_addr=$SERVER_DIRECT_ADDR delivered_udp=$UDP_DATAGRAMS" >&2
+
+# Block only the two namespace-local direct UDP destinations. Public DERP/TLS
+# remains reachable through each namespace default route. An authenticated
+# disco pong received through DERP must replace, rather than coexist with, the
+# direct public identity.
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -I OUTPUT -p udp -d 198.18.83.2 -j DROP
+sudo -n ip netns exec "$NS_SERVER" iptables -w -I OUTPUT -p udp -d 198.18.83.3 -j DROP
+run_client_cli ping "$SERVER_IP" --until-direct=false --count=3 --timeout=5s >"$DERP_PING"
+grep -Eq ' via DERP\([^)]+\) ' "$DERP_PING" || fail "CLI ping did not identify its authenticated DERP transport"
+run_client_cli status --json >"$DERP_JSON"
+DERP_PEER=$(peer_for_server "$DERP_JSON") || fail "DERP LocalAPI output lacks exactly one server peer"
+jq -e '.Active == true and ((.CurAddr // "") == "") and ((.PeerRelay // "") == "") and ((.Relay // "") | test("^derp-[1-9][0-9]*$")) and ((.LastHandshake // "1970-01-01T00:00:00Z") == "1970-01-01T00:00:00Z")' \
+  <<<"$DERP_PEER" >/dev/null || fail "DERP LocalAPI fields are inconsistent: $DERP_PEER"
+DERP_REGION=$(jq -r '.Relay' <<<"$DERP_PEER")
+run_client_cli status >"$DERP_TABLE"
+grep -Fq "active; relay \"$DERP_REGION\"" "$DERP_TABLE" || fail "CLI DERP label does not agree with LocalAPI"
+assert_public_web_status "$DERP_JSON" derp
+
+echo "[interop-tun-oops] OOPS_PUBLIC_DERP_EVIDENCE relay=$DERP_REGION transport=authenticated-disco-pong" >&2
+
+# Externally isolate the client from its authenticated DERP/control TLS
+# transports as well as the already blocked direct UDP underlay. This prevents
+# real peer heartbeats from continually refreshing LastSeen while leaving the
+# LocalAPI and namespace loopback web surface available. With no candidate or
+# local-send shortcut, the production 45s freshness deadline must expire.
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -I OUTPUT -p tcp --dport 443 -j DROP
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -I INPUT -p tcp --sport 443 -j DROP
+timeout 50s tail -f /dev/null || [[ $? -eq 124 ]]
+run_client_cli status --json >"$IDLE_JSON"
+IDLE_PEER=$(peer_for_server "$IDLE_JSON") || fail "idle LocalAPI output lacks exactly one server peer"
+jq -e '((.Active // false) == false) and ((.CurAddr // "") == "") and ((.Relay // "") == "") and ((.PeerRelay // "") == "") and .LastSeen != "1970-01-01T00:00:00Z" and ((.LastHandshake // "1970-01-01T00:00:00Z") == "1970-01-01T00:00:00Z")' \
+  <<<"$IDLE_PEER" >/dev/null || fail "idle LocalAPI fields are inconsistent: $IDLE_PEER"
+run_client_cli status --json >"$IDLE_CONFIRM_JSON"
+IDLE_CONFIRM_PEER=$(peer_for_server "$IDLE_CONFIRM_JSON") || fail "idle confirmation lacks exactly one server peer"
+[[ "$(jq -r '.LastSeen' <<<"$IDLE_PEER")" == "$(jq -r '.LastSeen' <<<"$IDLE_CONFIRM_PEER")" ]] \
+  || fail "read-only idle status changed LastSeen"
+[[ "$(jq -r '.LastWrite // "1970-01-01T00:00:00Z"' <<<"$IDLE_PEER")" == "$(jq -r '.LastWrite // "1970-01-01T00:00:00Z"' <<<"$IDLE_CONFIRM_PEER")" ]] \
+  || fail "read-only idle status changed LastWrite"
+run_client_cli status >"$IDLE_TABLE"
+grep -Fq "rs-oops-server-$$" "$IDLE_TABLE" || fail "ordinary status omitted the online idle peer"
+grep -Fq "idle" "$IDLE_TABLE" || fail "ordinary status did not label the expired peer idle"
+run_client_cli status --active >"$IDLE_ACTIVE"
+! grep -Fq "rs-oops-server-$$" "$IDLE_ACTIVE" || fail "status --active retained the expired peer"
+assert_public_web_status "$IDLE_JSON" idle
+
+echo "[interop-tun-oops] OOPS_PUBLIC_IDLE_EVIDENCE active=false filtered=true fields=clear" >&2
+
+# Peer-relay identity is exercised by the separate TLS hermetic integration
+# regression. This namespace gate makes no peer-relay claim because these two
+# nodes were not configured as peer-relay servers.
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -D INPUT -p tcp --sport 443 -j DROP
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -D OUTPUT -p tcp --dport 443 -j DROP
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -D OUTPUT -p udp -d 198.18.83.2 -j DROP
+sudo -n ip netns exec "$NS_SERVER" iptables -w -D OUTPUT -p udp -d 198.18.83.3 -j DROP
+printf 'continue\n' >"$PHASE_FIFO"
+
+set +e
+wait "$CLIENT_PID"
 CLIENT_RC=$?
+CLIENT_PID=""
 wait "$SERVER_PID"
 SERVER_RC=$?
 set -e
@@ -430,7 +596,6 @@ if ! timeout --foreground --signal=TERM --kill-after=2s 10s tail --pid="$CAPTURE
 fi
 wait "$CAPTURE_PID" || fail "underlay packet capture failed"
 CAPTURE_PID=""
-SERVER_DIRECT_PORT=$(sed -n 's/.*local UDP endpoints: .*198\.18\.83\.2:\([0-9][0-9]*\).*/\1/p' "$SERVER_LOG" | tail -n 1)
 CLIENT_DIRECT_PORT=$(sed -n 's/.*local UDP endpoints: .*198\.18\.83\.3:\([0-9][0-9]*\).*/\1/p' "$CLIENT_LOG" | tail -n 1)
 [[ "$SERVER_DIRECT_PORT" =~ ^[1-9][0-9]*$ && "$CLIENT_DIRECT_PORT" =~ ^[1-9][0-9]*$ ]] \
   || fail "could not identify both advertised local UDP endpoint ports"

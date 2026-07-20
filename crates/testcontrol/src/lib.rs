@@ -380,6 +380,19 @@ impl Server {
         }
     }
 
+    /// Set a node's control-plane online state and notify every live map
+    /// stream. This is testcontrol state only; it does not imply transport
+    /// activity, which remains independently evidenced by magicsock.
+    pub fn set_node_online(&self, node_key: &NodePublic, online: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(node) = inner.nodes.get_mut(node_key) {
+            node.Online = Some(online);
+        }
+        for tx in inner.updates.values() {
+            let _ = tx.try_send(UpdateType::PeerChanged);
+        }
+    }
+
     /// Override the capability map sent to a specific client.
     pub fn set_node_cap_map(&self, node_key: &NodePublic, cap_map: NodeCapMap) {
         let mut inner = self.inner.lock().unwrap();

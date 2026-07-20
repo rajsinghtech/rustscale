@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long to trust a direct path after receiving a pong.
 /// Mirrors Go's `trustUDPAddrDuration` (magicsock.go:4036).
@@ -17,6 +17,11 @@ pub const TRUST_BEST_ADDR_DURATION: Duration = Duration::from_millis(6500);
 /// DERP route stale and clear it. Mirrors Go's derpRoute inactivity
 /// semantics — the route is cleaned up after this timeout.
 pub const DERP_ROUTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A path observation is active only while transport evidence is this fresh.
+/// This deliberately differs from a control-plane `HomeDERP`: configuration
+/// alone is not evidence that packets are currently flowing through a relay.
+pub const PATH_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Maximum current/recent relay addresses retained per exact server
 /// generation for revocation cleanup.
@@ -72,15 +77,59 @@ impl From<rustscale_tailcfg::EndpointType> for EndpointType {
 /// Path class ranking — lower ordinal = better.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum PathClass {
-    /// No usable path.
+    /// No transport evidence is currently usable.
     #[default]
     None,
-    /// DERP relay fallback.
+    /// DERP relay transport.
     Derp,
-    /// Peer relay (UDP relay) path.
+    /// Peer relay (UDP relay) transport.
     Relay,
     /// Direct UDP path confirmed by pong.
     Direct,
+}
+
+/// A freshness-gated snapshot of the last authenticated physical transport.
+///
+/// `None` never means direct: it means no transport has been observed, or the
+/// prior observation aged out. `observed_at` remains available when stale so
+/// status consumers can expose timestamps without reviving an old path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathTelemetry {
+    pub class: PathClass,
+    pub addr: Option<SocketAddr>,
+    pub derp_region: Option<i32>,
+    pub observed_at: Option<SystemTime>,
+    pub last_rx_at: Option<SystemTime>,
+    pub last_tx_at: Option<SystemTime>,
+    pub fresh: bool,
+}
+
+impl Default for PathTelemetry {
+    fn default() -> Self {
+        Self {
+            class: PathClass::None,
+            addr: None,
+            derp_region: None,
+            observed_at: None,
+            last_rx_at: None,
+            last_tx_at: None,
+            fresh: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TransportObservation {
+    class: PathClass,
+    addr: Option<SocketAddr>,
+    derp_region: Option<i32>,
+    monotonic_at: Instant,
+    wall_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+struct TransportTimestamp {
+    wall_at: SystemTime,
 }
 
 /// Why a discovery ping was sent. Mirrors Go's `discoPingPurpose`
@@ -302,6 +351,12 @@ pub struct Endpoint {
     peer_mtu: usize,
     /// Last time a full candidate discovery round was started.
     last_full_ping: Option<Instant>,
+    /// Last authenticated physical path observation. This is intentionally
+    /// separate from best-path selection: configured DERP and an allocated
+    /// peer relay are candidates, not traffic evidence.
+    last_transport: Option<TransportObservation>,
+    last_transport_rx: Option<TransportTimestamp>,
+    last_transport_tx: Option<TransportTimestamp>,
 }
 
 impl Endpoint {
@@ -329,6 +384,9 @@ impl Endpoint {
             probe_udp_lifetime: Some(ProbeUDPLifetime::default_config()),
             peer_mtu: 0,
             last_full_ping: None,
+            last_transport: None,
+            last_transport_rx: None,
+            last_transport_tx: None,
         }
     }
 
@@ -516,6 +574,123 @@ impl Endpoint {
     /// Confirm a direct path after receiving a pong from `addr`.
     pub fn confirm_direct(&mut self, addr: SocketAddr, now: Instant) {
         self.best_addr = Some((addr, now + TRUST_BEST_ADDR_DURATION));
+        self.record_transport_at(
+            PathClass::Direct,
+            Some(addr),
+            None,
+            now,
+            SystemTime::now(),
+            true,
+        );
+    }
+
+    fn record_transport_at(
+        &mut self,
+        class: PathClass,
+        addr: Option<SocketAddr>,
+        derp_region: Option<i32>,
+        monotonic_at: Instant,
+        wall_at: SystemTime,
+        received: bool,
+    ) {
+        if !received {
+            // A successful local socket write is not evidence that the peer
+            // received or authenticated the packet. Preserve LastWrite only
+            // when it uses the same still-current, receive-authenticated path;
+            // never promote a fallback or extend transport freshness here.
+            let matches_current = self.last_transport.as_ref().is_some_and(|observation| {
+                observation.class == class
+                    && observation.addr == addr
+                    && observation.derp_region == derp_region
+                    && monotonic_at
+                        .checked_duration_since(observation.monotonic_at)
+                        .is_some_and(|age| age < PATH_ACTIVITY_TIMEOUT)
+                    && (class != PathClass::Direct
+                        || self.trusted_direct_addr(monotonic_at) == addr)
+            });
+            if matches_current {
+                self.last_transport_tx = Some(TransportTimestamp { wall_at });
+            }
+            return;
+        }
+
+        self.last_transport = Some(TransportObservation {
+            class,
+            addr,
+            derp_region,
+            monotonic_at,
+            wall_at,
+        });
+        self.last_transport_rx = Some(TransportTimestamp { wall_at });
+    }
+
+    /// Record authenticated traffic on a direct UDP path.
+    pub(crate) fn note_direct_transport(&mut self, addr: SocketAddr, received: bool) {
+        self.record_transport_at(
+            PathClass::Direct,
+            Some(addr),
+            None,
+            Instant::now(),
+            SystemTime::now(),
+            received,
+        );
+    }
+
+    /// Record traffic accepted by a DERP transport.
+    pub(crate) fn note_derp_transport(&mut self, region: i32, received: bool) {
+        self.record_transport_at(
+            PathClass::Derp,
+            None,
+            (region > 0).then_some(region),
+            Instant::now(),
+            SystemTime::now(),
+            received,
+        );
+    }
+
+    /// Record authenticated traffic on a peer-relay transport.
+    pub(crate) fn note_relay_transport(&mut self, addr: SocketAddr, received: bool) {
+        self.record_transport_at(
+            PathClass::Relay,
+            Some(addr),
+            None,
+            Instant::now(),
+            SystemTime::now(),
+            received,
+        );
+    }
+
+    /// Snapshot transport evidence at `now`. A stale observation is reported
+    /// as unknown/idle rather than falling back to a configured direct/DERP
+    /// candidate. Direct additionally requires its authenticated pong trust.
+    pub fn path_telemetry_at(&self, now: Instant) -> PathTelemetry {
+        let Some(observation) = self.last_transport.as_ref() else {
+            return PathTelemetry::default();
+        };
+        let fresh = now
+            .checked_duration_since(observation.monotonic_at)
+            .is_some_and(|age| age < PATH_ACTIVITY_TIMEOUT);
+        let direct_current =
+            observation.class != PathClass::Direct || self.trusted_direct_addr(now).is_some();
+        let current = fresh && direct_current;
+        PathTelemetry {
+            class: if current {
+                observation.class
+            } else {
+                PathClass::None
+            },
+            addr: current.then_some(observation.addr).flatten(),
+            derp_region: current.then_some(observation.derp_region).flatten(),
+            observed_at: Some(observation.wall_at),
+            last_rx_at: self.last_transport_rx.as_ref().map(|at| at.wall_at),
+            last_tx_at: self.last_transport_tx.as_ref().map(|at| at.wall_at),
+            fresh: current,
+        }
+    }
+
+    /// Snapshot transport evidence using the production clock.
+    pub fn path_telemetry(&self) -> PathTelemetry {
+        self.path_telemetry_at(Instant::now())
     }
 
     /// Record a peer relay path.
@@ -950,6 +1125,92 @@ mod tests {
         let nk = NodePrivate::generate().public();
         let dk = DiscoPrivate::generate().public();
         Endpoint::new(nk, dk, 1)
+    }
+
+    #[test]
+    fn path_telemetry_transitions_direct_derp_idle_without_configured_fallback() {
+        let mut endpoint = ep();
+        let start = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let direct = sa(41641);
+
+        // A configured HomeDERP alone is not status evidence.
+        assert_eq!(endpoint.path_telemetry_at(start).class, PathClass::None);
+
+        endpoint.confirm_direct(direct, start);
+        endpoint.record_transport_at(PathClass::Direct, Some(direct), None, start, wall, true);
+        let direct_status = endpoint.path_telemetry_at(start + Duration::from_secs(1));
+        assert_eq!(direct_status.class, PathClass::Direct);
+        assert!(direct_status.fresh);
+        assert_eq!(direct_status.addr, Some(direct));
+        assert_eq!(direct_status.last_rx_at, Some(wall));
+
+        let derp_at = start + Duration::from_secs(2);
+        endpoint.record_transport_at(
+            PathClass::Derp,
+            None,
+            Some(7),
+            derp_at,
+            wall + Duration::from_secs(2),
+            true,
+        );
+        let derp_status = endpoint.path_telemetry_at(derp_at + Duration::from_secs(1));
+        assert_eq!(derp_status.class, PathClass::Derp);
+        assert!(derp_status.fresh);
+        assert_eq!(derp_status.derp_region, Some(7));
+
+        let idle = endpoint.path_telemetry_at(derp_at + PATH_ACTIVITY_TIMEOUT);
+        assert_eq!(idle.class, PathClass::None);
+        assert!(!idle.fresh);
+        assert_eq!(idle.observed_at, Some(wall + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn local_send_never_promotes_or_refreshes_transport_evidence() {
+        let mut endpoint = ep();
+        let start = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        endpoint.record_transport_at(PathClass::Derp, None, Some(7), start, wall, false);
+        let unknown = endpoint.path_telemetry_at(start);
+        assert_eq!(unknown.class, PathClass::None);
+        assert_eq!(unknown.last_tx_at, None);
+
+        endpoint.record_transport_at(PathClass::Derp, None, Some(7), start, wall, true);
+        endpoint.record_transport_at(
+            PathClass::Derp,
+            None,
+            Some(7),
+            start + Duration::from_secs(1),
+            wall + Duration::from_secs(1),
+            false,
+        );
+        let active = endpoint.path_telemetry_at(start + Duration::from_secs(2));
+        assert_eq!(active.class, PathClass::Derp);
+        assert_eq!(active.last_tx_at, Some(wall + Duration::from_secs(1)));
+
+        let stale_at = start + PATH_ACTIVITY_TIMEOUT;
+        endpoint.record_transport_at(
+            PathClass::Derp,
+            None,
+            Some(7),
+            stale_at,
+            wall + PATH_ACTIVITY_TIMEOUT,
+            false,
+        );
+        let stale = endpoint.path_telemetry_at(stale_at);
+        assert_eq!(stale.class, PathClass::None);
+        assert!(!stale.fresh);
+        assert_eq!(stale.last_tx_at, Some(wall + Duration::from_secs(1)));
+
+        // A timestamp older than the observation is invalid, not fresh and
+        // must not panic or promote a configured fallback.
+        assert_eq!(
+            endpoint
+                .path_telemetry_at(start.checked_sub(Duration::from_secs(1)).unwrap())
+                .class,
+            PathClass::None
+        );
     }
 
     #[test]

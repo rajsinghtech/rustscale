@@ -652,6 +652,24 @@ function renderStatus(st) {
   document.getElementById('btn-up').disabled = running;
   document.getElementById('btn-down').disabled = !running;
 }
+function validEndpoint(value) {
+  // LocalAPI serializes SocketAddr, so require either IPv4/hostname:port or
+  // bracketed IPv6:port. A status page must fail closed on malformed data.
+  return /^(?:[^:\\s]+|\\[[0-9A-Fa-f:.]+\\]):[1-9][0-9]*$/.test(value || '');
+}
+function validDerp(value) {
+  return /^derp-[1-9][0-9]*$/.test(value || '');
+}
+function peerPath(p) {
+  const paths = [
+    validEndpoint(p.CurAddr) ? ['direct ', p.CurAddr] : null,
+    validDerp(p.Relay) ? ['relay ', p.Relay] : null,
+    validEndpoint(p.PeerRelay) ? ['peer-relay ', p.PeerRelay] : null
+  ].filter(Boolean);
+  if (!p.Online) return '-';
+  if (!p.Active || paths.length !== 1) return 'idle';
+  return paths[0][0] + paths[0][1];
+}
 function renderPeers(st) {
   const tbody = document.querySelector('#peers tbody');
   tbody.innerHTML = '';
@@ -665,7 +683,7 @@ function renderPeers(st) {
     const ip = (p.TailscaleIPs || [])[0] || '-';
     const os = p.OS || '-';
     const online = p.Online ? 'yes' : 'no';
-    const path = p.Relay ? 'relay ' + p.Relay : (p.Online ? 'direct' : '-');
+    const path = peerPath(p);
     tr.innerHTML = '<td>' + esc(name) + '</td><td>' + esc(ip) + '</td><td>' + esc(os) +
       '</td><td>' + online + '</td><td>' + esc(path) + '</td>';
     tbody.appendChild(tr);
@@ -1118,6 +1136,18 @@ mod tests {
             };
             assert!(security.authorize(&request).is_ok());
         }
+    }
+
+    #[test]
+    fn web_peer_table_requires_one_valid_active_path_identity() {
+        // Browser rendering is intentionally driven from the same LocalAPI
+        // fields as `status`; preserve the fail-closed checks in the emitted
+        // public page rather than relying on its Rust-side producer alone.
+        assert!(HTML_PAGE.contains("function peerPath(p)"));
+        assert!(HTML_PAGE.contains("!p.Active || paths.length !== 1"));
+        assert!(HTML_PAGE.contains("validEndpoint(p.CurAddr)"));
+        assert!(HTML_PAGE.contains("validDerp(p.Relay)"));
+        assert!(HTML_PAGE.contains("validEndpoint(p.PeerRelay)"));
     }
 
     #[test]

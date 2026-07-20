@@ -43,7 +43,7 @@ use rustscale_ipn::{
 };
 use rustscale_ipnstate::{PeerStatus, StatusBuilder, TailnetStatus};
 use rustscale_key::{MachinePrivate, MachinePublic, NodePrivate, NodePublic};
-use rustscale_magicsock::{Magicsock, PathClass};
+use rustscale_magicsock::Magicsock;
 use rustscale_safesocket::peercred::ConnIdentity;
 use rustscale_safesocket::ServerStream;
 use rustscale_tailcfg::{DERPMap, DNSConfig, Node, UserID, UserProfile};
@@ -3279,8 +3279,8 @@ async fn handle_debug_capture<W: AsyncWrite + Unpin>(
 /// - `BackendState`: the live IPN state machine string (e.g. "Running",
 ///   "Starting", "NeedsLogin"), not a hardcoded value.
 /// - `Self` and `Peer` entries omit fields not tracked by rustscale:
-///   `RxBytes`, `TxBytes`, `LastHandshake`, `LastSeen`, `LastWrite`,
-///   `AllowedIPs`, `Tags`, `PrimaryRoutes`, `Capabilities`, `CapMap`,
+///   `RxBytes`, `TxBytes`, `AllowedIPs`, `Tags`, `PrimaryRoutes`,
+///   `Capabilities`, `CapMap`,
 ///   `PeerAPIURL`, `SSH_HostKeys`, `KeyExpiry`, `Location`.
 /// - `ExitNodeStatus`: included when an exit node is selected via the
 ///   route table and identifies it by its control-stable node ID.
@@ -3388,15 +3388,10 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
             .filter_map(|s| s.split('/').next().and_then(|p| p.parse::<IpAddr>().ok()))
             .collect();
 
-        let path_class = state.magicsock.peer_path_class(&peer.Key);
-        let relay = match path_class {
-            PathClass::Derp => format!("derp-{}", state.home_derp),
-            _ => String::new(),
-        };
-
+        let telemetry = state.magicsock.peer_path_telemetry(&peer.Key);
         let exit_node_option = crate::peer_is_exit_capable(peer);
 
-        let ps = PeerStatus {
+        let mut ps = PeerStatus {
             ID: peer.StableID.clone(),
             NodeID: peer.ID,
             PublicKey: peer.Key.to_string(),
@@ -3404,7 +3399,6 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
             DNSName: peer.Name.clone(),
             TailscaleIPs: ips,
             Online: peer.Online.unwrap_or(false),
-            Relay: relay,
             ExitNode: selected_exit_key.as_ref() == Some(&peer.Key),
             ExitNodeOption: exit_node_option,
             InNetworkMap: true,
@@ -3413,6 +3407,7 @@ async fn build_status_json(state: &LocalApiState) -> serde_json::Value {
             UserID: peer.User,
             ..Default::default()
         };
+        crate::status::apply_path_telemetry(&mut ps, telemetry);
         sb.add_peer(&peer.Key, ps);
     }
 
@@ -3798,6 +3793,14 @@ async fn handle_disco_ping<W: AsyncWrite + Unpin>(
         Ok(mut pr) => {
             pr.NodeIP = ip.to_string();
             pr.IsLocalIP = is_local_ip;
+            if pr.DERPRegionID != 0 {
+                pr.DERPRegionCode = state
+                    .derp_map
+                    .Regions
+                    .get(&pr.DERPRegionID)
+                    .map(|region| region.RegionCode.clone())
+                    .unwrap_or_default();
+            }
             if pr.Err.is_empty() && is_local_ip {
                 pr.Err = "local IP".into();
             }
@@ -7690,6 +7693,20 @@ mod tests {
         assert!(json["Peer"].is_object());
         assert!(json["Health"].is_array());
         assert!(json["CurrentTailnet"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_status_json_does_not_invent_direct_path_without_traffic() {
+        let state = make_test_state().await;
+        let key = state.peers.read().await[0].Key.to_string();
+        let json = build_status_json(&state).await;
+        let peer = &json["Peer"][key];
+
+        assert_eq!(peer["Online"], true, "control-plane online is retained");
+        assert!(peer.get("Active").is_none());
+        assert!(peer.get("CurAddr").is_none());
+        assert!(peer.get("Relay").is_none());
+        assert!(peer.get("PeerRelay").is_none());
     }
 
     #[tokio::test]

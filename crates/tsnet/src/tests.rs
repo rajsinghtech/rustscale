@@ -3386,8 +3386,13 @@ fn whois_lookup_from_fake_netmap() {
 // ---------------------------------------------------------------------------
 // Cache restart readiness: fresh control wins; offline fallback is explicit.
 // ---------------------------------------------------------------------------
+//
+// These tests exercise ordered lifecycle transitions, not caller-worker
+// parallelism.  Keep their caller I/O driver single-threaded: Server cleanup
+// still runs on the process-owned lifecycle runtime, while avoiding Tokio's
+// overlapping fresh-driver readiness publication under TSan.
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn validated_cache_restart_is_degraded_offline_and_fresh_control_wins() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();
@@ -3612,7 +3617,7 @@ async fn invalid_cached_map_cannot_start_offline(
     assert!(!restart.is_up());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn expired_cached_map_cannot_start_when_control_is_offline() {
     invalid_cached_map_cannot_start_offline("expired-cache", |cached| {
         cached.Node.as_mut().unwrap().KeyExpiry =
@@ -3621,7 +3626,7 @@ async fn expired_cached_map_cannot_start_when_control_is_offline() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn empty_ip_cached_map_cannot_start_when_control_is_offline() {
     invalid_cached_map_cannot_start_offline("empty-ip-cache", |cached| {
         cached.Node.as_mut().unwrap().Addresses.clear();
@@ -3629,7 +3634,7 @@ async fn empty_ip_cached_map_cannot_start_when_control_is_offline() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn stale_cache_cannot_start_when_control_is_offline() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();

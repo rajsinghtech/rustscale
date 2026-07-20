@@ -253,7 +253,7 @@ state-dir fallback probing), `--json`.
 
 | Subcommand | Go source | Status |
 | --- | --- | --- |
-| `status` | `cli/status.go` | ✅ table + `--json` passthrough; `--peers=false`, `--active` flags; peer table (IP, hostname, owner, connection path, exit-node flag) |
+| `status` | `cli/status.go` | ✅ table + `--json` passthrough; `--peers=false`, `--active` flags; peer table (IP, hostname, owner, connection path, exit-node flag). `Active`, `CurAddr`, `Relay`, and `PeerRelay` require one current authenticated transport observation and fail closed on stale/malformed evidence. The protected two-process/two-namespace TUN gate correlates direct public output with captured underlay and delivered traffic, then proves authenticated DERP identity, idle expiry/filtering, timestamps, and web/ping agreement; peer-relay identity has a separate TLS transport integration regression. |
 | `ip` | `cli/ip.go` | ✅ `-4`/`-6`/`-1` filters; peer lookup by IP or hostname |
 | `version` | `cli/version.go` | ✅ client version (build.rs git stamp) + `--daemon` daemon version from status; `--json` |
 | `whois` | `cli/whois.go` | ✅ machine + user table; `--json` |

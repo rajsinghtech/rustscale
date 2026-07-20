@@ -1697,8 +1697,8 @@ fn pump_connection(
     // backpressure up the mpsc chain — the bounded app_rx fills, which
     // makes `NetstackStream::poll_write` return Pending to the app.
     let can_send = sockets.get::<tcp::Socket>(handle).can_send();
-    if can_send {
-        if let Some(conn) = conns.get_mut(&handle) {
+    if let Some(conn) = conns.get_mut(&handle) {
+        if can_send {
             // 1. Flush a previously-stored unwritten tail.
             if !conn.pending_write.is_empty() {
                 let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -1730,15 +1730,18 @@ fn pump_connection(
                     break;
                 }
             }
+        }
 
-            if conn.pending_write.is_empty()
-                && conn.app_rx.is_empty()
-                && conn.lifecycle.close_requested.load(Ordering::Acquire)
-            {
-                sockets.get_mut::<tcp::Socket>(handle).close();
-                conn.lifecycle.complete_close();
-                did_work = true;
-            }
+        // A peer can make the socket non-sendable while a local shutdown is
+        // pending. Once all application bytes already accepted by this stream
+        // are drained, closing must not wait for `can_send` to become true.
+        if conn.pending_write.is_empty()
+            && conn.app_rx.is_empty()
+            && conn.lifecycle.close_requested.load(Ordering::Acquire)
+        {
+            sockets.get_mut::<tcp::Socket>(handle).close();
+            conn.lifecycle.complete_close();
+            did_work = true;
         }
     }
     did_work

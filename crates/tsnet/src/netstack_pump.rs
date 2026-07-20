@@ -695,6 +695,165 @@ mod tests {
         assert_eq!(*scalar_plaintext.lock().unwrap(), plaintext);
     }
 
+    /// Exercise the production direct-UDP handoff end to end at the benchmark
+    /// scale. Unlike the netstack-only rig, this owns real loopback UDP
+    /// sockets, Magicsock receive credits, authenticated WG batches, route
+    /// lookup, and the production netstack pump.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_udp_wg_netstack_retains_p1000_connections() {
+        const STREAMS: usize = 1000;
+        let a_private = NodePrivate::generate();
+        let b_private = NodePrivate::generate();
+        let a_ip = Ipv4Addr::new(100, 64, 0, 1);
+        let b_ip = Ipv4Addr::new(100, 64, 0, 2);
+        let config = |private_key| MagicsockConfig {
+            private_key,
+            disco_key: DiscoPrivate::generate(),
+            derp_client: None,
+            derp_map: None,
+            home_derp_region: 0,
+            udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+            sockstats: None,
+            control_knobs: None,
+        };
+        let (a_magic, a_recv) = Magicsock::new(config(a_private.clone())).await.unwrap();
+        let (b_magic, b_recv) = Magicsock::new(config(b_private.clone())).await.unwrap();
+        let a_magic = Arc::new(a_magic);
+        let b_magic = Arc::new(b_magic);
+        let a_udp_addr = a_magic.bound_udp_addr().unwrap();
+        let b_udp_addr = b_magic.bound_udp_addr().unwrap();
+        let a_node = Node {
+            ID: 1,
+            Key: a_magic.node_public(),
+            DiscoKey: a_magic.disco_public(),
+            Addresses: vec![format!("{a_ip}/32")],
+            Endpoints: vec![a_udp_addr.to_string()],
+            ..Default::default()
+        };
+        let b_node = Node {
+            ID: 2,
+            Key: b_magic.node_public(),
+            DiscoKey: b_magic.disco_public(),
+            Addresses: vec![format!("{b_ip}/32")],
+            Endpoints: vec![b_udp_addr.to_string()],
+            ..Default::default()
+        };
+        a_magic.set_netmap(vec![b_node.clone()]).await.unwrap();
+        b_magic.set_netmap(vec![a_node.clone()]).await.unwrap();
+        // The first A→B probe can precede B's initial map installation.
+        // Reapplying the unchanged map is the production refresh path and
+        // gives both peers an authenticated direct pong.
+        a_magic.set_netmap(vec![b_node.clone()]).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if a_magic.peer_direct_trusted(&b_node.Key)
+                    && b_magic.peer_direct_trusted(&a_node.Key)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("loopback UDP direct paths were not authenticated");
+
+        let a_net = Arc::new(Netstack::new(a_ip, DEFAULT_MTU).unwrap());
+        let b_net = Arc::new(Netstack::new(b_ip, DEFAULT_MTU).unwrap());
+        let a_tunnels = Arc::new(RwLock::new(HashMap::from([(
+            b_node.Key.clone(),
+            Arc::new(Mutex::new(WgTunn::new(&a_private, &b_node.Key, 1).unwrap())),
+        )])));
+        let b_tunnels = Arc::new(RwLock::new(HashMap::from([(
+            a_node.Key.clone(),
+            Arc::new(Mutex::new(WgTunn::new(&b_private, &a_node.Key, 2).unwrap())),
+        )])));
+        let a_cancel = Arc::new(CancelToken::new());
+        let b_cancel = Arc::new(CancelToken::new());
+        let a_pump = tokio::spawn(run_netstack_pump(
+            a_magic.clone(),
+            a_recv,
+            a_net.clone(),
+            a_tunnels,
+            Arc::new(RwLock::new(RouteTable::from_peers(&[b_node.clone()]))),
+            Arc::new(std::sync::Mutex::new(Filter::allow_all())),
+            Arc::new(AtomicU64::new(0)),
+            a_cancel.clone(),
+            crate::capture::new_slot(),
+            crate::peer_map::Runtime::new(&[b_node.clone()]).unwrap(),
+        ));
+        let b_pump = tokio::spawn(run_netstack_pump(
+            b_magic.clone(),
+            b_recv,
+            b_net.clone(),
+            b_tunnels,
+            Arc::new(RwLock::new(RouteTable::from_peers(&[a_node.clone()]))),
+            Arc::new(std::sync::Mutex::new(Filter::allow_all())),
+            Arc::new(AtomicU64::new(0)),
+            b_cancel.clone(),
+            crate::capture::new_slot(),
+            crate::peer_map::Runtime::new(&[a_node.clone()]).unwrap(),
+        ));
+
+        let mut listener = b_net.listen(41001).await.unwrap();
+        let accept = tokio::spawn(async move {
+            let mut streams = Vec::with_capacity(STREAMS);
+            for _ in 0..STREAMS {
+                streams.push(listener.accept().await.unwrap());
+            }
+            streams
+        });
+        let clients = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            a_net.dial_many(
+                SocketAddr::new(b_ip.into(), 41001),
+                STREAMS,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(25),
+            ),
+        )
+        .await
+        .expect("P1000 direct-UDP setup deadline")
+        .expect("P1000 direct-UDP setup");
+        let servers = accept.await.unwrap();
+        assert_eq!(clients.len(), STREAMS);
+        assert_eq!(servers.len(), STREAMS);
+        assert!(a_magic.peer_direct_trusted(&b_node.Key));
+        assert!(b_magic.peer_direct_trusted(&a_node.Key));
+        assert!(a_net.dial_stats().pending_dials <= rustscale_netstack::TCP_DIAL_WINDOW);
+
+        drop(clients);
+        drop(servers);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let a = a_net.connection_stats();
+                let b = b_net.connection_stats();
+                if a.live_connections == 0
+                    && b.live_connections == 0
+                    && a.pending_closes == 0
+                    && b.pending_closes == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("P1000 direct-UDP teardown leaked connection ownership");
+        a_cancel.cancel();
+        b_cancel.cancel();
+        a_pump.abort();
+        b_pump.abort();
+        let _ = a_pump.await;
+        let _ = b_pump.await;
+        drop(a_magic);
+        drop(b_magic);
+    }
+
     #[tokio::test]
     async fn wireguard_rotation_drops_old_ciphertext_and_opens_new_key() {
         let local_private = NodePrivate::generate();

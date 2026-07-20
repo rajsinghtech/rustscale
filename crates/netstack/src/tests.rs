@@ -287,6 +287,70 @@ async fn back_to_back_dial_and_echo() {
     pump.abort();
 }
 
+/// A full app channel must still turn shutdown into a peer-visible FIN. This
+/// regression uses the real TCP and WireGuard path and is intentionally
+/// compatible with the predecessor implementation, where it times out because
+/// the in-band empty close marker cannot enter the full channel.
+#[tokio::test]
+async fn full_app_channel_shutdown_reaches_peer_eof() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+    let a_addr = Ipv4Addr::new(100, 64, 0, 1);
+    let b_addr = Ipv4Addr::new(100, 64, 0, 2);
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
+    let a_tunn = Arc::new(Mutex::new(WgTunn::new(&a_priv, &b_pub, 1).unwrap()));
+    let b_tunn = Arc::new(Mutex::new(WgTunn::new(&b_priv, &a_pub, 2).unwrap()));
+
+    let pump = {
+        let a_tunn = a_tunn.clone();
+        let b_tunn = b_tunn.clone();
+        let a_net = a_net.clone();
+        let b_net = b_net.clone();
+        tokio::spawn(async move {
+            let a_tx = a_net.tx_notify();
+            let b_tx = b_net.tx_notify();
+            loop {
+                if !pump_cycle(&a_tunn, &b_tunn, &a_net, &b_net) {
+                    tokio::select! {
+                        () = a_tx.notified() => {}
+                        () = b_tx.notified() => {}
+                        () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
+                }
+            }
+        })
+    };
+
+    let mut listener = b_net.listen(12346).await.unwrap();
+    let mut client = a_net
+        .dial(SocketAddr::new(b_addr.into(), 12346))
+        .await
+        .unwrap();
+    let mut server = listener.accept().await.unwrap();
+    for _ in 0..64 {
+        server.write_all(&[0xA5]).await.unwrap();
+    }
+    server.shutdown().await.unwrap();
+
+    let mut received = [0; 64];
+    client.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, [0xA5; 64]);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut [0; 1]),)
+            .await
+            .expect("full-channel shutdown never reached the peer")
+            .unwrap(),
+        0,
+        "peer received data but not the shutdown FIN"
+    );
+    pump.abort();
+}
+
 #[tokio::test]
 async fn listen_rejects_duplicate_port() {
     let addr = Ipv4Addr::new(100, 64, 0, 1);
@@ -698,7 +762,7 @@ async fn concurrent_connections_all_succeed() {
 /// Exercise the production netstack and WireGuard data path at an explicit
 /// setup scale. The in-memory link is credential-free; it only replaces the
 /// UDP underlay, not dial admission, packet ownership, TCP, or WireGuard.
-async fn assert_bounded_bulk_dial_phases(phases: &[usize]) {
+async fn assert_bounded_bulk_dial_phases(phases: &[(usize, bool)]) {
     let a_priv = NodePrivate::generate();
     let b_priv = NodePrivate::generate();
     let a_pub = a_priv.public();
@@ -736,7 +800,7 @@ async fn assert_bounded_bulk_dial_phases(phases: &[usize]) {
 
     let mut listener = b_net.listen(41000).await.expect("listen");
     let mut expected_closes = 0;
-    for &streams in phases {
+    for &(streams, fill_server_app_channel) in phases {
         let accept = tokio::spawn(async move {
             let mut accepted = Vec::with_capacity(streams);
             for _ in 0..streams {
@@ -768,7 +832,7 @@ async fn assert_bounded_bulk_dial_phases(phases: &[usize]) {
             .expect("dial worker")
             .expect("bulk setup outer deadline")
             .expect("bulk dial");
-        let (server_streams, returned_listener) = accept.await.expect("accept worker");
+        let (mut server_streams, returned_listener) = accept.await.expect("accept worker");
         listener = returned_listener;
 
         assert_eq!(client_streams.len(), streams);
@@ -778,6 +842,21 @@ async fn assert_bounded_bulk_dial_phases(phases: &[usize]) {
             "maximum in flight: {maximum}"
         );
         assert_eq!(a_net.dial_stats(), DialStats::default());
+        if fill_server_app_channel {
+            use tokio::io::AsyncWriteExt;
+
+            // This is the exact production boundary from the down trial:
+            // fill all 64 app→smoltcp slots without yielding, then publish a
+            // shutdown. The old empty in-band marker was lost for every
+            // stream here. One-byte chunks keep the P500 proof bounded to
+            // 32 KiB rather than allocating firehose-sized payloads.
+            for stream in &mut server_streams {
+                for _ in 0..64 {
+                    stream.write_all(&[0xA5]).await.expect("fill app channel");
+                }
+                stream.shutdown().await.expect("durable server close");
+            }
+        }
         drop(client_streams);
         drop(server_streams);
         expected_closes += streams;
@@ -809,14 +888,14 @@ async fn assert_bounded_bulk_dial_phases(phases: &[usize]) {
 /// the peer's listener-sized admission window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounded_bulk_dial_establishes_and_retains_p500() {
-    assert_bounded_bulk_dial_phases(&[500]).await;
+    assert_bounded_bulk_dial_phases(&[(500, false)]).await;
 }
 
 /// P1000 setup takes the same production bounded path as P500: all streams
 /// must remain established without widening the handshake window or deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounded_bulk_dial_establishes_and_retains_p1000() {
-    assert_bounded_bulk_dial_phases(&[1000]).await;
+    assert_bounded_bulk_dial_phases(&[(1000, false)]).await;
 }
 
 /// Reproduce the benchmark's long-lived-server boundary: P500 must retire
@@ -824,7 +903,7 @@ async fn bounded_bulk_dial_establishes_and_retains_p1000() {
 /// tunnels, listener, channel limits, and four-dial admission window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p500_teardown_then_p1000_has_no_stale_connections() {
-    assert_bounded_bulk_dial_phases(&[500, 1000]).await;
+    assert_bounded_bulk_dial_phases(&[(500, true), (1000, false)]).await;
 }
 
 /// A P1000 request that cannot connect still owns at most one bounded window,

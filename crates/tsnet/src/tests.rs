@@ -6027,16 +6027,31 @@ fn require_tun_interop(test_name: &str) -> Option<InteropEnv> {
 /// At this point every startup error is a regression, never a reason to skip.
 async fn up_tun_required(server: &mut Server, test_name: &str) -> rustscale_tun::TunConfig {
     let tun = rustscale_tun::TunConfig::default();
-    Box::pin(server.up_tun(TunModeConfig {
-        tun: tun.clone(),
-        apply_routes: true,
-        exit_node: None,
-    }))
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        Box::pin(server.up_tun(TunModeConfig {
+            tun: tun.clone(),
+            apply_routes: true,
+            exit_node: None,
+        })),
+    )
     .await
+    .unwrap_or_else(|_| {
+        panic!("{test_name}: up_tun timed out after 120s after privileged TUN prerequisites were established")
+    })
     .unwrap_or_else(|error| {
         panic!("{test_name}: up_tun failed after privileged TUN prerequisites were established: {error}")
     });
     tun
+}
+
+/// Bound TUN teardown so a stalled cleanup cannot consume the complete
+/// workflow timeout and conceal its actual failure from the protected gate.
+async fn close_tun_required(server: &mut Server, test_name: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(60), server.close())
+        .await
+        .unwrap_or_else(|_| panic!("{test_name}: Server::close timed out after 60s"))
+        .unwrap_or_else(|error| panic!("{test_name}: Server::close failed: {error}"));
 }
 
 /// The existing ignored interop selector also has a dedicated, credential-free
@@ -6078,6 +6093,34 @@ fn required_command_output(program: &str, args: &[&str], assertion: &str) -> Str
     assert!(
         output.status.success(),
         "{assertion}: {program} {args:?} failed with {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("{assertion}: command output was not UTF-8: {error}"))
+}
+
+/// Execute a host-resolver probe with an external deadline. `getent` can wait
+/// indefinitely when a broken per-link DNS route drops packets, which formerly
+/// allowed a failed MagicDNS assertion to run until the GitHub job timeout.
+#[cfg(target_os = "linux")]
+fn required_bounded_command_output(
+    program: &str,
+    args: &[&str],
+    seconds: u64,
+    assertion: &str,
+) -> String {
+    let limit = format!("{seconds}s");
+    let output = std::process::Command::new("timeout")
+        .args(["--foreground", "--signal=KILL", limit.as_str(), program])
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("{assertion}: failed to run bounded {program} {args:?}: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "{assertion}: {program} {args:?} failed or timed out after {limit} with {:?}: {}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -6217,9 +6260,10 @@ fn assert_linux_tun_kernel_state(tun: &rustscale_tun::TunConfig) {
 /// evidence that ordinary host applications can resolve peer names.
 #[cfg(target_os = "linux")]
 fn assert_linux_magicdns_reachable(tun: &rustscale_tun::TunConfig, go: &InteropEnv) {
-    let dns = required_command_output(
+    let dns = required_bounded_command_output(
         "resolvectl",
         &["dns", &tun.name],
+        10,
         "MagicDNS resolvectl DNS link state",
     );
     assert!(
@@ -6227,9 +6271,10 @@ fn assert_linux_magicdns_reachable(tun: &rustscale_tun::TunConfig, go: &InteropE
         "MagicDNS resolvectl DNS state for {} lacks service VIP:\n{dns}",
         tun.name
     );
-    let domains = required_command_output(
+    let domains = required_bounded_command_output(
         "resolvectl",
         &["domain", &tun.name],
+        10,
         "MagicDNS resolvectl domain link state",
     );
     assert!(
@@ -6239,7 +6284,12 @@ fn assert_linux_magicdns_reachable(tun: &rustscale_tun::TunConfig, go: &InteropE
     );
 
     let name = go.go_name.trim_end_matches('.');
-    let hosts = required_command_output("getent", &["ahostsv4", name], "MagicDNS getent lookup");
+    let hosts = required_bounded_command_output(
+        "getent",
+        &["ahostsv4", name],
+        15,
+        "MagicDNS getent lookup",
+    );
     assert!(
         hosts
             .lines()
@@ -6709,7 +6759,7 @@ async fn interop_tun_rust_dials_go() {
     assert_eq!(&got, payload, "echo mismatch through TUN");
 
     log_go_path(&server, ienv.go_ip, "tun_rust_dials_go");
-    server.close().await.unwrap();
+    close_tun_required(&mut server, "interop_tun_rust_dials_go").await;
 }
 
 /// Interop TUN: Go dials the rustscale node through its SOCKS5 proxy.
@@ -6819,7 +6869,7 @@ async fn interop_tun_go_dials_rust() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(15), echo_task)
         .await
         .expect("echo task did not exit");
-    server.close().await.unwrap();
+    close_tun_required(&mut server, "interop_tun_go_dials_rust").await;
 }
 
 /// Interop TUN: verify OS routes were installed — `100.64.0.0/10` should
@@ -6869,7 +6919,7 @@ async fn interop_tun_os_routes() {
     }
 
     log_go_path(&server, ienv.go_ip, "tun_os_routes");
-    server.close().await.unwrap();
+    close_tun_required(&mut server, "interop_tun_os_routes").await;
 }
 
 /// Interop TUN: Go advertises a subnet route, rustscale in TUN mode with
@@ -6958,7 +7008,7 @@ async fn interop_tun_subnet_forward() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    server.close().await.unwrap();
+    close_tun_required(&mut server, "interop_tun_subnet_forward").await;
 }
 
 // ---------------------------------------------------------------------------

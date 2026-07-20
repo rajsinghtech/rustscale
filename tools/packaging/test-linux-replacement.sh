@@ -1177,18 +1177,34 @@ NODE_IDENTITY_AFTER=$(curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
   | python3 -c 'import json,sys; wanted=sys.argv[1]; nodes=json.load(sys.stdin)["nodes"]; matches=[node for node in nodes if (node.get("ip") or "").split("/",1)[0] == wanted]; assert len(matches) == 1; node=matches[0]; print("{}|{}|{}".format(node["key"], node["id"], node["ip"]))' "$RUST_IP")
 [[ "$NODE_IDENTITY_AFTER" == "$NODE_IDENTITY_BEFORE" ]]
 # `tailscale up` returned Running only after this generation committed every
-# public resource above; one immediate roundtrip is therefore the assertion.
-run_bounded 5 lifecycle-restored-roundtrip \
+# local public resource above. Peer path convergence remains asynchronous, so
+# require the first successful restored roundtrip within one short bounded
+# readiness interval rather than racing one connect against disco convergence.
+run_bounded 15 lifecycle-restored-roundtrip \
   python3 - "$GO_IP" "$PEER_PORT" <<'PY'
 import socket
 import sys
+import time
 payload = b"public-down-up-roundtrip\n"
-with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2) as connection:
-    connection.settimeout(2)
-    connection.sendall(payload)
-    received = connection.recv(len(payload))
-    if received != payload:
-        raise SystemExit(f"post-up Go peer echo mismatch: {received!r}")
+last = None
+for _ in range(20):
+    try:
+        with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=1) as connection:
+            connection.settimeout(1)
+            connection.sendall(payload)
+            received = b""
+            while len(received) < len(payload):
+                chunk = connection.recv(len(payload) - len(received))
+                if not chunk:
+                    break
+                received += chunk
+            if received == payload:
+                raise SystemExit(0)
+            raise RuntimeError(f"post-up Go peer echo mismatch: {received!r}")
+    except (OSError, RuntimeError) as error:
+        last = error
+        time.sleep(0.25)
+raise SystemExit(f"post-up Go peer echo did not recover: {last}")
 PY
 
 # Logout is durable before the LocalAPI call returns. Restart=always then starts

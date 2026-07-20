@@ -265,7 +265,10 @@ sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_NAME,TS_INTERO
       exit 1
     fi
     export RUSTSCALE_REQUIRE_TUN_INTEROP=1
-    exec \"\$@\"
+    # An async timeout cannot make progress if cancellation itself blocks in
+    # runtime or TUN teardown. Keep a process-level fail-closed deadline so the
+    # job reports that defect instead of being cancelled by GitHub's job cap.
+    exec timeout --foreground --signal=TERM --kill-after=15s 600s \"\$@\"
   " sh "$TEST_BIN" \
   --ignored --exact tests::interop_tun_rust_dials_go \
   --nocapture --test-threads=1

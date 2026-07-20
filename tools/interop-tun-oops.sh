@@ -509,12 +509,14 @@ assert_public_web_status "$DERP_JSON" derp
 
 echo "[interop-tun-oops] OOPS_PUBLIC_DERP_EVIDENCE relay=$DERP_REGION transport=authenticated-disco-pong" >&2
 
-# No application or CLI sends occur during this bounded freshness window.
-# Querying status is read-only. The active-session heartbeat can receive an
-# authenticated pong until the 45s session-active deadline; wait beyond that
-# possible observation plus the 45s path-freshness timeout. The same online
-# peer must then be idle and excluded by --active.
-timeout 95s tail -f /dev/null || [[ $? -eq 124 ]]
+# Externally isolate the client from its authenticated DERP/control TLS
+# transports as well as the already blocked direct UDP underlay. This prevents
+# real peer heartbeats from continually refreshing LastSeen while leaving the
+# LocalAPI and namespace loopback web surface available. With no candidate or
+# local-send shortcut, the production 45s freshness deadline must expire.
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -I OUTPUT -p tcp --dport 443 -j DROP
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -I INPUT -p tcp --sport 443 -j DROP
+timeout 50s tail -f /dev/null || [[ $? -eq 124 ]]
 run_client_cli status --json >"$IDLE_JSON"
 IDLE_PEER=$(peer_for_server "$IDLE_JSON") || fail "idle LocalAPI output lacks exactly one server peer"
 jq -e '.Active == false and ((.CurAddr // "") == "") and ((.Relay // "") == "") and ((.PeerRelay // "") == "") and .LastSeen != "1970-01-01T00:00:00Z" and ((.LastHandshake // "1970-01-01T00:00:00Z") == "1970-01-01T00:00:00Z")' \
@@ -537,6 +539,8 @@ echo "[interop-tun-oops] OOPS_PUBLIC_IDLE_EVIDENCE active=false filtered=true fi
 # Peer-relay identity is exercised by the separate TLS hermetic integration
 # regression. This namespace gate makes no peer-relay claim because these two
 # nodes were not configured as peer-relay servers.
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -D INPUT -p tcp --sport 443 -j DROP
+sudo -n ip netns exec "$NS_CLIENT" iptables -w -D OUTPUT -p tcp --dport 443 -j DROP
 sudo -n ip netns exec "$NS_CLIENT" iptables -w -D OUTPUT -p udp -d 198.18.83.2 -j DROP
 sudo -n ip netns exec "$NS_SERVER" iptables -w -D OUTPUT -p udp -d 198.18.83.3 -j DROP
 printf 'continue\n' >"$PHASE_FIFO"

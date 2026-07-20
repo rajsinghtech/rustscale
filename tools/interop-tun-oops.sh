@@ -519,7 +519,7 @@ sudo -n ip netns exec "$NS_CLIENT" iptables -w -I INPUT -p tcp --sport 443 -j DR
 timeout 50s tail -f /dev/null || [[ $? -eq 124 ]]
 run_client_cli status --json >"$IDLE_JSON"
 IDLE_PEER=$(peer_for_server "$IDLE_JSON") || fail "idle LocalAPI output lacks exactly one server peer"
-jq -e '.Active == false and ((.CurAddr // "") == "") and ((.Relay // "") == "") and ((.PeerRelay // "") == "") and .LastSeen != "1970-01-01T00:00:00Z" and ((.LastHandshake // "1970-01-01T00:00:00Z") == "1970-01-01T00:00:00Z")' \
+jq -e '((.Active // false) == false) and ((.CurAddr // "") == "") and ((.Relay // "") == "") and ((.PeerRelay // "") == "") and .LastSeen != "1970-01-01T00:00:00Z" and ((.LastHandshake // "1970-01-01T00:00:00Z") == "1970-01-01T00:00:00Z")' \
   <<<"$IDLE_PEER" >/dev/null || fail "idle LocalAPI fields are inconsistent: $IDLE_PEER"
 run_client_cli status --json >"$IDLE_CONFIRM_JSON"
 IDLE_CONFIRM_PEER=$(peer_for_server "$IDLE_CONFIRM_JSON") || fail "idle confirmation lacks exactly one server peer"

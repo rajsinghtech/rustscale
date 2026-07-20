@@ -938,8 +938,13 @@ async fn finish_running_state(mut inner: RunningState) -> Result<(), (RunningSta
 fn lifecycle_cleanup_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
+        // Cleanup transactions are asynchronous and yield at every external
+        // operation, so one process-owned worker can interleave generations
+        // without tying their lifetime to a caller runtime. Keeping I/O
+        // registration and readiness dispatch on that worker also avoids the
+        // kernel epoll publication edge that ThreadSanitizer cannot observe.
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(1)
             .thread_name("rustscale-lifecycle-cleanup")
             .enable_all()
             .build()

@@ -54,7 +54,8 @@ type KernelPacket = [u8];
 /// per-slot kernel scratch is never detached into queued ciphertexts.
 pub(crate) const RECEIVE_BUFFER_POOL_CAPACITY: usize = 512;
 const RECEIVE_BUFFER_POOL_FREE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY;
-const RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH;
+pub(crate) const RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY: usize =
+    RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH;
 const GRO_SNAPSHOT_INTERVAL: u64 = 256;
 
 /// A fixed receive buffer detached from a `ReceiveBatch`.

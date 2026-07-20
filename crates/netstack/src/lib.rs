@@ -520,6 +520,15 @@ impl Netstack {
         self.tx_queue.lock().is_ok_and(|queue| !queue.is_empty())
     }
 
+    /// Current plaintext data-plane queue depths for bounded runtime
+    /// diagnostics. Values are instantaneous and must not be used for flow
+    /// control.
+    pub fn data_plane_queue_depths(&self) -> (usize, usize) {
+        let rx = self.rx_queue.lock().map_or(0, |queue| queue.len());
+        let tx = self.tx_queue.lock().map_or(0, |queue| queue.len());
+        (rx, tx)
+    }
+
     #[cfg(test)]
     pub(crate) fn push_tx_for_test(&self, packet: Vec<u8>) {
         self.tx_queue

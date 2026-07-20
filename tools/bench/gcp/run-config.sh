@@ -436,7 +436,7 @@ capture_rs_tun_runtime_stats() {
   local vm="$1" zone="$2" logfile="$3" quoted_log
   printf -v quoted_log '%q' "$logfile"
   ssh_cmd "$vm" "$zone" \
-    "grep -E 'rustscale: (Linux UDP GRO receive (enabled|unavailable|disabled|permanently disabled)|udp_gro_stats|.*RXQ overflow|SO_RXQ_OVFL|.*wg_handoff_stats|magicsock_udp_socket_buffers)' $quoted_log 2>/dev/null | tail -n $RUNTIME_STATS_MAX_LINES | cut -c1-$RUNTIME_STATS_MAX_COLUMNS | head -c $RUNTIME_STATS_MAX_BYTES" \
+    "grep -E 'rustscale: (Linux UDP GRO receive (enabled|unavailable|disabled|permanently disabled)|udp_gro_stats|.*RXQ overflow|SO_RXQ_OVFL|.*wg_handoff_stats|.*netstack_pump_stats|magicsock_udp_socket_buffers)' $quoted_log 2>/dev/null | tail -n $RUNTIME_STATS_MAX_LINES | cut -c1-$RUNTIME_STATS_MAX_COLUMNS | head -c $RUNTIME_STATS_MAX_BYTES" \
     2>/dev/null | bound_rs_tun_runtime_stats || true
 }
 
@@ -1182,12 +1182,30 @@ cleanup_rs_userspace() { cleanup_userspace_endpoints; }
 cleanup_ts_embedded() { cleanup_userspace_endpoints; }
 cleanup_ts_userspace() { cleanup_userspace_endpoints; }
 
+# Capture bounded, phase-specific embedded Rust diagnostics before cleanup.
+# General process logs are never attached. Args: VM ZONE ROLE.
+capture_rs_userspace_runtime_stats() {
+  local vm="$1" zone="$2" role="$3" files
+  case "$role" in
+    server) files=/tmp/rs-srv.log ;;
+    client) files='/tmp/rsb1-*.log' ;;
+    *) return 2 ;;
+  esac
+  ssh_cmd "$vm" "$zone" \
+    "grep -hE '^(BENCH_IDENTITY|rustscale: (udp_gro_stats|wg_handoff_stats|netstack_pump_stats|magicsock_udp_socket_buffers))' $files 2>/dev/null | tail -n $RUNTIME_STATS_MAX_LINES | cut -c1-$RUNTIME_STATS_MAX_COLUMNS | head -c $RUNTIME_STATS_MAX_BYTES" \
+    2>/dev/null | bound_rs_tun_runtime_stats || true
+}
+
 # Args: CLEANUP_FUNCTION ERROR_STRING [LOG_TAIL].  This is the sole failure
 # exit used after a userspace daemon has been started, making cleanup ordering
 # explicit and testable.
 fail_userspace_config() {
-  local cleanup_fn="$1" err="$2" log_tail="${3:-}"
-  emit_stub "$err" "$log_tail" || true
+  local cleanup_fn="$1" err="$2" log_tail="${3:-}" runtime_server="" runtime_client=""
+  if [[ "$CONFIG" == rs-userspace ]]; then
+    runtime_server=$(capture_rs_userspace_runtime_stats "$SVM" "$SZONE" server)
+    runtime_client=$(capture_rs_userspace_runtime_stats "$CVM" "$CZONE" client)
+  fi
+  emit_stub "$err" "$log_tail" "$runtime_server" "$runtime_client" || true
   "$cleanup_fn" || true
   return 1
 }
@@ -1203,10 +1221,11 @@ ts_tun_measurement_preflight() {
 
 # Write an explicit failed-cell JSON (used in dry-run or on failure).  A
 # failure is not a zero-valued benchmark: consumers must never chart it as one.
-# Args: ERROR_STRING [LOG_TAIL]
+# Args: ERROR_STRING [LOG_TAIL] [RUNTIME_SERVER] [RUNTIME_CLIENT]
 emit_stub() {
   local err="${1:-dry-run}"
   local log_tail="${2:-}"
+  local runtime_server="${3:-}" runtime_client="${4:-}"
   if (( PROFILE_ONLY )); then
     echo "[gcp] profile-only rs-tun failed: $err" >&2
     return
@@ -1223,19 +1242,26 @@ emit_stub() {
 
   # Use Python so log_tail (which may contain quotes, newlines, etc.) is
   # properly JSON-escaped. Pass log_tail via a temp file to avoid argv limits.
-  local _lt_tmp
+  local _lt_tmp _server_tmp _client_tmp
   _lt_tmp=$(mktemp)
+  _server_tmp=$(mktemp)
+  _client_tmp=$(mktemp)
   printf '%s' "$log_tail" > "$_lt_tmp"
+  printf '%s' "$runtime_server" > "$_server_tmp"
+  printf '%s' "$runtime_client" > "$_client_tmp"
   python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$tool" "$mode" "$err" \
-    "$DURATION" "$LATENCY_COUNT" "$REPEAT" "${PARALLELS[@]}" "$_lt_tmp" >"$OUT" <<'PYEOF'
+    "$DURATION" "$LATENCY_COUNT" "$REPEAT" "${PARALLELS[@]}" \
+    "$_lt_tmp" "$_server_tmp" "$_client_tmp" >"$OUT" <<'PYEOF'
 import json, sys
 config, topo, path_tag, tool, mode, err, dur, lat_count, repeat, *rest = sys.argv[1:]
-*parallel_values, lt_path = rest
-try:
-    with open(lt_path) as f:
-        log_tail = f.read()
-except OSError:
-    log_tail = ""
+*parallel_values, lt_path, server_path, client_path = rest
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+log_tail = read(lt_path)
 obj = {
     "schema_version": 6,
     "status": "failed",
@@ -1252,6 +1278,7 @@ obj = {
     "latency": None,
     "footprint": None,
     "path_class_reported": "unknown",
+    "runtime_stats": {"server": read(server_path), "client": read(client_path)},
 }
 print(json.dumps(obj, indent=2))
 PYEOF
@@ -1260,7 +1287,7 @@ PYEOF
   if ! finalize_result_metadata; then
     echo "[gcp] failed to attach provenance to failed cell" >&2
   fi
-  rm -f "$_lt_tmp"
+  rm -f "$_lt_tmp" "$_server_tmp" "$_client_tmp"
 }
 
 cleanup_self_test() {
@@ -1502,7 +1529,7 @@ cleanup_self_test() {
 }
 
 result_shape_self_test() {
-  emit_stub self-test
+  emit_stub self-test '' server-evidence client-evidence
   python3 - "$OUT" "$DURATION" "$LATENCY_COUNT" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" "${PARALLELS[@]}" <<'PYEOF'
 import json, sys
 path, duration, latency_count, inbound_pipeline, outbound_pipeline, udp_batch, udp_gro, udp_gso, *parallels = sys.argv[1:]
@@ -1514,6 +1541,7 @@ assert result["run"]["runtime"] == {"rs_tun_inbound_pipeline": inbound_pipeline 
 assert result["observed"]["resolved_image"] == "dry-run"
 assert result["parallelism_requested"] == [int(p) for p in parallels]
 assert result["throughput"] is None and result["latency"] is None and result["footprint"] is None
+assert result["runtime_stats"] == {"server": "server-evidence", "client": "client-evidence"}
 PYEOF
 
   # render-html consumes an aggregate JSON list, not one per-config object.
@@ -1576,6 +1604,19 @@ runtime_stats_self_test() {
 
   ssh_cmd() { :; }
   [[ -z "$(capture_rs_tun_runtime_stats "$SVM" "$SZONE" /tmp/rs-tun-empty.log)" ]] || return 1
+
+  ssh_cmd() {
+    printf '%s\n' "$3" >"$log_file"
+    printf '%s\n' 'BENCH_IDENTITY role=client test-only' \
+      'rustscale: wg_handoff_stats event=credit_wait credit_wait_events=1' \
+      'rustscale: netstack_pump_stats event=periodic tcp_retransmit=2'
+  }
+  stats=$(capture_rs_userspace_runtime_stats "$CVM" "$CZONE" client)
+  [[ "$stats" == *'BENCH_IDENTITY role=client'* \
+    && "$stats" == *'wg_handoff_stats'* \
+    && "$stats" == *'netstack_pump_stats'* ]] || return 1
+  command=$(<"$log_file")
+  [[ "$command" == *'/tmp/rsb1-*.log'* && "$command" == *'grep -hE'* ]] || return 1
   rm -f "$log_file"
   unset -f ssh_cmd
 }
@@ -2368,6 +2409,7 @@ rsb1_client_command() {
 rsb1_measure() {
   local client_kind="$1" reported_transport="$2" target="$3" gated_path="$4"
   local path_class warmup_json warmup_evidence tp_json="[]" trial_json="[]" lat_json server_foot client_foot bin_size
+  local runtime_server="" runtime_client=""
   local server_subjects client_subjects expected_client_tool primary_subject primary_path workload_implementation client_state_prep=""
   RS_PARITY_FAILURE_LOG=/tmp/rsb1-setup.log
   RSB1_MEASURE_PATH_POST=unknown
@@ -2436,15 +2478,19 @@ rsb1_measure() {
   RSB1_MEASURE_PATH_POST=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path_class"])') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && RSB1_MEASURE_PATH_POST="$gated_path"
 
+  if [[ "$CONFIG" == rs-userspace ]]; then
+    runtime_server=$(capture_rs_userspace_runtime_stats "$SVM" "$SZONE" server)
+    runtime_client=$(capture_rs_userspace_runtime_stats "$CVM" "$CZONE" client)
+  fi
   server_foot=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rsb1-server.footprint) || return 1
   client_foot=$(remote_stop_footprint "$CVM" "$CZONE" /tmp/rsb1-client.footprint) || return 1
   bin_size=$(ssh_cmd "$SVM" "$SZONE" "stat -c %s $primary_path") || return 1
   server_subjects=$(IFS=,; printf '%s' "${RSB1_SERVER_SUBJECTS[*]}")
   client_subjects=$(IFS=,; printf '%s' "${RSB1_CLIENT_SUBJECTS[*]}")
 
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$reported_transport" "$bin_size" "$tp_json" "$trial_json" "$warmup_evidence" "$lat_json" "$server_foot" "$client_foot" "$REPEAT" "$server_subjects" "$client_subjects" "$primary_subject" "$primary_path" "$workload_implementation" "${PARALLELS[@]}" >"$PENDING_OUT" <<'PYEOF'
+  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$reported_transport" "$bin_size" "$tp_json" "$trial_json" "$warmup_evidence" "$lat_json" "$server_foot" "$client_foot" "$REPEAT" "$server_subjects" "$client_subjects" "$primary_subject" "$primary_path" "$workload_implementation" "$runtime_server" "$runtime_client" "${PARALLELS[@]}" >"$PENDING_OUT" <<'PYEOF'
 import json, math, sys
-config, topo, requested_path, observed_path, transport, size, tp, trials, warmup_evidence, lat, server, client, repeat, server_subjects, client_subjects, primary_subject, primary_path, workload_implementation, *parallels = sys.argv[1:]
+config, topo, requested_path, observed_path, transport, size, tp, trials, warmup_evidence, lat, server, client, repeat, server_subjects, client_subjects, primary_subject, primary_path, workload_implementation, runtime_server, runtime_client, *parallels = sys.argv[1:]
 server, client = json.loads(server), json.loads(client)
 subject_sets = [server_subjects.split(","), client_subjects.split(",")]
 for endpoint, subjects in zip((server, client), subject_sets):
@@ -2478,6 +2524,7 @@ obj={"schema_version":6,"status":"ok","tool":tool,
              "latency_count":200,"transport_path":transport_path,"userspace_portmapping":portmapping},
  "warmup_evidence":json.loads(warmup_evidence),"throughput":json.loads(tp),
  "throughput_trials":json.loads(trials),"latency":json.loads(lat),
+ "runtime_stats":{"server":runtime_server,"client":runtime_client},
  "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,
               "server":dict(server,endpoint="server",subjects=subject_sets[0],scope=scope),
               "client":dict(client,endpoint="client",subjects=subject_sets[1],scope=scope)},

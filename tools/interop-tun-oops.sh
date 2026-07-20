@@ -422,6 +422,7 @@ DERP_JSON="$STATE_DIR/status-derp.json"
 DERP_TABLE="$STATE_DIR/status-derp.txt"
 DERP_PING="$STATE_DIR/ping-derp.txt"
 IDLE_JSON="$STATE_DIR/status-idle.json"
+IDLE_CONFIRM_JSON="$STATE_DIR/status-idle-confirm.json"
 IDLE_TABLE="$STATE_DIR/status-idle.txt"
 IDLE_ACTIVE="$STATE_DIR/status-idle-active.txt"
 WEB_LOG="$STATE_DIR/web.log"
@@ -509,17 +510,21 @@ assert_public_web_status "$DERP_JSON" derp
 echo "[interop-tun-oops] OOPS_PUBLIC_DERP_EVIDENCE relay=$DERP_REGION transport=authenticated-disco-pong" >&2
 
 # No application or CLI sends occur during this bounded freshness window.
-# Querying status is read-only. After the production 45s timeout, the same
-# online peer must be idle and excluded by --active while retaining historical
-# timestamps and clearing all mutually-exclusive current path identities.
-timeout 47s tail -f /dev/null || [[ $? -eq 124 ]]
+# Querying status is read-only. The active-session heartbeat can receive an
+# authenticated pong until the 45s session-active deadline; wait beyond that
+# possible observation plus the 45s path-freshness timeout. The same online
+# peer must then be idle and excluded by --active.
+timeout 95s tail -f /dev/null || [[ $? -eq 124 ]]
 run_client_cli status --json >"$IDLE_JSON"
 IDLE_PEER=$(peer_for_server "$IDLE_JSON") || fail "idle LocalAPI output lacks exactly one server peer"
-jq -e '.Active == false and ((.CurAddr // "") == "") and ((.Relay // "") == "") and ((.PeerRelay // "") == "")'   <<<"$IDLE_PEER" >/dev/null || fail "idle LocalAPI fields are inconsistent: $IDLE_PEER"
-[[ "$(jq -r '.LastSeen' <<<"$IDLE_PEER")" == "$(jq -r '.LastSeen' <<<"$DERP_PEER")" ]] \
-  || fail "idle expiry changed LastSeen instead of only expiring freshness"
-[[ "$(jq -r '.LastWrite' <<<"$IDLE_PEER")" == "$(jq -r '.LastWrite' <<<"$DERP_PEER")" ]] \
-  || fail "idle expiry changed LastWrite instead of only expiring freshness"
+jq -e '.Active == false and ((.CurAddr // "") == "") and ((.Relay // "") == "") and ((.PeerRelay // "") == "") and .LastSeen != "1970-01-01T00:00:00Z" and ((.LastHandshake // "1970-01-01T00:00:00Z") == "1970-01-01T00:00:00Z")' \
+  <<<"$IDLE_PEER" >/dev/null || fail "idle LocalAPI fields are inconsistent: $IDLE_PEER"
+run_client_cli status --json >"$IDLE_CONFIRM_JSON"
+IDLE_CONFIRM_PEER=$(peer_for_server "$IDLE_CONFIRM_JSON") || fail "idle confirmation lacks exactly one server peer"
+[[ "$(jq -r '.LastSeen' <<<"$IDLE_PEER")" == "$(jq -r '.LastSeen' <<<"$IDLE_CONFIRM_PEER")" ]] \
+  || fail "read-only idle status changed LastSeen"
+[[ "$(jq -r '.LastWrite // "1970-01-01T00:00:00Z"' <<<"$IDLE_PEER")" == "$(jq -r '.LastWrite // "1970-01-01T00:00:00Z"' <<<"$IDLE_CONFIRM_PEER")" ]] \
+  || fail "read-only idle status changed LastWrite"
 run_client_cli status >"$IDLE_TABLE"
 grep -Fq "rs-oops-server-$$" "$IDLE_TABLE" || fail "ordinary status omitted the online idle peer"
 grep -Fq "idle" "$IDLE_TABLE" || fail "ordinary status did not label the expired peer idle"

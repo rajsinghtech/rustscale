@@ -623,7 +623,13 @@ async fn localapi_handoff_rolls_back_on_cancellation_and_failure_then_retries() 
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The caller only drives admission and assertions. Logout cleanup still runs
+// concurrently on the process-owned multi-thread lifecycle runtime, so this
+// preserves the ownership race under test without registering the caller's
+// bootstrap UDP socket concurrently with its own Tokio I/O driver. TSan cannot
+// observe epoll's publication edge and otherwise reports Tokio ScheduledIo
+// initialization as a race when a fresh worker sees the socket become ready.
+#[tokio::test]
 async fn cancelled_logout_transaction_blocks_retry_until_owned_cleanup_finishes() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();

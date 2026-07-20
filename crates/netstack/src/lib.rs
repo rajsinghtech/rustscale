@@ -836,7 +836,24 @@ impl Netstack {
             .collect())
     }
 
+    /// Wait until the poll loop has reclaimed every canceled dial visible
+    /// before this call.
+    ///
+    /// This is an ownership barrier, not an eventual-idle wait: live dials
+    /// remain live, while dropped callers and closed reply channels are
+    /// removed before the acknowledgement is published.
+    pub async fn reclaim_pending_dials(&self) -> Result<(), NetstackError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ReclaimPendingDials { reply: reply_tx })
+            .await
+            .map_err(|_| NetstackError::ShuttingDown)?;
+        reply_rx.await.map_err(|_| NetstackError::ShuttingDown)
+    }
+
     /// Return current pending-dial socket and buffer ownership counts.
+    /// Successful and failed dial replies are published only after these
+    /// counters acknowledge removal of that dial's socket and buffers.
     pub fn dial_stats(&self) -> DialStats {
         DialStats {
             pending_dials: self.dial_stats.pending_dials.load(Ordering::Acquire),
@@ -936,6 +953,9 @@ enum Command {
     },
     CancelDial {
         id: u64,
+    },
+    ReclaimPendingDials {
+        reply: oneshot::Sender<()>,
     },
     ListenPacket {
         addr: IpAddr,
@@ -1139,6 +1159,10 @@ async fn poll_loop(
     let mut sockets: SocketSet<'static> = SocketSet::new(vec![]);
     let mut conns: HashMap<SocketHandle, ConnState> = HashMap::new();
     let mut pending_dials: HashMap<SocketHandle, PendingDial> = HashMap::new();
+    // Reclaim acknowledgements are deferred until after the pending-dial pass
+    // in the same iteration. Replying in the command arm would only prove
+    // command receipt, racing closed-reply reclamation below.
+    let mut dial_reclaim_waiters: Vec<oneshot::Sender<()>> = Vec::new();
     let mut tcp_allocated_ports: HashSet<u16> = HashSet::new();
     // (ip, port) -> (listener_socket_handle, accept_sender)
     let mut listeners: HashMap<(IpAddr, u16), ListenerEntry> = HashMap::new();
@@ -1194,6 +1218,7 @@ async fn poll_loop(
                                 remote,
                                 reply,
                             );
+                            publish_dial_stats(&dial_stats, &pending_dials);
                         }
                     }
                     Some(Command::CancelDial { id }) => {
@@ -1205,7 +1230,11 @@ async fn poll_loop(
                                 tcp_allocated_ports.remove(&pending.local_port);
                             }
                             let _ = sockets.remove(handle);
+                            publish_dial_stats(&dial_stats, &pending_dials);
                         }
+                    }
+                    Some(Command::ReclaimPendingDials { reply }) => {
+                        dial_reclaim_waiters.push(reply);
                     }
                     Some(Command::ListenPacket { addr: bind_addr, port, reply }) => {
                         let result = do_listen_packet(
@@ -1357,6 +1386,7 @@ async fn poll_loop(
                     tcp_allocated_ports.remove(&pending.local_port);
                 }
                 let _ = sockets.remove(handle);
+                publish_dial_stats(&dial_stats, &pending_dials);
                 continue;
             }
             if pending_dials
@@ -1365,6 +1395,9 @@ async fn poll_loop(
             {
                 if let Some(pending) = pending_dials.remove(&handle) {
                     tcp_allocated_ports.remove(&pending.local_port);
+                    // Publish reclamation before waking the caller. The reply
+                    // is the production ownership acknowledgement.
+                    publish_dial_stats(&dial_stats, &pending_dials);
                     let _ = pending.reply.send(Err(NetstackError::DialFailed(
                         "dial deadline exceeded".into(),
                     )));
@@ -1385,6 +1418,9 @@ async fn poll_loop(
                             Some(local_port),
                         );
                         conns.insert(handle, conn);
+                        // A returned stream must never race stale pending-dial
+                        // accounting from its own socket.
+                        publish_dial_stats(&dial_stats, &pending_dials);
                         if pd.reply.send(Ok(stream)).is_err() {
                             if let Some(conn) = conns.remove(&handle) {
                                 conn.lifecycle.retire();
@@ -1401,6 +1437,7 @@ async fn poll_loop(
                 State::Closed | State::TimeWait => {
                     if let Some(pd) = pending_dials.remove(&handle) {
                         tcp_allocated_ports.remove(&pd.local_port);
+                        publish_dial_stats(&dial_stats, &pending_dials);
                         let _ = pd.reply.send(Err(NetstackError::ConnectionRefused));
                     }
                     let _ = sockets.remove(handle);
@@ -1408,15 +1445,10 @@ async fn poll_loop(
                 _ => {}
             }
         }
-        dial_stats
-            .pending_dials
-            .store(pending_dials.len(), Ordering::Release);
-        dial_stats.pending_buffer_bytes.store(
-            pending_dials
-                .len()
-                .saturating_mul(TCP_BUF.saturating_mul(2)),
-            Ordering::Release,
-        );
+        publish_dial_stats(&dial_stats, &pending_dials);
+        for waiter in dial_reclaim_waiters.drain(..) {
+            let _ = waiter.send(());
+        }
 
         // Pass 3: pump data for established connections.
         let conn_handles: Vec<SocketHandle> = conns.keys().copied().collect();
@@ -1448,6 +1480,15 @@ async fn poll_loop(
     }
     dial_stats.pending_dials.store(0, Ordering::Release);
     dial_stats.pending_buffer_bytes.store(0, Ordering::Release);
+}
+
+fn publish_dial_stats(stats: &DialStatsInner, pending_dials: &HashMap<SocketHandle, PendingDial>) {
+    let count = pending_dials.len();
+    stats.pending_dials.store(count, Ordering::Release);
+    stats.pending_buffer_bytes.store(
+        count.saturating_mul(TCP_BUF.saturating_mul(2)),
+        Ordering::Release,
+    );
 }
 
 /// Create a listening socket for `addr:port`.

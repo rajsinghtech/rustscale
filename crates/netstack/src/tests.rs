@@ -703,13 +703,14 @@ async fn repeated_canceled_dials_release_sockets_and_buffers_promptly() {
 
         dial.abort();
         let _ = dial.await;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while net.dial_stats() != DialStats::default() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("round {round} retained a canceled dial or its buffers"));
+        net.reclaim_pending_dials()
+            .await
+            .unwrap_or_else(|_| panic!("round {round} reclaim barrier failed"));
+        assert_eq!(
+            net.dial_stats(),
+            DialStats::default(),
+            "round {round} retained a canceled dial or its buffers"
+        );
     }
 }
 
@@ -913,6 +914,8 @@ async fn assert_bounded_bulk_dial_phases(phases: &[(usize, bool)]) {
             maximum <= crate::TCP_DIAL_WINDOW,
             "maximum in flight: {maximum}"
         );
+        // The final dial reply is a production reclamation acknowledgement:
+        // the poll-loop owner publishes removal before waking dial_many.
         assert_eq!(a_net.dial_stats(), DialStats::default());
         if fill_server_app_channel {
             use tokio::io::AsyncWriteExt;
@@ -1013,13 +1016,14 @@ async fn bounded_bulk_dial_p1000_cancels_without_task_pileup() {
         maximum <= crate::TCP_DIAL_WINDOW,
         "maximum in flight: {maximum}"
     );
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while net.dial_stats() != DialStats::default() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelled P1000 dials leaked resources");
+    net.reclaim_pending_dials()
+        .await
+        .expect("cancelled P1000 reclaim barrier");
+    assert_eq!(
+        net.dial_stats(),
+        DialStats::default(),
+        "cancelled P1000 dials leaked resources"
+    );
 }
 
 /// Verify that `add_addr` + `listen_on` allows listening on a VIP address

@@ -188,16 +188,33 @@ struct ConnectionStatsInner {
 
 struct ConnectionLifecycle {
     close_requested: std::sync::atomic::AtomicBool,
+    abort_requested: std::sync::atomic::AtomicBool,
+    close_applied: std::sync::atomic::AtomicBool,
     close_completed: std::sync::atomic::AtomicBool,
     retired: std::sync::atomic::AtomicBool,
     remote_closed: std::sync::atomic::AtomicBool,
     read_waker: std::sync::Mutex<Option<std::task::Waker>>,
+    close_waker: std::sync::Mutex<Option<std::task::Waker>>,
     notify: Arc<Notify>,
     stats: Arc<ConnectionStatsInner>,
 }
 
 impl ConnectionLifecycle {
     fn request_close(&self) {
+        self.publish_close(false);
+    }
+
+    fn request_abort(&self) {
+        self.publish_close(true);
+    }
+
+    fn publish_close(&self, abort: bool) {
+        if abort {
+            // Dropping the application owner is an ownership boundary, not a
+            // request to keep retransmitting buffered data indefinitely. An
+            // earlier graceful shutdown may therefore be escalated to abort.
+            self.abort_requested.store(true, Ordering::Release);
+        }
         if self
             .close_requested
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -217,7 +234,18 @@ impl ConnectionLifecycle {
         }
     }
 
+    fn mark_close_applied(&self) {
+        if !self.close_applied.swap(true, Ordering::AcqRel) {
+            if let Ok(mut waker) = self.close_waker.lock() {
+                if let Some(waker) = waker.take() {
+                    waker.wake();
+                }
+            }
+        }
+    }
+
     fn complete_close(&self) {
+        self.mark_close_applied();
         if self.close_requested.load(Ordering::Acquire)
             && self
                 .close_completed
@@ -382,6 +410,7 @@ pub struct NetstackStream {
     tx: PollSender<Bytes>,
     read_buf: Bytes,
     lifecycle: Arc<ConnectionLifecycle>,
+    shutdown_requested: bool,
     notify: Arc<Notify>,
     remote_addr: Option<SocketAddr>,
     peer_node_key: Option<NodePublic>,
@@ -401,6 +430,7 @@ impl NetstackStream {
             tx,
             read_buf: Bytes::new(),
             lifecycle,
+            shutdown_requested: false,
             notify,
             remote_addr,
             peer_node_key,
@@ -505,17 +535,34 @@ impl AsyncWrite for NetstackStream {
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.lifecycle.request_close();
-        std::task::Poll::Ready(Ok(()))
+        if !self.shutdown_requested {
+            self.lifecycle.request_close();
+            self.shutdown_requested = true;
+        }
+        if self.lifecycle.close_applied.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        if let Ok(mut waker) = self.lifecycle.close_waker.lock() {
+            *waker = Some(cx.waker().clone());
+        }
+        if self.lifecycle.close_applied.load(Ordering::Acquire) {
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            std::task::Poll::Pending
+        }
     }
 }
 
 impl Drop for NetstackStream {
     fn drop(&mut self) {
-        self.lifecycle.request_close();
+        // Once the application owner is gone there is nobody left to observe
+        // graceful-drain completion or a terminal error. Abort the smoltcp
+        // socket so canceled firehose writes cannot survive into a later
+        // process/trial as a retransmission backlog.
+        self.lifecycle.request_abort();
     }
 }
 
@@ -1041,10 +1088,13 @@ fn make_stream_and_conn(
     let poll_sender = PollSender::new(stream_tx);
     let lifecycle = Arc::new(ConnectionLifecycle {
         close_requested: std::sync::atomic::AtomicBool::new(false),
+        abort_requested: std::sync::atomic::AtomicBool::new(false),
+        close_applied: std::sync::atomic::AtomicBool::new(false),
         close_completed: std::sync::atomic::AtomicBool::new(false),
         retired: std::sync::atomic::AtomicBool::new(false),
         remote_closed: std::sync::atomic::AtomicBool::new(false),
         read_waker: std::sync::Mutex::new(None),
+        close_waker: std::sync::Mutex::new(None),
         notify: Arc::clone(&notify),
         stats: Arc::clone(&stats),
     });
@@ -1698,6 +1748,13 @@ fn pump_connection(
     // makes `NetstackStream::poll_write` return Pending to the app.
     let can_send = sockets.get::<tcp::Socket>(handle).can_send();
     if let Some(conn) = conns.get_mut(&handle) {
+        if conn.lifecycle.abort_requested.load(Ordering::Acquire) {
+            conn.pending_write.clear();
+            while conn.app_rx.try_recv().is_ok() {}
+            sockets.get_mut::<tcp::Socket>(handle).abort();
+            return true;
+        }
+
         if can_send {
             // 1. Flush a previously-stored unwritten tail.
             if !conn.pending_write.is_empty() {
@@ -1740,7 +1797,10 @@ fn pump_connection(
             && conn.lifecycle.close_requested.load(Ordering::Acquire)
         {
             sockets.get_mut::<tcp::Socket>(handle).close();
-            conn.lifecycle.complete_close();
+            // Wake poll_shutdown only after every application byte accepted
+            // before shutdown has entered smoltcp in order. Completion still
+            // belongs to cleanup_closed after a terminal socket state.
+            conn.lifecycle.mark_close_applied();
             did_work = true;
         }
     }

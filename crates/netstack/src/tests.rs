@@ -29,7 +29,9 @@ async fn full_app_channel_cannot_lose_close_ownership() {
     }
     assert_eq!(conn.app_rx.len(), 64);
 
-    stream.shutdown().await.expect("publish durable close");
+    let mut shutdown = Box::pin(stream.shutdown());
+    assert!(futures_util::poll!(&mut shutdown).is_pending());
+    drop(shutdown);
     assert!(conn
         .lifecycle
         .close_requested
@@ -82,6 +84,63 @@ async fn full_app_channel_cannot_lose_close_ownership() {
         1
     );
     conn.lifecycle.complete_close();
+    assert_eq!(
+        stats
+            .close_completions
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_full_app_channel_escalates_shutdown_to_abort() {
+    use tokio::io::AsyncWriteExt;
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let stats = Arc::new(crate::ConnectionStatsInner::default());
+    let (mut stream, mut conn) =
+        crate::make_stream_and_conn(notify, Arc::clone(&stats), None, None, None);
+
+    for _ in 0..64 {
+        stream.write_all(&[0xA5]).await.expect("fill app channel");
+    }
+    let mut shutdown = Box::pin(stream.shutdown());
+    assert!(futures_util::poll!(&mut shutdown).is_pending());
+    drop(shutdown);
+    assert!(!conn
+        .lifecycle
+        .abort_requested
+        .load(std::sync::atomic::Ordering::Acquire));
+
+    drop(stream);
+    assert!(conn
+        .lifecycle
+        .abort_requested
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(conn.app_rx.len(), 64, "drop must not need channel capacity");
+    assert_eq!(
+        stats
+            .close_requests
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "shutdown and drop share one close owner"
+    );
+    assert_eq!(
+        stats
+            .duplicate_close_requests
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "drop records the graceful-to-abort escalation"
+    );
+
+    while conn.app_rx.try_recv().is_ok() {}
+    conn.lifecycle.retire();
+    assert_eq!(
+        stats
+            .pending_closes
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
     assert_eq!(
         stats
             .close_completions

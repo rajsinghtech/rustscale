@@ -31,18 +31,22 @@ configure() {
   ip addr add "$MAGIC/32" dev lo
   ip route add 100.64.0.0/10 dev tun0 table 52
   ip route add "$MAGIC/32" dev tun0 table 52
+  # Match the production router's policy rule; route-get itself consults the
+  # RPDB and does not accept a table selector.
+  ip rule add pref 5270 table 52
 
   ip -4 -o addr show dev tun0 | grep -Fq "inet $node/32"
   ! ip -4 -o addr show dev tun0 | grep -Fq "$MAGIC/32"
   ip -4 -o addr show dev lo | grep -Fq "inet $MAGIC/32"
   ip -4 route show exact "$MAGIC/32" table 52 | grep -Fq "dev tun0"
-  route=$(ip -4 route get "$PEER" table 52)
+  route=$(ip -4 route get "$PEER")
   grep -Fq "dev tun0" <<<"$route"
   grep -Fq "src $node" <<<"$route"
   ! grep -Fq "src $MAGIC" <<<"$route"
 }
 
 clear_config() {
+  ip rule del pref 5270 table 52
   ip route del "$MAGIC/32" dev tun0 table 52
   ip route del 100.64.0.0/10 dev tun0 table 52
   ip addr del "$MAGIC/32" dev lo

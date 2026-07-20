@@ -298,6 +298,7 @@ async fn handle_inbound_wg_datagrams(
             };
             if let Some(tunnel) = tunnel {
                 let mut replies = Vec::new();
+                let mut authenticated = Vec::new();
                 {
                     // The caller holds peer_map.gate. This second guard keeps
                     // magicsock's generation stable through the entire ordered
@@ -306,11 +307,12 @@ async fn handle_inbound_wg_datagrams(
                     let _delivery = magicsock.authorization_delivery_guard().await;
                     if magicsock.is_authorization_current(&peer, generation) {
                         let mut tunnel = tunnel.lock().await;
-                        for datagram in &datagrams[start..end] {
+                        for (offset, datagram) in datagrams[start..end].iter().enumerate() {
                             if !magicsock.is_authorization_current(&peer, generation) {
                                 break;
                             }
                             if let Ok(decap) = tunnel.decapsulate(&datagram.data) {
+                                authenticated.push(start + offset);
                                 if let Some(plaintext) = decap.plaintext {
                                     deliver(peer.clone(), plaintext);
                                 }
@@ -318,6 +320,9 @@ async fn handle_inbound_wg_datagrams(
                             }
                         }
                     }
+                }
+                for index in authenticated {
+                    magicsock.note_authenticated_wg_transport(&datagrams[index]);
                 }
                 for reply in replies {
                     if !magicsock.is_authorization_current(&peer, generation) {

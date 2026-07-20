@@ -612,7 +612,8 @@ fn detach_linux_wg_datagrams(
                     pool_reservation.clone(),
                     identified.generations[index]
                         .expect("only authorized packets reserve and detach storage"),
-                ),
+                )
+                .received_via(WgTransportEvidence::Direct(addr)),
             });
         } else if let Some((node, destination, packets, bytes)) = physical_run.take() {
             record_phys_rx(node, destination, packets, bytes);
@@ -808,6 +809,14 @@ pub struct MagicsockConfig {
 pub struct WgCiphertext {
     storage: WgCiphertextStorage,
     authorization_generation: u64,
+    transport: Option<WgTransportEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WgTransportEvidence {
+    Direct(SocketAddr),
+    Derp(i32),
+    Relay(SocketAddr),
 }
 
 enum WgCiphertextStorage {
@@ -869,6 +878,7 @@ impl WgCiphertext {
         Self {
             storage: WgCiphertextStorage::Vec { bytes, range },
             authorization_generation: 0,
+            transport: None,
         }
     }
 
@@ -884,11 +894,17 @@ impl WgCiphertext {
                 _pool_reservation: pool_reservation,
             },
             authorization_generation,
+            transport: None,
         }
     }
 
     fn authorized(mut self, generation: u64) -> Self {
         self.authorization_generation = generation;
+        self
+    }
+
+    fn received_via(mut self, transport: WgTransportEvidence) -> Self {
+        self.transport = Some(transport);
         self
     }
 
@@ -899,11 +915,17 @@ impl WgCiphertext {
         match &self.storage {
             WgCiphertextStorage::Vec { bytes, range } => Some(
                 Self::from_vec_range(bytes.clone(), range.clone())
-                    .authorized(self.authorization_generation),
+                    .authorized(self.authorization_generation)
+                    .with_optional_transport(self.transport),
             ),
             #[cfg(target_os = "linux")]
             WgCiphertextStorage::Pooled { .. } => None,
         }
+    }
+
+    fn with_optional_transport(mut self, transport: Option<WgTransportEvidence>) -> Self {
+        self.transport = transport;
+        self
     }
 }
 
@@ -2434,6 +2456,32 @@ impl Magicsock {
     /// plaintext delivery.
     pub fn is_authorization_current(&self, peer: &NodePublic, generation: u64) -> bool {
         self.inner.peer_authorization.is_current(peer, generation)
+    }
+
+    /// Publish path activity only after WireGuard authenticated this exact
+    /// ciphertext. Reverse address maps alone are not transport evidence.
+    pub fn note_authenticated_wg_transport(&self, datagram: &WgDatagram) {
+        if !self.is_authorization_current(&datagram.peer, datagram.authorization_generation()) {
+            return;
+        }
+        let Some(transport) = datagram.data.transport else {
+            return;
+        };
+        let mut endpoints = self
+            .inner
+            .endpoints
+            .write()
+            .expect("endpoints lock poisoned");
+        let Some(endpoint) = endpoints.get_mut(&datagram.peer) else {
+            return;
+        };
+        match transport {
+            WgTransportEvidence::Direct(addr) => {
+                endpoint.confirm_direct(addr, std::time::Instant::now());
+            }
+            WgTransportEvidence::Derp(region) => endpoint.note_derp_transport(region, true),
+            WgTransportEvidence::Relay(addr) => endpoint.note_relay_transport(addr, true),
+        }
     }
 
     /// Acquire the delivery side of the map-commit barrier. Revalidate while
@@ -4484,7 +4532,9 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer: source,
-                    data: WgCiphertext::from_vec_range(frame, payload).authorized(generation),
+                    data: WgCiphertext::from_vec_range(frame, payload)
+                        .authorized(generation)
+                        .received_via(WgTransportEvidence::Derp(region_id)),
                 }],
                 Some((
                     &self.peer_authorization,
@@ -4556,7 +4606,9 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer,
-                    data: WgCiphertext::from(data.to_vec()).authorized(generation),
+                    data: WgCiphertext::from(data.to_vec())
+                        .authorized(generation)
+                        .received_via(WgTransportEvidence::Direct(src)),
                 }],
                 Some((
                     &self.peer_authorization,
@@ -4727,7 +4779,9 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer,
-                    data: WgCiphertext::from(data.to_vec()).authorized(generation),
+                    data: WgCiphertext::from(data.to_vec())
+                        .authorized(generation)
+                        .received_via(WgTransportEvidence::Relay(src)),
                 }],
                 Some((
                     &self.peer_authorization,

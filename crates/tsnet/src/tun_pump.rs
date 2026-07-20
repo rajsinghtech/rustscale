@@ -194,6 +194,9 @@ async fn process_tun_inbound_batch(
     if !collect_tun_inbound_batch(wg_tunnels, inbound, cancel).await {
         return false;
     }
+    for &index in &inbound.authenticated_datagrams {
+        magicsock.note_authenticated_wg_transport(&inbound.datagrams[index]);
+    }
     // Normal transport data only writes the TUN and must not serialize the
     // outbound pipeline. Fence precisely before a generated reply could
     // bypass the sender task.
@@ -408,6 +411,9 @@ async fn run_tun_pump_pipeline_inner(
             } else if !commit_or_scalar_tun_inbound_batch(&wg_tunnels, &mut current, &cancel).await
             {
                 break 'pump;
+            }
+            for &index in &current.authenticated_datagrams {
+                magicsock.note_authenticated_wg_transport(&current.datagrams[index]);
             }
             current.datagrams.clear();
             if !flush_outbound_before_replies(outbound_sender.as_mut(), &current).await {
@@ -941,6 +947,8 @@ struct InboundBatchScratch {
     plaintext_peers: Vec<NodePublic>,
     plaintext_generations: Vec<u64>,
     replies: Vec<(NodePublic, u64, Vec<u8>)>,
+    /// Ciphertext indices accepted by boringtun in the scalar batch path.
+    authenticated_datagrams: Vec<usize>,
     /// One opaque entry per ciphertext datagram while this scratch is OPENED.
     opened: Vec<Option<rustscale_wg::WgOpenedPacket>>,
     /// Reused only by the ordered pump commit; always empty before this owned
@@ -971,6 +979,7 @@ impl InboundBatchScratch {
         self.plaintext_peers.clear();
         self.plaintext_generations.clear();
         self.replies.clear();
+        self.authenticated_datagrams.clear();
     }
 }
 
@@ -1043,10 +1052,11 @@ async fn collect_tun_inbound_batch(
                 tunnel = run.tunnel.lock() => tunnel,
                 () = cancel.cancelled() => return false,
             };
-            for datagram in &inbound.datagrams[run.start..run.end] {
+            for (offset, datagram) in inbound.datagrams[run.start..run.end].iter().enumerate() {
                 let plaintext_start = inbound.plaintext.len();
                 if let Ok(replies) = tunnel.decapsulate_into(&datagram.data, &mut inbound.plaintext)
                 {
+                    inbound.authenticated_datagrams.push(run.start + offset);
                     for _ in plaintext_start..inbound.plaintext.len() {
                         inbound.plaintext_peers.push(run.peer.clone());
                         inbound
@@ -1207,6 +1217,7 @@ async fn commit_or_scalar_tun_inbound_batch(
             };
             match tunnel.commit_opened(opened, &mut inbound.plaintext) {
                 Ok(rustscale_wg::WgCommitResult::Accepted) => {
+                    inbound.authenticated_datagrams.push(index);
                     inbound.plaintext_peers.push(run.peer.clone());
                     inbound
                         .plaintext_generations

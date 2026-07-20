@@ -57,16 +57,22 @@ The same job then runs the corrected out-of-process parity gate,
 `tools/interop-tun-oops.sh`. The in-process repro above can pass while a
 failure mode only appears when the endpoints live in separate processes, like
 the benchmark harness. The split harness starts two independent rustscale TUN
-nodes as separate OS processes under sudo — each with its own TUN device,
-state directory, the same Linux kernel-state assertions, and a full captured
-log — then drives the issue-#75-shaped cadenced UDP exchange and a TCP echo
-roundtrip across the process boundary. The gate requires both processes to
-exit 0 with the complete structured evidence in both logs.
+nodes in separate Linux network namespaces under sudo — each with its own
+loopback, veth underlay, TUN device, state directory, policy rules, and table
+52 — then requires namespace-local route lookup and bidirectional TUN counter
+evidence while driving the issue-#75-shaped cadenced UDP exchange and a TCP
+echo roundtrip. This TUN-vs-TUN coverage is distinct from embedded, proxy, and
+RustScale-TUN-to-Go-userspace modes. The gate requires both processes to exit
+0 with the complete structured evidence in both logs and fails on any cleanup
+leak.
 
-This credentialed job is deliberately not part of ordinary local or pull
-request validation. It uses only short-lived OIDC and an ephemeral tailnet with
-unconditional teardown; run it locally only when explicitly supplying the
-documented disposable tailnet credentials.
+This credentialed job is deliberately not part of ordinary local validation.
+Trusted pull requests also run the same exact workload in the separate
+`Privileged TUN / Privileged isolated TUN interop` context, using only
+short-lived OIDC and an ephemeral tailnet with unconditional teardown. That
+context must have a successful run at the exact PR head before it can become a
+protected merge requirement. Run the harness locally only when explicitly
+supplying the documented disposable tailnet credentials.
 
 ### Installed Linux replacement journey
 

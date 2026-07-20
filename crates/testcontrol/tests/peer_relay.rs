@@ -8,8 +8,11 @@
 //! No external network access required.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use rcgen::CertifiedKey;
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustscale_derp::DerpServer;
 use rustscale_tailcfg::{
     DERPMap, DERPNode, DERPRegion, NodeCapMap, RawMessage, PEER_CAPABILITY_RELAY_TARGET,
@@ -17,6 +20,46 @@ use rustscale_tailcfg::{
 use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_tsnet::Server as TsnetServer;
 use rustscale_udprelay::ServerConfig;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+
+/// Put a self-signed TLS listener in front of the plaintext in-process DERP
+/// server. Real DERP clients always use TLS; `InsecureForTests` relaxes only
+/// certificate verification, matching the Go client and testcontrol DERP.
+async fn spawn_tls_derp_proxy(
+    upstream: std::net::SocketAddr,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).expect("test cert");
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key)
+        .expect("test TLS config");
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("TLS proxy bind");
+    let addr = listener.local_addr().expect("TLS proxy address");
+    let task = tokio::spawn(async move {
+        let mut children = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((client, _)) = accepted else { break };
+                    let acceptor = acceptor.clone();
+                    children.spawn(async move {
+                        let Ok(mut client) = acceptor.accept(client).await else { return };
+                        let Ok(mut server) = TcpStream::connect(upstream).await else { return };
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    });
+                }
+                Some(_) = children.join_next(), if !children.is_empty() => {}
+            }
+        }
+    });
+    (addr, task)
+}
 
 /// Build a DERPMap with a single local region pointing at `addr`.
 fn local_derp_map(addr: std::net::SocketAddr) -> DERPMap {
@@ -136,8 +179,9 @@ async fn peer_relay_e2e() {
     let control_url = tc.base_url();
 
     let derp_server = DerpServer::with_random_key();
-    let (derp_addr, derp_handle) = derp_server.spawn_local().await.expect("DERP spawn");
-    eprintln!("DERP listening at {derp_addr}");
+    let (derp_upstream, derp_handle) = derp_server.spawn_local().await.expect("DERP spawn");
+    let (derp_addr, derp_tls_task) = spawn_tls_derp_proxy(derp_upstream).await;
+    eprintln!("DERP TLS proxy listening at {derp_addr}");
 
     let derp_map = local_derp_map(derp_addr);
     tc.set_derp_map(derp_map);
@@ -329,6 +373,8 @@ async fn peer_relay_e2e() {
     node_a.close().await.unwrap();
     node_b.close().await.unwrap();
     node_r.close().await.unwrap();
+    derp_tls_task.abort();
+    let _ = derp_tls_task.await;
     derp_handle.shutdown();
     eprintln!("peer_relay_e2e: all scenarios passed");
 }

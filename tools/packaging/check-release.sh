@@ -166,6 +166,12 @@ fi
 # Match exact source text retaining the escaped child argv.
 # shellcheck disable=SC2016
 grep -Fq -- 'exec timeout --foreground --signal=TERM --kill-after=15s 600s \"\$@\"' tools/interop-tun.sh
+grep -Fq -- 'source tools/interop-tun-cleanup.sh' tools/interop-tun.sh
+# shellcheck disable=SC2016
+grep -Fq -- 'interop_tun_stop_child "$GO_PID" "Go tailscaled" 10' tools/interop-tun.sh
+# shellcheck disable=SC2016
+grep -Fq -- 'interop_tun_stop_child "$ECHO_BACKEND_PID" "echo backend" 5' tools/interop-tun.sh
+tools/packaging/test-interop-tun-cleanup.sh
 grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/interop-tun.sh
 grep -Fq -- '--nocapture --test-threads=1' tools/interop-tun.sh
 grep -Fq 'std::env::var("RUSTSCALE_REQUIRE_TUN_INTEROP")' crates/tsnet/src/tests.rs

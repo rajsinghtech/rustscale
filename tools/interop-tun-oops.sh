@@ -446,7 +446,8 @@ assert_public_web_status() {
   set -o pipefail
   (( ready_rc == 0 )) || fail "$phase web output did not become ready"
   timeout 10s sudo -n ip netns exec "$NS_CLIENT" curl -fsS \
-    -H 'Host: 127.0.0.1:18088' http://127.0.0.1:18088/api/status >"$WEB_JSON"
+    -H 'Host: 127.0.0.1:18088' -H 'Origin: http://127.0.0.1:18088' \
+    http://127.0.0.1:18088/api/status >"$WEB_JSON"
   kill -TERM "$WEB_PID" 2>/dev/null
   wait "$WEB_PID" 2>/dev/null || true
   WEB_PID=""

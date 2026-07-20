@@ -325,6 +325,15 @@ async fn peer_relay_e2e() {
         .find(|ip| ip.is_ipv4())
         .copied()
         .expect("B has IPv4");
+    let a_ip = node_a
+        .status()
+        .tailscale_ips
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .copied()
+        .expect("A has IPv4");
+    let ms_a = node_a.magicsock().expect("A magicsock");
+    let ms_b = node_b.magicsock().expect("B magicsock");
     let mut listener = node_b.listen(RELAY_ECHO_PORT).await.expect("B listen");
     let dial_addr = format!("{peer_ip}:{RELAY_ECHO_PORT}");
     let (dialed, accepted) = tokio::join!(
@@ -339,6 +348,13 @@ async fn peer_relay_e2e() {
         .local_addr()
         .expect("relay has a UDP address")
         .to_string();
+    // CLI pings probe the allocated peer relay independently from DERP. Only
+    // authenticated pongs can publish PeerRelay. Run both directions together
+    // so one slow callback cannot consume the evidence deadline.
+    let _ = tokio::join!(
+        ms_a.cli_ping(&key_b, "client-b", peer_ip, 0),
+        ms_b.cli_ping(&key_a, "client-a", a_ip, 0),
+    );
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut sequence = 0_u32;
     loop {

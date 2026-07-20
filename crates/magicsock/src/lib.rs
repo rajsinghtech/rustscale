@@ -2880,7 +2880,7 @@ impl Magicsock {
 
         // Look up the endpoint to get its disco key, UDP candidates, and
         // preferred DERP send route.
-        let (peer_disco, candidates, derp_region) = {
+        let (peer_disco, candidates, derp_region, peer_relay) = {
             let endpoints = self
                 .inner
                 .endpoints
@@ -2891,6 +2891,7 @@ impl Magicsock {
                 ep.peer_disco_key().clone(),
                 ep.candidates(),
                 ep.derp_send_region(),
+                ep.current_relay().map(|(addr, vni, _, _)| (addr, vni)),
             )
         };
 
@@ -2987,13 +2988,25 @@ impl Magicsock {
                         );
                     }
                 }
-                // Use the regular DERP sender so an unknown region takes
-                // its bootstrap fanout path, just like a normal datagram.
-                // A send failure remains observable through the existing
-                // CLI timeout/error contract.
-                let _ = self
-                    .send_via_derp(peer_key.clone(), derp_region, &packet)
-                    .await;
+                // Probe an established peer relay independently too. Its
+                // authenticated pong records the actual relay socket/VNI;
+                // configured relay candidates and successful local sends are
+                // never status evidence. DERP remains an independent fallback.
+                if let Some((addr, vni)) = peer_relay {
+                    // An allocated relay is the current fallback transport.
+                    // Probe it instead of racing the same transaction over
+                    // DERP: otherwise a later DERP pong can overwrite the
+                    // actual peer-relay identity before public output reads it.
+                    self.inner.send_disco_udp(addr, vni, false, &packet);
+                } else {
+                    // Use the regular DERP sender so an unknown region takes
+                    // its bootstrap fanout path, just like a normal datagram.
+                    // A send failure remains observable through the existing
+                    // CLI timeout/error contract.
+                    let _ = self
+                        .send_via_derp(peer_key.clone(), derp_region, &packet)
+                        .await;
+                }
             }
         }
 

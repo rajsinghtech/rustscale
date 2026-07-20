@@ -1027,7 +1027,12 @@ async fn loopback_credential_never_grants_drive_root_authority_or_debug_disclosu
     server.close().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The caller only bootstraps the server, opens the loopback connection, and
+// awaits close. Central close still drains the dropped handle concurrently on
+// the process-owned lifecycle runtime, preserving the product ownership
+// regression without a second multi-thread I/O driver publishing the freshly
+// registered bootstrap socket to its own worker.
+#[tokio::test]
 async fn dropped_loopback_handle_is_joined_by_central_close() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();

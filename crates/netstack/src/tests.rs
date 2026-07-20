@@ -618,11 +618,10 @@ async fn concurrent_connections_all_succeed() {
     );
 }
 
-/// Production bulk dialing must retain every P500 stream while never
-/// exceeding the peer's listener-sized admission window.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bounded_bulk_dial_establishes_and_retains_p500() {
-    const STREAMS: usize = 500;
+/// Exercise the production netstack and WireGuard data path at an explicit
+/// setup scale. The in-memory link is credential-free; it only replaces the
+/// UDP underlay, not dial admission, packet ownership, TCP, or WireGuard.
+async fn assert_bounded_bulk_dial_setup(streams: usize) {
     let a_priv = NodePrivate::generate();
     let b_priv = NodePrivate::generate();
     let a_pub = a_priv.public();
@@ -660,11 +659,11 @@ async fn bounded_bulk_dial_establishes_and_retains_p500() {
 
     let mut listener = b_net.listen(41000).await.expect("listen");
     let accept = tokio::spawn(async move {
-        let mut streams = Vec::with_capacity(STREAMS);
-        for _ in 0..STREAMS {
-            streams.push(listener.accept().await.expect("accept"));
+        let mut accepted = Vec::with_capacity(streams);
+        for _ in 0..streams {
+            accepted.push(listener.accept().await.expect("accept"));
         }
-        streams
+        accepted
     });
     let dial = {
         let a_net = a_net.clone();
@@ -673,7 +672,7 @@ async fn bounded_bulk_dial_establishes_and_retains_p500() {
                 std::time::Duration::from_secs(30),
                 a_net.dial_many(
                     SocketAddr::new(b_addr.into(), 41000),
-                    STREAMS,
+                    streams,
                     tokio::time::Instant::now() + std::time::Duration::from_secs(25),
                 ),
             )
@@ -688,12 +687,12 @@ async fn bounded_bulk_dial_establishes_and_retains_p500() {
     let client_streams = dial
         .await
         .expect("dial worker")
-        .expect("P500 outer deadline")
-        .expect("P500 bulk dial");
+        .expect("bulk setup outer deadline")
+        .expect("bulk dial");
     let server_streams = accept.await.expect("accept worker");
 
-    assert_eq!(client_streams.len(), STREAMS);
-    assert_eq!(server_streams.len(), STREAMS);
+    assert_eq!(client_streams.len(), streams);
+    assert_eq!(server_streams.len(), streams);
     assert!(
         maximum <= crate::TCP_DIAL_WINDOW,
         "maximum in flight: {maximum}"
@@ -702,6 +701,20 @@ async fn bounded_bulk_dial_establishes_and_retains_p500() {
     drop(client_streams);
     drop(server_streams);
     pump.abort();
+}
+
+/// Production bulk dialing retains every P500 stream while never exceeding
+/// the peer's listener-sized admission window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_bulk_dial_establishes_and_retains_p500() {
+    assert_bounded_bulk_dial_setup(500).await;
+}
+
+/// P1000 setup takes the same production bounded path as P500: all streams
+/// must remain established without widening the handshake window or deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_bulk_dial_establishes_and_retains_p1000() {
+    assert_bounded_bulk_dial_setup(1000).await;
 }
 
 /// A P1000 request that cannot connect still owns at most one bounded window,

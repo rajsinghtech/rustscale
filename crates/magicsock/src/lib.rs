@@ -835,12 +835,9 @@ struct PoolInventoryReservation {
 
 #[cfg(any(target_os = "linux", test))]
 impl PoolInventoryReservation {
-    async fn acquire(inventory: Arc<Semaphore>, count: usize) -> Option<Arc<Self>> {
-        Self::acquire_measured(inventory, count)
-            .await
-            .map(|(reservation, _, _)| reservation)
-    }
-
+    /// Reserve detachable fixed-buffer inventory and report whether capacity
+    /// backpressure delayed admission. The receive path consumes this result
+    /// directly so its diagnostics and ownership boundary cannot diverge.
     async fn acquire_measured(
         inventory: Arc<Semaphore>,
         count: usize,
@@ -5163,9 +5160,11 @@ mod linux_batch_tests {
         let channel_credits = Arc::new(Semaphore::new(1));
         let pool_inventory = Arc::new(Semaphore::new(1));
         let channel_permit = channel_credits.clone().try_acquire_owned().unwrap();
-        let pool_reservation = PoolInventoryReservation::acquire(pool_inventory.clone(), 1)
-            .await
-            .expect("open pool inventory reserves one buffer");
+        let (pool_reservation, waited, _) =
+            PoolInventoryReservation::acquire_measured(pool_inventory.clone(), 1)
+                .await
+                .expect("open pool inventory reserves one buffer");
+        assert!(!waited);
         let batch = WgReceiveBatch::new(pending(1), channel_permit);
 
         let datagrams = batch.into_datagrams();
@@ -5214,7 +5213,7 @@ mod linux_batch_tests {
         assert_eq!(inventory.available_permits(), 2);
 
         inventory.close();
-        assert!(PoolInventoryReservation::acquire(inventory, 1)
+        assert!(PoolInventoryReservation::acquire_measured(inventory, 1)
             .await
             .is_none());
     }

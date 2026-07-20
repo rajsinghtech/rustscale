@@ -20,6 +20,7 @@ use rustscale_tailcfg::{
 use rustscale_testcontrol::Server as TestControlServer;
 use rustscale_tsnet::Server as TsnetServer;
 use rustscale_udprelay::ServerConfig;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -309,26 +310,48 @@ async fn peer_relay_e2e() {
     }
 
     // ── 7. Verify authenticated relay identities ───────────────────────
-    // A successful local write is deliberately not status evidence. Exchange
-    // packets and require at least one public status to name R's actual UDP
-    // socket. The other direction may genuinely remain on DERP in this
-    // hermetic topology; if it does, it must name the observed DERP region
-    // rather than claim a relay. The preceding allocation flow is TLS DERP.
-    eprintln!("sending authenticated relay traffic in both directions...");
-    let ms_a = node_a.magicsock().expect("A up");
-    let ms_b = node_b.magicsock().expect("B up");
-    ms_a.send(key_b.clone(), b"relay e2e test data from A to B")
-        .await
-        .expect("send A→B");
-    ms_b.send(key_a.clone(), b"relay e2e test data from B to A")
-        .await
-        .expect("send B→A");
+    // A successful local UDP write is deliberately not status evidence.
+    // Establish a real WireGuard/netstack TCP stream, verify payload delivery
+    // in both directions, then require public status to name R's actual UDP
+    // socket. The other status may genuinely be overwritten by a later
+    // authenticated DERP control packet, but at least one delivered exchange
+    // must expose the peer-relay transport identity.
+    eprintln!("delivering authenticated TCP traffic through peer relay...");
+    const RELAY_ECHO_PORT: u16 = 34567;
+    let peer_ip = node_b
+        .status()
+        .tailscale_ips
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .copied()
+        .expect("B has IPv4");
+    let mut listener = node_b.listen(RELAY_ECHO_PORT).await.expect("B listen");
+    let dial_addr = format!("{peer_ip}:{RELAY_ECHO_PORT}");
+    let (dialed, accepted) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(30), node_a.dial(&dial_addr)),
+        tokio::time::timeout(Duration::from_secs(30), listener.accept()),
+    );
+    let mut stream_a = dialed.expect("A dial timed out").expect("A dial failed");
+    let mut stream_b = accepted
+        .expect("B accept timed out")
+        .expect("B accept failed");
     let relay_addr = rs
         .local_addr()
         .expect("relay has a UDP address")
         .to_string();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut sequence = 0_u32;
     loop {
+        sequence += 1;
+        let payload = format!("peer-relay-authenticated-{sequence}").into_bytes();
+        stream_a.write_all(&payload).await.expect("A write");
+        let mut delivered = vec![0_u8; payload.len()];
+        stream_b.read_exact(&mut delivered).await.expect("B read");
+        assert_eq!(delivered, payload, "A→B relay payload changed");
+        stream_b.write_all(&payload).await.expect("B write");
+        stream_a.read_exact(&mut delivered).await.expect("A read");
+        assert_eq!(delivered, payload, "B→A relay payload changed");
+
         let a_status = peer_status(&node_a, &key_b).await;
         let b_status = peer_status(&node_b, &key_a).await;
         let actual_path = |status: &rustscale_ipnstate::PeerStatus| {
@@ -350,9 +373,8 @@ async fn peer_relay_e2e() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "status did not identify an authenticated relay {relay_addr} or observed DERP region; A={a_status:?}, B={b_status:?}"
+            "delivered traffic did not expose authenticated relay {relay_addr}; A={a_status:?}, B={b_status:?}"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // ── 8. Scenario 4: Rebind from new source port ─────────────────────

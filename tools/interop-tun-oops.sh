@@ -358,9 +358,10 @@ unset AUTHKEY
 
 BUILD_LOG="$STATE_DIR/build.log"
 echo "[interop-tun-oops] building isolated TUN node (unprivileged)" >&2
-if ! cargo build -p rustscale-tsnet --example interop-tun-node -p rustscale-cli >"$BUILD_LOG" 2>&1; then
+if ! cargo build -p rustscale-tsnet --example interop-tun-node >"$BUILD_LOG" 2>&1 \
+  || ! cargo build -p rustscale-cli --bin rustscale >>"$BUILD_LOG" 2>&1; then
   tail -n 80 "$BUILD_LOG" >&2
-  fail "interop-tun-node build failed"
+  fail "interop TUN node or CLI build failed"
 fi
 NODE_BIN="$(pwd)/target/debug/examples/interop-tun-node"
 CLI_BIN="$(pwd)/target/debug/rustscale"

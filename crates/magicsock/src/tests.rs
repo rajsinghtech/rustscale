@@ -1161,6 +1161,110 @@ async fn queued_disco_handler_cannot_reinsert_state_after_revocation() {
 }
 
 #[tokio::test]
+async fn unauthenticated_wireguard_ciphertext_never_promotes_direct_path_status() {
+    let peer_key = NodePrivate::generate().public();
+    let peer_disco = DiscoPrivate::generate().public();
+    let (magicsock, mut rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    magicsock
+        .set_netmap(vec![make_peer(peer_key.clone(), peer_disco, vec![], 1)])
+        .await
+        .unwrap();
+    let source: SocketAddr = "127.0.0.1:4545".parse().unwrap();
+    magicsock
+        .inner
+        .addr_to_peer
+        .write()
+        .unwrap()
+        .insert(source, peer_key.clone());
+
+    magicsock
+        .inner
+        .handle_wg_udp(b"not-authenticated-yet", source)
+        .await;
+    let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("WireGuard authentication handoff deadline")
+        .expect("ciphertext handed to WireGuard")
+        .into_datagrams()
+        .into_iter()
+        .next()
+        .expect("one ciphertext");
+    assert_eq!(received.peer, peer_key);
+    assert_eq!(received.data.as_ref(), b"not-authenticated-yet");
+    assert_eq!(
+        magicsock.peer_path_telemetry(&peer_key).class,
+        PathClass::None,
+        "reverse-map lookup before WireGuard authentication is not path evidence"
+    );
+}
+
+#[tokio::test]
+async fn unauthenticated_derp_ciphertext_never_promotes_relay_path_status() {
+    let peer_key = NodePrivate::generate().public();
+    let peer_disco = DiscoPrivate::generate().public();
+    let (magicsock, mut rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    magicsock
+        .set_netmap(vec![make_peer(peer_key.clone(), peer_disco, vec![], 1)])
+        .await
+        .unwrap();
+
+    let ciphertext = b"not-authenticated-yet".to_vec();
+    magicsock
+        .inner
+        .handle_derp_packet(ciphertext.clone(), 0..ciphertext.len(), peer_key.clone(), 7)
+        .await;
+    let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("WireGuard authentication handoff deadline")
+        .expect("ciphertext handed to WireGuard")
+        .into_datagrams()
+        .into_iter()
+        .next()
+        .expect("one ciphertext");
+    assert_eq!(received.peer, peer_key);
+    assert_eq!(received.data.as_ref(), ciphertext.as_slice());
+    assert_eq!(
+        magicsock.peer_path_telemetry(&peer_key).class,
+        PathClass::None,
+        "DERP routing metadata plus ciphertext before WireGuard authentication is not path evidence"
+    );
+}
+
+#[tokio::test]
 async fn relay_server_role_revocation_clears_paths_and_reverse_mappings() {
     let target_key = NodePrivate::generate().public();
     let target_disco = DiscoPrivate::generate().public();
@@ -1340,6 +1444,11 @@ async fn relay_server_role_revocation_clears_paths_and_reverse_mappings() {
         .expect("one current relay datagram");
     assert_eq!(received.peer, target_key);
     assert_eq!(received.data.as_ref(), b"from-b");
+    assert_eq!(
+        magicsock.peer_path_telemetry(&target_key).class,
+        PathClass::None,
+        "current relay routing before WireGuard authentication is not path evidence"
+    );
 }
 
 #[tokio::test]
@@ -1804,6 +1913,14 @@ async fn cli_ping_cmm_recovers_direct_path_after_initial_netmap_drop() {
         "CLI ping should return its direct endpoint when DERP is unavailable"
     );
     assert_eq!(a.peer_path_class(&b.node_public()), PathClass::Direct);
+    let telemetry = a.peer_path_telemetry(&b.node_public());
+    assert_eq!(telemetry.class, PathClass::Direct);
+    assert!(telemetry.fresh);
+    assert_eq!(
+        telemetry.addr.map(|addr| addr.to_string()),
+        Some(direct.Endpoint),
+        "the public telemetry must be corroborated by the direct pong, not a configured candidate"
+    );
 }
 
 #[tokio::test]
@@ -2337,6 +2454,13 @@ async fn direct_path_upgrade_over_udp() {
         PathClass::Direct,
         "B's path to A should be Direct"
     );
+    let public_direct = a.peer_path_telemetry(&b.node_public());
+    assert_eq!(public_direct.class, PathClass::Direct);
+    assert_eq!(
+        public_direct.addr,
+        b.bound_udp_addr(),
+        "the public direct label must name the two-endpoint UDP underlay destination"
+    );
 
     // A standalone byte equal to the sender's mitigation tail has no trusted
     // provenance. It must remain ordinary peer traffic on scalar/plain paths.
@@ -2351,12 +2475,25 @@ async fn direct_path_upgrade_over_udp() {
     assert_eq!(standalone.len(), 1);
     assert_eq!(standalone[0].peer, a.node_public());
     assert_eq!(standalone[0].data, b"\x07".as_slice());
+    // This two-real-UDP-endpoint gate correlates the public direct label with
+    // both an externally observable underlay callback and delivery at B; it
+    // does not accept the in-memory best-path selection as sole proof.
     let standalone_tx = a_counts.lock().unwrap()[0].clone();
     assert_eq!((standalone_tx.packets, standalone_tx.bytes), (1, 1));
+    assert_eq!(
+        standalone_tx.destination,
+        (
+            b.bound_udp_addr().unwrap().ip(),
+            b.bound_udp_addr().unwrap().port()
+        )
+    );
     assert!(!standalone_tx.recv);
     let standalone_rx = b_counts.lock().unwrap()[0].clone();
     assert_eq!((standalone_rx.packets, standalone_rx.bytes), (1, 1));
     assert!(standalone_rx.recv);
+    let public_after_underlay = a.peer_path_telemetry(&b.node_public());
+    assert_eq!(public_after_underlay.class, PathClass::Direct);
+    assert_eq!(public_after_underlay.addr, b.bound_udp_addr());
     a_counts.lock().unwrap().clear();
     b_counts.lock().unwrap().clear();
 

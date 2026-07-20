@@ -145,11 +145,54 @@ struct PeerEntry {
     first_ip: String,
     hostname: String,
     owner: String,
+    cur_addr: String,
     relay: String,
+    peer_relay: String,
     online: bool,
     exit_node: bool,
     exit_node_option: bool,
     active: bool,
+}
+
+/// A validated LocalAPI path identity. `Active` alone is deliberately not a
+/// path claim: exactly one current, syntactically valid identity is required.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CurrentPath<'a> {
+    Direct(&'a str),
+    Derp(&'a str),
+    PeerRelay(&'a str),
+}
+
+fn valid_socket_addr(value: &str) -> bool {
+    value
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| address.port() != 0)
+}
+
+fn valid_derp_identity(value: &str) -> bool {
+    value
+        .strip_prefix("derp-")
+        .and_then(|region| region.parse::<i32>().ok())
+        .is_some_and(|region| region > 0)
+}
+
+fn current_path<'a>(
+    cur_addr: &'a str,
+    relay: &'a str,
+    peer_relay: &'a str,
+) -> Option<CurrentPath<'a>> {
+    let direct = valid_socket_addr(cur_addr).then_some(CurrentPath::Direct(cur_addr));
+    let derp = valid_derp_identity(relay).then_some(CurrentPath::Derp(relay));
+    let peer_relay = valid_socket_addr(peer_relay).then_some(CurrentPath::PeerRelay(peer_relay));
+    match [direct, derp, peer_relay]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [path] => Some(*path),
+        _ => None,
+    }
 }
 
 fn parse_peer_entry(
@@ -216,8 +259,18 @@ fn parse_peer_entry(
         String::from("-")
     };
 
+    let cur_addr = node
+        .get("CurAddr")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let relay = node
         .get("Relay")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let peer_relay = node
+        .get("PeerRelay")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
@@ -235,15 +288,24 @@ fn parse_peer_entry(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    // rustscale doesn't track Active/TxBytes/RxBytes yet. Consider a peer
-    // "active" if it's online and has a relay or direct path.
-    let active = online;
+    // `Active` is magicsock's freshness-gated transport evidence. Online is
+    // control-plane reachability and must never be promoted to "direct".
+    // Treat malformed and mutually-exclusive wire fields as idle, including
+    // for `--active`; a producer cannot turn a peer active without naming the
+    // authenticated path it observed.
+    let active = node
+        .get("Active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && current_path(&cur_addr, &relay, &peer_relay).is_some();
 
     PeerEntry {
         first_ip,
         hostname: display_name,
         owner,
+        cur_addr,
         relay,
+        peer_relay,
         online,
         exit_node,
         exit_node_option,
@@ -260,26 +322,7 @@ fn print_peer_entry(entry: &PeerEntry) {
         &entry.first_ip
     };
 
-    // Build the status column.
-    let status_str = if entry.exit_node {
-        if entry.online {
-            "active; exit node".to_string()
-        } else {
-            "idle; exit node; offline".to_string()
-        }
-    } else if entry.exit_node_option {
-        if entry.online {
-            "active; offers exit node".to_string()
-        } else {
-            "idle; offers exit node; offline".to_string()
-        }
-    } else if !entry.online {
-        "offline".to_string()
-    } else if !entry.relay.is_empty() {
-        format!("active; relay \"{}\"", entry.relay)
-    } else {
-        "active; direct".to_string()
-    };
+    let status_str = peer_state(entry);
 
     println!(
         "{ip}\t{host}\t{owner}\t{status}",
@@ -287,4 +330,117 @@ fn print_peer_entry(entry: &PeerEntry) {
         owner = entry.owner,
         status = status_str
     );
+}
+
+fn peer_state(entry: &PeerEntry) -> String {
+    if entry.exit_node {
+        if entry.online && entry.active {
+            "active; exit node".to_string()
+        } else if entry.online {
+            "idle; exit node".to_string()
+        } else {
+            "idle; exit node; offline".to_string()
+        }
+    } else if entry.exit_node_option {
+        if entry.online && entry.active {
+            "active; offers exit node".to_string()
+        } else if entry.online {
+            "idle; offers exit node".to_string()
+        } else {
+            "idle; offers exit node; offline".to_string()
+        }
+    } else if !entry.online {
+        "offline".to_string()
+    } else if !entry.active {
+        "idle".to_string()
+    } else {
+        match current_path(&entry.cur_addr, &entry.relay, &entry.peer_relay) {
+            Some(CurrentPath::PeerRelay(addr)) => format!("active; peer-relay \"{addr}\""),
+            Some(CurrentPath::Derp(region)) => format!("active; relay \"{region}\""),
+            Some(CurrentPath::Direct(addr)) => format!("active; direct {addr}"),
+            None => {
+                // A malformed/future producer must fail closed: no evidence
+                // means idle, never the historical optimistic "direct" label.
+                "idle".to_string()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(active: bool) -> PeerEntry {
+        PeerEntry {
+            first_ip: "100.64.0.2".into(),
+            hostname: "peer".into(),
+            owner: "-".into(),
+            cur_addr: String::new(),
+            relay: String::new(),
+            peer_relay: String::new(),
+            online: true,
+            exit_node: false,
+            exit_node_option: false,
+            active,
+        }
+    }
+
+    #[test]
+    fn path_labels_require_fresh_transport_evidence() {
+        assert_eq!(peer_state(&peer(false)), "idle");
+        assert_eq!(peer_state(&peer(true)), "idle");
+
+        let mut direct = peer(true);
+        direct.cur_addr = "198.51.100.2:41641".into();
+        assert_eq!(peer_state(&direct), "active; direct 198.51.100.2:41641");
+
+        let mut derp = peer(true);
+        derp.relay = "derp-7".into();
+        assert_eq!(peer_state(&derp), "active; relay \"derp-7\"");
+
+        let mut relay = peer(true);
+        relay.peer_relay = "203.0.113.3:3478".into();
+        assert_eq!(
+            peer_state(&relay),
+            "active; peer-relay \"203.0.113.3:3478\""
+        );
+    }
+
+    #[test]
+    fn active_filter_requires_a_single_valid_path_identity() {
+        let status = serde_json::json!({
+            "TailscaleIPs": ["100.64.0.2"],
+            "HostName": "peer",
+            "Online": true,
+            "Active": false,
+            "CurAddr": "198.51.100.2:41641",
+        });
+        assert!(!parse_peer_entry(&status, "", false, &serde_json::json!({})).active);
+
+        for malformed in [
+            serde_json::json!({"Active": true}),
+            serde_json::json!({"Active": true, "CurAddr": "not-an-address"}),
+            serde_json::json!({"Active": true, "Relay": "derp-0"}),
+            serde_json::json!({"Active": true, "PeerRelay": "203.0.113.1:0"}),
+            serde_json::json!({
+                "Active": true,
+                "CurAddr": "198.51.100.2:41641",
+                "Relay": "derp-7",
+            }),
+        ] {
+            let entry = parse_peer_entry(&malformed, "", false, &serde_json::json!({}));
+            assert!(!entry.active, "{malformed}");
+            assert_eq!(peer_state(&entry), "offline");
+        }
+
+        let direct = serde_json::json!({
+            "Active": true,
+            "Online": true,
+            "CurAddr": "198.51.100.2:41641",
+        });
+        let entry = parse_peer_entry(&direct, "", false, &serde_json::json!({}));
+        assert!(entry.active);
+        assert_eq!(peer_state(&entry), "active; direct 198.51.100.2:41641");
+    }
 }

@@ -89,6 +89,7 @@ struct Args {
     udp_port: u16,
     peer: Option<Ipv4Addr>,
     ready_fifo: Option<String>,
+    phase_fifo: Option<String>,
 }
 
 impl Args {
@@ -114,7 +115,7 @@ impl Args {
 fn usage() -> ! {
     eprintln!(
         "usage: interop-tun-node <server|client> (--authkey K|--authkey-file F) --hostname H \
-         --state-dir D --tun-name N [--port P] [--udp-port U] [--peer V4] [--ready-fifo F]"
+         --state-dir D --tun-name N [--port P] [--udp-port U] [--peer V4] [--ready-fifo F] [--phase-fifo F]"
     );
     std::process::exit(2);
 }
@@ -149,6 +150,7 @@ fn parse_args() -> Args {
         udp_port: 18283,
         peer: None,
         ready_fifo: None,
+        phase_fifo: None,
     };
     let mut i = 1;
     while i < args.len() {
@@ -184,6 +186,9 @@ fn parse_args() -> Args {
             "--ready-fifo" => {
                 parsed.ready_fifo = Some(take_value(&args, &mut i, "--ready-fifo").to_string());
             }
+            "--phase-fifo" => {
+                parsed.phase_fifo = Some(take_value(&args, &mut i, "--phase-fifo").to_string());
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 usage();
@@ -209,6 +214,10 @@ fn parse_args() -> Args {
     }
     if parsed.role == Role::Client && parsed.ready_fifo.is_some() {
         eprintln!("client role must not receive --ready-fifo");
+        usage();
+    }
+    if parsed.role == Role::Server && parsed.phase_fifo.is_some() {
+        eprintln!("server role must not receive --phase-fifo");
         usage();
     }
     parsed
@@ -452,6 +461,7 @@ async fn up_tun_node(
         .ephemeral(true)
         .disable_portmapping(true)
         .state_dir(std::path::PathBuf::from(&args.state_dir))
+        .localapi_path(std::path::PathBuf::from(&args.state_dir).join("localapi.sock"))
         .build()?;
 
     let tun = TunConfig {
@@ -749,6 +759,18 @@ async fn run_client(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
         args.role,
         &format!("OOPS_CLIENT_UDP_ROUNDTRIP_OK count={UDP_DATAGRAMS}"),
     );
+
+    // Keep the endpoint alive while the parent obtains public CLI/LocalAPI
+    // evidence, blocks only the namespace-local direct underlay, exercises an
+    // authenticated DERP ping, and waits for freshness expiry. The FIFO is
+    // optional for direct local invocations; the protected gate always uses it.
+    if let Some(path) = args.phase_fifo.clone() {
+        line(start, args.role, "OOPS_CLIENT_PATH_EVIDENCE_READY");
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(path))
+            .await
+            .map_err(|error| format!("path phase handoff task failed: {error}"))??;
+        line(start, args.role, "OOPS_CLIENT_PATH_EVIDENCE_DONE");
+    }
 
     // TCP roundtrip through the kernel/TUN path. The server readiness FIFO
     // makes retries unnecessary: a failed first dial is a failed workload.

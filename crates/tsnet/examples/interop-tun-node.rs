@@ -385,6 +385,13 @@ fn assert_kernel_state(tun_name: &str, expected_mtu: usize) -> u32 {
         tailnet_route.is_some(),
         "real TUN gate: table 52 is missing 100.64.0.0/10 via {tun_name}\n{routes}"
     );
+    assert!(
+        routes.lines().any(|line| {
+            line.split_whitespace().next() == Some("100.100.100.100")
+                && line.contains(&format!("dev {tun_name}"))
+        }),
+        "real TUN gate: table 52 is missing the MagicDNS service route via {tun_name}\n{routes}"
+    );
 
     ifindex
 }
@@ -418,7 +425,7 @@ fn tun_counters(_tun_name: &str) -> (u64, u64) {
 
 /// Verify that an ordinary socket's destination lookup selects this endpoint's
 /// TUN. Kernel route existence alone is insufficient evidence of the path.
-fn assert_tun_route(tun_name: &str, peer: Ipv4Addr) -> String {
+fn assert_tun_route(tun_name: &str, peer: Ipv4Addr, local: Ipv4Addr) -> String {
     let destination = peer.to_string();
     let route = command_output(
         "ip",
@@ -426,10 +433,14 @@ fn assert_tun_route(tun_name: &str, peer: Ipv4Addr) -> String {
         "real TUN gate route lookup",
     );
     assert!(
-        route
-            .lines()
-            .any(|line| line.contains(&format!("dev {tun_name}"))),
-        "real TUN gate: route to {peer} does not select {tun_name}: {route}"
+        route.lines().any(|line| {
+            line.contains(&format!("dev {tun_name}")) && line.contains(&format!("src {local}"))
+        }),
+        "real TUN gate: route to {peer} must select {tun_name} with node source {local}: {route}"
+    );
+    assert!(
+        !route.contains("src 100.100.100.100"),
+        "real TUN gate: MagicDNS service VIP contaminated peer source selection: {route}"
     );
     route.trim().to_owned()
 }
@@ -511,6 +522,39 @@ async fn up_tun_node(
             IpAddr::V4(v4) => Some(*v4),
             IpAddr::V6(_) => None,
         }) {
+            let tun_addrs = command_output(
+                "ip",
+                &["-4", "-o", "addr", "show", "dev", &tun.name],
+                "real TUN gate node address ownership",
+            );
+            assert!(
+                tun_addrs.contains(&format!("inet {v4}/32")),
+                "real TUN gate: node address {v4}/32 is missing from {}: {tun_addrs}",
+                tun.name
+            );
+            assert!(
+                !tun_addrs.contains("100.100.100.100"),
+                "real TUN gate: MagicDNS service VIP is incorrectly owned by {}: {tun_addrs}",
+                tun.name
+            );
+            let loopback_addrs = command_output(
+                "ip",
+                &["-4", "-o", "addr", "show", "dev", "lo"],
+                "real TUN gate MagicDNS loopback ownership",
+            );
+            assert!(
+                loopback_addrs.contains("inet 100.100.100.100/32"),
+                "real TUN gate: loopback does not own MagicDNS service VIP: {loopback_addrs}"
+            );
+            line(
+                start,
+                args.role,
+                &format!(
+                    "OOPS_SOURCE_OWNERSHIP_OK role={} node={v4} dev={} magicdns=100.100.100.100 dev=lo",
+                    args.role.as_str(),
+                    tun.name
+                ),
+            );
             return Ok((server, v4));
         }
         if Instant::now() >= deadline {
@@ -655,7 +699,7 @@ async fn run_server(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
         IpAddr::V4(v4) => v4,
         IpAddr::V6(_) => return Err("server accepted a non-IPv4 tailnet peer".into()),
     };
-    let route = assert_tun_route(&args.tun_name, peer_v4);
+    let route = assert_tun_route(&args.tun_name, peer_v4, v4);
     line(
         start,
         args.role,
@@ -726,7 +770,7 @@ async fn run_client(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
 
     wait_for_peer(&server, peer, start, args.role).await?;
     let tun_before = tun_counters(&args.tun_name);
-    let route = assert_tun_route(&args.tun_name, peer);
+    let route = assert_tun_route(&args.tun_name, peer, v4);
     line(
         start,
         args.role,

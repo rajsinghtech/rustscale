@@ -577,6 +577,7 @@ set -e
 (( SERVER_RC == 0 )) || fail "server process exited with status $SERVER_RC"
 
 require_exactly_one_marker "$SERVER_LOG" "OOPS_KERNEL_OK role=server" server
+require_exactly_one_marker "$SERVER_LOG" "OOPS_SOURCE_OWNERSHIP_OK role=server" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_READY" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_PEER_OK" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TUN_ROUTE" server
@@ -585,6 +586,7 @@ require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TCP_ACCEPT" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TCP_DONE" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_DONE" server
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_KERNEL_OK role=client" client
+require_exactly_one_marker "$CLIENT_LOG" "OOPS_SOURCE_OWNERSHIP_OK role=client" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_PEER_OK" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_REVERSE_PEER_READY" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TUN_ROUTE" client

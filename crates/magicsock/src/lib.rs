@@ -34,8 +34,8 @@ mod udp_batch;
 mod udp_socket_buffers;
 
 pub use endpoint::{
-    BestPath, DiscoPingPurpose, Endpoint, PathClass, PendingPing, ProbeUDPLifetime,
-    TRUST_BEST_ADDR_DURATION,
+    BestPath, DiscoPingPurpose, Endpoint, PathClass, PathTelemetry, PendingPing, ProbeUDPLifetime,
+    PATH_ACTIVITY_TIMEOUT, TRUST_BEST_ADDR_DURATION,
 };
 pub use relay::{
     decode_geneve, decode_geneve_full, encode_geneve, encode_geneve_disco,
@@ -2542,7 +2542,7 @@ impl Magicsock {
                     #[cfg(target_os = "linux")]
                     {
                         return self
-                            .send_direct_batch_linux(&udp, addr, node_addr, datagrams)
+                            .send_direct_batch_linux(&peer, &udp, addr, node_addr, datagrams)
                             .await;
                     }
                     #[cfg(not(target_os = "linux"))]
@@ -2567,6 +2567,17 @@ impl Magicsock {
                             sent_bytes,
                             false,
                         );
+                        if sent_packets > 0 {
+                            if let Some(endpoint) = self
+                                .inner
+                                .endpoints
+                                .write()
+                                .expect("endpoints lock poisoned")
+                                .get_mut(&peer)
+                            {
+                                endpoint.note_direct_transport(addr, false);
+                            }
+                        }
                         return first_error.map_or(Ok(()), Err);
                     }
                 }
@@ -2607,6 +2618,17 @@ impl Magicsock {
                         sent_bytes,
                         false,
                     );
+                    if sent_packets > 0 {
+                        if let Some(endpoint) = self
+                            .inner
+                            .endpoints
+                            .write()
+                            .expect("endpoints lock poisoned")
+                            .get_mut(&peer)
+                        {
+                            endpoint.note_relay_transport(addr, false);
+                        }
+                    }
                     return first_error.map_or(Ok(()), Err);
                 }
                 for datagram in datagrams {
@@ -2637,6 +2659,7 @@ impl Magicsock {
     #[cfg(target_os = "linux")]
     async fn send_direct_batch_linux<T: AsRef<[u8]>>(
         &self,
+        peer: &NodePublic,
         udp: &Arc<UdpSocket>,
         addr: SocketAddr,
         node_addr: Option<IpAddr>,
@@ -2727,6 +2750,17 @@ impl Magicsock {
         self.inner
             .connection_counter
             .record(node_addr, addr, sent_packets, sent_bytes, false);
+        if sent_packets > 0 {
+            if let Some(endpoint) = self
+                .inner
+                .endpoints
+                .write()
+                .expect("endpoints lock poisoned")
+                .get_mut(peer)
+            {
+                endpoint.note_direct_transport(addr, false);
+            }
+        }
         first_error.map_or(Ok(()), |error| Err(MagicsockError::Io(error)))
     }
 
@@ -2741,6 +2775,31 @@ impl Magicsock {
             .get(peer)
             .map(|ep| ep.best_path(std::time::Instant::now()).class())
             .unwrap_or_default()
+    }
+
+    /// Snapshot authenticated transport evidence for a peer. Unlike
+    /// [`Self::peer_path_class`], this never promotes a configured fallback
+    /// (HomeDERP, a candidate, or an allocated relay) into an active path.
+    /// Absent or stale evidence is `PathClass::None`.
+    pub fn peer_path_telemetry(&self, peer: &NodePublic) -> PathTelemetry {
+        self.inner
+            .endpoints
+            .read()
+            .expect("endpoints lock poisoned")
+            .get(peer)
+            .map_or_else(PathTelemetry::default, Endpoint::path_telemetry)
+    }
+
+    fn note_peer_derp_transport(&self, peer: &NodePublic, region: i32, received: bool) {
+        if let Some(endpoint) = self
+            .inner
+            .endpoints
+            .write()
+            .expect("endpoints lock poisoned")
+            .get_mut(peer)
+        {
+            endpoint.note_derp_transport(region, received);
+        }
     }
 
     /// React to a major link change: re-gather local interface endpoints from
@@ -2956,7 +3015,7 @@ impl Magicsock {
 
         // Look up the endpoint to get its disco key, UDP candidates, and
         // preferred DERP send route.
-        let (peer_disco, candidates, derp_region) = {
+        let (peer_disco, candidates, derp_region, peer_relay) = {
             let endpoints = self
                 .inner
                 .endpoints
@@ -2967,6 +3026,7 @@ impl Magicsock {
                 ep.peer_disco_key().clone(),
                 ep.candidates(),
                 ep.derp_send_region(),
+                ep.current_relay().map(|(addr, vni, _, _)| (addr, vni)),
             )
         };
 
@@ -3063,13 +3123,25 @@ impl Magicsock {
                         );
                     }
                 }
-                // Use the regular DERP sender so an unknown region takes
-                // its bootstrap fanout path, just like a normal datagram.
-                // A send failure remains observable through the existing
-                // CLI timeout/error contract.
-                let _ = self
-                    .send_via_derp(peer_key.clone(), derp_region, &packet)
-                    .await;
+                // Probe an established peer relay independently too. Its
+                // authenticated pong records the actual relay socket/VNI;
+                // configured relay candidates and successful local sends are
+                // never status evidence. DERP remains an independent fallback.
+                if let Some((addr, vni)) = peer_relay {
+                    // An allocated relay is the current fallback transport.
+                    // Probe it instead of racing the same transaction over
+                    // DERP: otherwise a later DERP pong can overwrite the
+                    // actual peer-relay identity before public output reads it.
+                    self.inner.send_disco_udp(addr, vni, false, &packet);
+                } else {
+                    // Use the regular DERP sender so an unknown region takes
+                    // its bootstrap fanout path, just like a normal datagram.
+                    // A send failure remains observable through the existing
+                    // CLI timeout/error contract.
+                    let _ = self
+                        .send_via_derp(peer_key.clone(), derp_region, &packet)
+                        .await;
+                }
             }
         }
 
@@ -3213,6 +3285,7 @@ impl Magicsock {
                 .send_packet(region, peer.clone(), datagram.to_vec())
                 .await
             {
+                self.note_peer_derp_transport(&peer, region, false);
                 if debug_enabled() {
                     eprintln!(
                         "DBG derp_send peer={} region={} packet_len={}",
@@ -3283,11 +3356,16 @@ impl Magicsock {
                 .send_packet(region, peer.clone(), datagram.to_vec())
         });
         let results = futures_util::future::join_all(sends).await;
+        // Fanout is bootstrap duplication of one logical packet. Attribute it
+        // once, to the first region that accepted it.
         let accounting_region = all_regions
             .into_iter()
             .zip(results)
             .find_map(|(region, sent)| sent.then_some(region))
             .unwrap_or(0);
+        if accounting_region > 0 {
+            self.note_peer_derp_transport(&peer, accounting_region, false);
+        }
         Ok(accounting_region)
     }
 }
@@ -4356,18 +4434,20 @@ impl Inner {
             health.note_derp_region_frame(region_id);
         }
 
-        // Record the route only while source authorization is ordered against
-        // map replacement. The generation is rechecked again at enqueue.
+        // Authorization identifies which endpoint may receive this frame, but
+        // WireGuard ciphertext remains unauthenticated until the engine
+        // consumes it. Route and status evidence are therefore recorded only
+        // by `handle_disco_derp` after its authenticated disco envelope check.
+        // The generation is rechecked again at enqueue.
         let (node_addr, generation) = {
             let _ordering = self.authorization_delivery_barrier.read().await;
             let Some(generation) = self.peer_authorization.generation(&source) else {
                 return;
             };
-            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
-            let Some(endpoint) = endpoints.get_mut(&source) else {
+            let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+            let Some(endpoint) = endpoints.get(&source) else {
                 return;
             };
-            endpoint.set_last_recv_derp_region(region_id);
             (endpoint.node_addr(), generation)
         };
 
@@ -4384,7 +4464,7 @@ impl Inner {
         }
 
         if is_disco {
-            self.handle_disco_derp(data, source).await;
+            self.handle_disco_derp(data, source, region_id).await;
         } else {
             // WG datagram via DERP — account only after peer lookup and before
             // delivery. Disco/control frames took the branch above.
@@ -4463,6 +4543,9 @@ impl Inner {
                 let Some(endpoint) = endpoints.get_mut(&peer) else {
                     return;
                 };
+                // The reverse map identifies the candidate peer, but the WG
+                // ciphertext is authenticated later by the WireGuard engine.
+                // Do not publish path evidence before that authentication.
                 endpoint.note_recv_udp(std::time::Instant::now());
                 (generation, endpoint.node_addr())
             };
@@ -4540,6 +4623,30 @@ impl Inner {
                 else {
                     return;
                 };
+                // `disco.open` authenticated the sender. Corroborate the
+                // physical relay address/VNI against the current allocation
+                // before publishing peer-relay status evidence.
+                {
+                    let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+                    if let Some(endpoint) = endpoints.get_mut(&sender_key) {
+                        if let Some((
+                            relay_addr,
+                            relay_vni,
+                            relay_server,
+                            relay_server_generation,
+                        )) = endpoint.current_relay()
+                        {
+                            if relay_addr == src
+                                && relay_vni == vni
+                                && self
+                                    .peer_authorization
+                                    .is_current(relay_server, relay_server_generation)
+                            {
+                                endpoint.note_relay_transport(src, true);
+                            }
+                        }
+                    }
+                }
                 rm.handle_rx_disco_msg(relay_manager::RelayDiscoMsg {
                     msg,
                     disco: sender_disco,
@@ -4589,8 +4696,8 @@ impl Inner {
                 let Some(generation) = self.peer_authorization.generation(&peer) else {
                     return;
                 };
-                let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
-                let Some(endpoint) = endpoints.get(&peer) else {
+                let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+                let Some(endpoint) = endpoints.get_mut(&peer) else {
                     return;
                 };
                 let Some((relay_addr, relay_vni, relay_server, relay_server_generation)) =
@@ -4606,6 +4713,9 @@ impl Inner {
                 {
                     return;
                 }
+                // As with direct UDP, this payload is not authenticated until
+                // the WireGuard engine consumes it. Authenticated relay disco
+                // traffic records the public path observation instead.
                 (generation, endpoint.node_addr())
             };
             // Receive accounting includes the Geneve header, matching
@@ -4709,6 +4819,7 @@ impl Inner {
                     let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
                     if let Some(ep) = endpoints.get_mut(&peer) {
                         ep.note_recv_udp(std::time::Instant::now());
+                        ep.note_direct_transport(src, true);
                         // The packet was authenticated with this peer's disco
                         // key, so its observed source is safe to retain for
                         // future direct probing.
@@ -4820,7 +4931,7 @@ impl Inner {
         }
     }
 
-    async fn handle_disco_derp(&self, packet: &[u8], source: NodePublic) {
+    async fn handle_disco_derp(&self, packet: &[u8], source: NodePublic, region_id: i32) {
         let (sender_disco, msg) = match self.disco.open(packet) {
             Some(v) => v,
             None => return,
@@ -4832,18 +4943,23 @@ impl Inner {
             return;
         };
 
-        // Look up the peer's DERP send region (last-recv-region > HomeDERP).
+        // The envelope has authenticated the peer and the DERP frame names
+        // its actual region, so this is the sole point where DERP can refresh
+        // routing or public path status. Ciphertext alone cannot do either.
         let derp_region = {
-            let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
-            endpoints
-                .get(&source)
-                .map_or(0, endpoint::Endpoint::derp_send_region)
+            let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
+            let Some(endpoint) = endpoints.get_mut(&source) else {
+                return;
+            };
+            endpoint.set_last_recv_derp_region(region_id);
+            endpoint.note_derp_transport(region_id, true);
+            endpoint.derp_send_region()
         };
 
         match msg {
             Message::Ping(ping) => {
-                // Respond with a Pong via the peer's DERP region (arrival
-                // region is already recorded by handle_derp_packet).
+                // Respond with a Pong via the peer's authenticated DERP
+                // region recorded above.
                 let pong = Message::Pong(Pong {
                     tx_id: ping.tx_id,
                     src: rustscale_disco::AddrPort::new(

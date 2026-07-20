@@ -142,17 +142,10 @@ impl Server {
                 .filter_map(|s| s.split('/').next().and_then(|p| p.parse::<IpAddr>().ok()))
                 .collect();
 
-            let path_class = inner.magicsock.peer_path_class(&peer.Key);
-            let relay = match path_class {
-                rustscale_magicsock::PathClass::Derp => {
-                    format!("derp-{}", inner.magicsock.home_derp_region())
-                }
-                _ => String::new(),
-            };
-
+            let telemetry = inner.magicsock.peer_path_telemetry(&peer.Key);
             let exit_node_option = crate::peer_is_exit_capable(peer);
 
-            let ps = rustscale_ipnstate::PeerStatus {
+            let mut ps = rustscale_ipnstate::PeerStatus {
                 ID: peer.StableID.clone(),
                 NodeID: peer.ID,
                 PublicKey: peer.Key.to_string(),
@@ -160,7 +153,6 @@ impl Server {
                 DNSName: peer.Name.clone(),
                 TailscaleIPs: ips,
                 Online: peer.Online.unwrap_or(false),
-                Relay: relay,
                 ExitNode: selected_exit_key.as_ref() == Some(&peer.Key),
                 ExitNodeOption: exit_node_option,
                 InNetworkMap: true,
@@ -169,6 +161,7 @@ impl Server {
                 UserID: peer.User,
                 ..Default::default()
             };
+            crate::status::apply_path_telemetry(&mut ps, telemetry);
             sb.add_peer(&peer.Key, ps);
         }
 

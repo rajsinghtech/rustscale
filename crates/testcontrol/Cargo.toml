@@ -34,6 +34,7 @@ rustscale-derp = { path = "../derp", version = "0.1.4" }
 rustscale-tailcfg = { path = "../tailcfg", version = "0.1.4" }
 rustscale-key = { path = "../key", version = "0.1.4" }
 rustscale-magicsock = { path = "../magicsock", version = "0.1.4" }
+rustscale-ipnstate = { path = "../ipnstate", version = "0.1.4" }
 rustscale-udprelay = { path = "../udprelay", version = "0.1.4" }
 rcgen.workspace = true
 rustls.workspace = true

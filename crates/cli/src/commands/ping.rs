@@ -287,7 +287,7 @@ where
                 let via = if !result.PeerRelay.is_empty() {
                     format!("peer-relay({})", result.PeerRelay)
                 } else if result.DERPRegionID != 0 {
-                    format!("DERP({})", result.DERPRegionCode)
+                    derp_path_label(&result)
                 } else if !result.Endpoint.is_empty() {
                     result.Endpoint.clone()
                 } else {
@@ -323,6 +323,17 @@ where
             return progress.exhausted(parsed.until_direct);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Format only the DERP identity returned by the completed ping. The numeric
+/// region is the observed transport identity; the optional code is only its
+/// current control-plane display name.
+fn derp_path_label(result: &PingResult) -> String {
+    if result.DERPRegionCode.is_empty() {
+        format!("DERP({})", result.DERPRegionID)
+    } else {
+        format!("DERP({})", result.DERPRegionCode)
     }
 }
 
@@ -402,6 +413,25 @@ mod tests {
         ] {
             assert!(parse_ping_args(&input).is_err(), "{input:?}");
         }
+    }
+
+    #[test]
+    fn derp_ping_label_falls_back_to_the_observed_region_id() {
+        assert_eq!(
+            derp_path_label(&PingResult {
+                DERPRegionID: 7,
+                ..Default::default()
+            }),
+            "DERP(7)"
+        );
+        assert_eq!(
+            derp_path_label(&PingResult {
+                DERPRegionID: 7,
+                DERPRegionCode: "test-region".into(),
+                ..Default::default()
+            }),
+            "DERP(test-region)"
+        );
     }
 
     #[test]

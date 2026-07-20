@@ -394,8 +394,7 @@ async fn drop_retries_final_extension_owner_instead_of_discarding_it() {
 
 #[test]
 fn close_owner_survives_caller_runtime_destruction() {
-    let first_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let first_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -445,8 +444,7 @@ fn close_owner_survives_caller_runtime_destruction() {
 
     assert!(!extension_closed.load(Ordering::SeqCst));
     assert!(!router_closed.load(Ordering::SeqCst));
-    let retry_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let retry_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -709,8 +707,7 @@ fn logout_transaction_survives_caller_runtime_destruction_and_resumes_phase() {
     let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let control_worker = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
@@ -745,8 +742,7 @@ fn logout_transaction_survives_caller_runtime_destruction_and_resumes_phase() {
         .extension_registry(registry)
         .build()
         .unwrap();
-    let first_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let first_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -775,8 +771,7 @@ fn logout_transaction_survives_caller_runtime_destruction_and_resumes_phase() {
     });
     first_runtime.shutdown_background();
 
-    let retry_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let retry_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();

@@ -543,15 +543,24 @@ mod tests {
     async fn synthetic_rsb1_round(parallel: usize) -> ThroughputResult {
         let mut clients = Vec::with_capacity(parallel);
         let mut servers = tokio::task::JoinSet::new();
-        for _ in 0..parallel {
+        for index in 0..parallel {
             let (client, mut server) = tokio::io::duplex(1024);
             clients.push(client);
             servers.spawn(async move {
-                let header = read_header(&mut server).await.expect("read header");
-                assert_eq!(header.mode, MODE_THROUGHPUT);
-                write_ack(&mut server).await.expect("write ACK");
-                read_go(&mut server).await.expect("read GO");
-                server.shutdown().await.expect("shutdown server stream");
+                let header = read_header(&mut server)
+                    .await
+                    .unwrap_or_else(|error| panic!("stream {index} read header: {error}"));
+                assert_eq!(header.mode, MODE_THROUGHPUT, "stream {index}");
+                write_ack(&mut server)
+                    .await
+                    .unwrap_or_else(|error| panic!("stream {index} write ACK: {error}"));
+                read_go(&mut server)
+                    .await
+                    .unwrap_or_else(|error| panic!("stream {index} read GO: {error}"));
+                server
+                    .shutdown()
+                    .await
+                    .unwrap_or_else(|error| panic!("stream {index} shutdown: {error}"));
             });
         }
 
@@ -588,6 +597,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    // This preserves the stream index in a failure and exercises the exact
+    // long-lived RSB1 down-path teardown that previously stranded stream 679
+    // in a P1000 fan-out: client readers stop at the timing boundary, then
+    // every server writer must still complete its shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn userspace_p1000_rsb1_down_shutdown_completes_every_stream() {
+        const STREAMS: usize = 1000;
+        let result = synthetic_rsb1_round(STREAMS).await;
+        assert_eq!(
+            (result.established, result.handshaken, result.completed),
+            (STREAMS, STREAMS, STREAMS)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

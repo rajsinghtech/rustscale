@@ -158,8 +158,10 @@ pub struct DialStats {
 
 #[derive(Default)]
 struct DialStatsInner {
+    // A single source of truth makes a DialStats read a coherent ownership
+    // snapshot. Buffer ownership is fixed per pending socket and is derived
+    // from this count rather than racing a second atomic publication.
     pending_dials: std::sync::atomic::AtomicUsize,
-    pending_buffer_bytes: std::sync::atomic::AtomicUsize,
 }
 
 /// TCP connection lifecycle counters from the netstack poll loop.
@@ -167,6 +169,8 @@ struct DialStatsInner {
 pub struct ConnectionStats {
     /// Established sockets currently owned by the poll loop.
     pub live_connections: usize,
+    /// Ephemeral TCP ports owned by pending or established outbound sockets.
+    pub allocated_tcp_ports: usize,
     /// Durable local close requests not yet applied to smoltcp.
     pub pending_closes: usize,
     /// First close requests published by shutdown or drop.
@@ -180,6 +184,7 @@ pub struct ConnectionStats {
 #[derive(Default)]
 struct ConnectionStatsInner {
     live_connections: std::sync::atomic::AtomicUsize,
+    allocated_tcp_ports: std::sync::atomic::AtomicUsize,
     pending_closes: std::sync::atomic::AtomicUsize,
     close_requests: std::sync::atomic::AtomicUsize,
     close_completions: std::sync::atomic::AtomicUsize,
@@ -851,13 +856,14 @@ impl Netstack {
         reply_rx.await.map_err(|_| NetstackError::ShuttingDown)
     }
 
-    /// Return current pending-dial socket and buffer ownership counts.
-    /// Successful and failed dial replies are published only after these
-    /// counters acknowledge removal of that dial's socket and buffers.
+    /// Return a coherent pending-dial socket and buffer ownership snapshot.
+    /// Successful and failed dial replies are published only after the poll
+    /// loop has removed that dial's socket and released its port ownership.
     pub fn dial_stats(&self) -> DialStats {
+        let pending_dials = self.dial_stats.pending_dials.load(Ordering::Acquire);
         DialStats {
-            pending_dials: self.dial_stats.pending_dials.load(Ordering::Acquire),
-            pending_buffer_bytes: self.dial_stats.pending_buffer_bytes.load(Ordering::Acquire),
+            pending_dials,
+            pending_buffer_bytes: pending_dials.saturating_mul(TCP_BUF.saturating_mul(2)),
         }
     }
 
@@ -867,6 +873,10 @@ impl Netstack {
             live_connections: self
                 .connection_stats
                 .live_connections
+                .load(Ordering::Acquire),
+            allocated_tcp_ports: self
+                .connection_stats
+                .allocated_tcp_ports
                 .load(Ordering::Acquire),
             pending_closes: self.connection_stats.pending_closes.load(Ordering::Acquire),
             close_requests: self.connection_stats.close_requests.load(Ordering::Acquire),
@@ -1219,6 +1229,7 @@ async fn poll_loop(
                                 reply,
                             );
                             publish_dial_stats(&dial_stats, &pending_dials);
+                            publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                         }
                     }
                     Some(Command::CancelDial { id }) => {
@@ -1231,6 +1242,7 @@ async fn poll_loop(
                             }
                             let _ = sockets.remove(handle);
                             publish_dial_stats(&dial_stats, &pending_dials);
+                            publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                         }
                     }
                     Some(Command::ReclaimPendingDials { reply }) => {
@@ -1387,6 +1399,7 @@ async fn poll_loop(
                 }
                 let _ = sockets.remove(handle);
                 publish_dial_stats(&dial_stats, &pending_dials);
+                publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                 continue;
             }
             if pending_dials
@@ -1395,14 +1408,16 @@ async fn poll_loop(
             {
                 if let Some(pending) = pending_dials.remove(&handle) {
                     tcp_allocated_ports.remove(&pending.local_port);
-                    // Publish reclamation before waking the caller. The reply
-                    // is the production ownership acknowledgement.
+                    // Remove the physical socket before publishing or waking
+                    // the caller. The reply is an ownership acknowledgement,
+                    // not merely a map/accounting acknowledgement.
+                    let _ = sockets.remove(handle);
                     publish_dial_stats(&dial_stats, &pending_dials);
+                    publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                     let _ = pending.reply.send(Err(NetstackError::DialFailed(
                         "dial deadline exceeded".into(),
                     )));
                 }
-                let _ = sockets.remove(handle);
                 continue;
             }
             let state = sockets.get::<tcp::Socket>(handle).state();
@@ -1431,16 +1446,20 @@ async fn poll_loop(
                             }
                             tcp_allocated_ports.remove(&local_port);
                             let _ = sockets.remove(handle);
+                            publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                         }
                     }
                 }
                 State::Closed | State::TimeWait => {
                     if let Some(pd) = pending_dials.remove(&handle) {
                         tcp_allocated_ports.remove(&pd.local_port);
+                        // As with deadlines, a refused-dial reply is only
+                        // observable after its socket and port are gone.
+                        let _ = sockets.remove(handle);
                         publish_dial_stats(&dial_stats, &pending_dials);
+                        publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                         let _ = pd.reply.send(Err(NetstackError::ConnectionRefused));
                     }
-                    let _ = sockets.remove(handle);
                 }
                 _ => {}
             }
@@ -1477,18 +1496,24 @@ async fn poll_loop(
             &mut listeners,
             &mut tcp_allocated_ports,
         );
+        publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
     }
     dial_stats.pending_dials.store(0, Ordering::Release);
-    dial_stats.pending_buffer_bytes.store(0, Ordering::Release);
+    connection_stats
+        .allocated_tcp_ports
+        .store(0, Ordering::Release);
 }
 
 fn publish_dial_stats(stats: &DialStatsInner, pending_dials: &HashMap<SocketHandle, PendingDial>) {
-    let count = pending_dials.len();
-    stats.pending_dials.store(count, Ordering::Release);
-    stats.pending_buffer_bytes.store(
-        count.saturating_mul(TCP_BUF.saturating_mul(2)),
-        Ordering::Release,
-    );
+    stats
+        .pending_dials
+        .store(pending_dials.len(), Ordering::Release);
+}
+
+fn publish_tcp_port_stats(stats: &ConnectionStatsInner, allocated_ports: &HashSet<u16>) {
+    stats
+        .allocated_tcp_ports
+        .store(allocated_ports.len(), Ordering::Release);
 }
 
 /// Create a listening socket for `addr:port`.

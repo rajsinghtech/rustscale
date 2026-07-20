@@ -714,6 +714,53 @@ async fn repeated_canceled_dials_release_sockets_and_buffers_promptly() {
     }
 }
 
+/// The reclaim command follows all preceding dial/cancel commands in the
+/// bounded command channel. Even when cancellation fills that channel and
+/// `try_send` drops some CancelDial commands, closed reply channels are swept
+/// before the barrier acknowledgement. This checks socket-buffer, port, and
+/// application-channel ownership together: no pending dial buffers or port
+/// may remain, and no established stream channel may have been created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaim_barrier_drains_a_saturated_cancellation_queue() {
+    const DIALS: usize = 65; // command channel capacity is 64
+    let net = Arc::new(
+        Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).expect("create netstack"),
+    );
+    let mut dials = Vec::with_capacity(DIALS);
+    for _ in 0..DIALS {
+        let dial_net = Arc::clone(&net);
+        dials.push(tokio::spawn(async move {
+            dial_net
+                .dial(SocketAddr::from(([100, 64, 0, 254], 9)))
+                .await
+        }));
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while net.dial_stats().pending_dials == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("no dial reached poll-loop ownership");
+    for dial in &dials {
+        dial.abort();
+    }
+    for dial in dials {
+        let _ = dial.await;
+    }
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        net.reclaim_pending_dials(),
+    )
+    .await
+    .expect("reclaim barrier deadlocked behind canceled commands")
+    .expect("poll loop stopped during reclaim");
+    assert_eq!(net.dial_stats(), DialStats::default());
+    assert_eq!(net.connection_stats(), crate::ConnectionStats::default());
+}
+
 #[tokio::test(start_paused = true)]
 async fn pending_dial_has_an_internal_deadline() {
     let net = Arc::new(
@@ -734,7 +781,10 @@ async fn pending_dial_has_an_internal_deadline() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("deadline exceeded"));
+    // The error reply itself is the ownership boundary: no follow-up yield or
+    // reclaim command is required to observe socket-buffer reclamation.
     assert_eq!(net.dial_stats(), DialStats::default());
+    assert_eq!(net.connection_stats(), crate::ConnectionStats::default());
 }
 
 /// Verify that multiple peers can connect simultaneously. Before the backlog
@@ -916,7 +966,10 @@ async fn assert_bounded_bulk_dial_phases(phases: &[(usize, bool)]) {
         );
         // The final dial reply is a production reclamation acknowledgement:
         // the poll-loop owner publishes removal before waking dial_many.
+        // Its socket buffers are no longer pending, while every established
+        // stream owns one distinct client port and its bounded app channels.
         assert_eq!(a_net.dial_stats(), DialStats::default());
+        assert_eq!(a_net.connection_stats().allocated_tcp_ports, streams);
         if fill_server_app_channel {
             use tokio::io::AsyncWriteExt;
 
@@ -941,6 +994,8 @@ async fn assert_bounded_bulk_dial_phases(phases: &[(usize, bool)]) {
                 let b = b_net.connection_stats();
                 if a.live_connections == 0
                     && b.live_connections == 0
+                    && a.allocated_tcp_ports == 0
+                    && b.allocated_tcp_ports == 0
                     && a.pending_closes == 0
                     && b.pending_closes == 0
                 {

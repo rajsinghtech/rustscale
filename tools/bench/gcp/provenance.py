@@ -46,7 +46,14 @@ CONFIG_PRODUCTS = {
     "ts-embedded": ("go-tsnet-rsb1",),
     "ts-userspace": ("tailscaled", "tailscale", "rustscale-bench"),
 }
-TOPOLOGY_ZONES = {"same-zone": ("us-central1-a", "us-central1-b"), "cross-region": ("us-central1-a", "us-west1-a")}
+# Ordered pairs accepted by the harness capacity preflight. The historical
+# same-zone label remains same-region/cross-zone; selected endpoint zones are
+# retained in observed provenance and must be one of these approved pairs.
+TOPOLOGY_ZONE_PAIRS = {
+    "same-zone": (("us-central1-a", "us-central1-b"), ("us-central1-c", "us-central1-f"), ("us-central1-a", "us-central1-f")),
+    "cross-region": (("us-central1-a", "us-west1-a"), ("us-central1-c", "us-west1-a")),
+}
+TOPOLOGY_ZONES = {topology: pairs[0] for topology, pairs in TOPOLOGY_ZONE_PAIRS.items()}
 
 
 def read(path):
@@ -215,6 +222,22 @@ def validate_endpoint(value, config, name):
     if any(not is_string(value.get(k)) for k in required) or type(value.get("logical_cpus")) is not int or value["logical_cpus"] <= 0: raise ValueError(f"invalid {name} environment")
 
 
+def observed_topology_zones(observed, topology):
+    """Return the approved pair recorded by observed metadata (or dry primary)."""
+    pairs = TOPOLOGY_ZONE_PAIRS.get(topology)
+    if not pairs:
+        raise ValueError("invalid selected topology zones")
+    if not isinstance(observed, dict) or dry(observed.get("server")):
+        return pairs[0]
+    server, client = observed.get("server"), observed.get("client")
+    if not isinstance(server, dict) or not isinstance(client, dict):
+        raise ValueError("invalid observed endpoint zones")
+    pair = (server.get("zone"), client.get("zone"))
+    if pair not in pairs:
+        raise ValueError("observed endpoint zones are not an approved topology pair")
+    return pair
+
+
 def validate_observed(observed, config, dry_run, topology=None, server_zone=None, client_zone=None, requested_machine=None, current=True):
     if not isinstance(observed, dict): raise ValueError("observed must be an object")
     values = [observed.get("resolved_image"), observed.get("server"), observed.get("client"), observed.get("toolchain"), observed.get("product")]
@@ -226,8 +249,8 @@ def validate_observed(observed, config, dry_run, topology=None, server_zone=None
     if not is_string(observed.get("resolved_image")): raise ValueError("invalid resolved_image")
     validate_endpoint(observed.get("server"), config, "server"); validate_endpoint(observed.get("client"), config, "client")
     if topology is not None:
-        expected = TOPOLOGY_ZONES.get(topology)
-        if expected is None or (server_zone, client_zone) != expected: raise ValueError("invalid selected topology zones")
+        expected = TOPOLOGY_ZONE_PAIRS.get(topology)
+        if expected is None or (server_zone, client_zone) not in expected: raise ValueError("invalid selected topology zones")
         if observed["server"]["zone"] != server_zone or observed["client"]["zone"] != client_zone: raise ValueError("observed endpoint zones do not match invocation")
         if requested_machine and (observed["server"]["machine_type"] != requested_machine or observed["client"]["machine_type"] != requested_machine): raise ValueError("observed machine type does not match request")
     toolchain = observed.get("toolchain")
@@ -346,8 +369,7 @@ def command_attach(args):
     config = result.get("config")
     topology, path = result.get("topology"), result.get("path")
     if config not in manifest["configs"] or topology not in manifest["topologies"] or path not in manifest["paths"]: raise ValueError("result identity is not selected by manifest")
-    zones = TOPOLOGY_ZONES.get(topology)
-    if zones is None: raise ValueError("invalid result topology")
+    zones = observed_topology_zones(observed, topology)
     validate_observed(observed, config, manifest["dry_run"], topology, *zones, manifest["run"]["cloud"]["requested_machine_type"])
     source_schema = result.get("schema_version")
     if source_schema not in (2, 4, 5, 6): raise ValueError("producer result schema_version must be 2, 4, 5, or 6")
@@ -402,8 +424,9 @@ def command_validate(args):
     if args.result:
         result = read(args.result)
         if result.get("schema_version") not in (3, 4, 5, 6) or result.get("run") != manifest["run"]: raise ValueError("result run does not exactly equal matrix run")
-        topology = result.get("topology"); zones = TOPOLOGY_ZONES.get(topology)
-        if result.get("config") not in manifest["configs"] or topology not in manifest["topologies"] or result.get("path") not in manifest["paths"] or zones is None: raise ValueError("result identity is not selected by manifest")
+        topology = result.get("topology")
+        if result.get("config") not in manifest["configs"] or topology not in manifest["topologies"] or result.get("path") not in manifest["paths"]: raise ValueError("result identity is not selected by manifest")
+        zones = observed_topology_zones(result.get("observed"), topology)
         validate_observed(result.get("observed"), result.get("config"), manifest["dry_run"], topology, *zones, manifest["run"]["cloud"]["requested_machine_type"], current=result.get("schema_version") in (4, 5, 6))
 
 
@@ -433,8 +456,7 @@ def command_profile(args):
     if not isinstance(profile, dict): raise ValueError("profile metadata must be an object")
     topology, path = profile.get("topology"), profile.get("path")
     if args.config not in manifest["configs"] or topology not in manifest["topologies"] or path not in manifest["paths"]: raise ValueError("profile identity is not selected by manifest")
-    zones = TOPOLOGY_ZONES.get(topology)
-    if zones is None: raise ValueError("invalid profile topology")
+    zones = observed_topology_zones(observed, topology)
     validate_observed(observed, args.config, manifest["dry_run"], topology, *zones, manifest["run"]["cloud"]["requested_machine_type"])
     profile["run"] = copy.deepcopy(manifest["run"]); profile["observed"] = observed
     profile["source_commit"] = manifest["run"]["source"]["commit"]; profile["run_id"] = manifest["run"]["id"]

@@ -171,6 +171,12 @@ tools/bench/gcp/run-matrix.sh
 tools/bench/gcp/run-matrix.sh --scale-streams
 ```
 
+A paid run accepts only an existing noninteractive `gcloud` account or an
+already configured ADC, workload-identity, or service-account credential file.
+If the active account is expired but an existing credential file is valid, the
+harness temporarily selects it with `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`;
+it never starts browser/device login, prints a token, or writes credentials.
+
 Every selected cell executes byte-identical RSB1 download semantics (direction
 `down`, 1280-byte writes), one P1/3-second warmup before sampling, the ordered
 throughput points and repeats, and 200 complete 8-byte TCP ping-pongs with raw
@@ -244,8 +250,12 @@ self-contained.
 peer load are not implemented, so current manifests explicitly record
 `effective=null`, `observed=null`, and `status=not-applied`; dashboards must not
 call it configured or effective load. The historical `same-zone` harness label
-currently provisions `us-central1-a` and `us-central1-b`, so reports describe
-it accurately as same-region/cross-zone.
+means same-region/cross-zone. Capacity preflight tries each approved pair once,
+in order: `us-central1-a`/`us-central1-b`, then
+`us-central1-c`/`us-central1-f`, then `us-central1-a`/`us-central1-f`.
+It advances only after an explicit GCP capacity-exhaustion error, cleans up any
+partial pair first, prints the selected pair, and retains it in endpoint
+provenance; it never silently changes topology or machine type.
 
 ### Isolated native baseline
 

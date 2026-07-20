@@ -54,6 +54,66 @@ TOPOLOGY_SOURCE="explicit"
 PATH_SOURCE="explicit"
 CONFIG_SOURCE="explicit"
 
+# `same-zone` is the historical label; every candidate remains a same-region,
+# cross-zone us-central1 pair. Candidates are ordered and finite rather than an
+# open-ended retry policy. A selected pair is retained in endpoint provenance.
+declare -A ZONE_PAIR_CANDIDATES=(
+  [same-zone]="us-central1-a:us-central1-b us-central1-c:us-central1-f us-central1-a:us-central1-f"
+  [cross-region]="us-central1-a:us-west1-a us-central1-c:us-west1-a"
+)
+ACTIVE_SRV=""
+ACTIVE_SRV_ZONE=""
+ACTIVE_CLI=""
+ACTIVE_CLI_ZONE=""
+
+capacity_exhausted() {
+  grep -Eq 'ZONE_RESOURCE_POOL_EXHAUSTED|RESOURCE_EXHAUSTED|resource pool.*exhausted' "$1"
+}
+
+# Try each approved pair at most once. Only a documented capacity exhaustion
+# advances to the next equivalent pair; all other create failures fail closed.
+# ACTIVE_* is set before each attempt so an interrupt cannot leak a partial VM.
+provision_topology_pair() {
+  local topology="$1" server="$2" client="$3" pair server_zone client_zone log status
+  for pair in ${ZONE_PAIR_CANDIDATES[$topology]}; do
+    IFS=: read -r server_zone client_zone <<<"$pair"
+    ACTIVE_SRV="$server"; ACTIVE_SRV_ZONE="$server_zone"
+    ACTIVE_CLI="$client"; ACTIVE_CLI_ZONE="$client_zone"
+    log=$(mktemp) || return 1
+    if create_vms "$server" "$server_zone" "$client" "$client_zone" 2>"$log"; then
+      cat "$log" >&2
+      rm -f "$log"
+      Z_A="$server_zone"; Z_B="$client_zone"
+      echo "[gcp] capacity preflight selected $topology zones $Z_A / $Z_B" >&2
+      return 0
+    fi
+    status=$?
+    cat "$log" >&2
+    if ! capacity_exhausted "$log"; then
+      rm -f "$log"
+      return "$status"
+    fi
+    rm -f "$log"
+    echo "[gcp] capacity exhausted for approved $topology pair $server_zone / $client_zone; cleaning up before the next pair" >&2
+    delete_vms "$server" "$server_zone" "$client" "$client_zone" || return 1
+    ACTIVE_SRV=""; ACTIVE_SRV_ZONE=""; ACTIVE_CLI=""; ACTIVE_CLI_ZONE=""
+  done
+  echo "[gcp] no approved $topology zone pair has capacity for $GCP_MACHINE; no benchmark cell was started" >&2
+  return 1
+}
+
+matrix_zone_pair_self_test() (
+  local calls=""
+  create_vms() {
+    calls+=" create:$2/$4"
+    [[ "$2/$4" != us-central1-a/us-central1-b ]] || { echo ZONE_RESOURCE_POOL_EXHAUSTED >&2; return 1; }
+  }
+  delete_vms() { calls+=" delete:$2/$4"; }
+  provision_topology_pair same-zone server client || return 1
+  [[ "$Z_A/$Z_B" == us-central1-c/us-central1-f ]] || return 1
+  [[ "$calls" == ' create:us-central1-a/us-central1-b delete:us-central1-a/us-central1-b create:us-central1-c/us-central1-f' ]]
+)
+
 MATRIX_SELF_TEST=0
 if [[ "${1:-}" == "--self-test" ]]; then
   MATRIX_SELF_TEST=1
@@ -937,6 +997,7 @@ matrix_inbound_pipeline_self_test
 matrix_outbound_send_pipeline_self_test
 matrix_linux_udp_receive_modes_self_test
 matrix_linux_udp_tx_gso_mode_self_test
+matrix_zone_pair_self_test
 matrix_finalization_self_test
 
 if (( MATRIX_SELF_TEST )); then
@@ -976,15 +1037,19 @@ fi
 if [[ $DRY_RUN -eq 1 ]]; then
   export GCP_DRY_RUN=1
   echo "[dry-run] enabled — gcloud/API mutations skipped, stub JSONs emitted"
+else
+  # Never invoke browser/device login here. This selects only an already valid
+  # active account, ADC, workload identity, or service-account credential.
+  gcloud_auth_preflight || exit $?
+  if [[ -z "${GCP_PROJECT:-}" || "$GCP_PROJECT" == "(unset)" ]]; then
+    GCP_PROJECT=$(gcloud config get-value core/project 2>/dev/null || true)
+  fi
+  echo "[gcp] noninteractive auth route: $GCP_AUTH_ROUTE" >&2
 fi
 
 # ---------------------------------------------------------------------------
-# Zone pairings.
+# Zone pairings are selected by the bounded preflight declared above.
 # ---------------------------------------------------------------------------
-declare -A ZONES=(
-  [same-zone]="us-central1-a:us-central1-b"
-  [cross-region]="us-central1-a:us-west1-a"
-)
 ALL_TOPOLOGIES=(same-zone cross-region)
 ALL_PATHS=(direct derp)
 ALL_CONFIGS=(rs-userspace rs-tun ts-embedded ts-userspace ts-tun)
@@ -1123,12 +1188,8 @@ matrix_select_cell_observed() {
     --topology "$topology" --server-zone "$server_zone" --client-zone "$client_zone" --machine "$GCP_MACHINE" "${dry_flag[@]}"
 }
 
-# Track VMs created for cleanup. ASSUMES one pair per topology; we delete each
-# topology's VMs before starting the next to keep quota usage at 2 VMs.
-ACTIVE_SRV=""
-ACTIVE_SRV_ZONE=""
-ACTIVE_CLI=""
-ACTIVE_CLI_ZONE=""
+# Track VMs created for cleanup. We delete each topology's pair before the
+# next to keep quota usage at two VMs, including a partial capacity attempt.
 CLEANUP_RAN=0
 
  # ---------------------------------------------------------------------------
@@ -1185,19 +1246,15 @@ trap gcp_bench_cleanup EXIT
 # Main matrix loop.
 # ---------------------------------------------------------------------------
 for TOPO in "${TOPOLOGIES[@]}"; do
-  IFS=: read -r Z_A Z_B <<< "${ZONES[$TOPO]}"
   SERVER_VM=$(matrix_vm_name "$MATRIX_RUN_ID" "$TOPO" srv)
   CLIENT_VM=$(matrix_vm_name "$MATRIX_RUN_ID" "$TOPO" cli)
-  ACTIVE_SRV="$SERVER_VM"
-  ACTIVE_SRV_ZONE="$Z_A"
-  ACTIVE_CLI="$CLIENT_VM"
-  ACTIVE_CLI_ZONE="$Z_B"
 
   echo ""
-  echo "[gcp] === topology: $TOPO (zones $Z_A / $Z_B) ==="
+  echo "[gcp] === topology: $TOPO (approved zone-pair preflight) ==="
 
-  # Provision VMs (no-op in dry-run).
-  create_vms "$SERVER_VM" "$Z_A" "$CLIENT_VM" "$Z_B"
+  # Provision the first capacity-available approved pair (no-op in dry-run).
+  provision_topology_pair "$TOPO" "$SERVER_VM" "$CLIENT_VM"
+  echo "[gcp] === topology: $TOPO (zones $Z_A / $Z_B) ==="
 
   if [[ -n "$REMOTE_BUILD_COMMAND" ]]; then
     # Deliver source sequentially, then build every selected source endpoint on

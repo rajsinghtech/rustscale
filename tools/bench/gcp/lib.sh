@@ -104,7 +104,32 @@ declare -A _SSH_IP=()
 declare -A _SSH_USER=()
 _SSH_KEY="$HOME/.ssh/google_compute_engine"
 
-# Auto-detect project if not set.
+# Select an already configured noninteractive credential without changing the
+# user's gcloud configuration or starting an interactive login. An expired
+# active account is deliberately not preferred over a valid ADC/service-account
+# file. CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE lets gcloud refresh the existing
+# credential for the bounded matrix instead of pinning a printed access token.
+gcloud_auth_preflight() {
+  local candidate
+  if gcloud auth print-access-token >/dev/null 2>&1; then
+    GCP_AUTH_ROUTE=active-gcloud-account
+    return 0
+  fi
+  for candidate in "${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" "${GOOGLE_APPLICATION_CREDENTIALS:-}" "$HOME/.config/gcloud/application_default_credentials.json"; do
+    [[ -n "$candidate" && -r "$candidate" ]] || continue
+    if CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$candidate" gcloud auth print-access-token >/dev/null 2>&1; then
+      export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$candidate"
+      GCP_AUTH_ROUTE=credential-file-override
+      return 0
+    fi
+  done
+  echo "[gcp] no valid noninteractive gcloud credential; configure ADC, workload identity, or a service-account credential before a paid run" >&2
+  return 2
+}
+
+# Auto-detect project if not set. A real run repeats this after auth selection,
+# because the configured account can be expired while a documented ADC file is
+# still valid.
 if [[ -z "${GCP_PROJECT:-}" ]]; then
   GCP_PROJECT=$(gcloud config get-value core/project 2>/dev/null || true)
 fi

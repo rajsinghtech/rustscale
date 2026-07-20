@@ -115,7 +115,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         if obj.get("run") != matrix["run"]:
             errors.append("result run must exactly equal matrix run")
         try:
-            zones = provenance.TOPOLOGY_ZONES[topo]
+            zones = provenance.observed_topology_zones(obj.get("observed"), topo)
             provenance.validate_observed(obj.get("observed"), config, matrix["dry_run"], topo, *zones, matrix["run"]["cloud"]["requested_machine_type"], current=scoped)
         except (ValueError, TypeError) as exc:
             errors.append(str(exc))
@@ -438,7 +438,7 @@ def validate_failed(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[
         if obj.get("run") != matrix["run"]:
             errors.append("result run must exactly equal matrix run")
         try:
-            zones = provenance.TOPOLOGY_ZONES[key[0]]
+            zones = provenance.observed_topology_zones(obj.get("observed"), key[0])
             provenance.validate_observed(obj.get("observed"), key[2], matrix["dry_run"], key[0], *zones, matrix["run"]["cloud"]["requested_machine_type"], current=obj.get("schema_version") in (SCOPED_RESULT_SCHEMA_VERSION, PRIOR_MATCHED_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION))
         except (ValueError, TypeError) as exc:
             errors.append(str(exc))

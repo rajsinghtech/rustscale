@@ -499,7 +499,7 @@ run_client_cli ping "$SERVER_IP" --until-direct=false --count=3 --timeout=5s >"$
 grep -Eq ' via DERP\([^)]+\) ' "$DERP_PING" || fail "CLI ping did not identify its authenticated DERP transport"
 run_client_cli status --json >"$DERP_JSON"
 DERP_PEER=$(peer_for_server "$DERP_JSON") || fail "DERP LocalAPI output lacks exactly one server peer"
-jq -e '.Active == true and ((.CurAddr // "") == "") and ((.PeerRelay // "") == "") and ((.Relay // "") | test("^derp-[1-9][0-9]*$")) and .LastHandshake == "1970-01-01T00:00:00Z"' \
+jq -e '.Active == true and ((.CurAddr // "") == "") and ((.PeerRelay // "") == "") and ((.Relay // "") | test("^derp-[1-9][0-9]*$")) and ((.LastHandshake // "1970-01-01T00:00:00Z") == "1970-01-01T00:00:00Z")' \
   <<<"$DERP_PEER" >/dev/null || fail "DERP LocalAPI fields are inconsistent: $DERP_PEER"
 DERP_REGION=$(jq -r '.Relay' <<<"$DERP_PEER")
 run_client_cli status >"$DERP_TABLE"

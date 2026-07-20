@@ -189,12 +189,10 @@ struct ConnectionStatsInner {
 struct ConnectionLifecycle {
     close_requested: std::sync::atomic::AtomicBool,
     abort_requested: std::sync::atomic::AtomicBool,
-    close_applied: std::sync::atomic::AtomicBool,
     close_completed: std::sync::atomic::AtomicBool,
     retired: std::sync::atomic::AtomicBool,
     remote_closed: std::sync::atomic::AtomicBool,
     read_waker: std::sync::Mutex<Option<std::task::Waker>>,
-    close_waker: std::sync::Mutex<Option<std::task::Waker>>,
     notify: Arc<Notify>,
     stats: Arc<ConnectionStatsInner>,
 }
@@ -234,18 +232,7 @@ impl ConnectionLifecycle {
         }
     }
 
-    fn mark_close_applied(&self) {
-        if !self.close_applied.swap(true, Ordering::AcqRel) {
-            if let Ok(mut waker) = self.close_waker.lock() {
-                if let Some(waker) = waker.take() {
-                    waker.wake();
-                }
-            }
-        }
-    }
-
     fn complete_close(&self) {
-        self.mark_close_applied();
         if self.close_requested.load(Ordering::Acquire)
             && self
                 .close_completed
@@ -411,6 +398,7 @@ pub struct NetstackStream {
     read_buf: Bytes,
     lifecycle: Arc<ConnectionLifecycle>,
     shutdown_requested: bool,
+    write_backpressured: bool,
     notify: Arc<Notify>,
     remote_addr: Option<SocketAddr>,
     peer_node_key: Option<NodePublic>,
@@ -431,6 +419,7 @@ impl NetstackStream {
             read_buf: Bytes::new(),
             lifecycle,
             shutdown_requested: false,
+            write_backpressured: false,
             notify,
             remote_addr,
             peer_node_key,
@@ -513,6 +502,7 @@ impl AsyncWrite for NetstackStream {
             .is_some_and(|s| s.capacity() == s.max_capacity());
         match self.tx.poll_reserve(cx) {
             std::task::Poll::Ready(Ok(())) => {
+                self.write_backpressured = false;
                 let _ = self.tx.send_item(Bytes::copy_from_slice(&buf[..chunk_len]));
                 if was_empty {
                     self.notify.notify_one();
@@ -523,7 +513,10 @@ impl AsyncWrite for NetstackStream {
                 std::io::ErrorKind::ConnectionReset,
                 "connection closed",
             ))),
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Pending => {
+                self.write_backpressured = true;
+                std::task::Poll::Pending
+            }
         }
     }
 
@@ -536,33 +529,38 @@ impl AsyncWrite for NetstackStream {
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         if !self.shutdown_requested {
-            self.lifecycle.request_close();
+            // A pending write followed directly by shutdown means that write
+            // was canceled at the backpressure boundary. No further owner can
+            // account for the accepted backlog, so retire it instead of
+            // retransmitting it into a later workload. A write that is polled
+            // through to success clears this latch and remains graceful.
+            if self.write_backpressured {
+                self.lifecycle.request_abort();
+            } else {
+                self.lifecycle.request_close();
+            }
             self.shutdown_requested = true;
         }
-        if self.lifecycle.close_applied.load(Ordering::Acquire) {
-            return std::task::Poll::Ready(Ok(()));
-        }
-        if let Ok(mut waker) = self.lifecycle.close_waker.lock() {
-            *waker = Some(cx.waker().clone());
-        }
-        if self.lifecycle.close_applied.load(Ordering::Acquire) {
-            std::task::Poll::Ready(Ok(()))
-        } else {
-            std::task::Poll::Pending
-        }
+        // Publishing the out-of-band request transfers close ownership to the
+        // poll loop. It remains durable even when the data channel is full.
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for NetstackStream {
     fn drop(&mut self) {
-        // Once the application owner is gone there is nobody left to observe
-        // graceful-drain completion or a terminal error. Abort the smoltcp
-        // socket so canceled firehose writes cannot survive into a later
-        // process/trial as a retransmission backlog.
-        self.lifecycle.request_abort();
+        if self.shutdown_requested {
+            // Preserve a graceful explicit shutdown unless poll_shutdown
+            // already classified a full-channel backlog for abort.
+            self.lifecycle.request_close();
+        } else {
+            // Once the application owner disappears without shutdown there is
+            // nobody left to observe a graceful drain or terminal error.
+            self.lifecycle.request_abort();
+        }
     }
 }
 
@@ -1089,12 +1087,10 @@ fn make_stream_and_conn(
     let lifecycle = Arc::new(ConnectionLifecycle {
         close_requested: std::sync::atomic::AtomicBool::new(false),
         abort_requested: std::sync::atomic::AtomicBool::new(false),
-        close_applied: std::sync::atomic::AtomicBool::new(false),
         close_completed: std::sync::atomic::AtomicBool::new(false),
         retired: std::sync::atomic::AtomicBool::new(false),
         remote_closed: std::sync::atomic::AtomicBool::new(false),
         read_waker: std::sync::Mutex::new(None),
-        close_waker: std::sync::Mutex::new(None),
         notify: Arc::clone(&notify),
         stats: Arc::clone(&stats),
     });
@@ -1797,10 +1793,8 @@ fn pump_connection(
             && conn.lifecycle.close_requested.load(Ordering::Acquire)
         {
             sockets.get_mut::<tcp::Socket>(handle).close();
-            // Wake poll_shutdown only after every application byte accepted
-            // before shutdown has entered smoltcp in order. Completion still
-            // belongs to cleanup_closed after a terminal socket state.
-            conn.lifecycle.mark_close_applied();
+            // Completion belongs to cleanup_closed after a terminal socket
+            // state; poll_shutdown already transferred durable ownership.
             did_work = true;
         }
     }

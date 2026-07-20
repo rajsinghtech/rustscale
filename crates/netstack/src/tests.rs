@@ -28,14 +28,23 @@ async fn full_app_channel_cannot_lose_close_ownership() {
         stream.write_all(&[7]).await.expect("fill app channel");
     }
     assert_eq!(conn.app_rx.len(), 64);
+    let mut canceled_write = Box::pin(stream.write_all(&[8]));
+    assert!(futures_util::poll!(&mut canceled_write).is_pending());
+    drop(canceled_write);
 
-    let mut shutdown = Box::pin(stream.shutdown());
-    assert!(futures_util::poll!(&mut shutdown).is_pending());
-    drop(shutdown);
+    // A durable ownership transfer must complete even though no poll loop can
+    // drain this full channel. The predecessor blocked here indefinitely.
+    stream.shutdown().await.expect("publish durable close");
     assert!(conn
         .lifecycle
         .close_requested
         .load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        conn.lifecycle
+            .abort_requested
+            .load(std::sync::atomic::Ordering::Acquire),
+        "a saturated shutdown must retire its unowned backlog"
+    );
     assert_eq!(
         conn.app_rx.len(),
         64,
@@ -93,7 +102,7 @@ async fn full_app_channel_cannot_lose_close_ownership() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn dropping_full_app_channel_escalates_shutdown_to_abort() {
+async fn full_app_channel_shutdown_aborts_and_drop_is_idempotent() {
     use tokio::io::AsyncWriteExt;
 
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -104,10 +113,14 @@ async fn dropping_full_app_channel_escalates_shutdown_to_abort() {
     for _ in 0..64 {
         stream.write_all(&[0xA5]).await.expect("fill app channel");
     }
-    let mut shutdown = Box::pin(stream.shutdown());
-    assert!(futures_util::poll!(&mut shutdown).is_pending());
-    drop(shutdown);
-    assert!(!conn
+    let mut canceled_write = Box::pin(stream.write_all(&[0x5A]));
+    assert!(futures_util::poll!(&mut canceled_write).is_pending());
+    drop(canceled_write);
+    tokio::time::timeout(std::time::Duration::from_millis(50), stream.shutdown())
+        .await
+        .expect("full-channel shutdown retained the application task")
+        .expect("publish durable close");
+    assert!(conn
         .lifecycle
         .abort_requested
         .load(std::sync::atomic::Ordering::Acquire));
@@ -130,7 +143,7 @@ async fn dropping_full_app_channel_escalates_shutdown_to_abort() {
             .duplicate_close_requests
             .load(std::sync::atomic::Ordering::Acquire),
         1,
-        "drop records the graceful-to-abort escalation"
+        "drop repeats the already durable abort idempotently"
     );
 
     while conn.app_rx.try_recv().is_ok() {}

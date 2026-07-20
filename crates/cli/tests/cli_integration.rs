@@ -7,6 +7,7 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rustscale_key::NLPublic;
@@ -325,6 +326,140 @@ async fn cli_get_honors_global_json_before_or_after_subcommand() {
     assert!(!stdout.trim_start().starts_with('{'));
 
     env.server.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_localapi_status_correlates_direct_identity_with_real_udp_underlay() {
+    // Two independently configured tsnet endpoints share only testcontrol.
+    // The proof below does not accept magicsock path selection alone: it
+    // requires LocalAPI and CLI output to identify B's actual UDP socket, and
+    // an underlay callback to observe a payload delivered to that socket.
+    let mut env_a = setup().await;
+    let state_b = tempfile::tempdir().expect("state tempdir B");
+    let socket_b_dir = tempfile::tempdir().expect("socket tempdir B");
+    let socket_b = socket_b_dir.path().join("rustscale-cli-peer-b.sock");
+    let mut node_b = Server::builder()
+        .disable_portmapping(true)
+        .hostname("cli-path-peer-b")
+        .auth_key("tskey-test")
+        .control_url(env_a.tc.base_url())
+        .ephemeral(true)
+        .state_dir(state_b.path().to_path_buf())
+        .localapi_path(&socket_b)
+        .build()
+        .expect("build peer B");
+    Box::pin(tokio::time::timeout(Duration::from_secs(60), node_b.up()))
+        .await
+        .expect("peer B up timed out")
+        .expect("peer B up failed");
+    wait_for_socket(&socket_b, Duration::from_secs(10));
+
+    let key_a = env_a.server.node_key().expect("A node key");
+    let key_b = node_b.node_key().expect("B node key");
+    let magicsock_a = env_a.server.magicsock().expect("A magicsock");
+    let magicsock_b = node_b.magicsock().expect("B magicsock");
+    let a_bound = magicsock_a.bound_udp_addr().expect("A UDP socket");
+    let b_bound = magicsock_b.bound_udp_addr().expect("B UDP socket");
+    // A wildcard bind is a local socket property, not a peer-reachable
+    // endpoint. Publish the concrete loopback underlay that reaches each
+    // independently bound socket, exactly as an external peer would.
+    let a_underlay =
+        std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), a_bound.port());
+    let b_underlay =
+        std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), b_bound.port());
+    // Testcontrol normally learns these from later endpoint map requests.
+    // Publish the two concrete loopback sockets explicitly so the gate has no
+    // dependency on DERP/STUN or background endpoint refresh timing.
+    env_a
+        .tc
+        .set_node_endpoints(&key_a, vec![a_underlay.to_string()]);
+    env_a
+        .tc
+        .set_node_endpoints(&key_b, vec![b_underlay.to_string()]);
+    env_a.tc.set_node_online(&key_a, true);
+    env_a.tc.set_node_online(&key_b, true);
+    let observed_underlay = Arc::new(Mutex::new(Vec::new()));
+    magicsock_a.set_connection_counter(Some({
+        let observed_underlay = Arc::clone(&observed_underlay);
+        Arc::new(
+            move |_protocol, _source, destination, packets, bytes, received| {
+                if !received && packets > 0 && bytes > 0 {
+                    observed_underlay.lock().unwrap().push(destination);
+                }
+            },
+        )
+    }));
+
+    let client_a = LocalClient::new(&env_a.socket_path);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = client_a.status_bounded().await.expect("LocalAPI status");
+        let peer = status["Peer"][key_b.to_string()].clone();
+        if peer["Active"] == true
+            && peer["CurAddr"] == b_underlay.to_string()
+            && peer.get("Relay").is_none()
+            && peer.get("PeerRelay").is_none()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "LocalAPI never correlated A's direct peer status with B's UDP socket: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    magicsock_a
+        .send(key_b.clone(), b"external-underlay-status-gate")
+        .await
+        .expect("send direct underlay payload");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if observed_underlay
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|destination| *destination == (b_underlay.ip(), b_underlay.port()))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no underlay callback observed a payload to B's direct UDP socket {b_underlay}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let json = run_cli(&env_a.socket_path, &["status", "--json"]);
+    assert!(
+        json.status.success(),
+        "status --json: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).expect("CLI JSON status");
+    assert_eq!(json["Peer"][key_b.to_string()]["Active"], true);
+    assert_eq!(
+        json["Peer"][key_b.to_string()]["CurAddr"],
+        b_underlay.to_string()
+    );
+    assert!(json["Peer"][key_b.to_string()]["LastSeen"].is_string());
+    assert!(json["Peer"][key_b.to_string()]["LastHandshake"].is_string());
+
+    let active = run_cli(&env_a.socket_path, &["status", "--active"]);
+    assert!(
+        active.status.success(),
+        "status --active: {}",
+        String::from_utf8_lossy(&active.stderr)
+    );
+    let active = String::from_utf8(active.stdout).expect("active status UTF-8");
+    assert!(
+        active.contains(&format!("active; direct {b_underlay}")),
+        "{active}"
+    );
+
+    magicsock_a.set_connection_counter(None);
+    node_b.close().await.expect("close B");
+    env_a.server.close().await.expect("close A");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

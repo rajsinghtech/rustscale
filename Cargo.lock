@@ -3809,6 +3809,7 @@ dependencies = [
  "rustls",
  "rustscale-controlclient",
  "rustscale-derp",
+ "rustscale-ipnstate",
  "rustscale-key",
  "rustscale-magicsock",
  "rustscale-tailcfg",

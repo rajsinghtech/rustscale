@@ -170,6 +170,17 @@ async fn wait_for_streaming(
     }
 }
 
+async fn peer_status(
+    node: &TsnetServer,
+    peer: &rustscale_key::NodePublic,
+) -> Option<rustscale_ipnstate::PeerStatus> {
+    node.ipn_status()
+        .await?
+        .Peer
+        .get(&peer.to_string())
+        .cloned()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines, clippy::large_futures)]
 async fn peer_relay_e2e() {
@@ -274,13 +285,10 @@ async fn peer_relay_e2e() {
             eprintln!("scenario 2: A→B path is Relay");
             break;
         }
-        if std::time::Instant::now() >= deadline {
-            eprintln!(
-                "warning: A→B path is {:?} (expected Relay), continuing...",
-                class_a
-            );
-            break;
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A→B never established an authenticated peer-relay path; last class: {class_a:?}"
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
@@ -293,33 +301,59 @@ async fn peer_relay_e2e() {
             eprintln!("scenario 3: B→A path is Relay (CallMeMaybeVia worked)");
             break;
         }
-        if std::time::Instant::now() >= deadline {
-            eprintln!(
-                "warning: B→A path is {:?} (expected Relay), continuing...",
-                class_b
-            );
-            break;
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B→A never established an authenticated peer-relay path; last class: {class_b:?}"
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // ── 7. Verify bidirectional data exchange through relay ────────────
-    // Send WG datagrams between A and B. With direct paths disabled,
-    // data flows via the relay path (if established) or DERP fallback.
-    // Note: the pump task owns the WG receive channel, so we can't
-    // intercept packets at the magicsock level here. The data exchange
-    // is verified indirectly via path-class checks above + the rebind
-    // endpoint-count assertions below.
-    eprintln!("sending test data A→B...");
-    let test_payload = b"relay e2e test data from A to B";
+    // ── 7. Verify authenticated relay identities ───────────────────────
+    // A successful local write is deliberately not status evidence. Exchange
+    // packets and require at least one public status to name R's actual UDP
+    // socket. The other direction may genuinely remain on DERP in this
+    // hermetic topology; if it does, it must name the observed DERP region
+    // rather than claim a relay. The preceding allocation flow is TLS DERP.
+    eprintln!("sending authenticated relay traffic in both directions...");
     let ms_a = node_a.magicsock().expect("A up");
-    ms_a.send(key_b.clone(), test_payload)
+    let ms_b = node_b.magicsock().expect("B up");
+    ms_a.send(key_b.clone(), b"relay e2e test data from A to B")
         .await
         .expect("send A→B");
-
-    // Give the pump time to process the packet.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    eprintln!("scenario 2: data A→B sent (pump consumes WG channel)");
+    ms_b.send(key_a.clone(), b"relay e2e test data from B to A")
+        .await
+        .expect("send B→A");
+    let relay_addr = rs
+        .local_addr()
+        .expect("relay has a UDP address")
+        .to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let a_status = peer_status(&node_a, &key_b).await;
+        let b_status = peer_status(&node_b, &key_a).await;
+        let actual_path = |status: &rustscale_ipnstate::PeerStatus| {
+            status.Active
+                && status.CurAddr.is_empty()
+                && ((status.PeerRelay == relay_addr && status.Relay.is_empty())
+                    || (status.Relay == "derp-1" && status.PeerRelay.is_empty()))
+        };
+        if a_status.as_ref().is_some_and(actual_path)
+            && b_status.as_ref().is_some_and(actual_path)
+            && (a_status
+                .as_ref()
+                .is_some_and(|status| status.PeerRelay == relay_addr)
+                || b_status
+                    .as_ref()
+                    .is_some_and(|status| status.PeerRelay == relay_addr))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "status did not identify an authenticated relay {relay_addr} or observed DERP region; A={a_status:?}, B={b_status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // ── 8. Scenario 4: Rebind from new source port ─────────────────────
     // Trigger a link change on A, which causes the relay manager to

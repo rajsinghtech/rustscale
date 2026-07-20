@@ -16,7 +16,6 @@ pub(crate) fn apply_path_telemetry(status: &mut PeerStatus, telemetry: PathTelem
     // StatusBuilder may reuse a PeerStatus. Clear every mutually-exclusive
     // path field before copying the one currently authenticated observation,
     // so a direct -> DERP -> idle transition cannot leak a stale label.
-    status.Active = telemetry.fresh;
     status.CurAddr.clear();
     status.Relay.clear();
     status.PeerRelay.clear();
@@ -30,30 +29,43 @@ pub(crate) fn apply_path_telemetry(status: &mut PeerStatus, telemetry: PathTelem
         .map(DateTime::<Utc>::from)
         .unwrap_or(DateTime::UNIX_EPOCH);
 
+    // PathTelemetry is produced internally, but LocalAPI is a wire boundary:
+    // reject malformed or internally contradictory snapshots rather than
+    // exposing Active without an identity. This keeps Active and the three
+    // mutually-exclusive path fields truthful even if a future producer is
+    // buggy or a test injects an incomplete observation.
+    let current = telemetry.fresh
+        && match telemetry.class {
+            PathClass::Direct | PathClass::Relay => telemetry.addr.is_some(),
+            PathClass::Derp => telemetry.derp_region.is_some_and(|region| region > 0),
+            PathClass::None => false,
+        };
+    status.Active = current;
+    if !current {
+        return;
+    }
+
     match telemetry.class {
         PathClass::Direct => {
-            status.CurAddr = telemetry
-                .addr
-                .map(|addr| addr.to_string())
-                .unwrap_or_default();
+            // `current` above proves the address is present.
+            status.CurAddr = telemetry.addr.expect("checked direct address").to_string();
             status.LastHandshake = telemetry
                 .observed_at
                 .map(DateTime::<Utc>::from)
                 .unwrap_or(DateTime::UNIX_EPOCH);
         }
         PathClass::Derp => {
-            status.Relay = telemetry
-                .derp_region
-                .map(|region| format!("derp-{region}"))
-                .unwrap_or_default();
+            // `current` above proves the observed region is positive.
+            status.Relay = format!(
+                "derp-{}",
+                telemetry.derp_region.expect("checked DERP region")
+            );
         }
         PathClass::Relay => {
-            status.PeerRelay = telemetry
-                .addr
-                .map(|addr| addr.to_string())
-                .unwrap_or_default();
+            // `current` above proves the address is present.
+            status.PeerRelay = telemetry.addr.expect("checked relay address").to_string();
         }
-        PathClass::None => {}
+        PathClass::None => unreachable!("non-empty telemetry must have a path class"),
     }
 }
 
@@ -269,6 +281,47 @@ mod tests {
             DateTime::<Utc>::from(at + std::time::Duration::from_secs(1))
         );
         assert_eq!(status.LastHandshake, DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn malformed_or_stale_telemetry_fails_closed() {
+        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        for telemetry in [
+            PathTelemetry {
+                class: PathClass::Direct,
+                observed_at: Some(at),
+                fresh: true,
+                ..Default::default()
+            },
+            PathTelemetry {
+                class: PathClass::Derp,
+                derp_region: Some(0),
+                observed_at: Some(at),
+                fresh: true,
+                ..Default::default()
+            },
+            PathTelemetry {
+                class: PathClass::Relay,
+                observed_at: Some(at),
+                fresh: true,
+                ..Default::default()
+            },
+            PathTelemetry {
+                class: PathClass::Direct,
+                addr: Some("198.51.100.7:41641".parse().unwrap()),
+                observed_at: Some(at),
+                fresh: false,
+                ..Default::default()
+            },
+        ] {
+            let mut status = PeerStatus::default();
+            apply_path_telemetry(&mut status, telemetry);
+            assert!(!status.Active);
+            assert!(status.CurAddr.is_empty());
+            assert!(status.Relay.is_empty());
+            assert!(status.PeerRelay.is_empty());
+            assert_eq!(status.LastHandshake, DateTime::UNIX_EPOCH);
+        }
     }
 
     #[test]

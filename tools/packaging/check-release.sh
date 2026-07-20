@@ -111,6 +111,13 @@ grep -Fq 'targets: x86_64-unknown-linux-gnu' .github/workflows/sanitizer.yml
 grep -Fq 'CARGO_TARGET_DIR: target/tsan/${{ matrix.crate }}' .github/workflows/sanitizer.yml
 grep -Fq 'cargo +nightly test -Zbuild-std' .github/workflows/sanitizer.yml
 grep -Fq -- '--target x86_64-unknown-linux-gnu' .github/workflows/sanitizer.yml
+grep -Fq 'TSAN_OPTIONS: halt_on_error=1' .github/workflows/sanitizer.yml
+grep -Fq 'set -euo pipefail' .github/workflows/sanitizer.yml
+grep -Fq 'TSan executed zero tests' .github/workflows/sanitizer.yml
+if grep -Fq 'continue-on-error' .github/workflows/sanitizer.yml; then
+    echo "TSan workflow must fail when a sanitizer job fails" >&2
+    exit 1
+fi
 if grep -Fq -- '-Cunsafe-allow-abi-mismatch=sanitizer' .github/workflows/sanitizer.yml; then
     echo "TSan workflow must rebuild std, not permit sanitizer ABI mismatch" >&2
     exit 1

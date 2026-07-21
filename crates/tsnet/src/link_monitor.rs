@@ -1,5 +1,14 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use rand_core::{OsRng, RngCore as _};
+
+const PERIODIC_ENDPOINT_UPDATE_MIN: std::time::Duration = std::time::Duration::from_secs(270);
+const PERIODIC_ENDPOINT_UPDATE_JITTER_SECS: u64 = 60;
+
+fn periodic_endpoint_update_delay(random: u64) -> std::time::Duration {
+    PERIODIC_ENDPOINT_UPDATE_MIN
+        + std::time::Duration::from_secs(random % (PERIODIC_ENDPOINT_UPDATE_JITTER_SECS + 1))
+}
 
 #[derive(Clone)]
 pub(crate) struct LinkRouteSync {
@@ -430,12 +439,13 @@ pub(crate) async fn spawn_link_monitor(
 
 /// Periodic endpoint update task (Bug 4).
 ///
-/// Sends a non-streaming MapRequest with `OmitPeers=true` every 5 minutes
+/// Sends a non-streaming MapRequest with `OmitPeers=true` every 4.5–5.5 minutes
 /// so the control server always has fresh endpoint data (local IPs, STUN
-/// results, port-mapped endpoints). Go's controlclient does this via
-/// `setEndpoints` on a timer; rustscale only sent endpoints once at startup
-/// and on link-change (netmon), which could leave the control server with
-/// stale data for the lifetime of a long-lived session.
+/// results, port-mapped endpoints). Randomizing every interval mirrors Go's
+/// periodic re-STUN anti-synchronization and prevents peers started together
+/// from phase-locking their maintenance work. Go's controlclient publishes
+/// via `setEndpoints`; rustscale previously sent endpoints only at startup and
+/// on link-change (netmon), which could leave them stale in long-lived sessions.
 ///
 /// The task is self-contained: it creates its own `ControlClient` per
 /// update (to avoid sharing the streaming map-poll client) and respects
@@ -458,15 +468,22 @@ pub(crate) fn spawn_periodic_endpoint_updates(
         let node_pub = node_key.public();
         let disco_pub = disco_key.public();
         loop {
-            tokio::time::sleep(std::time::Duration::from_mins(5)).await;
-            if cancel.is_cancelled() {
-                break;
+            let delay = periodic_endpoint_update_delay(OsRng.next_u64());
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = cancel.cancelled() => break,
             }
 
             let mut eps = magicsock.all_endpoints();
             if !derp_map.Regions.is_empty() {
                 if let Ok(report) = rustscale_netcheck::Prober
-                    .run(&derp_map, &rustscale_netcheck::ProberOpts::default())
+                    .run_endpoint_refresh(
+                        &derp_map,
+                        &rustscale_netcheck::ProberOpts {
+                            previous_preferred_derp: home_derp,
+                            ..Default::default()
+                        },
+                    )
                     .await
                 {
                     if let Some(g) = report.global_v4 {
@@ -735,6 +752,27 @@ mod tests {
     use rustscale_key::NodePrivate;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn periodic_endpoint_update_delay_is_bounded_and_dephased() {
+        assert_eq!(
+            periodic_endpoint_update_delay(0),
+            std::time::Duration::from_secs(270)
+        );
+        assert_eq!(
+            periodic_endpoint_update_delay(60),
+            std::time::Duration::from_secs(330)
+        );
+        assert_eq!(
+            periodic_endpoint_update_delay(61),
+            std::time::Duration::from_secs(270)
+        );
+        assert!((0..=60).all(|sample| {
+            let delay = periodic_endpoint_update_delay(sample);
+            (std::time::Duration::from_secs(270)..=std::time::Duration::from_secs(330))
+                .contains(&delay)
+        }));
+    }
 
     struct BlockCountingRouter(Arc<AtomicUsize>);
 

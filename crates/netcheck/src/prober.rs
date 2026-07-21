@@ -122,6 +122,29 @@ impl Prober {
     /// matching response within the configured timeouts. Regions that don't
     /// respond are simply absent from the report's latency maps.
     pub async fn run(&self, dm: &DERPMap, opts: &ProberOpts) -> Result<Report, NetcheckError> {
+        self.run_inner(dm, opts, true).await
+    }
+
+    /// Gather only the STUN-derived endpoint data needed for periodic endpoint
+    /// publication. Unlike [`Self::run`], this skips ICMP fallback and captive
+    /// portal HTTP probes so maintenance cannot turn into a full diagnostic
+    /// sweep on an active data-plane executor.
+    pub async fn run_endpoint_refresh(
+        &self,
+        dm: &DERPMap,
+        opts: &ProberOpts,
+    ) -> Result<Report, NetcheckError> {
+        let mut endpoint_opts = opts.clone();
+        endpoint_opts.skip_icmp = true;
+        self.run_inner(dm, &endpoint_opts, false).await
+    }
+
+    async fn run_inner(
+        &self,
+        dm: &DERPMap,
+        opts: &ProberOpts,
+        detect_captive_portal: bool,
+    ) -> Result<Report, NetcheckError> {
         let probes = build_probe_plan(dm).await;
         if probes.is_empty() {
             return Err(NetcheckError::NoRegions);
@@ -172,20 +195,22 @@ impl Prober {
         report.preferred_derp =
             pick_with_hysteresis(&report.region_latency, opts.previous_preferred_derp);
 
-        // Run captive portal detection on every full netcheck. The delay
-        // mirrors Go's `captivePortalDelay` and lets STUN socket cleanup win
-        // before opening HTTP connections.
-        let dm_clone = dm.clone();
-        let detector = opts.captive_detector.clone();
-        let preferred = report.preferred_derp;
-        let captive = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            detector.detect_bool(Some(&dm_clone), preferred).await
-        })
-        .await
-        .ok()
-        .flatten();
-        report.captive_portal = captive;
+        if detect_captive_portal {
+            // Run captive portal detection on every full netcheck. The delay
+            // mirrors Go's `captivePortalDelay` and lets STUN socket cleanup
+            // win before opening HTTP connections.
+            let dm_clone = dm.clone();
+            let detector = opts.captive_detector.clone();
+            let preferred = report.preferred_derp;
+            let captive = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                detector.detect_bool(Some(&dm_clone), preferred).await
+            })
+            .await
+            .ok()
+            .flatten();
+            report.captive_portal = captive;
+        }
 
         // Forward captive portal result to the health tracker.
         if let Some(ref health) = opts.health {

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Randomized periodic endpoint-refresh timing and limited maintenance probes to
+  STUN endpoint discovery so colocated embedded peers do not phase-lock full
+  netchecks and stall active application datagrams.
+
 ## 0.1.4
 
 Patch release for idle application UDP latency and release-readiness hardening.

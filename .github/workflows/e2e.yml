@@ -126,7 +126,10 @@ jobs:
     name: TUN-mode interop (rustscale TUN <-> Go userspace)
     if: github.repository == 'rajsinghtech/rustscale'
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # A release version/lockfile bump invalidates the job-local Rust cache. Keep
+    # the complete cold build plus both independently bounded workloads inside
+    # one fail-closed cap, with enough time for runner teardown and log upload.
+    timeout-minutes: 50
     permissions:
       id-token: write
       contents: read
@@ -139,6 +142,18 @@ jobs:
       # if this runner cannot create and configure a real Linux TUN device.
       - name: Establish Linux TUN prerequisites (credential-free)
         run: tools/interop-tun-preflight.sh
+
+      # Build every binary used by both privileged workloads before minting an
+      # external credential. Besides shrinking the credentialed window, this
+      # gives a cold release build its own bounded, diagnosable phase instead
+      # of allowing it to consume the workload's job deadline.
+      - name: Build TUN interop binaries (credential-free)
+        run: |
+          python3 tools/agent/run-with-deadline.py 1800 -- bash -c '
+            cargo test -p rustscale-tsnet --lib --no-run &&
+            cargo build -p rustscale-tsnet --example interop-tun-node &&
+            cargo build -p rustscale-cli --bin rustscale
+          '
 
       - name: Install Go tailscale client
         run: |

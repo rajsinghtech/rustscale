@@ -191,7 +191,8 @@ jobs:
       - name: Run TUN interop tests
         env:
           TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
-        run: tools/interop-tun.sh
+          RUSTSCALE_DEADLINE_GRACE_SECONDS: "120"
+        run: python3 tools/agent/run-with-deadline.py 900 -- tools/interop-tun.sh
 
       # Corrected parity gate: the in-process repro above can pass while the
       # failure mode only appears with bench-style separate processes. Run
@@ -203,3 +204,14 @@ jobs:
         env:
           TS_ORG_TOKEN: ${{ steps.tsauth.outputs.token }}
         run: tools/interop-tun-oops.sh
+
+      # A process-level deadline can terminate the primary cleanup trap. Retry
+      # from its persisted child credentials after every outcome, and keep this
+      # final leak-protection attempt independently bounded as well.
+      - name: Clean up recorded TUN interop tailnet
+        if: always()
+        run: |
+          python3 tools/agent/run-with-deadline.py 120 -- bash -c '
+            source tools/bench/lib.sh
+            _bench_cleanup_leftover
+          '

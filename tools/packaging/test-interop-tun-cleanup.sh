@@ -43,4 +43,24 @@ fi
   exit 1
 }
 
+if tail --help 2>&1 | grep -q -- '--pid' && command -v timeout >/dev/null 2>&1; then
+  bench_cleanup_tailnet() { return 0; }
+  interop_tun_cleanup_tailnet 2
+
+  bench_cleanup_tailnet() {
+    trap '' TERM
+    while :; do :; done
+  }
+  start_seconds=$SECONDS
+  if interop_tun_cleanup_tailnet 1; then
+    echo "stubborn tailnet cleanup unexpectedly passed" >&2
+    exit 1
+  fi
+  elapsed=$((SECONDS - start_seconds))
+  (( elapsed <= 4 )) || {
+    echo "tailnet cleanup exceeded outer bound: ${elapsed}s" >&2
+    exit 1
+  }
+fi
+
 echo "interop TUN bounded cleanup regression passed"

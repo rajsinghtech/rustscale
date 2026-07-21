@@ -51,7 +51,7 @@ interop_tun_cleanup() {
   if [[ -n "$STATE_DIR" && -d "$STATE_DIR" ]]; then
     timeout 10s sudo -n rm -rf "$STATE_DIR" || cleanup_rc=1
   fi
-  bench_cleanup_tailnet || cleanup_rc=1
+  interop_tun_cleanup_tailnet 45 || cleanup_rc=1
 
   if (( original_rc != 0 )); then
     exit "$original_rc"

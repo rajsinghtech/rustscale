@@ -31,3 +31,24 @@ interop_tun_stop_child() {
   fi
   return 0
 }
+
+interop_tun_cleanup_tailnet() {
+  local deadline_seconds="${1:-45}"
+  local tailnet_pid=""
+
+  bench_cleanup_tailnet &
+  tailnet_pid=$!
+  if ! timeout --foreground --signal=TERM --kill-after=2s "${deadline_seconds}s" \
+      tail --pid="$tailnet_pid" -f /dev/null; then
+    kill -TERM "$tailnet_pid" 2>/dev/null || true
+    kill -KILL "$tailnet_pid" 2>/dev/null || true
+    wait "$tailnet_pid" 2>/dev/null || true
+    echo "[interop-tun] ERROR: ephemeral tailnet cleanup exceeded ${deadline_seconds}s" >&2
+    return 1
+  fi
+  if ! wait "$tailnet_pid"; then
+    echo "[interop-tun] ERROR: ephemeral tailnet cleanup failed" >&2
+    return 1
+  fi
+  return 0
+}

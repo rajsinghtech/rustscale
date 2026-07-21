@@ -102,18 +102,24 @@ pub async fn run_userspace(
             .dial_many(&target, parallel, SETUP_DEADLINE)
             .await
             .map_err(|error| format!("capacity error: {error}"))?;
-        let path_class = extract_path_class(&server.status(), &target);
-        measure(
+        // Match the pinned-Go comparator's observation boundary: classify the
+        // path only after the measured transfer has completed successfully.
+        // A fresh embedded process can still be converging immediately after
+        // dial setup, so the pre-measurement snapshot is not the trial's
+        // retained post-workload path evidence.
+        let mut result = measure(
             streams,
             "userspace-tsnet",
-            target,
+            target.clone(),
             duration,
             direction,
             parallel,
-            path_class,
+            "unknown".into(),
             my_ip,
         )
-        .await
+        .await?;
+        result.path_class = extract_path_class(&server.status(), &target);
+        Ok(result)
     }
     .await;
     // Stream Drop queues the netstack TCP close. Keep the packet pump alive

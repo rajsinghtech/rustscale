@@ -67,8 +67,20 @@ pub async fn run_userspace(
         let stream = tokio::time::timeout(Duration::from_secs(180), server.dial(&target))
             .await
             .map_err(|_| "RSB1 latency connection setup timeout")??;
-        let path = super::throughput::extract_path_class(&server.status(), &target);
-        measure(stream, "userspace-tsnet", target, count, path, my_ip).await
+        // Keep the Rust and pinned-Go embedded clients on the same evidence
+        // boundary: retain the path after the complete latency exchange, not
+        // the fresh process's immediately post-dial convergence snapshot.
+        let mut result = measure(
+            stream,
+            "userspace-tsnet",
+            target.clone(),
+            count,
+            "unknown".into(),
+            my_ip,
+        )
+        .await?;
+        result.path_class = super::throughput::extract_path_class(&server.status(), &target);
+        Ok(result)
     }
     .await;
     let shutdown = super::throughput::close_userspace(&mut server).await;

@@ -210,6 +210,19 @@ grep -Fq -- 'interop_tun_stop_child "$ECHO_BACKEND_PID" "echo backend" 5' tools/
 grep -Fq -- 'interop_tun_cleanup_tailnet 45' tools/interop-tun.sh
 grep -Fq -- '--connect-timeout 10 --max-time 20' tools/bench/lib.sh
 grep -Fq -- '--retry-max-time 45' tools/bench/lib.sh
+# The Go cross-client journey mutates host TUN routes, so it must never also
+# take over the shared runner's live resolver. DNS ownership remains protected
+# by the isolated namespace workflow and hermetic configurator regressions.
+tun_cross_client_test=$(awk '
+    /async fn interop_tun_rust_dials_go\(\)/ { test = 1 }
+    test && /^}/ { print; exit }
+    test { print }
+' crates/tsnet/src/tests.rs)
+printf '%s\n' "$tun_cross_client_test" | grep -Fq '.configure_os_dns(false)'
+if printf '%s\n' "$tun_cross_client_test" | grep -Fq '.configure_os_dns(true)'; then
+    echo "shared-runner TUN cross-client test takes over host DNS" >&2
+    exit 1
+fi
 tools/packaging/test-interop-tun-cleanup.sh
 grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/interop-tun.sh
 grep -Fq -- '--nocapture --test-threads=1' tools/interop-tun.sh

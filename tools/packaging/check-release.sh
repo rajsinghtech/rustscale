@@ -129,6 +129,15 @@ if grep -Fq -- '-Cunsafe-allow-abi-mismatch=sanitizer' .github/workflows/sanitiz
     exit 1
 fi
 
+# Credentialed tailnet jobs must remain serial: concurrent API-only tailnet
+# creation has produced transient map-stream and node-propagation failures.
+interop_job=$(awk '
+    /^  interop:/ { job = 1 }
+    job && /^  [A-Za-z0-9_-]+:/ && $1 != "interop:" { exit }
+    job { print }
+' .github/workflows/e2e.yml)
+printf '%s\n' "$interop_job" | grep -Fq 'needs: e2e'
+
 # The privileged TUN job must establish local kernel prerequisites before it
 # mints any external credential, then run one exact serial fail-closed test.
 tun_job=$(awk '
@@ -136,6 +145,7 @@ tun_job=$(awk '
     job && /^  [A-Za-z0-9_-]+:/ && $1 != "interop-tun:" { exit }
     job { print }
 ' .github/workflows/e2e.yml)
+printf '%s\n' "$tun_job" | grep -Fq 'needs: interop'
 preflight_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'tools/interop-tun-preflight.sh' | cut -d: -f1)
 build_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'Build TUN interop binaries (credential-free)' | cut -d: -f1)
 token_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'Mint Tailscale org token' | cut -d: -f1)

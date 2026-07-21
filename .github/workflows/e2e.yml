@@ -67,6 +67,10 @@ jobs:
   # ---------------------------------------------------------------------------
   interop:
     name: Cross-client interop (rustscale <-> Go tailscaled)
+    # Creating several API-only tailnets at once has produced transient map
+    # stream and node-propagation failures. Keep the credentialed jobs serial
+    # so a green run is reproducible rather than dependent on manual retries.
+    needs: e2e
     if: github.repository == 'rajsinghtech/rustscale'
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -124,6 +128,7 @@ jobs:
   # ---------------------------------------------------------------------------
   interop-tun:
     name: TUN-mode interop (rustscale TUN <-> Go userspace)
+    needs: interop
     if: github.repository == 'rajsinghtech/rustscale'
     runs-on: ubuntu-latest
     # A release version/lockfile bump invalidates the job-local Rust cache. Keep

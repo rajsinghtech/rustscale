@@ -139,14 +139,22 @@ tun_job=$(awk '
 preflight_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'tools/interop-tun-preflight.sh' | cut -d: -f1)
 build_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'Build TUN interop binaries (credential-free)' | cut -d: -f1)
 token_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'Mint Tailscale org token' | cut -d: -f1)
+cleanup_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'Clean up recorded TUN interop tailnet' | cut -d: -f1)
 test -n "$preflight_line"
 test -n "$build_line"
 test -n "$token_line"
+test -n "$cleanup_line"
 test "$preflight_line" -lt "$token_line"
 test "$preflight_line" -lt "$build_line"
 test "$build_line" -lt "$token_line"
+test "$token_line" -lt "$cleanup_line"
 printf '%s\n' "$tun_job" | grep -Fq 'timeout-minutes: 50'
 printf '%s\n' "$tun_job" | grep -Fq 'tools/agent/run-with-deadline.py 1800'
+printf '%s\n' "$tun_job" | grep -Fq 'tools/agent/run-with-deadline.py 900 -- tools/interop-tun.sh'
+printf '%s\n' "$tun_job" | grep -Fq 'RUSTSCALE_DEADLINE_GRACE_SECONDS: "120"'
+printf '%s\n' "$tun_job" | grep -Fq 'if: always()'
+printf '%s\n' "$tun_job" | grep -Fq 'tools/agent/run-with-deadline.py 120 -- bash -c'
+printf '%s\n' "$tun_job" | grep -Fq '_bench_cleanup_leftover'
 grep -Fq -- 'cargo test -p rustscale-tsnet --lib --no-run' tools/interop-tun.sh
 grep -Fq -- "target.get('name') == 'rustscale_tsnet'" tools/interop-tun.sh
 grep -Fq -- "'lib' in target.get('kind', [])" tools/interop-tun.sh
@@ -199,6 +207,9 @@ grep -Fq -- 'source tools/interop-tun-cleanup.sh' tools/interop-tun.sh
 grep -Fq -- 'interop_tun_stop_child "$GO_PID" "Go tailscaled" 10' tools/interop-tun.sh
 # shellcheck disable=SC2016
 grep -Fq -- 'interop_tun_stop_child "$ECHO_BACKEND_PID" "echo backend" 5' tools/interop-tun.sh
+grep -Fq -- 'interop_tun_cleanup_tailnet 45' tools/interop-tun.sh
+grep -Fq -- '--connect-timeout 10 --max-time 20' tools/bench/lib.sh
+grep -Fq -- '--retry-max-time 45' tools/bench/lib.sh
 tools/packaging/test-interop-tun-cleanup.sh
 grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/interop-tun.sh
 grep -Fq -- '--nocapture --test-threads=1' tools/interop-tun.sh

@@ -298,7 +298,21 @@ async fn incomplete_close_preserves_router_dns_and_magicsock_until_retry() {
     inner.router = Some(shared_test_router(Box::new(FlagRouter(Arc::clone(
         &router_closed,
     )))));
-    inner.os_dns_configurator = Some(Box::new(FlagDns(Arc::clone(&dns_closed))));
+    let dns_manager = crate::dns_manager::DnsManager::new(
+        inner.resolver.clone(),
+        inner.dns_config.clone(),
+        inner.peers.clone(),
+        inner.domain.clone(),
+        inner.health.clone(),
+        true,
+        true,
+        inner.dns_config.read().await.clone(),
+    );
+    dns_manager
+        .attach(Box::new(FlagDns(Arc::clone(&dns_closed))))
+        .await
+        .unwrap();
+    inner.dns_manager = Some(dns_manager);
 
     assert!(matches!(
         server.close().await,
@@ -1045,7 +1059,14 @@ async fn dropped_loopback_handle_is_joined_by_central_close() {
         .await
         .unwrap();
     let addr = handle.local_addr();
-    let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Leave an accepted LocalAPI connection waiting for the rest of its
+    // request. Central close must cancel and join this child as well as the
+    // listener before an immediate bind can reuse the address.
+    tokio::io::AsyncWriteExt::write_all(&mut idle, b"G")
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
     drop(handle);
     server.close().await.unwrap();
     drop(idle);
@@ -1869,7 +1890,11 @@ fn os_dns_config_from_netmap_proxied() {
         vec![std::net::IpAddr::V4(Ipv4Addr::new(100, 100, 100, 100))]
     );
     assert_eq!(os.search_domains, vec!["tailnet.ts.net", "corp.example"]);
-    assert_eq!(os.match_domains, vec!["tailnet.ts.net"]);
+    assert_eq!(
+        os.match_domains,
+        vec!["tailnet.ts.net", "."],
+        "control default resolvers require the same root route in the OS plan"
+    );
 }
 
 #[test]
@@ -1979,8 +2004,7 @@ fn requested_os_dns_health_is_generation_owned_and_serialized_consistently() {
         .current_warnings()
         .iter()
         .any(|warning| {
-            warning.id == rustscale_health::WARN_OS_DNS
-                && warning.text.contains("permission denied")
+            warning.id == "subsystem-dns" && warning.text.contains("permission denied")
         }));
     assert!(crate::localapi::health_status_text(&localapi_status_health)
         .iter()
@@ -1989,7 +2013,7 @@ fn requested_os_dns_health_is_generation_owned_and_serialized_consistently() {
     assert!(rich
         .as_array()
         .is_some_and(|warnings| warnings.iter().any(|warning| {
-            warning["id"] == rustscale_health::WARN_OS_DNS
+            warning["id"] == "subsystem-dns"
                 && warning["text"]
                     .as_str()
                     .is_some_and(|text| text.contains("permission denied"))
@@ -2000,17 +2024,17 @@ fn requested_os_dns_health_is_generation_owned_and_serialized_consistently() {
     assert!(health
         .current_warnings()
         .iter()
-        .any(|warning| warning.id == rustscale_health::WARN_OS_DNS));
+        .any(|warning| warning.id == "subsystem-dns"));
 
     // A retired generation has a different tracker; its late clear cannot
     // mutate the published generation's DNS warning.
     let stale_generation_health = Tracker::new();
-    stale_generation_health.set_unhealthy(rustscale_health::WARN_OS_DNS, "stale failure");
-    stale_generation_health.set_healthy(rustscale_health::WARN_OS_DNS);
+    stale_generation_health.set_unhealthy("subsystem-dns", "stale failure");
+    stale_generation_health.set_healthy("subsystem-dns");
     assert!(health
         .current_warnings()
         .iter()
-        .any(|warning| warning.id == rustscale_health::WARN_OS_DNS));
+        .any(|warning| warning.id == "subsystem-dns"));
 
     // Only a genuine successful DNS reconfiguration of the committed tracker
     // clears the warning.
@@ -2022,7 +2046,7 @@ fn requested_os_dns_health_is_generation_owned_and_serialized_consistently() {
     assert!(!health
         .current_warnings()
         .iter()
-        .any(|warning| warning.id == rustscale_health::WARN_OS_DNS));
+        .any(|warning| warning.id == "subsystem-dns"));
     successful_owner.close().unwrap();
     owner.close().unwrap();
     assert!(closed.load(Ordering::SeqCst));
@@ -6003,16 +6027,31 @@ fn require_tun_interop(test_name: &str) -> Option<InteropEnv> {
 /// At this point every startup error is a regression, never a reason to skip.
 async fn up_tun_required(server: &mut Server, test_name: &str) -> rustscale_tun::TunConfig {
     let tun = rustscale_tun::TunConfig::default();
-    Box::pin(server.up_tun(TunModeConfig {
-        tun: tun.clone(),
-        apply_routes: true,
-        exit_node: None,
-    }))
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        Box::pin(server.up_tun(TunModeConfig {
+            tun: tun.clone(),
+            apply_routes: true,
+            exit_node: None,
+        })),
+    )
     .await
+    .unwrap_or_else(|_| {
+        panic!("{test_name}: up_tun timed out after 120s after privileged TUN prerequisites were established")
+    })
     .unwrap_or_else(|error| {
         panic!("{test_name}: up_tun failed after privileged TUN prerequisites were established: {error}")
     });
     tun
+}
+
+/// Bound TUN teardown so a stalled cleanup cannot consume the complete
+/// workflow timeout and conceal its actual failure from the protected gate.
+async fn close_tun_required(server: &mut Server, test_name: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(60), server.close())
+        .await
+        .unwrap_or_else(|_| panic!("{test_name}: Server::close timed out after 60s"))
+        .unwrap_or_else(|error| panic!("{test_name}: Server::close failed: {error}"));
 }
 
 /// The existing ignored interop selector also has a dedicated, credential-free
@@ -6054,6 +6093,34 @@ fn required_command_output(program: &str, args: &[&str], assertion: &str) -> Str
     assert!(
         output.status.success(),
         "{assertion}: {program} {args:?} failed with {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("{assertion}: command output was not UTF-8: {error}"))
+}
+
+/// Execute a host-resolver probe with an external deadline. `getent` can wait
+/// indefinitely when a broken per-link DNS route drops packets, which formerly
+/// allowed a failed MagicDNS assertion to run until the GitHub job timeout.
+#[cfg(target_os = "linux")]
+fn required_bounded_command_output(
+    program: &str,
+    args: &[&str],
+    seconds: u64,
+    assertion: &str,
+) -> String {
+    let limit = format!("{seconds}s");
+    let output = std::process::Command::new("timeout")
+        .args(["--foreground", "--signal=KILL", limit.as_str(), program])
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("{assertion}: failed to run bounded {program} {args:?}: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "{assertion}: {program} {args:?} failed or timed out after {limit} with {:?}: {}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -6188,6 +6255,50 @@ fn assert_linux_tun_kernel_state(tun: &rustscale_tun::TunConfig) {
     );
 }
 
+/// Prove the system resolver reaches the TUN's MagicDNS responder. These are
+/// deliberately out-of-process commands: a netmap-only resolver is not enough
+/// evidence that ordinary host applications can resolve peer names.
+#[cfg(target_os = "linux")]
+fn assert_linux_magicdns_reachable(tun: &rustscale_tun::TunConfig, go: &InteropEnv) {
+    let dns = required_bounded_command_output(
+        "resolvectl",
+        &["dns", &tun.name],
+        10,
+        "MagicDNS resolvectl DNS link state",
+    );
+    assert!(
+        dns.contains("100.100.100.100"),
+        "MagicDNS resolvectl DNS state for {} lacks service VIP:\n{dns}",
+        tun.name
+    );
+    let domains = required_bounded_command_output(
+        "resolvectl",
+        &["domain", &tun.name],
+        10,
+        "MagicDNS resolvectl domain link state",
+    );
+    assert!(
+        domains.contains('~'),
+        "MagicDNS resolvectl domain state for {} lacks a routing domain:\n{domains}",
+        tun.name
+    );
+
+    let name = go.go_name.trim_end_matches('.');
+    let hosts = required_bounded_command_output(
+        "getent",
+        &["ahostsv4", name],
+        15,
+        "MagicDNS getent lookup",
+    );
+    assert!(
+        hosts
+            .lines()
+            .any(|line| line.starts_with(&go.go_ip.to_string())),
+        "MagicDNS getent lookup for {name} did not return {}:\n{hosts}",
+        go.go_ip
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn linux_tun_kernel_cleanup_failures(tun: &rustscale_tun::TunConfig, ifindex: u32) -> Vec<String> {
     let mut failures = Vec::new();
@@ -6311,6 +6422,16 @@ async fn run_required_tun_dns_failure_scenario() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();
     let state = tempfile::tempdir().unwrap();
+    // This scenario exercises a *requested* OS-DNS failure. The live DNS
+    // manager correctly leaves the configurator closed when CorpDNS is false,
+    // so persist the same explicit accept-dns intent used by the public CLI.
+    rustscale_ipn::Prefs {
+        WantRunning: true,
+        CorpDNS: true,
+        ..Default::default()
+    }
+    .save(state.path())
+    .unwrap();
     let tun_name = std::env::var("RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME")
         .expect("required TUN DNS gate did not provide RUSTSCALE_REQUIRED_TUN_DNS_TUN_NAME");
     assert!(
@@ -6438,7 +6559,7 @@ async fn run_required_tun_dns_failure_scenario() {
             return Err("injected DNS configurator was not called".into());
         }
         if !returned.health.iter().any(|warning| {
-            warning.id == rustscale_health::WARN_OS_DNS
+            warning.id == "subsystem-dns"
                 && warning.text.contains("injected DNS failure")
         }) {
             return Err(format!("returned status lost OS-DNS warning: {:?}", returned.health));
@@ -6451,7 +6572,7 @@ async fn run_required_tun_dns_failure_scenario() {
         if server
             .inner
             .as_ref()
-            .is_none_or(|inner| inner.os_dns_configurator.is_none())
+            .is_none_or(|inner| inner.dns_manager.is_none())
         {
             return Err("failed DNS configurator was not retained for cleanup".into());
         }
@@ -6488,7 +6609,7 @@ async fn run_required_tun_dns_failure_scenario() {
         .map_err(|_| "LocalAPI health request timed out after 10s".to_owned())?
         .map_err(|error| format!("LocalAPI health request failed: {error}"))?;
         if !local_health.as_array().is_some_and(|warnings| warnings.iter().any(|warning| {
-            warning["id"] == rustscale_health::WARN_OS_DNS
+            warning["id"] == "subsystem-dns"
                 && warning["text"]
                     .as_str()
                     .is_some_and(|text| text.contains("injected DNS failure"))
@@ -6575,6 +6696,7 @@ async fn interop_tun_rust_dials_go() {
         .hostname(format!("rustscale-tun-dial-{uid}"))
         .auth_key(ienv.authkey.clone())
         .ephemeral(true)
+        .configure_os_dns(true)
         .disable_portmapping(true)
         .build()
         .expect("build");
@@ -6582,7 +6704,10 @@ async fn interop_tun_rust_dials_go() {
     let tun = Box::pin(up_tun_required(&mut server, "interop_tun_rust_dials_go")).await;
 
     #[cfg(target_os = "linux")]
-    assert_linux_tun_kernel_state(&tun);
+    {
+        assert_linux_tun_kernel_state(&tun);
+        assert_linux_magicdns_reachable(&tun, &ienv);
+    }
     #[cfg(not(target_os = "linux"))]
     let _ = tun;
 
@@ -6634,7 +6759,7 @@ async fn interop_tun_rust_dials_go() {
     assert_eq!(&got, payload, "echo mismatch through TUN");
 
     log_go_path(&server, ienv.go_ip, "tun_rust_dials_go");
-    server.close().await.unwrap();
+    close_tun_required(&mut server, "interop_tun_rust_dials_go").await;
 }
 
 /// Interop TUN: Go dials the rustscale node through its SOCKS5 proxy.
@@ -6744,7 +6869,7 @@ async fn interop_tun_go_dials_rust() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(15), echo_task)
         .await
         .expect("echo task did not exit");
-    server.close().await.unwrap();
+    close_tun_required(&mut server, "interop_tun_go_dials_rust").await;
 }
 
 /// Interop TUN: verify OS routes were installed — `100.64.0.0/10` should
@@ -6794,7 +6919,7 @@ async fn interop_tun_os_routes() {
     }
 
     log_go_path(&server, ienv.go_ip, "tun_os_routes");
-    server.close().await.unwrap();
+    close_tun_required(&mut server, "interop_tun_os_routes").await;
 }
 
 /// Interop TUN: Go advertises a subnet route, rustscale in TUN mode with
@@ -6883,7 +7008,7 @@ async fn interop_tun_subnet_forward() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    server.close().await.unwrap();
+    close_tun_required(&mut server, "interop_tun_subnet_forward").await;
 }
 
 // ---------------------------------------------------------------------------

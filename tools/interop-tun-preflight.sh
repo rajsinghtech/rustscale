@@ -9,7 +9,7 @@ if [[ "$(uname -s)" != Linux ]]; then
   echo "[interop-tun-preflight] ERROR: the CI real-TUN gate requires Linux" >&2
   exit 1
 fi
-for cmd in ip sudo; do
+for cmd in ip sudo resolvectl getent timeout; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "[interop-tun-preflight] ERROR: required tool '$cmd' not found" >&2
     exit 1
@@ -17,6 +17,13 @@ for cmd in ip sudo; do
 done
 if ! sudo -n true 2>/dev/null; then
   echo "[interop-tun-preflight] ERROR: passwordless sudo is required" >&2
+  exit 1
+fi
+# The privileged MagicDNS gate exercises the systemd-resolved per-link D-Bus
+# API. A runner without it is unsupported and must fail before credentials are
+# minted; it is never a passing skip or a resolv.conf fallback.
+if ! timeout --foreground --signal=KILL 5s resolvectl status >/dev/null 2>&1; then
+  echo "[interop-tun-preflight] ERROR: systemd-resolved/resolvectl is unavailable" >&2
   exit 1
 fi
 if [[ ! -c /dev/net/tun ]]; then

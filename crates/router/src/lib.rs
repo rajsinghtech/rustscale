@@ -1785,6 +1785,11 @@ fn linux_rule_owners() -> &'static std::sync::Mutex<std::collections::HashMap<u3
 }
 
 #[cfg(target_os = "linux")]
+fn is_linux_loopback_service_addr(address: IpAddr) -> bool {
+    address == IpAddr::V4(std::net::Ipv4Addr::new(100, 100, 100, 100))
+}
+
+#[cfg(target_os = "linux")]
 impl Platform for LinuxPlatform {
     fn claim_ownership(&self) -> Result<(), RouterError> {
         let base = self.rule_base.ok_or_else(|| {
@@ -1973,34 +1978,28 @@ impl Platform for LinuxPlatform {
                 commands.extend(self.policy_rules(false));
                 commands
             }
-            RouterOperation::AddAddr(address) => vec![("ip".into(), {
+            RouterOperation::AddAddr(address) | RouterOperation::RemoveAddr(address) => {
                 let mut args = Vec::new();
                 if address.is_ipv6() {
                     args.push("-6".into());
                 }
                 args.extend([
                     "addr".into(),
-                    "add".into(),
+                    if matches!(operation, RouterOperation::AddAddr(_)) {
+                        "add".into()
+                    } else {
+                        "del".into()
+                    },
                     format!("{address}/{}", if address.is_ipv4() { 32 } else { 128 }),
                     "dev".into(),
-                    self.tun_name.clone(),
+                    if is_linux_loopback_service_addr(*address) {
+                        "lo".into()
+                    } else {
+                        self.tun_name.clone()
+                    },
                 ]);
-                args
-            })],
-            RouterOperation::RemoveAddr(address) => vec![("ip".into(), {
-                let mut args = Vec::new();
-                if address.is_ipv6() {
-                    args.push("-6".into());
-                }
-                args.extend([
-                    "addr".into(),
-                    "del".into(),
-                    format!("{address}/{}", if address.is_ipv4() { 32 } else { 128 }),
-                    "dev".into(),
-                    self.tun_name.clone(),
-                ]);
-                args
-            })],
+                vec![("ip".into(), args)]
+            }
             RouterOperation::AddRoute(prefix) => vec![self.route("add", *prefix)],
             RouterOperation::RemoveRoute(prefix) => vec![self.route("del", *prefix)],
             RouterOperation::AddLocalRoute(prefix) => vec![("ip".into(), {
@@ -3269,6 +3268,55 @@ mod tests {
             .commands
             .iter()
             .all(|(_, args)| !args.iter().any(|arg| arg == "del")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_magicdns_service_is_loopback_owned_not_a_tun_source() {
+        let platform = LinuxPlatform::new("tailscale0");
+        assert_eq!(
+            platform.commands(&RouterOperation::AddAddr(
+                "100.100.100.100".parse().unwrap()
+            )),
+            vec![(
+                "ip".into(),
+                vec![
+                    "addr".into(),
+                    "add".into(),
+                    "100.100.100.100/32".into(),
+                    "dev".into(),
+                    "lo".into(),
+                ]
+            )]
+        );
+        assert_eq!(
+            platform.commands(&RouterOperation::AddAddr("100.115.224.78".parse().unwrap())),
+            vec![(
+                "ip".into(),
+                vec![
+                    "addr".into(),
+                    "add".into(),
+                    "100.115.224.78/32".into(),
+                    "dev".into(),
+                    "tailscale0".into(),
+                ]
+            )]
+        );
+        assert_eq!(
+            platform.commands(&RouterOperation::RemoveAddr(
+                "100.100.100.100".parse().unwrap()
+            )),
+            vec![(
+                "ip".into(),
+                vec![
+                    "addr".into(),
+                    "del".into(),
+                    "100.100.100.100/32".into(),
+                    "dev".into(),
+                    "lo".into(),
+                ]
+            )]
+        );
     }
 
     #[cfg(target_os = "linux")]

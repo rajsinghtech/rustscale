@@ -2223,6 +2223,16 @@
     },
     {
       "classification": "shimmed",
+      "denominator_id": "method:Socks5CancelToken.cancelled",
+      "id": "stability:method:Socks5CancelToken.cancelled",
+      "local_ids": [
+        "method:Socks5CancelToken.cancelled"
+      ],
+      "note": "rustscale-specific public extension; retained by the local API denominator",
+      "upstream_ids": []
+    },
+    {
+      "classification": "shimmed",
       "denominator_id": "method:Socks5CancelToken.is_cancelled",
       "id": "stability:method:Socks5CancelToken.is_cancelled",
       "local_ids": [
@@ -3044,7 +3054,7 @@
   ],
   "contract_version": 1,
   "denominator": {
-    "count": 304,
+    "count": 305,
     "ids": [
       "constant:DEFAULT_CONTROL_URL",
       "constant:FUNNEL_PORTS",
@@ -3268,6 +3278,7 @@
       "method:ServiceMode.with_proxy_protocol",
       "method:ServiceStream.peer_addr",
       "method:Socks5CancelToken.cancel",
+      "method:Socks5CancelToken.cancelled",
       "method:Socks5CancelToken.is_cancelled",
       "method:Socks5CancelToken.new",
       "method:Socks5Handle.local_addr",
@@ -3351,13 +3362,13 @@
       "type:Logger",
       "type:SharedOverrides"
     ],
-    "sha256": "1476317e00dfd7368a60e647e63c310318450f8679fd9c173fa7649e09eb8d02",
+    "sha256": "2f0306b464ddf400a00fb671735d36fc595cc447066b3f9d623f177f5d264722",
     "source": "local-public-api"
   },
   "generator_version": 1,
   "guards": {
     "local": {
-      "count": 304,
+      "count": 305,
       "ids": [
         "constant:DEFAULT_CONTROL_URL",
         "constant:FUNNEL_PORTS",
@@ -3581,6 +3592,7 @@
         "method:ServiceMode.with_proxy_protocol",
         "method:ServiceStream.peer_addr",
         "method:Socks5CancelToken.cancel",
+        "method:Socks5CancelToken.cancelled",
         "method:Socks5CancelToken.is_cancelled",
         "method:Socks5CancelToken.new",
         "method:Socks5Handle.local_addr",
@@ -3664,10 +3676,10 @@
         "type:Logger",
         "type:SharedOverrides"
       ],
-      "sha256": "1476317e00dfd7368a60e647e63c310318450f8679fd9c173fa7649e09eb8d02"
+      "sha256": "2f0306b464ddf400a00fb671735d36fc595cc447066b3f9d623f177f5d264722"
     },
     "local_shape": {
-      "count": 304,
+      "count": 305,
       "ids": [
         "constant:DEFAULT_CONTROL_URL@37057fc84d9638e3e63fc7f3a94b95da2f5f82a9128fcad55d8a93cc2d54501c",
         "constant:FUNNEL_PORTS@41574d4d902320787c1667247d50b7ed334fff56c710c97b7b61c8acfbbb72bc",
@@ -3891,6 +3903,7 @@
         "method:ServiceMode.with_proxy_protocol@6adecb18bd6c5068fd26c5d8f8a315000118872f3bab860fca673d67a9ea9a47",
         "method:ServiceStream.peer_addr@a0f0188c0d2db2d23c7dd379da136bea5935ce0ca3d014979f06568e03c2d083",
         "method:Socks5CancelToken.cancel@dd171ca11c51ba03f2002db1876f7f65eb30f97df06ae91307e5a4dd9556f812",
+        "method:Socks5CancelToken.cancelled@446794647eb26ae4d81e01cfb26e78330e7707d6d0d608fd02cca045418b1c68",
         "method:Socks5CancelToken.is_cancelled@625bf07ebd8f159a67595a7f51df7f37bb3cd9b5a9dae78ce42f403badd5a480",
         "method:Socks5CancelToken.new@44b7c7e421d42fd32c9ae95f806674b7a309eb12228788fae5f37a9ad8412944",
         "method:Socks5Handle.local_addr@b2b271b246164fd73b2333b4af9e6cc475fc6a2622ebe3364c545866f88e1be9",
@@ -3974,7 +3987,7 @@
         "type:Logger@24c245d95b078ec5dc8d385afc50221d47b3c52620470f605de81c5c7b43d8be",
         "type:SharedOverrides@e36a74a2fc1c72a26e18dc9497e134c6b6dfa049ab56f229f6433c3632791123"
       ],
-      "sha256": "a1e3093a00ccc93f267fa84a72d55652398a4e474d978796e7e32fc9908e5221"
+      "sha256": "b34d85fc5a5a85a2be1a463f060147a441039ebaac6b1a3e8d2f98701c0b9495"
     }
   },
   "inventory": {
@@ -5724,6 +5737,14 @@
         "name": "cancel",
         "owner": "Socks5CancelToken",
         "signature": "pub fn cancel(&self)",
+        "source": "rustdoc:struct.Socks5CancelToken.html"
+      },
+      {
+        "id": "method:Socks5CancelToken.cancelled",
+        "kind": "method",
+        "name": "cancelled",
+        "owner": "Socks5CancelToken",
+        "signature": "pub async fn cancelled(&self)",
         "source": "rustdoc:struct.Socks5CancelToken.html"
       },
       {

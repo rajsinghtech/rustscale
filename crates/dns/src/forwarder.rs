@@ -107,26 +107,11 @@ impl Forwarder {
         }
     }
 
-    /// Create a forwarder from a `DNSConfig`'s `Resolvers` + `FallbackResolvers`.
-    pub fn from_dns_config(dns_config: Option<&rustscale_tailcfg::DNSConfig>) -> Self {
-        let mut defaults = Vec::new();
-        if let Some(cfg) = dns_config {
-            for r in &cfg.Resolvers {
-                if r.Addr.is_empty() {
-                    continue;
-                }
-                defaults.push(UpstreamResolver::from_addr(&r.Addr));
-            }
-            if defaults.is_empty() {
-                for r in &cfg.FallbackResolvers {
-                    if r.Addr.is_empty() {
-                        continue;
-                    }
-                    defaults.push(UpstreamResolver::from_addr(&r.Addr));
-                }
-            }
-        }
-        Self::new(defaults)
+    /// Create a forwarder whose control-selected routes come exclusively from
+    /// the resolver's live config snapshot. Capturing control defaults here
+    /// would resurrect a removed root route after a later map update.
+    pub fn from_dns_config(_dns_config: Option<&rustscale_tailcfg::DNSConfig>) -> Self {
+        Self::new(Vec::new())
     }
 
     /// Forward using the configured default resolvers, followed by the base
@@ -441,6 +426,9 @@ mod tests {
             ..Default::default()
         };
         let fwd = Forwarder::from_dns_config(Some(&cfg));
-        assert_eq!(fwd.default_resolvers.len(), 1);
+        assert!(
+            fwd.default_resolvers.is_empty(),
+            "control defaults are selected from the live resolver snapshot"
+        );
     }
 }

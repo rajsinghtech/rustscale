@@ -1867,6 +1867,13 @@ pub(crate) fn build_router_config_with_local_routes(
     exit_node_allow_lan_access: bool,
     mut local_interface_prefixes: Vec<rustscale_tsaddr::IpPrefix>,
 ) -> rustscale_router::RouterConfig {
+    // The router's Linux configurator recognizes the MagicDNS service VIP and
+    // owns it on loopback rather than the TUN device. Retain it across every
+    // initial and link-monitor reconciliation so the DNS listener remains
+    // bindable without becoming a peer-route source candidate.
+    let mut owned_addrs = local_addrs.to_vec();
+    owned_addrs.push(IpAddr::V4(MAGICDNS_VIP));
+
     rustscale_tsaddr::sort_prefixes(&mut local_interface_prefixes);
     local_interface_prefixes.dedup();
     let exit_node = route_table.exit_node_requested();
@@ -1881,7 +1888,18 @@ pub(crate) fn build_router_config_with_local_routes(
         Vec::new()
     };
 
-    let mut routes = vec![rustscale_tsaddr::cgnat_range()];
+    // Keep the MagicDNS listener address distinct from node addresses. Linux
+    // owns service addresses on loopback, while this host route sends resolver
+    // traffic through the TUN policy table. In particular, the service VIP can
+    // never become the preferred source for ordinary tailnet destinations.
+    let service_ip = IpAddr::V4(MAGICDNS_VIP);
+    let mut routes = vec![
+        rustscale_tsaddr::IpPrefix {
+            ip: service_ip,
+            bits: 32,
+        },
+        rustscale_tsaddr::cgnat_range(),
+    ];
     if exit_node && !exit_node_allow_lan_access {
         // Install two child routes for each connected prefix. They cover the
         // same address set while outranking (and not replacing/claiming) the
@@ -1902,7 +1920,7 @@ pub(crate) fn build_router_config_with_local_routes(
     rustscale_tsaddr::sort_prefixes(&mut routes);
     routes.dedup();
     rustscale_router::RouterConfig {
-        local_addrs: local_addrs.iter().copied().map(normalize_ip).collect(),
+        local_addrs: owned_addrs.into_iter().map(normalize_ip).collect(),
         routes,
         local_routes,
         exit_node: route_table.exit_node_requested(),
@@ -3093,6 +3111,28 @@ mod tests {
         assert!(!allowed.routes.contains(&lan_v4));
         assert!(!allowed.routes.contains(&lan_v6));
         assert_eq!(allowed.local_routes, [vpn_host, lan_v4, lan_v6]);
+    }
+
+    #[test]
+    fn magicdns_service_ownership_preserves_node_addresses_and_host_route() {
+        let node_v4: IpAddr = "100.115.224.78".parse().unwrap();
+        let node_v6: IpAddr = "fd7a:115c:a1e0::1234".parse().unwrap();
+        let config = build_router_config_with_local_routes(
+            &[node_v4, node_v6],
+            &RouteTable::default(),
+            false,
+            vec![],
+        );
+        let service = IpAddr::V4(MAGICDNS_VIP);
+        let service_route = rustscale_tsaddr::IpPrefix {
+            ip: service,
+            bits: 32,
+        };
+
+        assert!(config.local_addrs.contains(&node_v4));
+        assert!(config.local_addrs.contains(&node_v6));
+        assert!(config.local_addrs.contains(&service));
+        assert!(config.routes.contains(&service_route));
     }
 
     #[test]

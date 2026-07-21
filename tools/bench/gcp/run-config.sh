@@ -35,7 +35,7 @@ AUTHKEY_FILE RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
 CONFIG: rs-userspace | rs-tun | ts-embedded | ts-userspace | ts-tun
 --profile: rs-tun only; collect a Linux perf profile after normal metrics
 --profile-only: rs-tun only; collect a Linux perf diagnostic without writing metrics
---repeat N: measured samples per parallelism (1..=9; default 3)
+--repeat N: measured samples per parallelism (3..=9; default 3)
 --parallelism LIST: ordered unique stream counts, each in 1..=1000
 --duration N: measured throughput duration in seconds (3..=120)
 --peer-count N: configured remote-peer load, including the benchmark peer (1..=1000)
@@ -310,6 +310,11 @@ fi
 IFS=, read -r -a PARALLELS <<<"$PARALLELISM_CSV"
 LATENCY_COUNT=200
 LATENCY_INTERVAL=0.1
+# A healthy RSB1 process finishes its control-plane handshake and the longest
+# permitted 120-second measurement inside this bound. Keep an outer GNU timeout
+# independent of client-internal deadlines so a wedged process cannot retain
+# paid VMs indefinitely.
+RSB1_TRIAL_TIMEOUT_SECONDS=300
 PORT=5201
 RUNTIME_STATS_MAX_LINES=80
 RUNTIME_STATS_MAX_COLUMNS=512
@@ -2382,21 +2387,21 @@ rsb1_client_command() {
   local kind="$1" operation="$2" target="$3" value="$4" parallel="$5" state_dir="$6" logfile="$7"
   case "$kind/$operation" in
     rust-userspace/throughput)
-      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport userspace --authkey-file %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
-        "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
+      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport userspace --authkey-file %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
+        "$RSB1_TRIAL_TIMEOUT_SECONDS" "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
     rust-userspace/latency)
-      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport userspace --authkey-file %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
-        "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
+      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport userspace --authkey-file %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
+        "$RSB1_TRIAL_TIMEOUT_SECONDS" "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
     rust-kernel/throughput)
-      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport kernel-tcp --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
-        "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
+      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport kernel-tcp --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
+        "$RSB1_TRIAL_TIMEOUT_SECONDS" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
     rust-kernel/latency)
-      printf 'prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport kernel-tcp --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
-        "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
+      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport kernel-tcp --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
+        "$RSB1_TRIAL_TIMEOUT_SECONDS" "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
     go-userspace/throughput)
-      printf 'prlimit --nofile=65535:65535 -- %s' "$(go_tsnet_client_command throughput "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile")" ;;
+      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- %s' "$RSB1_TRIAL_TIMEOUT_SECONDS" "$(go_tsnet_client_command throughput "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile")" ;;
     go-userspace/latency)
-      printf 'prlimit --nofile=65535:65535 -- %s' "$(go_tsnet_client_command latency "$REMOTE_AUTHKEY_FILE" "$target" "$value" 1 "$CHOST" "$state_dir" "$logfile")" ;;
+      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- %s' "$RSB1_TRIAL_TIMEOUT_SECONDS" "$(go_tsnet_client_command latency "$REMOTE_AUTHKEY_FILE" "$target" "$value" 1 "$CHOST" "$state_dir" "$logfile")" ;;
     *) return 2 ;;
   esac
 }
@@ -2579,7 +2584,7 @@ cell_exit_cleanup() {
 }
 
 rsb1_lifecycle_self_test() {
-  local command event status definition
+  local command event status definition rust_trial go_trial
   command=$(ts_tun_cleanup_command srv) || return 1
   bash -n <<<"$command" || return 1
   [[ "$command" == *'tailscale --socket="$socket" down'* \
@@ -2603,6 +2608,12 @@ rsb1_lifecycle_self_test() {
     && "$definition" == *'/opt/rustscale/bin/go-tsnet-rsb1 client'* \
     && "$definition" == *'"$CHOST" "$state_dir"'* \
     && "$definition" == *'throughput_trials'* ]] || return 1
+  rust_trial=$(rsb1_client_command rust-userspace throughput 100.64.0.1:5201 10 100 /tmp/rs-state /tmp/rs.log) || return 1
+  go_trial=$(rsb1_client_command go-userspace latency 100.64.0.1:5201 200 1 /tmp/go-state /tmp/go.log) || return 1
+  [[ "$rust_trial" == "timeout --signal=TERM --kill-after=5s ${RSB1_TRIAL_TIMEOUT_SECONDS}s prlimit "* \
+    && "$rust_trial" == *'/rustscale-bench client '* \
+    && "$go_trial" == "timeout --signal=TERM --kill-after=5s ${RSB1_TRIAL_TIMEOUT_SECONDS}s prlimit "* \
+    && "$go_trial" == *'/go-tsnet-rsb1 latency '* ]] || return 1
 
   event=$(mktemp "$RDIR/cell-exit-test.XXXXXX") || return 1
   if ( set +e; CELL_MUTATED=1; CELL_CLEANED=0; CELL_CLEANUP_FN=self_test_cleanup; self_test_cleanup() { printf clean >"$event"; return 0; }; false; cell_exit_cleanup ); then

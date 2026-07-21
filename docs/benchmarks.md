@@ -154,7 +154,7 @@ rm -f /tmp/rustscale-bench-authkey
 
 The ordinary paid GCP run is one affordable same-region/cross-zone, direct-path
 slice with all five cells and the routine load: three 10-second repeats at 1,
-10, and 100 streams. Each freshly minted key is written to a temporary
+10, 100, 500, and 1000 streams. Each freshly minted key is written to a temporary
 owner-only local file, copied to owner-only files on the two VMs, and removed
 at cell exit. Only file paths cross local or remote argv/rendered-command
 boundaries; self-tests fail closed on permissions, symlinks, malformed content,

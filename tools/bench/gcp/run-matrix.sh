@@ -1021,9 +1021,9 @@ Runs same-zone/direct rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun with o
   --topology comma-separated subset: same-zone,cross-region
   --path     comma-separated subset: direct,derp
   --config   comma-separated subset: rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun
-  --repeat N run each throughput point N times (1..=9; default 3)
+  --repeat N run each throughput point N times (3..=9; default 3)
   --parallelism LIST ordered unique stream counts in 1..=1000 (required 1,10,100,500,1000)
-  --scale-streams opt in to the honest all-cell 1,2,4,8,16,32,64,100,200,500,1000 RSB1 sweep
+  --scale-streams compatibility alias for the required 1,10,100,500,1000 RSB1 sweep
   --duration N measured throughput seconds (3..=120; default 10)
   --peer-count N record configured remote-peer load (1..=1000; default 1)
   --profile  profile only the selected rs-tun cell after normal metrics

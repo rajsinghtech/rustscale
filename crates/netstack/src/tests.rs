@@ -886,6 +886,16 @@ async fn concurrent_connections_all_succeed() {
 /// setup scale. The in-memory link is credential-free; it only replaces the
 /// UDP underlay, not dial admission, packet ownership, TCP, or WireGuard.
 async fn assert_bounded_bulk_dial_phases(phases: &[(usize, bool)]) {
+    // Each production-sized P1000 case can own roughly 4 GiB across both
+    // in-process endpoints. Keep the three high-scale cases from overlapping
+    // under libtest's default parallel scheduling.
+    static HIGH_SCALE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    let _high_scale_guard = HIGH_SCALE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
     let a_priv = NodePrivate::generate();
     let b_priv = NodePrivate::generate();
     let a_pub = a_priv.public();

@@ -442,15 +442,13 @@ preserves batching.
 - Both harnesses use ephemeral tailnets that are created and deleted per run.
 - On localhost, the path is typically **direct** (UDP loopback). DERP paths
   require network isolation (separate machines or UDP blocking).
-- The rustscale netstack uses a 1280-byte MTU and fixed 256 KiB TCP send and
-  receive buffers per socket. Pinned Tailscale 1.100.0 uses the pinned gVisor
-  defaults of 1 MiB send and 1 MiB receive, with Tailscale maxima of 8 MiB RX
-  and 6 MiB TX on non-iOS builds. The matrix does not normalize this
-  buffer/window asymmetry. This is disclosed as a certification blocker rather
-  than treated as comparable: paid publication remains prohibited until a
-  controlled same-binary Rust A/B at 256 KiB and 1 MiB is captured with the
-  same exact matrix and demonstrates an immaterial effect, or both stacks are
-  normalized. No current data may support a winner claim.
+- The rustscale netstack uses a 1280-byte MTU and fixed 1 MiB TCP send and
+  receive buffers per socket, matching the pinned gVisor send and receive
+  defaults used by Tailscale 1.100.0. Tailscale permits maxima of 8 MiB RX and
+  6 MiB TX on non-iOS builds, but the embedded comparator does not request
+  those larger values. The canonical matrix therefore has matched default TCP
+  buffer capacity; it still requires a complete exact-head run before any
+  comparative claim.
 - Throughput is limited by per-packet userspace processing overhead (WG
   encapsulation/decapsulation, smoltcp/gVisor TCP processing, magicsock IO).
   Both sides face the same fundamental bottleneck.

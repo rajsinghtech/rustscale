@@ -30,7 +30,7 @@ go vet ./...
 
 The GCP harness additionally records the executable path, `--version`, SHA-256,
 the pinned native Go archive name and SHA-256, module checksum, endpoint process
-scope, CPU, and RSS. It also discloses rather than normalizes the Rust 256 KiB
-per-socket buffers versus pinned Go/gVisor's 1 MiB defaults.
+scope, CPU, and RSS. Rust and pinned Go/gVisor both use 1 MiB TCP send and
+receive buffers per socket for the matched userspace cells.
 See [`docs/benchmarks.md`](../../../docs/benchmarks.md) for the five-cell
 contract and the separately labeled tailscaled daemon-proxy evidence.

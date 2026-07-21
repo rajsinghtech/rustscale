@@ -54,11 +54,9 @@ use device::LoopbackDevice;
 /// Default MTU (Tailscale tailnet MTU is 1280).
 pub const DEFAULT_MTU: usize = 1280;
 
-/// TCP send/recv buffer size. Tuned up from 65 KB to 256 KB so the socket
-/// can absorb more in-flight data per ACK round-trip, raising throughput
-/// before backpressure kicks in. (Go's gVisor netstack uses similar or
-/// larger defaults.)
-const TCP_BUF: usize = 256 * 1024;
+/// TCP send/receive buffer size, matched to the pinned Tailscale/gVisor
+/// `DefaultSendBufferSize` and `DefaultReceiveBufferSize` values.
+const TCP_BUF: usize = 1024 * 1024;
 
 /// Hard bound for a userspace TCP handshake even when the caller remains
 /// alive. LocalAPI applies its own whole-operation deadline as well.

@@ -10,4 +10,4 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.4" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.5" }

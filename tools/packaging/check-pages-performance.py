@@ -18,6 +18,24 @@ CANONICAL_RUN_ID = "gcp-20260721-080637-4aca6f6c1e"
 CANONICAL_SOURCE_COMMIT = "395bf8db6648e67f61bc571e1a755b27cd714e12"
 CANONICAL_DIR = ROOT / "docs/performance" / CANONICAL_RUN_ID
 
+
+def workspace_version() -> str:
+    manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    section = re.search(
+        r'^\[workspace\.package\]\s*$(.*?)(?=^\[|\Z)',
+        manifest,
+        re.MULTILINE | re.DOTALL,
+    )
+    if section is None:
+        raise SystemExit("workspace package section is unavailable")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', section.group(1), re.MULTILINE)
+    if match is None:
+        raise SystemExit("workspace package version is unavailable")
+    return match.group(1)
+
+
+WORKSPACE_VERSION = workspace_version()
+
 HOST_RUN_IDS = {
     "rustscale": "gcp-20260715-085022-076e87bd41",
     "tailscaled": "gcp-20260715-090601-02788a10b4",
@@ -53,7 +71,7 @@ PANEL_CONTRACTS = {
 
 CONTAINER_COMMAND = (
     "docker run --rm --privileged --device /dev/net/tun -e TS_USERSPACE=0 "
-    "-e TS_AUTHKEY=tskey-... ghcr.io/rajsinghtech/rustscale:v0.1.4"
+    f"-e TS_AUTHKEY=tskey-... ghcr.io/rajsinghtech/rustscale:v{WORKSPACE_VERSION}"
 )
 USERSPACE_COMMAND = (
     "tools/bench/gcp/run-matrix.sh --repeat 3 --topology same-zone "

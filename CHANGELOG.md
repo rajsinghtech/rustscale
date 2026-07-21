@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.5
+
+Patch release for lifecycle reliability, Linux replacement behavior, truthful
+path reporting, embedded connection capacity, and reproducible performance
+evidence.
+
+- Made daemon and CLI down/up, first-run, restart, and LocalAPI handoff paths
+  cancellation-safe and bounded.
+- Configured Linux MagicDNS through systemd-resolved and strengthened the exact
+  installed replacement and isolated two-TUN acceptance gates.
+- Reported peer paths only from fresh observed transport evidence.
+- Fixed embedded userspace P500/P1000 setup, receive scheduling, cancellation,
+  and cleanup limits, with deterministic high-load regressions.
+- Added a pinned Go embedded-tsnet comparator and published a credential-free,
+  checksum-verified five-mode canonical benchmark. The result discloses high
+  Rust embedded variance at several concurrency levels and makes no stable
+  winner claim.
+
 ## 0.1.4
 
 Patch release for idle application UDP latency and release-readiness hardening.

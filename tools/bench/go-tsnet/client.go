@@ -50,6 +50,7 @@ type throughputResult struct {
 	PathClass    string             `json:"path_class"`
 	TailscaleIP  string             `json:"tailscale_ip"`
 	Target       string             `json:"target"`
+	Shutdown     string             `json:"shutdown"`
 	TotalBytes   uint64             `json:"total_bytes"`
 	TotalMbps    float64            `json:"total_mbps"`
 	UpBytes      uint64             `json:"up_bytes"`
@@ -78,6 +79,7 @@ type latencyResult struct {
 	PathClass        string   `json:"path_class"`
 	TailscaleIP      string   `json:"tailscale_ip"`
 	Target           string   `json:"target"`
+	Shutdown         string   `json:"shutdown"`
 	MinNS            uint64   `json:"min_ns"`
 	MaxNS            uint64   `json:"max_ns"`
 	MeanNS           float64  `json:"mean_ns"`

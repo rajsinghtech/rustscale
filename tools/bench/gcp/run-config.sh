@@ -2464,8 +2464,8 @@ rsb1_measure() {
   trial_target=$(rsb1_trial_target "$client_kind" "$target" 0) || return 2
   command=$(rsb1_client_command "$client_kind" throughput "$trial_target" 3 1 "$client_state_dir" /tmp/rsb1-warmup.log) || return 2
   warmup_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
-  path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,tool=sys.argv[1:]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1 and d["established"]==1 and d["handshaken"]==1 and d["completed"]==1; value=float(d["total_mbps"]); assert math.isfinite(value) and value>0; print(d["path_class"])' "$reported_transport" "$expected_client_tool") || return 1
-  warmup_evidence=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in ("transport","protocol","direction","duration_secs","parallel","established","handshaken","completed","total_mbps","path_class","target")}))') || return 1
+  path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,tool=sys.argv[1:]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1 and d["established"]==1 and d["handshaken"]==1 and d["completed"]==1; shutdown=d.get("shutdown"); assert shutdown in ("graceful","process-exit-after-close-timeout") if tool=="go-tsnet-rsb1" else shutdown is None; value=float(d["total_mbps"]); assert math.isfinite(value) and value>0; print(d["path_class"])' "$reported_transport" "$expected_client_tool") || return 1
+  warmup_evidence=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); row={k:d[k] for k in ("transport","protocol","direction","duration_secs","parallel","established","handshaken","completed","total_mbps","path_class","target")}; row["shutdown"]=d.get("shutdown","process-return-after-complete"); print(json.dumps(row))') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && path_class="$gated_path"
   [[ "$PATH_TAG" == direct && "$path_class" == direct || "$PATH_TAG" == derp && "$path_class" == derp ]] || {
     echo "[gcp] RSB1 warmup observed wrong path: $path_class" >&2
@@ -2487,9 +2487,9 @@ rsb1_measure() {
       trial_target=$(rsb1_trial_target "$client_kind" "$target" "$((sample_number + 1))") || return 2
       command=$(rsb1_client_command "$client_kind" throughput "$trial_target" "$DURATION" "$N" "$client_state_dir" "/tmp/rsb1-$N-$sample_index.log") || return 2
       sample_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
-      mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected,tool=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$reported_transport" "$N" "$PATH_TAG" "$expected_client_tool") || return 1
+      mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected,tool=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; shutdown=d.get("shutdown"); assert shutdown in ("graceful","process-exit-after-close-timeout") if tool=="go-tsnet-rsb1" else shutdown is None; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$reported_transport" "$N" "$PATH_TAG" "$expected_client_tool") || return 1
       samples+=("$mbps")
-      trial_json=$(printf '%s' "$sample_json" | python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); d=json.load(sys.stdin); rows.append({"parallel":d["parallel"],"repeat_index":int(sys.argv[2]),"transport":d["transport"],"protocol":d["protocol"],"direction":d["direction"],"duration_s":d["duration_secs"],"established":d["established"],"handshaken":d["handshaken"],"completed":d["completed"],"total_mbps":d["total_mbps"],"path_class":d["path_class"],"target":d["target"]}); print(json.dumps(rows))' "$trial_json" "$sample_index") || return 1
+      trial_json=$(printf '%s' "$sample_json" | python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); d=json.load(sys.stdin); rows.append({"parallel":d["parallel"],"repeat_index":int(sys.argv[2]),"transport":d["transport"],"protocol":d["protocol"],"direction":d["direction"],"duration_s":d["duration_secs"],"established":d["established"],"handshaken":d["handshaken"],"completed":d["completed"],"total_mbps":d["total_mbps"],"path_class":d["path_class"],"target":d["target"],"shutdown":d.get("shutdown","process-return-after-complete")}); print(json.dumps(rows))' "$trial_json" "$sample_index") || return 1
       sample_number=$((sample_number+1))
       (( sample_number == total_samples )) || sleep 3
     done
@@ -2502,7 +2502,7 @@ rsb1_measure() {
   trial_target=$(rsb1_trial_target "$client_kind" "$target" "$((total_samples + 1))") || return 2
   command=$(rsb1_client_command "$client_kind" latency "$trial_target" "$LATENCY_COUNT" 1 "$client_state_dir" /tmp/rsb1-latency.log) || return 2
   lat_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
-  lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,n,expected,tool=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n and all(type(v) is int and v>0 for v in d["samples_ns"]); values=[d[k] for k in ("min_ns","mean_ns","p50_ns","p95_ns","p99_ns","max_ns","min_us","mean_us","p50_us","p95_us","p99_us","max_us")]; assert all(isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and v>0 for v in values) and d["p50_ns"]<=d["p95_ns"]<=d["p99_ns"]; assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$reported_transport" "$LATENCY_COUNT" "$PATH_TAG" "$expected_client_tool") || return 1
+  lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,n,expected,tool=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n and all(type(v) is int and v>0 for v in d["samples_ns"]); shutdown=d.get("shutdown"); assert shutdown in ("graceful","process-exit-after-close-timeout") if tool=="go-tsnet-rsb1" else shutdown is None; values=[d[k] for k in ("min_ns","mean_ns","p50_ns","p95_ns","p99_ns","max_ns","min_us","mean_us","p50_us","p95_us","p99_us","max_us")]; assert all(isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and v>0 for v in values) and d["p50_ns"]<=d["p95_ns"]<=d["p99_ns"]; assert transport=="kernel-tcp" or d["path_class"]==expected; d["shutdown"]=d.get("shutdown","process-return-after-complete"); print(json.dumps(d))' "$reported_transport" "$LATENCY_COUNT" "$PATH_TAG" "$expected_client_tool") || return 1
   RSB1_MEASURE_PATH_POST=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path_class"])') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && RSB1_MEASURE_PATH_POST="$gated_path"
 
@@ -2542,11 +2542,14 @@ portmapping = {"rs-userspace":"disabled", "ts-embedded":"upstream-default"}.get(
 tool = {"rs-userspace":"rustscale", "rs-tun":"rustscale", "ts-embedded":"go-tsnet-rsb1", "ts-userspace":"tailscaled", "ts-tun":"tailscaled"}[config]
 warmup_evidence, trials, latency = json.loads(warmup_evidence), json.loads(trials), json.loads(lat)
 destination_targets = [warmup_evidence["target"], *(trial["target"] for trial in trials), latency["target"]]
+client_shutdown_modes = [warmup_evidence["shutdown"], *(trial["shutdown"] for trial in trials), latency["shutdown"]]
 destination_lifecycle = "unique-per-process-trial" if config == "ts-embedded" else "fixed-per-cell"
 if config == "ts-embedded":
     assert len(set(destination_targets)) == len(destination_targets)
+    assert set(client_shutdown_modes) <= {"graceful", "process-exit-after-close-timeout"}
 else:
     assert len(set(destination_targets)) == 1
+    assert set(client_shutdown_modes) == {"process-return-after-complete"}
 obj={"schema_version":6,"status":"ok","tool":tool,
  "implementation":implementation,"mode":mode,"topology":topo,"path":requested_path,"config":config,
  "repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],"error":"","log_tail":"",
@@ -2557,7 +2560,9 @@ obj={"schema_version":6,"status":"ok","tool":tool,
              "transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,
              "latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,
              "latency_count":200,"transport_path":transport_path,"userspace_portmapping":portmapping,
-             "destination_target_lifecycle":destination_lifecycle,"destination_targets":destination_targets},
+             "destination_target_lifecycle":destination_lifecycle,"destination_targets":destination_targets,
+             "client_shutdown_lifecycle":"bounded-api-close-then-process-exit" if config == "ts-embedded" else "process-return-after-complete",
+             "client_shutdown_modes":client_shutdown_modes},
  "warmup_evidence":warmup_evidence,"throughput":json.loads(tp),
  "throughput_trials":trials,"latency":latency,
  "runtime_stats":{"server":runtime_server,"client":runtime_client},
@@ -2638,6 +2643,8 @@ rsb1_lifecycle_self_test() {
     && "$definition" == *'netmap-cache.json'* \
     && "$definition" == *'/opt/rustscale/bin/go-tsnet-rsb1 client'* \
     && "$definition" == *'"$CHOST" "$state_dir"'* \
+    && "$definition" == *'client_shutdown_modes'* \
+    && "$definition" == *'process-exit-after-close-timeout'* \
     && "$definition" == *'throughput_trials'* ]] || return 1
   rust_trial=$(rsb1_client_command rust-userspace throughput 100.64.0.1:5201 10 100 /tmp/rs-state /tmp/rs.log) || return 1
   go_trial=$(rsb1_client_command go-userspace latency 100.64.0.1:5201 200 1 /tmp/go-state /tmp/go.log) || return 1

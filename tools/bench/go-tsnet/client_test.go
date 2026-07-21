@@ -18,6 +18,10 @@ import (
 	"tailscale.com/types/key"
 )
 
+type closeFunc func() error
+
+func (f closeFunc) Close() error { return f() }
+
 func statusWithPeer(target netip.Addr, curAddr, peerRelay, relay string) *ipnstate.Status {
 	return &ipnstate.Status{Peer: map[key.NodePublic]*ipnstate.PeerStatus{
 		{}: {
@@ -117,6 +121,23 @@ func TestPersistentStateIsNonEphemeral(t *testing.T) {
 	}
 	if got, want := server.Hostname, "fixture"; got != want {
 		t.Fatalf("hostname = %q, want %q", got, want)
+	}
+}
+
+func TestClientCloseUsesProcessExitFallback(t *testing.T) {
+	mode, err := closeClientServer(closeFunc(func() error { return nil }), time.Second)
+	if err != nil || mode != "graceful" {
+		t.Fatalf("immediate close = %q, %v", mode, err)
+	}
+
+	release := make(chan struct{})
+	mode, err = closeClientServer(closeFunc(func() error {
+		<-release
+		return nil
+	}), time.Millisecond)
+	close(release)
+	if err != nil || mode != "process-exit-after-close-timeout" {
+		t.Fatalf("bounded close = %q, %v", mode, err)
 	}
 }
 

@@ -24,9 +24,15 @@ below pinned gVisor `gonet`'s 4096-connection listen backlog, so P1000 setup
 has room to finish inside the process deadline without recreating the failed
 unbounded burst. Paid acceptance still requires exact P1000 completion. Setup
 is outside the timed RSB1 data phase. Each requested stream is attempted once,
-results retain request order, and any failure cancels pending
-setup and closes every completed connection without publishing partial
-measurements.
+results retain request order, and any failure cancels pending setup and closes
+every completed connection without publishing partial measurements.
+
+After all exact denominators and path evidence are captured, the short-lived
+client gives upstream `tsnet.Server.Close` ten seconds to finish. If it does not
+return, the result records `process-exit-after-close-timeout` and the already
+required benchmark-process exit becomes the cleanup boundary. The matrix
+retains every trial's shutdown mode and still requires the remote process to
+exit successfully; no incomplete workload can reach this fallback or publish.
 
 The matrix starts the long-lived server with one consecutive destination port
 for the warmup, every measured process trial, and latency. Each restarted

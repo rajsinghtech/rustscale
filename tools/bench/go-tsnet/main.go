@@ -32,6 +32,8 @@ const (
 	toolVersion = "tailscale.com/v1.100.0"
 )
 
+const clientCloseTimeout = 10 * time.Second
+
 var hostnamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
 type commonOptions struct {
@@ -40,6 +42,28 @@ type commonOptions struct {
 	hostname    string
 	controlURL  string
 	stateDir    string
+}
+
+type serverCloser interface {
+	Close() error
+}
+
+func closeClientServer(closer serverCloser, timeout time.Duration) (string, error) {
+	closed := make(chan error, 1)
+	go func() { closed <- closer.Close() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-closed:
+		if err != nil {
+			return "", fmt.Errorf("tsnet close: %w", err)
+		}
+		log.Printf("BENCH_SHUTDOWN role=client status=graceful")
+		return "graceful", nil
+	case <-timer.C:
+		log.Printf("BENCH_SHUTDOWN role=client status=process-exit reason=close-timeout timeout_ms=%d", timeout.Milliseconds())
+		return "process-exit-after-close-timeout", nil
+	}
 }
 
 func main() {
@@ -312,7 +336,7 @@ func runClientCommand(ctx context.Context, args []string) error {
 	serverClosed := false
 	defer func() {
 		if !serverClosed {
-			_ = server.Close()
+			_, _ = closeClientServer(server, clientCloseTimeout)
 		}
 	}()
 	ip, client, err := bringUp(ctx, server, target.Addr())
@@ -334,12 +358,12 @@ func runClientCommand(ctx context.Context, args []string) error {
 		log.Printf("BENCH_SETUP phase=rsb1 status=failed established=%d requested=%d error=%q", len(connections), *parallel, err)
 		return err
 	}
-	log.Printf("BENCH_SETUP phase=rsb1 status=complete established=%d handshaken=%d requested=%d", result.Established, result.Handshaken, *parallel)
+	log.Printf("BENCH_SETUP phase=rsb1 status=complete established=%d handshaken=%d completed=%d requested=%d", result.Established, result.Handshaken, result.Completed, *parallel)
 	result.PathClass = currentPath(ctx, client, target.Addr())
-	closeErr := server.Close()
 	serverClosed = true
-	if closeErr != nil {
-		return fmt.Errorf("tsnet close: %w", closeErr)
+	result.Shutdown, err = closeClientServer(server, clientCloseTimeout)
+	if err != nil {
+		return err
 	}
 	return writeJSON(result)
 }
@@ -372,7 +396,7 @@ func runLatencyCommand(ctx context.Context, args []string) error {
 	serverClosed := false
 	defer func() {
 		if !serverClosed {
-			_ = server.Close()
+			_, _ = closeClientServer(server, clientCloseTimeout)
 		}
 	}()
 	ip, client, err := bringUp(ctx, server, target.Addr())
@@ -390,10 +414,10 @@ func runLatencyCommand(ctx context.Context, args []string) error {
 		return err
 	}
 	result.PathClass = currentPath(ctx, client, target.Addr())
-	closeErr := server.Close()
 	serverClosed = true
-	if closeErr != nil {
-		return fmt.Errorf("tsnet close: %w", closeErr)
+	result.Shutdown, err = closeClientServer(server, clientCloseTimeout)
+	if err != nil {
+		return err
 	}
 	return writeJSON(result)
 }

@@ -207,6 +207,14 @@ process trial and the harness selects each exactly once. This gives every
 restarted Go client a fresh four-tuple without retrying a stream or changing
 the timed RSB1 phase; the exact target sequence is retained in the result.
 
+Pinned Go client teardown is also explicit evidence. After every requested
+stream completes and post-workload path evidence is captured, the client gives
+upstream `tsnet.Server.Close` ten seconds to return. A timeout records
+`process-exit-after-close-timeout`; the already-required short-lived process
+exit then provides the cleanup boundary. The result retains every trial's
+shutdown mode, and the harness still requires a successful process exit. This
+fallback cannot admit an incomplete lifecycle or partial measurement.
+
 Credential-free Rust regressions retain all P500 netstack streams, bound a
 failing P1000 request's pending ownership, and exercise the complete P500 RSB1
 lifecycle. The Go package proves its dial and header/ACK admission ceiling,

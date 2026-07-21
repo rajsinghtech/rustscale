@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustscale_tsnet::{Server, ServerStatus};
+use rustscale_tsnet::Server;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -43,6 +43,18 @@ pub struct ThroughputResult {
     pub completed: usize,
 }
 
+pub(crate) fn log_userspace_identity(server: &Server, role: &str) -> Result<(), Box<dyn Error>> {
+    let node = server
+        .node_key()
+        .ok_or("userspace node identity unavailable")?;
+    let disco = server
+        .magicsock()
+        .ok_or("userspace discovery identity unavailable")?
+        .disco_public();
+    eprintln!("BENCH_IDENTITY role={role} node={node} disco={disco}");
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_userspace(
     authkey: String,
@@ -54,61 +66,84 @@ pub async fn run_userspace(
     control_url: String,
     state_dir: Option<std::path::PathBuf>,
 ) -> Result<ThroughputResult, Box<dyn Error>> {
+    // A supplied state directory is a restart-stable node identity. Its disco
+    // identity remains process-local so peers invalidate the prior UDP path.
+    let ephemeral = state_dir.is_none();
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(authkey)
-        .ephemeral(true)
+        .ephemeral(ephemeral)
         .disable_portmapping(true)
         .control_url(control_url);
     if let Some(ref d) = state_dir {
         builder = builder.state_dir(d);
     }
     let mut server = builder.build()?;
-    Box::pin(server.up()).await?;
-    let my_ip = server
-        .status()
-        .tailscale_ips
-        .iter()
-        .find_map(|ip| match ip {
-            std::net::IpAddr::V4(v4) => Some(v4.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    if let Some(ip) = extract_target_ip(&target) {
-        wait_for_peer(&server, ip, Duration::from_secs(90)).await;
-    }
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    // tsnet's public dial operation borrows the embedded server mutably, so
-    // these connections are serialized. Bound the complete fan-out with the
-    // same common deadline as kernel setup and never retry an individual
-    // measured connection inside the resource window.
-    let connect_all = async {
-        let mut streams = Vec::with_capacity(parallel);
-        for index in 0..parallel {
-            let stream = server.dial(&target).await.map_err(|error| {
-                format!("capacity error: established {index} of {parallel} requested connections: {error}")
-            })?;
-            streams.push(stream);
+    let operation: Result<ThroughputResult, Box<dyn Error>> = async {
+        Box::pin(server.up()).await?;
+        log_userspace_identity(&server, "client")?;
+        let my_ip = server
+            .status()
+            .tailscale_ips
+            .iter()
+            .find_map(|ip| match ip {
+                std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if let Some(ip) = extract_target_ip(&target) {
+            wait_for_peer(&server, ip, Duration::from_secs(90)).await?;
         }
-        Ok::<_, String>(streams)
-    };
-    let streams = tokio::time::timeout(SETUP_DEADLINE, connect_all)
-        .await
-        .map_err(|_| format!("capacity error: did not establish all {parallel} requested userspace connections before the common setup deadline"))??;
-    let path_class = extract_path_class(&server.status(), &target);
-    let result = measure(
-        streams,
-        "userspace-tsnet",
-        target,
-        duration,
-        direction,
-        parallel,
-        path_class,
-        my_ip,
-    )
-    .await?;
-    close_userspace(&mut server).await?;
-    Ok(result)
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Resolve once and admit TCP handshakes in the netstack's bounded
+        // listener-sized window. The primitive owns the common deadline and
+        // fails the requested set atomically without retrying a stream.
+        let streams = server
+            .dial_many(&target, parallel, SETUP_DEADLINE)
+            .await
+            .map_err(|error| format!("capacity error: {error}"))?;
+        // Match the pinned-Go comparator's observation boundary: classify the
+        // path only after the measured transfer has completed successfully.
+        // A fresh embedded process can still be converging immediately after
+        // dial setup, so the pre-measurement snapshot is not the trial's
+        // retained post-workload path evidence.
+        let mut result = measure(
+            streams,
+            "userspace-tsnet",
+            target.clone(),
+            duration,
+            direction,
+            parallel,
+            "unknown".into(),
+            my_ip,
+        )
+        .await?;
+        result.path_class = current_userspace_path(&server, &target).await;
+        eprintln!(
+            "BENCH_PATH role=client phase=post-measurement class={}",
+            result.path_class
+        );
+        Ok(result)
+    }
+    .await;
+    // Stream Drop queues the netstack TCP close. Keep the packet pump alive
+    // for the same bounded drain grace used by the server writer so FINs reach
+    // the long-lived peer before this short-lived trial tears down tsnet.
+    // Without this, later trial processes can encounter prior live four-tuples
+    // even though every preceding workload worker completed.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let shutdown = close_userspace(&mut server).await;
+    match (operation, shutdown) {
+        (Ok(result), Ok(())) => {
+            eprintln!("BENCH_SHUTDOWN role=client status=clean");
+            Ok(result)
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => {
+            Err(format!("{error}; userspace shutdown also failed: {shutdown_error}").into())
+        }
+    }
 }
 
 pub(crate) async fn close_userspace(server: &mut Server) -> Result<(), Box<dyn Error>> {
@@ -182,6 +217,23 @@ pub async fn run_kernel(
     .await
 }
 
+async fn handshake_stream<S>(
+    index: usize,
+    mut stream: S,
+    header: Header,
+) -> Result<(usize, S), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_header(&mut stream, &header)
+        .await
+        .map_err(|error| format!("stream {index} header: {error}"))?;
+    read_ack(&mut stream)
+        .await
+        .map_err(|error| format!("stream {index} ACK: {error}"))?;
+    Ok((index, stream))
+}
+
 async fn measure<S>(
     mut streams: Vec<S>,
     transport: &'static str,
@@ -208,27 +260,23 @@ where
         count: 0,
     };
     let established = streams.len();
-    // Send every header and await every ACK concurrently under one deadline.
-    // The returned streams are reassembled by index before the common GO
-    // barrier; no workload byte can flow while any handshake is incomplete.
+    // Bound header/ACK admission by the same receive-safe window as TCP
+    // setup. Streams are reassembled by index before the common GO barrier;
+    // no workload byte can flow while any handshake is incomplete.
     let setup = async move {
+        let mut input = streams.drain(..).enumerate();
         let mut tasks = tokio::task::JoinSet::new();
-        for (index, mut stream) in streams.drain(..).enumerate() {
-            tasks.spawn(async move {
-                write_header(&mut stream, &header)
-                    .await
-                    .map_err(|error| format!("stream {index} header: {error}"))?;
-                read_ack(&mut stream)
-                    .await
-                    .map_err(|error| format!("stream {index} ACK: {error}"))?;
-                Ok::<_, String>((index, stream))
-            });
+        for (index, stream) in input.by_ref().take(rustscale_netstack::TCP_DIAL_WINDOW) {
+            tasks.spawn(handshake_stream(index, stream, header));
         }
         let mut ready = Vec::with_capacity(parallel);
         while let Some(joined) = tasks.join_next().await {
             let item =
                 joined.map_err(|error| format!("protocol setup worker failed: {error}"))??;
             ready.push(item);
+            if let Some((index, stream)) = input.next() {
+                tasks.spawn(handshake_stream(index, stream, header));
+            }
         }
         ready.sort_unstable_by_key(|(index, _)| *index);
         Ok::<_, String>(
@@ -447,7 +495,7 @@ pub(crate) async fn wait_for_peer(
     server: &Server,
     target_ip: std::net::Ipv4Addr,
     timeout: Duration,
-) {
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if server.status().peers.iter().any(|p| {
@@ -455,35 +503,56 @@ pub(crate) async fn wait_for_peer(
                 .iter()
                 .any(|ip| matches!(ip, std::net::IpAddr::V4(v4) if *v4 == target_ip))
         }) {
-            return;
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let peers = server
+        .status()
+        .peers
+        .iter()
+        .map(|peer| format!("{}:{:?}:{:?}", peer.name, peer.ips, peer.path_class))
+        .collect::<Vec<_>>()
+        .join(",");
+    Err(format!(
+        "peer-map readiness timeout: target={target_ip} peers=[{peers}]"
+    ))
 }
-pub(crate) fn extract_path_class(status: &ServerStatus, target: &str) -> String {
+fn classify_path_fields(cur_addr: &str, peer_relay: &str, relay: &str) -> &'static str {
+    if !cur_addr.is_empty() {
+        "direct"
+    } else if !peer_relay.is_empty() {
+        "relay"
+    } else if !relay.is_empty() {
+        "derp"
+    } else {
+        "none"
+    }
+}
+
+pub(crate) async fn current_userspace_path(server: &Server, target: &str) -> String {
     let Some(target_ip) = extract_target_ip(target) else {
         return "unknown".into();
     };
-    status
-        .peers
-        .iter()
-        .find(|peer| {
-            peer.ips
-                .iter()
-                .any(|ip| matches!(ip, std::net::IpAddr::V4(v4) if *v4 == target_ip))
-        })
-        .map_or_else(
-            || "unknown".into(),
-            |peer| {
-                match peer.path_class {
-                    rustscale_magicsock::PathClass::Direct => "direct",
-                    rustscale_magicsock::PathClass::Derp => "derp",
-                    rustscale_magicsock::PathClass::Relay => "relay",
-                    rustscale_magicsock::PathClass::None => "none",
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = server.ipn_status().await {
+            if let Some(peer) = status.Peer.values().find(|peer| {
+                peer.TailscaleIPs
+                    .iter()
+                    .any(|ip| matches!(ip, std::net::IpAddr::V4(v4) if *v4 == target_ip))
+            }) {
+                let path = classify_path_fields(&peer.CurAddr, &peer.PeerRelay, &peer.Relay);
+                if !matches!(path, "unknown" | "none") {
+                    return path.into();
                 }
-                .into()
-            },
-        )
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return "unknown".into();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +560,139 @@ mod tests {
     use super::*;
     use crate::protocol::{read_go, read_header, write_ack};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn path_field_classification_matches_ipnstate_precedence() {
+        assert_eq!(classify_path_fields("198.51.100.7:41641", "", ""), "direct");
+        assert_eq!(classify_path_fields("", "203.0.113.7:3478", ""), "relay");
+        assert_eq!(classify_path_fields("", "", "derp-1"), "derp");
+        assert_eq!(classify_path_fields("", "", ""), "none");
+        assert_eq!(
+            classify_path_fields("198.51.100.7:41641", "203.0.113.7:3478", "derp-1"),
+            "direct"
+        );
+        assert_eq!(
+            classify_path_fields("", "203.0.113.7:3478", "derp-1"),
+            "relay"
+        );
+    }
+
+    async fn synthetic_rsb1_round(parallel: usize) -> ThroughputResult {
+        let mut clients = Vec::with_capacity(parallel);
+        let mut servers = tokio::task::JoinSet::new();
+        for index in 0..parallel {
+            let (client, mut server) = tokio::io::duplex(1024);
+            clients.push(client);
+            servers.spawn(async move {
+                let header = read_header(&mut server)
+                    .await
+                    .unwrap_or_else(|error| panic!("stream {index} read header: {error}"));
+                assert_eq!(header.mode, MODE_THROUGHPUT, "stream {index}");
+                write_ack(&mut server)
+                    .await
+                    .unwrap_or_else(|error| panic!("stream {index} write ACK: {error}"));
+                read_go(&mut server)
+                    .await
+                    .unwrap_or_else(|error| panic!("stream {index} read GO: {error}"));
+                server
+                    .shutdown()
+                    .await
+                    .unwrap_or_else(|error| panic!("stream {index} shutdown: {error}"));
+            });
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            measure(
+                clients,
+                "userspace-tsnet",
+                "100.64.0.1:5201".into(),
+                0,
+                "down",
+                parallel,
+                "direct".into(),
+                "100.64.0.2".into(),
+            ),
+        )
+        .await
+        .expect("round deadline")
+        .expect("complete RSB1 round");
+        while let Some(joined) = servers.join_next().await {
+            joined.expect("server worker");
+        }
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_userspace_p1_p10_p100_p500_rounds_count_every_stream() {
+        for _ in 0..3 {
+            for parallel in [1, 10, 100, 500] {
+                let result = synthetic_rsb1_round(parallel).await;
+                assert_eq!(
+                    (result.established, result.handshaken, result.completed),
+                    (parallel, parallel, parallel)
+                );
+            }
+        }
+    }
+
+    // This preserves the stream index in a failure and exercises the exact
+    // long-lived RSB1 down-path teardown that previously stranded stream 679
+    // in a P1000 fan-out: client readers stop at the timing boundary, then
+    // every server writer must still complete its shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn userspace_p1000_rsb1_down_shutdown_completes_every_stream() {
+        const STREAMS: usize = 1000;
+        let result = synthetic_rsb1_round(STREAMS).await;
+        assert_eq!(
+            (result.established, result.handshaken, result.completed),
+            (STREAMS, STREAMS, STREAMS)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incomplete_userspace_handshake_rejects_partial_capacity_and_joins_workers() {
+        const STREAMS: usize = 10;
+        const REJECTED: usize = 4;
+        let mut clients = Vec::with_capacity(STREAMS);
+        let mut servers = tokio::task::JoinSet::new();
+        for index in 0..STREAMS {
+            let (client, mut server) = tokio::io::duplex(1024);
+            clients.push(client);
+            servers.spawn(async move {
+                let _ = read_header(&mut server).await;
+                if index == REJECTED {
+                    return;
+                }
+                let _ = write_ack(&mut server).await;
+                let _ = read_go(&mut server).await;
+            });
+        }
+
+        let error = match measure(
+            clients,
+            "userspace-tsnet",
+            "100.64.0.1:5201".into(),
+            0,
+            "down",
+            STREAMS,
+            "direct".into(),
+            "100.64.0.2".into(),
+        )
+        .await
+        {
+            Ok(_) => panic!("partial handshake must not produce a sample"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(&format!("stream {REJECTED} ACK")), "{error}");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(joined) = servers.join_next().await {
+                joined.expect("server worker");
+            }
+        })
+        .await
+        .expect("failed setup leaked an RSB1 worker");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn kernel_setup_completes_all_one_thousand_streams() {

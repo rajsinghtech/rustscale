@@ -54,7 +54,8 @@ type KernelPacket = [u8];
 /// per-slot kernel scratch is never detached into queued ciphertexts.
 pub(crate) const RECEIVE_BUFFER_POOL_CAPACITY: usize = 512;
 const RECEIVE_BUFFER_POOL_FREE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY;
-const RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH;
+pub(crate) const RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY: usize =
+    RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH;
 const GRO_SNAPSHOT_INTERVAL: u64 = 256;
 
 /// A fixed receive buffer detached from a `ReceiveBatch`.
@@ -2070,7 +2071,9 @@ mod tests {
 
         let inventory = batch.pool_inventory();
         let waiting =
-            tokio::spawn(async move { PoolInventoryReservation::acquire(inventory, 1).await });
+            tokio::spawn(
+                async move { PoolInventoryReservation::acquire_measured(inventory, 1).await },
+            );
         tokio::task::yield_now().await;
         assert!(
             !waiting.is_finished(),
@@ -2078,11 +2081,13 @@ mod tests {
         );
 
         drop(retained.remove(0));
-        let reservation = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
-            .await
-            .expect("returned pooled buffers wake inventory waiter")
-            .expect("waiter task completes")
-            .expect("inventory remains open");
+        let (reservation, waited, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("returned pooled buffers wake inventory waiter")
+                .expect("waiter task completes")
+                .expect("inventory remains open");
+        assert!(waited, "exhausted inventory must report its wait");
         assert_eq!(batch.pool_snapshot().unavailable, 0);
         drop(reservation);
         drop(retained);

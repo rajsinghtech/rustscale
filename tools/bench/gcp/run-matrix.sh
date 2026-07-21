@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # tools/bench/gcp/run-matrix.sh — main orchestrator for the GCP bench matrix.
 #
-# Defaults to the routine same-zone/direct four-way matched matrix. --full
-# expands topology/path coverage to the 2x2x4 = 16-cell matrix on dedicated
+# Defaults to the routine same-zone/direct five-cell matched matrix. --full
+# expands topology/path coverage to the 2x2x5 = 20-cell matrix on dedicated
 # GCP VMs, writing per-run JSON + a combined summary.json + a standalone HTML
 # dashboard into bench-results/gcp-<stamp>/.
 #
 # Reuses tools/bench/lib.sh for ephemeral tailnet provisioning.
 #
 # Usage:
-#   tools/bench/gcp/run-matrix.sh            # four-way routine run
+#   tools/bench/gcp/run-matrix.sh            # five-cell routine run
 #   tools/bench/gcp/run-matrix.sh --dry-run  # validate args, no gcloud/API
 #
 # Environment:
@@ -47,12 +47,72 @@ MATRIX_MANIFEST_PATH="/dev/null"
 MATRIX_OBSERVED_PATH="/dev/null"
 DURATION=10
 PEER_COUNT=1
-PARALLELISM_CSV="1,10,100"
+PARALLELISM_CSV="1,10,100,500,1000"
 MATRIX_PRESET="custom"
 LOAD_PRESET="routine-v1"
 TOPOLOGY_SOURCE="explicit"
 PATH_SOURCE="explicit"
 CONFIG_SOURCE="explicit"
+
+# `same-zone` is the historical label; every candidate remains a same-region,
+# cross-zone us-central1 pair. Candidates are ordered and finite rather than an
+# open-ended retry policy. A selected pair is retained in endpoint provenance.
+declare -A ZONE_PAIR_CANDIDATES=(
+  [same-zone]="us-central1-a:us-central1-b us-central1-c:us-central1-f us-central1-a:us-central1-f"
+  [cross-region]="us-central1-a:us-west1-a us-central1-c:us-west1-a"
+)
+ACTIVE_SRV=""
+ACTIVE_SRV_ZONE=""
+ACTIVE_CLI=""
+ACTIVE_CLI_ZONE=""
+
+capacity_exhausted() {
+  grep -Eq 'ZONE_RESOURCE_POOL_EXHAUSTED|RESOURCE_EXHAUSTED|resource pool.*exhausted' "$1"
+}
+
+# Try each approved pair at most once. Only a documented capacity exhaustion
+# advances to the next equivalent pair; all other create failures fail closed.
+# ACTIVE_* is set before each attempt so an interrupt cannot leak a partial VM.
+provision_topology_pair() {
+  local topology="$1" server="$2" client="$3" pair server_zone client_zone log status
+  for pair in ${ZONE_PAIR_CANDIDATES[$topology]}; do
+    IFS=: read -r server_zone client_zone <<<"$pair"
+    ACTIVE_SRV="$server"; ACTIVE_SRV_ZONE="$server_zone"
+    ACTIVE_CLI="$client"; ACTIVE_CLI_ZONE="$client_zone"
+    log=$(mktemp) || return 1
+    if create_vms "$server" "$server_zone" "$client" "$client_zone" 2>"$log"; then
+      cat "$log" >&2
+      rm -f "$log"
+      Z_A="$server_zone"; Z_B="$client_zone"
+      echo "[gcp] capacity preflight selected $topology zones $Z_A / $Z_B" >&2
+      return 0
+    fi
+    status=$?
+    cat "$log" >&2
+    if ! capacity_exhausted "$log"; then
+      rm -f "$log"
+      return "$status"
+    fi
+    rm -f "$log"
+    echo "[gcp] capacity exhausted for approved $topology pair $server_zone / $client_zone; cleaning up before the next pair" >&2
+    delete_vms "$server" "$server_zone" "$client" "$client_zone" || return 1
+    ACTIVE_SRV=""; ACTIVE_SRV_ZONE=""; ACTIVE_CLI=""; ACTIVE_CLI_ZONE=""
+  done
+  echo "[gcp] no approved $topology zone pair has capacity for $GCP_MACHINE; no benchmark cell was started" >&2
+  return 1
+}
+
+matrix_zone_pair_self_test() (
+  local calls=""
+  create_vms() {
+    calls+=" create:$2/$4"
+    [[ "$2/$4" != us-central1-a/us-central1-b ]] || { echo ZONE_RESOURCE_POOL_EXHAUSTED >&2; return 1; }
+  }
+  delete_vms() { calls+=" delete:$2/$4"; }
+  provision_topology_pair same-zone server client || return 1
+  [[ "$Z_A/$Z_B" == us-central1-c/us-central1-f ]] || return 1
+  [[ "$calls" == ' create:us-central1-a/us-central1-b delete:us-central1-a/us-central1-b create:us-central1-c/us-central1-f' ]]
+)
 
 MATRIX_SELF_TEST=0
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -72,6 +132,7 @@ rust_build_command() {
     case "$config" in
       rs-userspace|ts-userspace|ts-tun) requested=(rustscale-bench) ;;
       rs-tun) requested=(rustscale-bench rustscale-cli rustscale-rustscaled) ;;
+      ts-embedded) continue ;;
       *) continue ;;
     esac
     for candidate in "${requested[@]}"; do
@@ -94,8 +155,29 @@ rust_build_command() {
   done
 }
 
+go_build_command() {
+  local config
+  for config in "${CONFIGS[@]}"; do
+    if [[ "$config" == ts-embedded ]]; then
+      printf '%s' 'export GOTOOLCHAIN=local; cd /opt/rustscale/tools/bench/go-tsnet && test "$(go env GOVERSION)" = go1.26.4 && go mod verify && mkdir -p /opt/rustscale/bin && go build -trimpath -buildvcs=false -ldflags=-buildid= -o /opt/rustscale/bin/go-tsnet-rsb1 .'
+      return 0
+    fi
+  done
+}
+
+remote_build_command() {
+  local rust_command go_command
+  rust_command=$(rust_build_command)
+  go_command=$(go_build_command)
+  if [[ -n "$rust_command" && -n "$go_command" ]]; then
+    printf '%s && %s' "$rust_command" "$go_command"
+  else
+    printf '%s%s' "$rust_command" "$go_command"
+  fi
+}
+
 matrix_command_shape_self_test() {
-  local actual
+  local actual go_actual remote_actual
   CONFIGS=(rs-userspace)
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench' ]] || return 1
@@ -108,10 +190,20 @@ matrix_command_shape_self_test() {
   CONFIGS=(ts-userspace ts-tun)
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench' ]] || return 1
-  CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
+  CONFIGS=(rs-userspace rs-tun ts-embedded ts-userspace ts-tun)
   actual=$(rust_build_command)
   [[ "$actual" == 'export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled' ]] || return 1
   [[ "$actual" != *'-p rustscaled'* ]] || return 1
+  go_actual=$(go_build_command)
+  [[ "$go_actual" == *'GOTOOLCHAIN=local'* && "$go_actual" == *'test "$(go env GOVERSION)" = go1.26.4'* \
+    && "$go_actual" == *'go mod verify'* && "$go_actual" == *'-trimpath -buildvcs=false -ldflags=-buildid='* \
+    && "$go_actual" == *'/opt/rustscale/bin/go-tsnet-rsb1'* ]] || return 1
+  remote_actual=$(remote_build_command)
+  [[ "$remote_actual" == "$actual && $go_actual" ]] || return 1
+  CONFIGS=(ts-embedded)
+  [[ -z "$(rust_build_command)" && "$(remote_build_command)" == "$(go_build_command)" ]] || return 1
+  CONFIGS=(rs-userspace)
+  [[ -z "$(go_build_command)" && "$(remote_build_command)" == "$(rust_build_command)" ]] || return 1
   RUSTFLAGS='-C target-cpu=native'; CARGO_PROFILE_RELEASE_LTO=thin; CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
   CONFIGS=(rs-tun); actual=$(rust_build_command)
   [[ "$actual" == *'RUSTFLAGS=-C\ target-cpu=native'* && "$actual" == *'CARGO_PROFILE_RELEASE_LTO=thin'* && "$actual" == *'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1'* ]] || return 1
@@ -162,6 +254,57 @@ matrix_run_config_with_policy() {
   fi
 }
 
+# Embedded clients reopen one state directory from a new process for every
+# trial, so their transport identity must survive each intentional disconnect.
+matrix_authkey_ephemeral_for_config() {
+  case "$1" in
+    rs-userspace|ts-embedded) printf '%s' false ;;
+    rs-tun|ts-userspace|ts-tun) printf '%s' true ;;
+    *) return 2 ;;
+  esac
+}
+
+matrix_authkey_policy_self_test() {
+  [[ "$(matrix_authkey_ephemeral_for_config rs-userspace)" == false ]] || return 1
+  [[ "$(matrix_authkey_ephemeral_for_config ts-embedded)" == false ]] || return 1
+  local config
+  for config in rs-tun ts-userspace ts-tun; do
+    [[ "$(matrix_authkey_ephemeral_for_config "$config")" == true ]] || return 1
+  done
+  if matrix_authkey_ephemeral_for_config invalid >/dev/null 2>&1; then return 1; fi
+  if bench_mint_authkey invalid >/dev/null 2>&1; then return 1; else [[ $? -eq 2 ]]; fi
+}
+
+# Write one credential to an owner-only local file. Only the path crosses the
+# run-matrix -> run-config argv boundary.
+ACTIVE_AUTHKEY_FILE=""
+matrix_create_authkey_file() {
+  local value="$1"
+  umask 077
+  ACTIVE_AUTHKEY_FILE=$(mktemp "${TMPDIR:-/tmp}/rustscale-bench-authkey.XXXXXX") || return 1
+  printf '%s\n' "$value" >"$ACTIVE_AUTHKEY_FILE"
+  chmod 600 "$ACTIVE_AUTHKEY_FILE"
+}
+matrix_remove_authkey_file() {
+  [[ -z "$ACTIVE_AUTHKEY_FILE" ]] || rm -f "$ACTIVE_AUTHKEY_FILE"
+  ACTIVE_AUTHKEY_FILE=""
+}
+matrix_authkey_file_self_test() {
+  local directory mode args secret=tskey-fixture-sentinel
+  directory=$(mktemp -d) || return 1
+  TMPDIR="$directory" matrix_create_authkey_file "$secret" || return 1
+  mode=$(portable_file_mode "$ACTIVE_AUTHKEY_FILE") || return 1
+  [[ "$mode" == 600 && "$(cat "$ACTIVE_AUTHKEY_FILE")" == "$secret" ]] || return 1
+  REPEAT=3; PARALLELISM_CSV=1,10,100,500,1000; DURATION=10; PEER_COUNT=1
+  MATRIX_MANIFEST_PATH=/dev/null; MATRIX_OBSERVED_PATH=/dev/null
+  matrix_build_run_config_args rs-userspace s c sz cz "$ACTIVE_AUTHKEY_FILE" out srv cli
+  args="${RUN_CONFIG_ARGS[*]}"
+  [[ "$args" == *"$ACTIVE_AUTHKEY_FILE"* && "$args" != *"$secret"* ]] || return 1
+  matrix_remove_authkey_file
+  [[ ! -e "$directory"/rustscale-bench-authkey.* ]] || return 1
+  rmdir "$directory"
+}
+
 matrix_config_failure_policy_self_test() {
   local output status
 
@@ -195,7 +338,7 @@ matrix_profile_self_test() {
   local config
   local -a calls=()
   REPEAT=4
-  PARALLELISM_CSV="1,10,100"
+  PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
   PROFILE=1
@@ -205,19 +348,19 @@ matrix_profile_self_test() {
   # The profile diagnostic must be distinct from, and follow, all normal
   # selected cells. Its profile-only option preserves the accepted rs-tun JSON.
   for config in rs-tun ts-tun; do
-    matrix_run_config_cell "$config" s c sz cz key dir host client matrix_test_record_run_config
+    matrix_run_config_cell "$config" s c sz cz /tmp/authkey-file dir host client matrix_test_record_run_config
   done
-  matrix_run_profile_diagnostic s c sz cz profile-key dir host client matrix_test_record_profile
+  matrix_run_profile_diagnostic s c sz cz /tmp/profile-authkey-file dir host client matrix_test_record_profile
   unset -f matrix_test_record_run_config matrix_test_record_profile
 
   [[ ${#calls[@]} -eq 3 ]] || return 1
-  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz key dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz key dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz profile-key dir host client --repeat 4 --parallelism 1,10,100 --duration 10 --peer-count 1 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz /tmp/profile-authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
 }
 
 # Build the directly invocable run-config command shape used by each cell.
-# Args: CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE AUTHKEY RESULTS_DIR
+# Args: CONFIG SERVER_VM CLIENT_VM SERVER_ZONE CLIENT_ZONE AUTHKEY_FILE RESULTS_DIR
 #       SERVER_HOSTNAME CLIENT_HOSTNAME
 matrix_build_run_config_args() {
   local config="$1"
@@ -232,11 +375,11 @@ matrix_build_run_config_args() {
 # helper lets the local self-test exercise the same loop without GCP access.
 matrix_run_config_cell() {
   local config="$1" server_vm="$2" client_vm="$3" server_zone="$4" client_zone="$5"
-  local authkey="$6" results_dir="$7" server_hostname="$8" client_hostname="$9"
+  local authkey_file="$6" results_dir="$7" server_hostname="$8" client_hostname="$9"
   local policy_fn="${10:-matrix_run_config_with_policy}"
 
   matrix_build_run_config_args "$config" "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
-    "$authkey" "$results_dir" "$server_hostname" "$client_hostname"
+    "$authkey_file" "$results_dir" "$server_hostname" "$client_hostname"
   "$policy_fn" "$config" " -> $results_dir/$config.json" \
     tools/bench/gcp/run-config.sh "${RUN_CONFIG_ARGS[@]}"
 }
@@ -246,10 +389,10 @@ matrix_run_config_cell() {
 # silently treated as a successful matrix run.
 matrix_run_profile_diagnostic() {
   local server_vm="$1" client_vm="$2" server_zone="$3" client_zone="$4"
-  local authkey="$5" results_dir="$6" server_hostname="$7" client_hostname="$8"
+  local authkey_file="$5" results_dir="$6" server_hostname="$7" client_hostname="$8"
   local runner="${9:-tools/bench/gcp/run-config.sh}"
   "$runner" rs-tun "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
-    "$authkey" "$results_dir" "$server_hostname" "$client_hostname" \
+    "$authkey_file" "$results_dir" "$server_hostname" "$client_hostname" \
     --repeat "$REPEAT" --parallelism "$PARALLELISM_CSV" --duration "$DURATION" --peer-count "$PEER_COUNT" \
     --profile-only --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
 }
@@ -260,7 +403,7 @@ matrix_parse_args() {
   DRY_RUN=0
   PROFILE=0
   REPEAT=3
-  PARALLELISM_CSV="1,10,100"
+  PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
   SCALE_STREAMS=0
@@ -308,7 +451,7 @@ matrix_parse_args() {
       --repeat)
         (( seen_repeat == 0 )) || { echo "duplicate option: --repeat" >&2; return 2; }
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
-        [[ "$2" =~ ^[1-9]$ ]] || { echo "--repeat must be an integer in 1..=9" >&2; return 2; }
+        [[ "$2" =~ ^[3-9]$ ]] || { echo "--repeat must be an integer in 3..=9" >&2; return 2; }
         REPEAT="$2"; seen_repeat=1; shift 2 ;;
       --parallelism)
         (( seen_parallelism == 0 && seen_scale == 0 )) || { echo "--parallelism conflicts with a duplicate or --scale-streams" >&2; return 2; }
@@ -317,7 +460,7 @@ matrix_parse_args() {
         PARALLELISM_CSV="$2"; LOAD_PRESET=custom; seen_parallelism=1; shift 2 ;;
       --scale-streams)
         (( seen_scale == 0 && seen_parallelism == 0 )) || { echo "--scale-streams conflicts with a duplicate or --parallelism" >&2; return 2; }
-        PARALLELISM_CSV="1,2,4,8,16,32,64,100,200,500,1000"; LOAD_PRESET=scale-streams-v1; SCALE_STREAMS=1; seen_scale=1; shift ;;
+        PARALLELISM_CSV="1,10,100,500,1000"; LOAD_PRESET=routine-v1; SCALE_STREAMS=1; seen_scale=1; shift ;;
       --duration)
         (( seen_duration == 0 )) || { echo "duplicate option: --duration" >&2; return 2; }
         [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 3 && "$2" -le 120 ]] || { echo "--duration must be an integer in 3..=120" >&2; return 2; }
@@ -351,20 +494,21 @@ validate_matrix_parallelism_csv() {
     [[ "$seen" != *",$item,"* ]] || { echo "duplicate --parallelism value: $item" >&2; return 1; }
     seen+="$item,"
   done
+  [[ "$csv" == "1,10,100,500,1000" ]] || { echo "--parallelism must be exactly 1,10,100,500,1000" >&2; return 1; }
 }
 
 matrix_option_parsing_self_test() {
   local actual status
   actual=$(matrix_parse_args; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
   [[ "$actual" == '3/0/0/0///' ]] || return 1
-  actual=$(matrix_parse_args --full --repeat 1 --profile --topology same-zone --path direct --config rs-tun,ts-tun; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
-  [[ "$actual" == '1/1/0/1/same-zone/direct/rs-tun,ts-tun' ]] || return 1
+  actual=$(matrix_parse_args --full --repeat 3 --profile --topology same-zone --path direct --config rs-tun,ts-tun; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
+  [[ "$actual" == '3/1/0/1/same-zone/direct/rs-tun,ts-tun' ]] || return 1
   actual=$(matrix_parse_args --dry-run --help --not-an-error; printf '%s/%s/%s\n' "$DRY_RUN" "$SHOW_HELP" "$REPEAT") || return 1
   [[ "$actual" == '1/1/3' ]] || return 1
-  actual=$(matrix_parse_args --parallelism 1,10,100,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
-  [[ "$actual" == '1,10,100,1000/20/250' ]] || return 1
+  actual=$(matrix_parse_args --parallelism 1,10,100,500,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
+  [[ "$actual" == '1,10,100,500,1000/20/250' ]] || return 1
   actual=$(matrix_parse_args --scale-streams; printf '%s' "$PARALLELISM_CSV") || return 1
-  [[ "$actual" == '1,2,4,8,16,32,64,100,200,500,1000' ]] || return 1
+  [[ "$actual" == '1,10,100,500,1000' ]] || return 1
   local -a case_args=()
   for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--full --full' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1 --parallelism 2' '--scale-streams --scale-streams' '--scale-streams --parallelism 1' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001'; do
     read -r -a case_args <<< "$args"
@@ -461,6 +605,7 @@ for name, explicit in (
     ("rustscale-bench", "/opt/rustscale/target/release/rustscale-bench"),
     ("rustscale", "/opt/rustscale/target/release/rustscale"),
     ("rustscaled", "/opt/rustscale/target/release/rustscaled"),
+    ("go-tsnet-rsb1", "/opt/rustscale/bin/go-tsnet-rsb1"),
 ):
     if os.path.isfile(explicit):
         products.append({"path": explicit, "version": output(["timeout", "15", explicit, "--version"]), "version_source": "executable --version", "sha256": hashlib.sha256(open(explicit,"rb").read()).hexdigest()})
@@ -474,7 +619,7 @@ cpu=output(["lscpu", "-J"])
 try: cpu_model=next(x["data"] for x in json.loads(cpu)["lscpu"] if x["field"].strip()=="Model name:")
 except Exception: raise SystemExit("unable to determine CPU model")
 utilities = [entry for entry in (utility("iperf3", ["--version"]), utility("socat", ["-V"]), utility("ncat", ["--version"]), utility("pidstat", ["-V"]), utility("python3", ["--version"])) if entry]
-print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env),"rustc_verbose":output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env),"product":products,"measurement_tools":utilities}))
+print(json.dumps({"cpu_model":cpu_model,"logical_cpus":os.cpu_count(),"kernel_release":platform.release(),"os_pretty_name":os_name,"cargo":output(["/opt/rust/cargo/bin/cargo","--version"], env=toolchain_env),"rustc_verbose":output(["/opt/rust/cargo/bin/rustc","-Vv"], env=toolchain_env),"go":output(["/usr/local/go/bin/go","version"]),"product":products,"measurement_tools":utilities}))
 PY
 PYEOF
 }
@@ -485,6 +630,8 @@ matrix_product_observation_self_test() {
   [[ "$program" == *'("rustscale-bench", "/opt/rustscale/target/release/rustscale-bench")'* ]] || return 1
   [[ "$program" == *'("rustscale", "/opt/rustscale/target/release/rustscale")'* ]] || return 1
   [[ "$program" == *'("rustscaled", "/opt/rustscale/target/release/rustscaled")'* ]] || return 1
+  [[ "$program" == *'("go-tsnet-rsb1", "/opt/rustscale/bin/go-tsnet-rsb1")'* ]] || return 1
+  [[ "$program" == *'output(["/usr/local/go/bin/go","version"])'* ]] || return 1
   [[ "$program" == *'output(["timeout", "15", explicit, "--version"])'* ]] || return 1
   [[ "$program" == *'utility("iperf3", ["--version"])'* && "$program" == *'utility("pidstat", ["-V"])'* ]] || return 1
   # On a fresh VM /usr/local/bin/cargo is a rustup shim and the SSH user's
@@ -503,6 +650,9 @@ matrix_product_observation_self_test() {
   grep -Fq 'fn metadata_version()' crates/bench/src/main.rs || return 1
   grep -Fq 'matches!(args[1].as_str(), "--version" | "-V")' crates/cli/src/main.rs || return 1
   grep -Fq 'matches!(arg.as_str(), "--version" | "-V")' crates/rustscaled/src/main.rs || return 1
+  grep -Fq 'toolVersion = "tailscale.com/v1.100.0"' tools/bench/go-tsnet/main.go || return 1
+  grep -Fxq 'require tailscale.com v1.100.0' tools/bench/go-tsnet/go.mod || return 1
+  grep -Fxq 'tailscale.com v1.100.0 h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=' tools/bench/go-tsnet/go.sum || return 1
 }
 
 # Atomically publish command stdout in the result directory. The command is
@@ -584,14 +734,14 @@ matrix_write_manifest() {
   [[ "$repeat" =~ ^[1-9][0-9]*$ ]] || return 1
   for value in "${parallelism[@]}"; do [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1; done
   local selected_load_preset="$LOAD_PRESET"
-  [[ "$selected_load_preset" != routine-v1 || "${parallelism[*]}" == "1 10 100" ]] || selected_load_preset=custom
+  [[ "$selected_load_preset" != routine-v1 || "${parallelism[*]}" == "1 10 100 500 1000" ]] || selected_load_preset=custom
   [[ "$selected_load_preset" != scale-streams-v1 || "${parallelism[*]}" == "1 2 4 8 16 32 64 100 200 500 1000" ]] || selected_load_preset=custom
   [[ "$dry_run" == 1 ]] && dry_flag=(--dry-run)
   python3 tools/bench/gcp/provenance.py manifest "$output" \
     --run-id "$MATRIX_RUN_ID" --started-at-utc "$MATRIX_STARTED_AT_UTC" --commit "$MATRIX_SOURCE_COMMIT" \
     --dirty "$MATRIX_WORKTREE_DIRTY" --project "$MATRIX_PROJECT" --image-project "$GCP_IMAGE_PROJECT" \
     --image-family "$GCP_IMAGE" --machine "$GCP_MACHINE" --network "$GCP_NETWORK" --disk-type pd-standard \
-    --disk-gb "$GCP_DISK_GB" --build-command "${RUST_BUILD_COMMAND:-}" --rustflags "${RUSTFLAGS:-}" \
+    --disk-gb "$GCP_DISK_GB" --build-command "${RUST_BUILD_COMMAND:-}" --go-build-command "${GO_BUILD_COMMAND:-}" --rustflags "${RUSTFLAGS:-}" \
     --lto "${CARGO_PROFILE_RELEASE_LTO:-}" --codegen-units "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}" \
     --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" \
     --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
@@ -696,21 +846,23 @@ def observed(dry_run):
     return {"resolved_image":"fixture-image","server":endpoint("us-central1-a"),"client":endpoint("us-central1-b"),"toolchain":{"server_cargo":"cargo fixture","server_rustc_verbose":"rustc fixture","client_cargo":"cargo fixture","client_rustc_verbose":"rustc fixture"},"product":{"server":products,"client":products}}
 def result(root, status):
     manifest=json.loads((root/"matrix.json").read_text()); run=manifest["run"]
-    common={"schema_version":5,"run":run,"observed":observed(status=="failed"),"status":status,"tool":"rustscale","implementation":"rustscale","mode":"tun",
+    obs=observed(status=="failed")
+    common={"schema_version":6,"run":run,"observed":obs,"status":status,"tool":"rustscale","implementation":"rustscale","mode":"tun",
           "topology":"same-zone","path":"direct","config":"rs-tun","repeat":1,
           "parallelism_requested":[1],"duration_s_requested":10,"sample_cadence_s":1,
           "peer_count_requested":1,"error":"dry-run","log_tail":"","throughput":None,"latency":None,"footprint":None,"path_class_reported":"unknown"}
     if status=="ok":
-        series={"rss_peak_kb":1,"rss_avg_kb":1,"cpu_peak_pct":0,"cpu_avg_pct":0,"samples":1,"missing_samples":0,"sample_cadence_s":1,"clock":"monotonic","series":[{"offset_ms":0,"rss_kb":1,"cpu_pct":0,"included_processes":["1:rustscaled"],"status":"observed"}],"series_truncated":False}
+        series={"rss_peak_kb":1,"rss_avg_kb":1,"cpu_peak_pct":0,"cpu_avg_pct":0,"samples":1,"missing_samples":0,"sample_cadence_s":1,"clock":"monotonic","series":[{"offset_ms":0,"rss_kb":1,"cpu_pct":0,"included_processes":["1:rustscaled","2:rustscale-bench"],"status":"observed"}],"series_truncated":False}
         scope={"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
-        samples=list(range(1,51))
-        common.update({"error":"","transport":"kernel-tcp","throughput":[{"parallel":1,"mbps":1.0,"duration_s":10,"samples_mbps":[1.0],"statistic":"median"}],
+        samples=list(range(1,201))
+        common.update({"error":"","transport":"kernel-tcp","throughput":[{"parallel":1,"mbps":1.0,"duration_s":10,"samples_mbps":[1.0],"statistic":"median","min_mbps":1.0,"max_mbps":1.0,"population_stddev_mbps":0.0,"coefficient_of_variation_pct":0.0}],
           "warmup_evidence":{"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_secs":3,"parallel":1,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"},
           "throughput_trials":[{"parallel":1,"repeat_index":1,"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_s":10,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"externally-gated"}],
-          "latency":{"protocol":"RSB1-tcp-pingpong","requested":50,"successful":50,"timed_out":0,"malformed":0,"count":50,"p50_us":1,"p95_us":2,"p99_us":3,"samples_ns":samples},
-          "footprint":dict(series,binary_size_bytes=1,scope=scope),
-          "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3,"max_attempts":3},"client_lifecycle":"new_benchmark_process_per_trial","transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,"latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"latency_count":50,"transport_path":"kernel-tcp-via-rustscaled-tun","userspace_portmapping":"not-applicable"},
-          "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,"server":dict(series,endpoint="server",subjects=["rustscaled","rustscale-bench"],scope=scope),"client":dict(series,endpoint="client",subjects=["rustscaled","rustscale-bench"],scope=scope)},
+          "latency":{"protocol":"RSB1-tcp-pingpong","requested":200,"successful":200,"timed_out":0,"malformed":0,"count":200,"min_ns":1,"mean_ns":100.5,"p50_ns":101,"p95_ns":190,"p99_ns":198,"max_ns":200,"min_us":0.001,"mean_us":0.1005,"p50_us":0.101,"p95_us":0.19,"p99_us":0.198,"max_us":0.2,"samples_ns":samples},
+          "footprint":dict(series,binary_size_bytes=1,subject="rustscaled",scope=scope),
+          "workload":{"implementation":"rustscale-bench","protocol":"RSB1","direction":"down","payload_bytes":1280,"warmup":{"parallel":1,"duration_s":3,"max_attempts":1},"client_lifecycle":"new_benchmark_process_per_trial","transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,"latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,"latency_count":200,"transport_path":"kernel-tcp-via-rustscaled-tun","userspace_portmapping":"not-applicable"},
+          "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,"server":dict(series,endpoint="server",subjects=["rustscaled","rustscale-bench"],scope=scope,binary_identities=[obs["product"]["server"][1],obs["product"]["server"][2]]),"client":dict(series,endpoint="client",subjects=["rustscaled","rustscale-bench"],scope=scope,binary_identities=[obs["product"]["client"][1],obs["product"]["client"][2]])},
+          "binary":dict(obs["product"]["server"][1],subject="rustscaled",size_bytes=1),
           "path_class_reported":"direct","path_gate":{"requested":"direct","pre":"direct","post":"direct","matched":True},"cleanup":{"status":"clean","samplers_stopped":True,"workload_stopped":True,"transport_stopped":True,"postconditions_verified":True},
           "identity":{"key":"same-zone/direct/rs-tun","cell_id":"rs-tun","implementation":"rustscale","mode":"tun","topology":"same-zone","path":"direct"},
           "load":{"preset":manifest["load"]["preset"],"parallelism_requested":[1],"repeat":1,"duration_s":10,"peer_load":manifest["load"]["peer_load"]},
@@ -750,11 +902,11 @@ matrix_manifest_self_test() {
   temp_dir=$(mktemp -d)
   manifest="$temp_dir/matrix.json"
   invalid_manifest="$temp_dir/invalid.json"
-  matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 || { rm -rf "$temp_dir"; return 1; }
+  matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 500 1000 || { rm -rf "$temp_dir"; return 1; }
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
   python3 - "$manifest" "$GCP_MACHINE" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; assert data["schema_version"] == 3 and data["parallelism"] == [1,10,100] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100,500,1000] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_toolchain_archive"] == "go1.26.4.linux-amd64.tar.gz" and build["go_toolchain_archive_sha256"] == "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1
@@ -830,6 +982,8 @@ configure_linux_udp_tx_gso_mode || exit $?
 
 matrix_command_shape_self_test
 matrix_remote_build_aggregation_self_test
+matrix_authkey_policy_self_test
+matrix_authkey_file_self_test
 matrix_config_failure_policy_self_test
 matrix_profile_self_test
 matrix_option_parsing_self_test
@@ -843,6 +997,7 @@ matrix_inbound_pipeline_self_test
 matrix_outbound_send_pipeline_self_test
 matrix_linux_udp_receive_modes_self_test
 matrix_linux_udp_tx_gso_mode_self_test
+matrix_zone_pair_self_test
 matrix_finalization_self_test
 
 if (( MATRIX_SELF_TEST )); then
@@ -860,15 +1015,15 @@ fi
 matrix_usage() {
   cat <<EOF
 usage: $0 [--dry-run] [--full] [--profile] [--repeat N] [--parallelism LIST] [--scale-streams] [--duration N] [--peer-count N] [--topology LIST] [--path LIST] [--config LIST]
-Runs same-zone/direct rs-userspace,rs-tun,ts-userspace,ts-tun with one matched RSB1 workload.
+Runs same-zone/direct rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun with one matched RSB1 workload.
   --dry-run  validate args + script structure without gcloud or API calls.
-  --full     expand to both topologies and both paths; all four configs remain selected.
+  --full     expand to both topologies and both paths; all five configs remain selected.
   --topology comma-separated subset: same-zone,cross-region
   --path     comma-separated subset: direct,derp
-  --config   comma-separated subset: rs-userspace,rs-tun,ts-userspace,ts-tun
-  --repeat N run each throughput point N times (1..=9; default 3)
-  --parallelism LIST ordered unique stream counts in 1..=1000 (default 1,10,100)
-  --scale-streams opt in to the honest all-cell 1,2,4,8,16,32,64,100,200,500,1000 RSB1 sweep
+  --config   comma-separated subset: rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun
+  --repeat N run each throughput point N times (3..=9; default 3)
+  --parallelism LIST ordered unique stream counts in 1..=1000 (required 1,10,100,500,1000)
+  --scale-streams compatibility alias for the required 1,10,100,500,1000 RSB1 sweep
   --duration N measured throughput seconds (3..=120; default 10)
   --peer-count N record configured remote-peer load (1..=1000; default 1)
   --profile  profile only the selected rs-tun cell after normal metrics
@@ -882,18 +1037,22 @@ fi
 if [[ $DRY_RUN -eq 1 ]]; then
   export GCP_DRY_RUN=1
   echo "[dry-run] enabled — gcloud/API mutations skipped, stub JSONs emitted"
+else
+  # Never invoke browser/device login here. This selects only an already valid
+  # active account, ADC, workload identity, or service-account credential.
+  gcloud_auth_preflight || exit $?
+  if [[ -z "${GCP_PROJECT:-}" || "$GCP_PROJECT" == "(unset)" ]]; then
+    GCP_PROJECT=$(gcloud config get-value core/project 2>/dev/null || true)
+  fi
+  echo "[gcp] noninteractive auth route: $GCP_AUTH_ROUTE" >&2
 fi
 
 # ---------------------------------------------------------------------------
-# Zone pairings.
+# Zone pairings are selected by the bounded preflight declared above.
 # ---------------------------------------------------------------------------
-declare -A ZONES=(
-  [same-zone]="us-central1-a:us-central1-b"
-  [cross-region]="us-central1-a:us-west1-a"
-)
 ALL_TOPOLOGIES=(same-zone cross-region)
 ALL_PATHS=(direct derp)
-ALL_CONFIGS=(rs-userspace rs-tun ts-userspace ts-tun)
+ALL_CONFIGS=(rs-userspace rs-tun ts-embedded ts-userspace ts-tun)
 if (( FULL )); then
   TOPOLOGIES=("${ALL_TOPOLOGIES[@]}")
   PATHS=("${ALL_PATHS[@]}")
@@ -941,8 +1100,10 @@ elif (( ! FULL )) && [[ -z "$TOPOLOGY_FILTER$PATH_FILTER$CONFIG_FILTER" ]]; then
 else
   MATRIX_PRESET=custom
 fi
-# Every selected cell uses rustscale-bench RSB1 and the exact requested list.
-# Capacity or lifecycle shortfalls fail the whole cell; the harness never caps,
+# Every selected cell uses the byte-identical RSB1 workload and exact requested
+# list. Rust cells and daemon/TUN evidence use rustscale-bench; ts-embedded uses
+# the pinned Go endpoint. Capacity or lifecycle shortfalls fail the whole cell;
+# the harness never caps,
 # truncates, or substitutes an effective stream count.
 if (( PROFILE )); then
   found=0
@@ -953,8 +1114,10 @@ if (( PROFILE )); then
   }
 fi
 RUST_BUILD_COMMAND=$(rust_build_command)
-if [[ -z "$RUST_BUILD_COMMAND" ]]; then
-  echo "[gcp] skipping Rust source delivery and builds (no Rust configs selected)" >&2
+GO_BUILD_COMMAND=$(go_build_command)
+REMOTE_BUILD_COMMAND=$(remote_build_command)
+if [[ -z "$REMOTE_BUILD_COMMAND" ]]; then
+  echo "[gcp] skipping source delivery and builds (no source-built configs selected)" >&2
 fi
 
 MATRIX_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1025,12 +1188,8 @@ matrix_select_cell_observed() {
     --topology "$topology" --server-zone "$server_zone" --client-zone "$client_zone" --machine "$GCP_MACHINE" "${dry_flag[@]}"
 }
 
-# Track VMs created for cleanup. ASSUMES one pair per topology; we delete each
-# topology's VMs before starting the next to keep quota usage at 2 VMs.
-ACTIVE_SRV=""
-ACTIVE_SRV_ZONE=""
-ACTIVE_CLI=""
-ACTIVE_CLI_ZONE=""
+# Track VMs created for cleanup. We delete each topology's pair before the
+# next to keep quota usage at two VMs, including a partial capacity attempt.
 CLEANUP_RAN=0
 
  # ---------------------------------------------------------------------------
@@ -1041,6 +1200,7 @@ CLEANUP_RAN=0
    [[ $CLEANUP_RAN -eq 0 ]] || return 0
    CLEANUP_RAN=1
    local status=0
+   matrix_remove_authkey_file || status=1
    echo "[gcp] cleanup: finalizing VMs + tailnet before result publication" >&2
    if [[ -z "${SKIP_VM_DELETE:-}" ]]; then
      if [[ -n "$ACTIVE_SRV" ]]; then delete_vm "$ACTIVE_SRV" "$ACTIVE_SRV_ZONE" || status=1; fi
@@ -1061,13 +1221,15 @@ gcp_bench_on_signal() {
 # ---------------------------------------------------------------------------
 # Provision tailnet (skipped in dry-run to avoid API calls).
 # A FRESH authkey is minted per config invocation inside the main loop to
-# avoid key expiry / invalidation across the ~40-min matrix run.  The
-# org-level child token / DNS / API base are exported so that bench_mint_authkey
+# avoid key expiry across the bounded matrix. Embedded clients use durable,
+# non-ephemeral identities between trial processes; continuously running
+# daemon cells remain ephemeral. The org-level child token / DNS / API base
+# are exported so that bench_mint_authkey
 # (defined in tools/bench/lib.sh) works inside run-config.sh if ever needed.
 # ---------------------------------------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "[dry-run] skipping tailnet provisioning" >&2
-  AUTHKEY="tskey-dryrun-placeholder"
+  :
 else
   bench_provision_tailnet
   export BENCH_DNS BENCH_CHILD_TOKEN BENCH_CHILD_CID BENCH_CHILD_CSEC BENCH_API
@@ -1084,28 +1246,25 @@ trap gcp_bench_cleanup EXIT
 # Main matrix loop.
 # ---------------------------------------------------------------------------
 for TOPO in "${TOPOLOGIES[@]}"; do
-  IFS=: read -r Z_A Z_B <<< "${ZONES[$TOPO]}"
   SERVER_VM=$(matrix_vm_name "$MATRIX_RUN_ID" "$TOPO" srv)
   CLIENT_VM=$(matrix_vm_name "$MATRIX_RUN_ID" "$TOPO" cli)
-  ACTIVE_SRV="$SERVER_VM"
-  ACTIVE_SRV_ZONE="$Z_A"
-  ACTIVE_CLI="$CLIENT_VM"
-  ACTIVE_CLI_ZONE="$Z_B"
 
   echo ""
+  echo "[gcp] === topology: $TOPO (approved zone-pair preflight) ==="
+
+  # Provision the first capacity-available approved pair (no-op in dry-run).
+  provision_topology_pair "$TOPO" "$SERVER_VM" "$CLIENT_VM"
   echo "[gcp] === topology: $TOPO (zones $Z_A / $Z_B) ==="
 
-  # Provision VMs (no-op in dry-run).
-  create_vms "$SERVER_VM" "$Z_A" "$CLIENT_VM" "$Z_B"
-
-  if [[ -n "$RUST_BUILD_COMMAND" ]]; then
-    # Deliver source sequentially, then build on both VMs in parallel.
+  if [[ -n "$REMOTE_BUILD_COMMAND" ]]; then
+    # Deliver source sequentially, then build every selected source endpoint on
+    # both VMs in parallel. The Go module and toolchain are independently pinned.
     deliver_source "$SERVER_VM" "$Z_A"
     deliver_source "$CLIENT_VM" "$Z_B"
-    echo "[gcp] building rustscale on both VMs in parallel..." >&2
-    ssh_cmd "$SERVER_VM" "$Z_A" "$RUST_BUILD_COMMAND" &
+    echo "[gcp] building selected source endpoints on both VMs in parallel..." >&2
+    ssh_cmd "$SERVER_VM" "$Z_A" "$REMOTE_BUILD_COMMAND" &
     SERVER_BUILD_PID=$!
-    ssh_cmd "$CLIENT_VM" "$Z_B" "$RUST_BUILD_COMMAND" &
+    ssh_cmd "$CLIENT_VM" "$Z_B" "$REMOTE_BUILD_COMMAND" &
     CLIENT_BUILD_PID=$!
     wait_for_remote_builds "$SERVER_BUILD_PID" "$CLIENT_BUILD_PID"
   fi
@@ -1132,36 +1291,43 @@ for TOPO in "${TOPOLOGIES[@]}"; do
       export BENCH_MATRIX="${TOPO}/${PATH_TAG}"
       matrix_select_cell_observed "$TOPO" "$CFG" "$Z_A" "$Z_B"
 
-      # Mint a FRESH authkey per config.  Reusing a single ephemeral key
-      # across all 16 configs causes "invalid key" / "node not found" errors
-      # as the key expires or its ephemeral nodes are reaped mid-run.
+      # Mint a fresh key per config. Reusing one key across a long matrix risks
+      # expiry, while an ephemeral embedded identity can be reaped during the
+      # intentional disconnect between measured client processes.
       if [[ $DRY_RUN -eq 1 ]]; then
-        AUTHKEY="tskey-dryrun-placeholder"
+        AUTHKEY_VALUE="tskey-dryrun-placeholder"
       else
-        AUTHKEY=$(bench_mint_authkey)
+        AUTHKEY_VALUE=$(bench_mint_authkey "$(matrix_authkey_ephemeral_for_config "$CFG")")
         echo "[gcp] minted fresh authkey for $CFG" >&2
       fi
+      matrix_create_authkey_file "$AUTHKEY_VALUE" || exit 1
+      unset AUTHKEY_VALUE
 
       matrix_run_config_cell "$CFG" "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
-        "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"
+        "$ACTIVE_AUTHKEY_FILE" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"
+      matrix_remove_authkey_file
     done
 
     if (( PROFILE )); then
       # Keep the profile diagnostic outside the normal selected-cell loop: it
       # gets a fresh key and cannot repeat or overwrite rs-tun measurements.
       if [[ $DRY_RUN -eq 1 ]]; then
-        AUTHKEY="tskey-dryrun-placeholder"
+        AUTHKEY_VALUE="tskey-dryrun-placeholder"
       else
-        AUTHKEY=$(bench_mint_authkey)
+        AUTHKEY_VALUE=$(bench_mint_authkey true)
         echo "[gcp] minted fresh authkey for rs-tun profile diagnostic" >&2
       fi
+      matrix_create_authkey_file "$AUTHKEY_VALUE" || exit 1
+      unset AUTHKEY_VALUE
       matrix_select_cell_observed "$TOPO" rs-tun "$Z_A" "$Z_B"
       echo "[gcp] >>> profile: rs-tun (topo=$TOPO path=$PATH_TAG) <<<"
       if matrix_run_profile_diagnostic "$SERVER_VM" "$CLIENT_VM" "$Z_A" "$Z_B" \
-        "$AUTHKEY" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"; then
+        "$ACTIVE_AUTHKEY_FILE" "$RESULTS_DIR/$TOPO/$PATH_TAG" "rs-srv-$TOPO" "rs-cli-$TOPO"; then
+        matrix_remove_authkey_file
         echo "[gcp] rs-tun profile: OK"
       else
         profile_status=$?
+        matrix_remove_authkey_file
         echo "[gcp] rs-tun profile: FAILED" >&2
         exit "$profile_status"
       fi

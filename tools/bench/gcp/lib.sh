@@ -24,6 +24,22 @@
 : "${GCP_IMAGE_PROJECT:=ubuntu-os-cloud}"
 : "${GCP_DRY_RUN:=}"
 
+# Print an owner/group/other mode portably. GNU stat accepts BSD's -f operand
+# as a filesystem-format request and may succeed with non-mode output, so each
+# candidate must be validated before it is accepted.
+portable_file_mode() {
+  local path="$1" mode
+  if mode=$(stat -c %a -- "$path" 2>/dev/null) && [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  if mode=$(stat -f %Lp "$path" 2>/dev/null) && [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  return 1
+}
+
 configure_rs_tun_inbound_pipeline() {
   [[ -n "${RS_TUN_INBOUND_PIPELINE+x}" ]] || RS_TUN_INBOUND_PIPELINE=0
   case "$RS_TUN_INBOUND_PIPELINE" in
@@ -88,7 +104,32 @@ declare -A _SSH_IP=()
 declare -A _SSH_USER=()
 _SSH_KEY="$HOME/.ssh/google_compute_engine"
 
-# Auto-detect project if not set.
+# Select an already configured noninteractive credential without changing the
+# user's gcloud configuration or starting an interactive login. An expired
+# active account is deliberately not preferred over a valid ADC/service-account
+# file. CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE lets gcloud refresh the existing
+# credential for the bounded matrix instead of pinning a printed access token.
+gcloud_auth_preflight() {
+  local candidate
+  if gcloud auth print-access-token >/dev/null 2>&1; then
+    GCP_AUTH_ROUTE=active-gcloud-account
+    return 0
+  fi
+  for candidate in "${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" "${GOOGLE_APPLICATION_CREDENTIALS:-}" "$HOME/.config/gcloud/application_default_credentials.json"; do
+    [[ -n "$candidate" && -r "$candidate" ]] || continue
+    if CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$candidate" gcloud auth print-access-token >/dev/null 2>&1; then
+      export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$candidate"
+      GCP_AUTH_ROUTE=credential-file-override
+      return 0
+    fi
+  done
+  echo "[gcp] no valid noninteractive gcloud credential; configure ADC, workload identity, or a service-account credential before a paid run" >&2
+  return 2
+}
+
+# Auto-detect project if not set. A real run repeats this after auth selection,
+# because the configured account can be expired while a documented ADC file is
+# still valid.
 if [[ -z "${GCP_PROJECT:-}" ]]; then
   GCP_PROJECT=$(gcloud config get-value core/project 2>/dev/null || true)
 fi
@@ -214,6 +255,13 @@ cp /opt/rust/cargo/bin/cargo /usr/local/bin/cargo
 cp /opt/rust/cargo/bin/rustc /usr/local/bin/rustc
 cp /opt/rust/cargo/bin/rustup /usr/local/bin/rustup
 chmod 755 /usr/local/bin/cargo /usr/local/bin/rustc /usr/local/bin/rustup
+# Build the embedded Go comparator with one checksum-pinned native toolchain.
+curl -fsSLo /tmp/go1.26.4.linux-amd64.tar.gz https://go.dev/dl/go1.26.4.linux-amd64.tar.gz
+echo '1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f  /tmp/go1.26.4.linux-amd64.tar.gz' | sha256sum -c -
+rm -rf /usr/local/go
+tar -C /usr/local -xzf /tmp/go1.26.4.linux-amd64.tar.gz
+ln -sf /usr/local/go/bin/go /usr/local/bin/go
+rm -f /tmp/go1.26.4.linux-amd64.tar.gz
 # World-writable build dir for the non-root SSH user (gcloud ssh runs as GCP account user).
 mkdir -p /opt/rustscale && chmod 777 /opt/rustscale
 # The non-root SSH user runs `cargo build`, which writes the registry cache
@@ -239,6 +287,9 @@ startup_script_self_test() {
   script=$(render_startup_script)
   bash -n <<<"$script" || return 1
   [[ "$script" == *'HN=$(hostname)'* ]] || return 1
+  [[ "$script" == *'go1.26.4.linux-amd64.tar.gz'* \
+    && "$script" == *'1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f'* \
+    && "$script" == *'sha256sum -c -'* ]] || return 1
   [[ "$script" == *'`cargo build`'* ]] || return 1
   [[ "$script" == *'systemctl stop tailscaled.service 2>/dev/null || true'* ]] || return 1
   [[ "$script" == *'systemctl disable tailscaled.service 2>/dev/null || true'* ]] || return 1

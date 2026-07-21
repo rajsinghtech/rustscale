@@ -4,54 +4,63 @@ The maintained TUN comparison, optimized runtime profile, raw samples, and
 footprint summary live in [`PERFORMANCE.md`](../PERFORMANCE.md). This document
 describes the broader benchmark methodology and harnesses.
 
-Hard, comparable throughput and latency numbers for rustscale's userspace
-netstack against Go's tailscaled in userspace-networking mode. Both sides use
-in-process TCP/IP stacks (smoltcp vs gVisor/netstack) over the same WireGuard
-data plane, on the same machine, on the same ephemeral tailnet.
+The maintained matrix separates embedded implementations from daemon-proxy
+and kernel-TUN evidence. The matched embedded comparison runs the same RSB1
+server and client semantics inside RustScale tsnet and pinned upstream Go
+tsnet. The older tailscaled SOCKS5/Serve route remains useful daemon-proxy
+evidence, but it is not described or ranked as embedded tsnet.
 
 ## Methodology
 
 ### What is being compared
 
-Both harnesses measure TCP throughput and RTT through two userspace netstacks
-connected over a real Tailscale tailnet:
+The routine matrix has five distinct cells:
 
-| Component        | rustscale                          | tailscaled (Go)                    |
-|------------------|------------------------------------|------------------------------------|
-| Netstack         | smoltcp (in-process)               | gVisor netstack (in-process)       |
-| WireGuard        | boringtun (Rust)                   | wireguard-go (Go)                  |
-| Control plane    | rustscale controlclient            | Go controlclient                   |
-| Magicsock        | rustscale magicsock                | Go magicsock                       |
-| Mode             | `tsnet::Server::up()` (netstack)   | `--tun=userspace-networking`       |
+| Cell | Implementation boundary | RSB1 endpoint | Declared mode |
+|---|---|---|---|
+| `rs-userspace` | `rustscale_tsnet::Server` in the workload process | `rustscale-bench` | embedded Rust tsnet |
+| `ts-embedded` | `tailscale.com/tsnet.Server` in the workload process | `go-tsnet-rsb1` | embedded Go tsnet |
+| `ts-userspace` | separate `tailscaled --tun=userspace-networking`, SOCKS5 bridge, and Serve | `rustscale-bench` over loopback kernel TCP | daemon-proxy evidence |
+| `rs-tun` | `rustscaled` plus kernel TUN/TCP | `rustscale-bench` | RustScale TUN |
+| `ts-tun` | `tailscaled` plus kernel TUN/TCP | `rustscale-bench` | tailscaled TUN |
 
-### Byte path (rustscale)
+`go-tsnet-rsb1` is built from `tailscale.com@v1.100.0`; `go.mod`, `go.sum`,
+the native `go1.26.4.linux-amd64.tar.gz` toolchain archive
+(`1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f`),
+and the resulting executable identity are pinned or checksum-recorded. It
+implements the same 14-byte RSB1 header,
+ready/GO barrier, 1280-byte download writes, setup deadline, stream lifecycle
+counts, and 8-byte latency exchanges as `rustscale-bench`.
+
+### Embedded byte paths
 
 ```
-rustscale-bench client → smoltcp netstack → WG encapsulate →
-  magicsock (UDP/DERP) → magicsock (server) → WG decapsulate →
-  smoltcp netstack → rustscale-bench server
+rustscale-bench client → embedded Rust tsnet/smoltcp → WG/magicsock →
+  embedded Rust tsnet/smoltcp → rustscale-bench server
+
+go-tsnet-rsb1 client → embedded Go tsnet/gVisor netstack → WG/magicsock →
+  embedded Go tsnet/gVisor netstack → go-tsnet-rsb1 server
 ```
 
-### Byte path (tailscaled)
+### Daemon-proxy byte path (not embedded tsnet)
 
 ```
-iperf3 client → socat (SOCKS5 bridge) → tailscaled B netstack →
-  WG encapsulate → magicsock (UDP/DERP) → magicsock (A) →
-  WG decapsulate → tailscaled A netstack → tailscale serve --tcp →
-  iperf3 server (localhost)
+rustscale-bench kernel-TCP client → ncat → tailscaled SOCKS5/netstack →
+  WG/magicsock → tailscaled netstack → Tailscale Serve →
+  rustscale-bench kernel-TCP server on loopback
 ```
 
-Both paths go through two userspace netstacks and the full WG/magicsock
-pipeline. The socat and iperf3 overhead on the Go side is negligible (SOCKS5
-handshake is one-time; iperf3 runs in-process after connect).
+This cell includes extra kernel TCP, ncat, SOCKS5, daemon IPC/configuration,
+and Serve boundaries. Those processes are measured and identified, but the
+result is not an in-process Go tsnet comparator.
 
 ### Path class reporting
 
-Both harnesses report the magicsock path class (direct/derp/relay) from the
-client's status after the test. On a single machine (localhost), the path
-typically settles to **direct** within seconds of the WG handshake completing.
-DERP paths can be observed by running across separate networks or blocking
-UDP. The harness reports whatever path was actually used.
+Embedded Rust and Go clients classify the exact target peer from their
+in-process status (`direct`, `derp`, or peer `relay`). Daemon and TUN cells use
+bounded product-CLI path gates before and after RSB1. A selected cell is
+publishable only when warmup, measured trials, latency, and the post gate agree
+with the requested direct/DERP class; requested path labels are never evidence.
 
 ### Test parameters
 
@@ -87,7 +96,23 @@ tools/bench/run-local.sh
 BENCH_DURATION=10 BENCH_PARALLEL=4 BENCH_DIRECTION=down tools/bench/run-local.sh
 ```
 
-### tailscaled (Go comparison)
+### Pinned Go tsnet endpoint
+
+The production matrix builds `tools/bench/go-tsnet` on each endpoint. Its
+credential-free protocol, lifecycle, path-classification, and P100 tests run
+with the benchmark gate:
+
+```bash
+(cd tools/bench/go-tsnet && go mod verify && go test ./...)
+tools/bench/check.sh
+```
+
+The binary exposes matching `server`, `client`, and `latency` subcommands; use
+`(cd tools/bench/go-tsnet && go run . --version)` verifies its pinned identity. Paid
+comparison runs should use the matrix so workload, resources, path, cleanup,
+and provenance are gated together.
+
+### tailscaled daemon-proxy evidence
 
 ```bash
 source .secrets/tailscale.env
@@ -97,101 +122,188 @@ tools/bench/run-tailscaled.sh
 BENCH_DURATION=10 BENCH_PARALLEL=4 BENCH_DIRECTION=down tools/bench/run-tailscaled.sh
 ```
 
+This retained local harness is a tailscaled SOCKS5/Serve daemon-proxy test. It
+is not embedded Go tsnet evidence.
+
 ### Manual rustscale-bench usage
 
 ```bash
 # Build
 cargo build -p rustscale-bench --release
 
+# Put the key in an owner-only file so it never appears in process argv.
+umask 077
+printf '%s\n' "$TS_AUTHKEY" > /tmp/rustscale-bench-authkey
+unset TS_AUTHKEY
+
 # Server (one terminal)
-target/release/rustscale-bench server --authkey tskey-... --port 5201
+target/release/rustscale-bench server --authkey-file /tmp/rustscale-bench-authkey --port 5201
 
 # Client (another terminal)
-target/release/rustscale-bench client --authkey tskey-... --target 100.64.0.1:5201 \
-  --duration 10 --direction down --parallel 1 --json
+target/release/rustscale-bench client --authkey-file /tmp/rustscale-bench-authkey \
+  --target 100.64.0.1:5201 --duration 10 --direction down --parallel 1 --json
 
 # Latency
-target/release/rustscale-bench latency --authkey tskey-... --target 100.64.0.1:5201 \
-  --count 1000 --json
+target/release/rustscale-bench latency --authkey-file /tmp/rustscale-bench-authkey \
+  --target 100.64.0.1:5201 --count 1000 --json
+
+rm -f /tmp/rustscale-bench-authkey
 ```
 
-### GCP four-way matched matrix
+### GCP five-cell matched matrix
 
 The ordinary paid GCP run is one affordable same-region/cross-zone, direct-path
-slice with all four cells and the routine load: three 10-second repeats at 1,
-10, and 100 streams.
+slice with all five cells and the routine load: three 10-second repeats at 1,
+10, 100, 500, and 1000 streams. Each freshly minted key is written to a temporary
+owner-only local file, copied to owner-only files on the two VMs, and removed
+at cell exit. Only file paths cross local or remote argv/rendered-command
+boundaries; self-tests fail closed on permissions, symlinks, malformed content,
+or a secret value in the run-config argument vector.
 
 ```bash
 # Credential-free command, provenance, aggregation, and dashboard validation.
 MATRIX_SKIP_COLLECT=1 tools/bench/gcp/run-matrix.sh --dry-run
 
-# Ordinary four-way matched run (the defaults shown above).
+# Ordinary five-cell matched run (the defaults shown above).
 tools/bench/gcp/run-matrix.sh
 
-# Explicit all-cell scale contract.
+# Compatibility alias for the same exact certification stream contract.
 tools/bench/gcp/run-matrix.sh --scale-streams
 ```
 
-Every selected cell executes the same `rustscale-bench` workload: RSB1 download
-(direction `down`, 1280-byte writes), one P1/3-second warmup before sampling,
-the ordered throughput points and repeats, and 50 complete 8-byte RSB1 TCP
-ping-pongs with raw nanosecond samples. `rs-userspace` uses embedded tsnet;
-`rs-tun` uses kernel TCP through `rustscaled`; `ts-userspace` uses a loopback
-kernel-TCP client through an ncat inetd-style bridge, tailscaled's SOCKS5
-listener, and Tailscale Serve; `ts-tun` uses kernel TCP through tailscaled's
-TUN. The bridge, proxy, and Serve processes are part of the declared
-`ts-userspace` configuration. The bridge admits 1100 simultaneous connections,
-so the P1000 contract is never silently reduced.
+A paid run accepts only an existing noninteractive `gcloud` account or an
+already configured ADC, workload-identity, or service-account credential file.
+If the active account is expired but an existing credential file is valid, the
+harness temporarily selects it with `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`;
+it never starts browser/device login, prints a token, or writes credentials.
 
-`--parallelism` preserves order, rejects duplicates, and accepts only 1–1000.
-`--scale-streams` expands to
-`1,2,4,8,16,32,64,100,200,500,1000` and conflicts with an explicit list. No
-cell is capped or silently truncated: every trial must report the requested
-`established`, `handshaken`, and `completed` counts. Kernel connections and all
-RSB1 handshakes fan out concurrently under one bounded deadline. Embedded tsnet
-connection creation remains serialized by its mutable dial API but shares that
-complete-setup deadline; publication therefore also requires the paid P1000
-gate. A local 1000-stream kernel setup gate runs in the `rustscale-bench` tests.
+Every selected cell executes byte-identical RSB1 download semantics (direction
+`down`, 1280-byte writes), one P1/3-second warmup before sampling, the ordered
+throughput points and repeats, and 200 complete 8-byte TCP ping-pongs with raw
+nanosecond samples. Rust, daemon-proxy, and TUN cells use `rustscale-bench`;
+`ts-embedded` uses `go-tsnet-rsb1`. The daemon-proxy bridge admits 1100
+simultaneous connections, above the public P1000 contract.
 
-The warmup may retry up to three times before resource sampling starts.
-Measured throughput and latency processes are never retried inside the resource
-window; one failed or incomplete trial discards the cell. Every trial uses a
-new benchmark process, while all four cells retain one transport identity per
-endpoint for the complete cell; embedded tsnet reopens one persisted client
-state rather than registering a new ephemeral peer before every fan-out. Both
-endpoint samplers run continuously from after warmup through the throughput trials,
-three-second inter-trial gaps, and latency. Dynamic exact-name process sets are:
+Certification accepts exactly the ordered stream set
+`1,10,100,500,1000`; `--parallelism` rejects every other list and
+`--scale-streams` is a compatibility alias for that same set. No cell is capped
+or silently truncated. Every measured trial must report exactly
+the requested `established`, `handshaken`, and `completed` counts after all
+connections finish the RSB1 ready/GO barrier under bounded setup deadlines.
+The clients use transport-specific listener-safe admission windows: four for
+RustScale's 32 passive sockets and sixteen for pinned Go, far below pinned
+gVisor `gonet`'s 4096-connection listen backlog. The Go bound gives P1000 setup
+room inside the whole-process deadline without recreating the failed unbounded
+burst; paid acceptance still requires exact completion. Setup remains outside
+the timed RSB1 data phase. Every requested stream is submitted exactly once,
+retained until the common GO barrier, and returned
+in request order; neither client truncates the request or submits an unbounded
+P500/P1000 SYN/header burst. Embedded Rust also resolves the target once. Its
+outbound TCP ports start at a fresh process offset and remain collision-owned
+through socket teardown, preventing restarted trial processes from immediately
+reusing live peer four-tuples. Pinned Go tsnet does not expose a source-port
+bind API, so its long-lived server opens one consecutive destination port per
+process trial and the harness selects each exactly once. This gives every
+restarted Go client a fresh four-tuple without retrying a stream or changing
+the timed RSB1 phase; the exact target sequence is retained in the result.
+
+Pinned Go client teardown is also explicit evidence. After every requested
+stream completes and post-workload path evidence is captured, the client gives
+upstream `tsnet.Server.Close` ten seconds to return. A timeout records
+`process-exit-after-close-timeout`; the already-required short-lived process
+exit then provides the cleanup boundary. The result retains every trial's
+shutdown mode, and the harness still requires a successful process exit. This
+fallback cannot admit an incomplete lifecycle or partial measurement.
+
+Credential-free Rust regressions retain all P500 netstack streams, bound a
+failing P1000 request's pending ownership, and exercise the complete P500 RSB1
+lifecycle. The Go package proves its dial and header/ACK admission ceiling,
+one-attempt cancellation cleanup, ordered retention, and a complete hermetic
+P100 lifecycle; Rust also retains its local P1000 kernel setup gate. Paid P1000
+publication still requires all selected cells to complete the requested point.
+
+The warmup, each measured throughput trial, and latency are each attempted
+exactly once. One failed or incomplete trial discards the cell. Every trial uses
+a new client process, while every cell retains one transport identity per
+endpoint. Embedded Rust and Go clients reopen durable, non-ephemeral state
+under one stable hostname between trials. Rust rotates its process-local disco
+identity, and peers replace stale WireGuard session state when that disco key
+changes. Both endpoint samplers run
+continuously from after warmup through throughput, three-second gaps, and
+latency. Dynamic exact-name process sets are:
 
 - `rs-userspace`: `rustscale-bench` on both endpoints.
-- `rs-tun`: `rustscaled` and `rustscale-bench` on both endpoints.
-- `ts-userspace`: server `tailscaled` + `rustscale-bench`; client `tailscaled`
-  + the ncat listener and all ncat SOCKS5 connector processes +
+- `ts-embedded`: `go-tsnet-rsb1` on both endpoints.
+- `ts-userspace` (daemon proxy): server `tailscaled` + `rustscale-bench`;
+  client `tailscaled` + every exact-name ncat listener/connector +
   `rustscale-bench`.
+- `rs-tun`: `rustscaled` and `rustscale-bench` on both endpoints.
 - `ts-tun`: `tailscaled` and `rustscale-bench` on both endpoints.
 
-These process-scope series include no descendants by inference and no kernel
-CPU. In particular, TUN kernel work is excluded and shared pages across ncat
-workers can be counted more than once. Results retain every throughput repeat,
-every stream lifecycle count, both endpoint timelines, pre/post path gates, and
-verified cleanup. A successful JSON is published only after samplers,
-workloads, Serve/SOCKS helpers, daemons, listeners, state, DNS changes, and TUN
-interfaces satisfy the cell's teardown postconditions. Unsafe handoff aborts
-the matrix.
+A successful result requires each endpoint to contain observed, nonempty RSS
+and CPU data, a monotonic series in which every declared process subject was
+actually observed, the exact declared process-set scope, and executable
+path/version/SHA-256 identities for every subject. The primary transport binary
+has its own positive on-disk size and
+identity binding. Scopes include no descendants by inference and no kernel
+CPU; TUN kernel work is therefore excluded, and shared ncat pages can be
+counted more than once.
 
-Manifest schema 3 records the normal/full/custom selection source and the
-routine/scale/custom load preset. Result schema 5 binds canonical
-implementation/mode identity, the manifest digest, requested load, RSB1
-workload, resources, path gates, and cleanup evidence. Historical manifest 1/2
-and result 3/4 data remain parseable as historical/partial evidence, but are not
-merged into current matched charts. The self-contained summary envelope can be
-moved or streamed without a sibling manifest.
+Results retain every throughput repeat and stream lifecycle, all latency
+samples, both endpoint timelines, path gates, and verified cleanup. Each
+throughput point reports its raw repeat vector, median, min/max, population
+standard deviation, and coefficient of variation; a median alone is not
+presented as repeat stability. Publication
+occurs only after samplers, workloads, helpers, daemons/listeners, state, DNS,
+and TUN interfaces satisfy cell postconditions. Unsafe handoff aborts the
+matrix.
+
+Manifest schema 4 records the five semantic cell identities, pinned Go build,
+selection source, and load preset. Result schema 6 binds canonical mode,
+manifest digest, exact RSB1 completion, valid latency, endpoint CPU/RSS,
+resource scope, endpoint binary identities, path gates, and cleanup. Historical
+manifest 1–3 and result 3–5 data remain parseable as historical/partial
+evidence, but old `ts-userspace` data retains its historical userspace label
+and is never rewritten as embedded Go tsnet. The current summary envelope is
+self-contained.
 
 `--peer-count` records requested context only. Peer generation and observed
 peer load are not implemented, so current manifests explicitly record
 `effective=null`, `observed=null`, and `status=not-applied`; dashboards must not
 call it configured or effective load. The historical `same-zone` harness label
-currently provisions `us-central1-a` and `us-central1-b`, so reports describe
-it accurately as same-region/cross-zone.
+means same-region/cross-zone. Capacity preflight tries each approved pair once,
+in order: `us-central1-a`/`us-central1-b`, then
+`us-central1-c`/`us-central1-f`, then `us-central1-a`/`us-central1-f`.
+It advances only after an explicit GCP capacity-exhaustion error, cleans up any
+partial pair first, prints the selected pair, and retains it in endpoint
+provenance; it never silently changes topology or machine type.
+
+### Isolated native baseline
+
+The opt-in Linux runner collects a native embedded-Rust P1/P10/P100 sample,
+exact lifecycle counts, observed path classification, and the benchmark
+executable SHA-256 inside the disposable remote source tree.
+Unlike a matched matrix cell, this smoke baseline intentionally gives each trial its own ephemeral named
+client identity and records that identity scope; the connected ephemeral
+server identity remains live until tailnet teardown. Every workload process is attempted exactly once; partial setup is a failed run:
+
+```bash
+# With credentials already provisioned in the remote SSH environment:
+tools/agent/remote-validate.sh baseline
+
+# Or, only for an explicitly authorized disposable builder:
+source .secrets/tailscale.env
+tools/agent/remote-validate.sh baseline --allow-local-tailnet-credentials
+```
+
+For the independent low-rate application-UDP wakeup baseline, run
+`tools/agent/remote-validate.sh interop`. Its isolated cadence gate sends 16
+one-way packets at 20 Hz after warmup, requires all ordered payloads and source
+addresses, rejects fallback-sized batching, and reports path, arrival span, and
+maximum one-way delay under `--nocapture`. Both journeys default to remote-provisioned credentials and require confirmed
+cleanup. Local forwarding requires the explicit envelope opt-in described in
+`docs/agent-harness.md`; credential values are excluded from source, command
+arguments, output, and provenance.
 
 ### CI (GitHub Actions)
 
@@ -201,6 +313,27 @@ GCP or Tailscale, create paid resources, execute the production benchmark, or
 upload `bench-results/`. Production runs are explicit local operator actions.
 
 ## Results
+
+### Current canonical matrix
+
+The complete five-configuration same-region/cross-zone direct-path run is
+`gcp-20260721-080637-4aca6f6c1e`, built from clean source commit
+`395bf8db6648e67f61bc571e1a755b27cd714e12`. Every configuration completed
+P1/P10/P100/P500/P1000 three times with exact connection denominators and
+200/200 latency exchanges. The credential-free manifest, raw samples,
+resource timelines, endpoint metadata, summary, dashboard, and hashes are
+tracked under
+[`docs/performance/gcp-20260721-080637-4aca6f6c1e`](performance/gcp-20260721-080637-4aca6f6c1e/).
+See [`PERFORMANCE.md`](../PERFORMANCE.md#canonical-five-configuration-rsb1-matrix-2026-07-21)
+for the compact five-mode tables and interpretation caveats. In particular,
+the high RustScale embedded CV and different daemon-proxy architecture mean
+the project does not declare an overall winner from this run.
+
+The successful `ts-userspace` cell also exercises file-backed local result
+assembly: high-stream resource and trial JSON never cross an operating-system
+argument boundary, so valid P1000 evidence cannot exceed macOS `ARG_MAX`.
+Every temporary payload file is owner-only and is removed on success, ordinary
+failure, or the cell exit trap.
 
 ### Machine
 
@@ -219,12 +352,13 @@ upload `bench-results/`. Production runs are explicit local operator actions.
 | rustscale (before 10c) | down | 1 | derp   | 13.14      | 5s       |
 | rustscale (after 10c)  | down | 1 | direct | 781.65     | 10s      |
 | rustscale (after 10d)  | down | 1 | direct | 838.46     | 10s      |
-| tailscaled             | down | 1 | direct | 383.71     | 5s       |
+| tailscaled daemon proxy | down | 1 | direct | 383.71     | 5s       |
 
 Note: single-run samples on a shared laptop are noisy — independent 10d re-runs
-measured 465–510 Mbps for rustscale throughput (still >tailscaled's 384) while
-latency stayed stable at p50 150–180us. Treat the throughput column as
-indicative until the CI harness produces multi-run medians.
+measured 465–510 Mbps for RustScale throughput while latency stayed stable at
+p50 150–180us. The 384 Mbps tailscaled row is historical SOCKS5/Serve
+daemon-proxy evidence, not an embedded-Go comparison; do not infer an embedded
+winner from this table.
 
 ### Latency
 
@@ -233,12 +367,14 @@ indicative until the CI harness produces multi-run medians.
 | rustscale (before 10c) | derp   | 69,284   | 74,325   | 79,122   | 200   |
 | rustscale (after 10c)  | direct | 10,140   | 11,048   | 15,082   | 200   |
 | rustscale (after 10d)  | direct | 180      | 364      | 1,752    | 200   |
-| tailscaled             | direct | 257      | 422      | 481      | 200   |
+| tailscaled daemon proxy | direct | 257      | 422      | 481      | 200   |
 
 ### Analysis
 
-**Phase 10c fixed two bugs that together closed the gap from 13 Mbps (DERP)
-to 782 Mbps (direct) — a 60x improvement, and 2x faster than tailscaled.**
+**Phase 10c fixed two bugs that together moved this historical RustScale run
+from 13 Mbps (DERP) to 782 Mbps (direct), a 60x improvement.** The old 2x
+statement compared against the daemon-proxy route and is not an embedded-tsnet
+claim.
 
 #### Bug 1: Direct path not established (endpoint gathering + disco key)
 
@@ -337,7 +473,7 @@ tick, accumulating 5+ ticks per RTT. The fix made the stack event-driven:
   `magicsock.poll_recv()` + a 250ms WG timer tick.
 
 Result: p50 latency dropped from 10,140µs to 180µs — a **56x improvement**,
-now **better than tailscaled** (257µs). Throughput held at 838 Mbps (up from
+below the historical daemon-proxy sample (257µs). Throughput held at 838 Mbps (up from
 782). The rising-edge notify pattern was the key insight: a naive notify on
 every write caused a 1:1 context-switch-per-packet pattern that dropped
 throughput to ~500 Mbps; notifying only on the empty→non-empty transition
@@ -348,11 +484,16 @@ preserves batching.
 - Both harnesses use ephemeral tailnets that are created and deleted per run.
 - On localhost, the path is typically **direct** (UDP loopback). DERP paths
   require network isolation (separate machines or UDP blocking).
-- The rustscale netstack uses a 1280-byte MTU (Tailscale default) with a 256KB
-  TCP socket buffer. The Go netstack uses similar defaults.
+- The rustscale netstack uses a 1280-byte MTU and fixed 1 MiB TCP send and
+  receive buffers per socket, matching the pinned gVisor send and receive
+  defaults used by Tailscale 1.100.0. Tailscale permits maxima of 8 MiB RX and
+  6 MiB TX on non-iOS builds, but the embedded comparator does not request
+  those larger values. The canonical matrix therefore has matched default TCP
+  buffer capacity; it still requires a complete exact-head run before any
+  comparative claim.
 - Throughput is limited by per-packet userspace processing overhead (WG
   encapsulation/decapsulation, smoltcp/gVisor TCP processing, magicsock IO).
   Both sides face the same fundamental bottleneck.
-- Localhost throughput varies run-to-run (458–854 Mbps observed) due to
-  ephemeral tailnet setup timing and system load. The best run (854 Mbps)
-  reflects the architecture's capability; the variance is environmental.
+- Historical localhost throughput varied from 458–854 Mbps across unmatched
+  single runs. Those samples did not isolate setup timing from system load and
+  do not support a comparative or architectural-capability claim.

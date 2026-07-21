@@ -170,8 +170,9 @@ handshake work, disco message routing, call-me-maybe via relay)
 · WireGuard data plane (boringtun) · userspace netstack (smoltcp,
 event-driven) · packet filter (incl. stateful UDP, capability ACLs, shields-up mode)
 · subnet routing (advertise/accept/forward) · TUN mode (macOS utun, Linux)
-· tsnet embed API · C FFI (librustscale) + Python ctypes · bench harness (beats
-tailscaled userspace: p50 ~170us vs 257us, 465–838 vs 384 Mbps).
+· tsnet embed API · C FFI (librustscale) + Python ctypes · benchmark harness
+with distinct embedded Rust, pinned embedded Go tsnet, daemon-proxy, and TUN
+cells; historical SOCKS5/Serve numbers are not embedded-tsnet claims.
 
 ## Test infrastructure
 

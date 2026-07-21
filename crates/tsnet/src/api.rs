@@ -314,6 +314,39 @@ impl Server {
         }
     }
 
+    /// Dial `requested` streams to one remote address with bounded admission.
+    ///
+    /// The server is started and the address is resolved exactly once. TCP
+    /// handshakes are submitted in an ordered window no larger than the peer
+    /// listener backlog. All streams are returned in request order, or all
+    /// completed and pending streams are dropped on the first error or common
+    /// `setup_timeout`; individual streams are never retried.
+    pub async fn dial_many(
+        &mut self,
+        addr: &str,
+        requested: usize,
+        setup_timeout: std::time::Duration,
+    ) -> Result<Vec<NetstackStream>, TsnetError> {
+        let deadline = tokio::time::Instant::now() + setup_timeout;
+        Box::pin(self.ensure_up()).await?;
+        let inner = self.inner.as_ref().expect("ensure_up guarantees inner");
+        let socket_addr = tokio::time::timeout_at(deadline, resolve_addr(addr, inner))
+            .await
+            .map_err(|_| {
+                TsnetError::Netstack(rustscale_netstack::NetstackError::DialCapacity {
+                    established: 0,
+                    requested,
+                    source: Box::new(rustscale_netstack::NetstackError::DialFailed(
+                        "common setup deadline exceeded while resolving target".into(),
+                    )),
+                })
+            })??;
+        match &inner.data_plane {
+            DataPlane::Netstack(ns) => Ok(ns.dial_many(socket_addr, requested, deadline).await?),
+            DataPlane::Tun => Err(TsnetError::NotAvailableInTunMode),
+        }
+    }
+
     /// Listen for UDP datagrams on `addr` (netstack mode only).
     ///
     /// `addr` is `":port"`, `"ip:port"`, or `"hostname:port"`. An empty host

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/bench/run-tailscaled.sh — Go tailscaled comparison harness.
+# tools/bench/run-tailscaled.sh — tailscaled daemon-proxy evidence harness.
 #
 # Runs two tailscaled instances in userspace-networking mode on the same
 # ephemeral tailnet, then iperf3 throughput + a Python-based latency test
@@ -14,8 +14,8 @@
 #   python ping-pong → SOCKS5 → tailscaled B netstack →
 #   WireGuard → tailscaled A netstack → tailscale serve --tcp → ncat echo (localhost)
 #
-# Both sides use userspace netstacks (no TUN), same machine, same tailnet —
-# apples-to-apples with rustscale-bench.
+# This deliberately retained route is not embedded Go tsnet: it includes
+# separate daemon, kernel-loopback TCP, SOCKS5, bridge, and Serve boundaries.
 #
 # Usage:
 #   source .secrets/tailscale.env && tools/bench/run-tailscaled.sh
@@ -36,7 +36,7 @@ PORT_THROUGHPUT=5201
 PORT_LATENCY=5202
 SOCKS_PORT=11080
 
-echo "[bench-go] tailscaled comparison harness: ${DURATION}s / ${PARALLEL} parallel / ${DIRECTION}"
+echo "[bench-go] tailscaled daemon-proxy harness: ${DURATION}s / ${PARALLEL} parallel / ${DIRECTION}"
 
 # Check tools.
 for cmd in tailscaled tailscale iperf3 socat ncat python3; do
@@ -253,7 +253,7 @@ try:
         return rtts[min(idx, n - 1)]
 
     result = {
-        "tool": "tailscaled-iperf3",
+        "tool": "tailscaled-daemon-proxy",
         "mode": "latency",
         "count": n,
         "min_us": rtts[0] if rtts else 0,
@@ -311,7 +311,7 @@ rm -rf "$STATE_A" "$STATE_B"
 # Write combined results.
 # ---------------------------------------------------------------------------
 jq -n \
-  --arg tool "tailscaled-iperf3" \
+  --arg tool "tailscaled-daemon-proxy" \
   --arg stamp "$STAMP" \
   --arg direction "$DIRECTION" \
   --arg path_class "$PATH_CLASS" \
@@ -325,7 +325,7 @@ jq -n \
 
 echo "[bench-go] results saved to $RESULTS_DIR/tailscaled.json" >&2
 echo ""
-echo "═══ tailscaled (Go) results ═══"
+echo "═══ tailscaled daemon-proxy results (not embedded tsnet) ═══"
 echo "  throughput ($DIRECTION): ${TOTAL_MBPS} Mbps  (path: $PATH_CLASS)"
 echo "  latency:  p50=${LAT_P50}us  p95=${LAT_P95}us  p99=${LAT_P99}us"
 echo "  results:  $RESULTS_DIR/tailscaled.json"

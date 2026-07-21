@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 GCP = ROOT / "tools/bench/gcp"
-PARALLELS = [1, 10, 100]
+PARALLELS = [1, 10, 100, 500, 1000]
 
 
 def run(*args, ok=True, env=None):
@@ -26,7 +26,12 @@ def run_identity():
             "cloud": {"provider": "gcp", "project": "fixture-project", "requested_image_project": "ubuntu-os-cloud",
                       "requested_image_family": "ubuntu-2204-lts", "requested_machine_type": "n1-standard-4",
                       "network": "default", "disk_type": "pd-standard", "disk_gb": 200},
-            "build": {"command": "cargo build --release", "rustflags": "", "cargo_profile_release_lto": "", "cargo_profile_release_codegen_units": ""},
+            "build": {"command": "cargo build --release", "rustflags": "", "cargo_profile_release_lto": "", "cargo_profile_release_codegen_units": "",
+                      "go_command": "go build", "go_toolchain": "go1.26.4",
+                      "go_toolchain_archive": "go1.26.4.linux-amd64.tar.gz",
+                      "go_toolchain_archive_sha256": "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f",
+                      "go_module": "tailscale.com", "go_module_version": "v1.100.0",
+                      "go_module_sum": "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE="},
             "runtime": {"rs_tun_inbound_pipeline": False, "rs_tun_outbound_send_pipeline": False, "linux_udp_batch": True, "linux_udp_gro": True, "linux_udp_gso": True}}
 
 
@@ -41,8 +46,11 @@ def observed(include_bench=True):
     return {"resolved_image": "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2204-immutable",
             "server": server, "client": client,
             "toolchain": {"server_cargo": "cargo 1.80", "server_rustc_verbose": "rustc 1.80\ncommit-hash: 'abc'",
-                          "client_cargo": "cargo 1.80", "client_rustc_verbose": "rustc 1.80\ncommit-hash: 'abc'"},
-            "product": {"server": products, "client": products}}
+                          "client_cargo": "cargo 1.80", "client_rustc_verbose": "rustc 1.80\ncommit-hash: 'abc'",
+                          "server_go": "go version go1.26.4 linux/amd64", "client_go": "go version go1.26.4 linux/amd64"},
+            "measurement_tools": {"server": [{"path": "/usr/bin/ncat", "version": "Ncat 7.80", "sha256": "1" * 64}],
+                                  "client": [{"path": "/usr/bin/ncat", "version": "Ncat 7.80", "sha256": "1" * 64}]},
+            "product": {"server": [dict(item) for item in products], "client": [dict(item) for item in products]}}
 
 
 def matrix(root, *, repeat=2, parallelism=PARALLELS, include_parallelism=True, dry_run=False, configs=None, identity=None):
@@ -63,8 +71,8 @@ def valid(*, repeat=2, config="rs-tun", path="direct", parallels=PARALLELS, iden
     return {"schema_version": 3, "status": "ok", "tool": "rustscale", "mode": "tun",
             "topology": "same-zone", "path": path, "config": config, "repeat": repeat,
             "parallelism_requested": list(parallels), "error": "", "log_tail": "",
-            "throughput": rows, "latency": {"requested": 50, "transmitted": 50, "received": 50,
-                                                "loss": 0, "p50_us": 10, "p95_us": 20, "p99_us": 30, "count": 50},
+            "throughput": rows, "latency": {"requested": 200, "transmitted": 200, "received": 200,
+                                                "loss": 0, "p50_us": 10, "p95_us": 20, "p99_us": 30, "count": 200},
             "footprint": {"binary_size_bytes": 1, "rss_peak_kb": 2, "rss_avg_kb": 1,
                           "cpu_peak_pct": 0, "cpu_avg_pct": 0, "samples": 1,
                           "sample_cadence_s": 1,
@@ -79,21 +87,22 @@ def valid_ts_tun():
     products = [{"path": "/usr/sbin/tailscaled", "version": "1.2.0", "version_source": "executable --version", "sha256": "d" * 64},
                 {"path": "/usr/bin/tailscale", "version": "1.2.0", "version_source": "executable --version", "sha256": "e" * 64},
                 {"path": "/opt/rustscale/target/release/rustscale-bench", "version": "rustscale-bench 1.2.0", "version_source": "executable --version", "sha256": "f" * 64}]
-    obj["observed"]["product"] = {"server": products, "client": products}
+    obj["observed"]["product"] = {"server": [dict(item) for item in products], "client": [dict(item) for item in products]}
     return obj
 
 
 def matched_manifest(root, identity):
-    data = {"schema_version": 3, "topologies": ["same-zone"], "paths": ["direct"],
-            "configs": ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"],
-            "parallelism": [1], "repeat": 1, "duration_s": 10, "sample_cadence_s": 1,
-            "peer_count_requested": 1, "dry_run": False,
+    configs = ["rs-userspace", "rs-tun", "ts-embedded", "ts-userspace", "ts-tun"]
+    modes = {"rs-userspace": "embedded", "rs-tun": "tun", "ts-embedded": "embedded",
+             "ts-userspace": "daemon-proxy", "ts-tun": "tun"}
+    data = {"schema_version": 4, "topologies": ["same-zone"], "paths": ["direct"],
+            "configs": configs, "parallelism": PARALLELS, "repeat": 3, "duration_s": 10,
+            "sample_cadence_s": 1, "peer_count_requested": 1, "dry_run": False,
             "warmup": {"parallel": 1, "duration_s": 3, "direction": "down", "protocol": "RSB1"},
             "selection": {"preset": "normal-v1", "source": {"topologies": "default", "paths": "default", "configs": "default"},
                           "cells": [{"id": config, "implementation": "rustscale" if config.startswith("rs-") else "tailscale",
-                                     "mode": "userspace" if config.endswith("userspace") else "tun"}
-                                    for config in ("rs-userspace", "rs-tun", "ts-userspace", "ts-tun")]},
-            "load": {"preset": "custom", "parallelism_target": [1], "repeat": 1, "duration_s": 10,
+                                     "mode": modes[config]} for config in configs]},
+            "load": {"preset": "routine-v1", "parallelism_target": PARALLELS, "repeat": 3, "duration_s": 10,
                      "sample_cadence_s": 1, "peer_load": {"requested": 1, "effective": None,
                                                             "observed": None, "status": "not-applied"}},
             "run": identity}
@@ -103,74 +112,102 @@ def matched_manifest(root, identity):
 
 def matched_result(root, config, manifest):
     import hashlib
-    mode = "userspace" if config.endswith("userspace") else "tun"
+    modes = {"rs-userspace": "embedded", "rs-tun": "tun", "ts-embedded": "embedded",
+             "ts-userspace": "daemon-proxy", "ts-tun": "tun"}
+    mode = modes[config]
     implementation = "rustscale" if config.startswith("rs-") else "tailscale"
-    tool = "rustscale" if implementation == "rustscale" else "tailscaled"
-    transport = "userspace-tsnet" if config == "rs-userspace" else "kernel-tcp"
+    tool = {"rs-userspace": "rustscale", "rs-tun": "rustscale", "ts-embedded": "go-tsnet-rsb1",
+            "ts-userspace": "tailscaled", "ts-tun": "tailscaled"}[config]
+    transport = "userspace-tsnet" if config in {"rs-userspace", "ts-embedded"} else "kernel-tcp"
     subject_map = {
         "rs-userspace": (["rustscale-bench"], ["rustscale-bench"]),
         "rs-tun": (["rustscaled", "rustscale-bench"], ["rustscaled", "rustscale-bench"]),
+        "ts-embedded": (["go-tsnet-rsb1"], ["go-tsnet-rsb1"]),
         "ts-userspace": (["tailscaled", "rustscale-bench"], ["tailscaled", "ncat", "rustscale-bench"]),
         "ts-tun": (["tailscaled", "rustscale-bench"], ["tailscaled", "rustscale-bench"]),
     }
-    transport_path = {"rs-userspace": "embedded-tsnet", "rs-tun": "kernel-tcp-via-rustscaled-tun",
+    transport_path = {"rs-userspace": "embedded-rust-tsnet", "rs-tun": "kernel-tcp-via-rustscaled-tun",
+                      "ts-embedded": "embedded-go-tsnet",
                       "ts-userspace": "kernel-tcp-via-loopback-ncat-socks5-tailscaled-serve",
                       "ts-tun": "kernel-tcp-via-tailscaled-tun"}[config]
+    primary_subject = {"rs-userspace": "rustscale-bench", "rs-tun": "rustscaled", "ts-embedded": "go-tsnet-rsb1",
+                       "ts-userspace": "tailscaled", "ts-tun": "tailscaled"}[config]
     if config.startswith("ts-"):
         obs = valid_ts_tun()["observed"]
+        if config == "ts-embedded":
+            products = [{"path": "/opt/rustscale/bin/go-tsnet-rsb1",
+                         "version": "go-tsnet-rsb1 tailscale.com/v1.100.0",
+                         "version_source": "executable --version", "sha256": "9" * 64}]
+            obs["product"] = {"server": products, "client": products}
+        elif config == "ts-userspace":
+            allowed = {"tailscaled", "tailscale", "rustscale-bench"}
+            obs["product"] = {endpoint: [item for item in obs["product"][endpoint]
+                                          if Path(item["path"]).name in allowed] for endpoint in ("server", "client")}
     else:
         obs = observed()
         allowed = {"rustscale-bench"} if config == "rs-userspace" else {"rustscale", "rustscaled", "rustscale-bench"}
         obs["product"] = {endpoint: [item for item in obs["product"][endpoint]
-                                     if Path(item["path"]).name in allowed] for endpoint in ("server", "client")}
+                                      if Path(item["path"]).name in allowed] for endpoint in ("server", "client")}
     scope = {"kind": "dynamic_process_set", "includes_descendants": False, "includes_kernel": False}
+    def identity(endpoint, subject):
+        candidates = list(obs["product"][endpoint]) + list(obs.get("measurement_tools", {}).get(endpoint, []))
+        return next(item for item in candidates if Path(item["path"]).name == subject)
     def resource(endpoint, subjects):
-        return {"endpoint": endpoint, "subjects": subjects, "scope": scope, "rss_peak_kb": 2,
-                "rss_avg_kb": 1, "cpu_peak_pct": 1, "cpu_avg_pct": 0.5, "samples": 2,
-                "missing_samples": 0, "sample_cadence_s": 1, "clock": "monotonic",
+        return {"endpoint": endpoint, "subjects": subjects, "scope": scope,
+                "binary_identities": [identity(endpoint, subject) for subject in subjects],
+                "rss_peak_kb": 2, "rss_avg_kb": 1, "cpu_peak_pct": 1, "cpu_avg_pct": 0.5,
+                "samples": 2, "missing_samples": 0, "sample_cadence_s": 1, "clock": "monotonic",
                 "series": [{"offset_ms": 0, "rss_kb": 1, "cpu_pct": 0,
-                            "included_processes": [f"1:{subjects[0]}"], "status": "observed"},
+                            "included_processes": [f"{index + 1}:{subject}" for index, subject in enumerate(subjects)], "status": "observed"},
                            {"offset_ms": 1000, "rss_kb": 2, "cpu_pct": 1,
-                            "included_processes": [f"1:{subjects[0]}"], "status": "observed"}],
+                            "included_processes": [f"{index + 1}:{subject}" for index, subject in enumerate(subjects)], "status": "observed"}],
                 "series_truncated": False}
-    server, client = (resource("server", subject_map[config][0]), resource("client", subject_map[config][1]))
-    warmup_path = "direct" if config == "rs-userspace" else "externally-gated"
-    result = {"schema_version": 5, "status": "ok", "tool": tool, "implementation": implementation,
+    server = resource("server", subject_map[config][0])
+    client = resource("client", subject_map[config][1])
+    warmup_path = "direct" if config in {"rs-userspace", "ts-embedded"} else "externally-gated"
+    raw_latency = list(range(1, 201))
+    result = {"schema_version": 6, "status": "ok", "tool": tool, "implementation": implementation,
               "mode": mode, "topology": "same-zone", "path": "direct", "config": config,
-              "repeat": 1, "parallelism_requested": [1], "duration_s_requested": 10,
+              "repeat": 3, "parallelism_requested": PARALLELS, "duration_s_requested": 10,
               "sample_cadence_s": 1, "peer_count_requested": 1, "error": "", "log_tail": "",
               "path_class_reported": "direct", "transport": transport,
               "warmup_evidence": {"transport": transport, "protocol": "RSB1", "direction": "down",
                                   "duration_secs": 3, "parallel": 1, "established": 1,
                                   "handshaken": 1, "completed": 1, "total_mbps": 10.0,
                                   "path_class": warmup_path},
-              "throughput": [{"parallel": 1, "mbps": 100.0, "duration_s": 10,
-                              "samples_mbps": [100.0], "statistic": "median"}],
-              "throughput_trials": [{"parallel": 1, "repeat_index": 1, "transport": transport,
+              "throughput": [{"parallel": p, "mbps": 100.0, "duration_s": 10,
+                              "samples_mbps": [100.0, 100.0, 100.0], "statistic": "median",
+                              "min_mbps": 100.0, "max_mbps": 100.0,
+                              "population_stddev_mbps": 0.0,
+                              "coefficient_of_variation_pct": 0.0} for p in PARALLELS],
+              "throughput_trials": [{"parallel": p, "repeat_index": repeat_index, "transport": transport,
                                      "protocol": "RSB1", "direction": "down", "duration_s": 10,
-                                     "established": 1, "handshaken": 1, "completed": 1,
-                                     "total_mbps": 100.0, "path_class": warmup_path}],
-              "latency": {"protocol": "RSB1-tcp-pingpong", "requested": 50, "successful": 50,
-                          "timed_out": 0, "malformed": 0, "count": 50, "p50_us": 1,
-                          "p95_us": 2, "p99_us": 3, "samples_ns": list(range(1, 51))},
-              "workload": {"implementation": "rustscale-bench", "protocol": "RSB1", "direction": "down",
-                           "payload_bytes": 1280, "warmup": {"parallel": 1, "duration_s": 3, "max_attempts": 3},
+                                     "established": p, "handshaken": p, "completed": p,
+                                     "total_mbps": 100.0, "path_class": warmup_path}
+                                    for p in PARALLELS for repeat_index in (1, 2, 3)],
+              "latency": {"protocol": "RSB1-tcp-pingpong", "requested": 200, "successful": 200,
+                          "timed_out": 0, "malformed": 0, "count": 200, "min_ns": 1,
+                          "max_ns": 200, "mean_ns": 100.5, "p50_ns": 101, "p95_ns": 190, "p99_ns": 198,
+                          "min_us": .001, "max_us": .2, "mean_us": .1005,
+                          "p50_us": .101, "p95_us": .19, "p99_us": .198, "samples_ns": raw_latency},
+              "workload": {"implementation": "go-tsnet-rsb1" if config == "ts-embedded" else "rustscale-bench",
+                           "protocol": "RSB1", "direction": "down", "payload_bytes": 1280,
+                           "warmup": {"parallel": 1, "duration_s": 3, "max_attempts": 1},
                            "client_lifecycle": "new_benchmark_process_per_trial",
                            "transport_identity_lifecycle": "one_persisted_identity_per_endpoint_cell",
-                           "measured_trial_attempts": 1,
-                           "latency_protocol": "RSB1-tcp-pingpong", "latency_payload_bytes": 8,
-                           "latency_count": 50, "transport_path": transport_path,
-                           "userspace_portmapping": "disabled" if config == "rs-userspace" else "not-applicable"},
+                           "measured_trial_attempts": 1, "latency_protocol": "RSB1-tcp-pingpong",
+                           "latency_payload_bytes": 8, "latency_count": 200, "transport_path": transport_path,
+                           "userspace_portmapping": {"rs-userspace": "disabled", "ts-embedded": "upstream-default"}.get(config, "not-applicable")},
               "resources": {"phase_set": ["measured_client_process_lifecycle", "inter_trial_gap", "latency"],
                             "sample_cadence_ms": 1000, "server": server, "client": client},
-              "footprint": dict(server, binary_size_bytes=1, subject="rustscale-bench"),
-              "binary": {"subject": "rustscale-bench", "size_bytes": 1},
+              "footprint": dict(server, binary_size_bytes=1, subject=primary_subject),
+              "binary": dict(identity("server", primary_subject), subject=primary_subject, size_bytes=1),
               "path_gate": {"requested": "direct", "pre": "direct", "post": "direct", "matched": True},
               "cleanup": {"status": "clean", "samplers_stopped": True, "workload_stopped": True,
                           "transport_stopped": True, "postconditions_verified": True},
               "identity": {"key": f"same-zone/direct/{config}", "cell_id": config,
                            "implementation": implementation, "mode": mode, "topology": "same-zone", "path": "direct"},
-              "load": {"preset": "custom", "parallelism_requested": [1], "repeat": 1, "duration_s": 10,
+              "load": {"preset": "routine-v1", "parallelism_requested": PARALLELS, "repeat": 3, "duration_s": 10,
                        "peer_load": manifest["load"]["peer_load"]},
               "manifest_sha256": hashlib.sha256((root / "matrix.json").read_bytes()).hexdigest(),
               "run": manifest["run"], "observed": obs}
@@ -208,11 +245,11 @@ with tempfile.TemporaryDirectory() as tmp:
     matrix(root); cell = write_cell(root, valid())
     result = run("python3", GCP / "aggregate.py", root)
     manifest = json.loads((root / "matrix.json").read_text())
-    assert manifest["parallelism"] == [1, 10, 100]
+    assert manifest["parallelism"] == [1, 10, 100, 500, 1000]
     assert all(type(value) is int for value in manifest["parallelism"])
     assert len(json.loads(result.stdout)) == 1
 
-    # A current schema-v3 run is one self-contained four-way matched envelope.
+    # A current schema-v4 run is one self-contained five-cell matched envelope.
     matched_identity = run_identity(); matched_identity["id"] = "gcp-20260714-010203-matched"
     matched_root = Path(tmp) / matched_identity["id"]; matched_root.mkdir()
     matched = matched_manifest(matched_root, matched_identity)
@@ -221,12 +258,15 @@ with tempfile.TemporaryDirectory() as tmp:
     matched_summary = run("python3", GCP / "aggregate.py", matched_root)
     envelope = json.loads(matched_summary.stdout)
     assert envelope["summary_schema_version"] == 1
-    assert envelope["completeness"] == {"expected": 4, "ok": 4, "failed": 0, "missing": 0,
+    assert envelope["completeness"] == {"expected": 5, "ok": 5, "failed": 0, "missing": 0,
                                           "complete": True, "normal_complete": True}
-    assert [cell["config"] for cell in envelope["cells"]] == matched["configs"]
+    assert [cell["config"] for cell in envelope["cells"]] == ["rs-userspace", "ts-embedded", "ts-userspace", "rs-tun", "ts-tun"]
     moved_summary = Path(tmp) / "moved-summary.json"; moved_summary.write_text(matched_summary.stdout)
     moved_html = run("python3", GCP / "render-html.py", moved_summary).stdout
-    assert "Matched four-way RSB1 workload" in moved_html and "requested peer load" in moved_html
+    assert "Matched five-cell RSB1 workload" in moved_html and "requested peer load" in moved_html
+    assert "RustScale embedded tsnet" in moved_html and "Go embedded tsnet" in moved_html
+    assert "tailscaled daemon proxy" in moved_html
+    assert "Repeat dispersion" in moved_html and "coefficient of variation" in moved_html
     ts_user_path = matched_root / "same-zone/direct/ts-userspace.json"
     original_ts_user = json.loads(ts_user_path.read_text())
     for expected_error, mutate in (
@@ -234,6 +274,18 @@ with tempfile.TemporaryDirectory() as tmp:
         ("clean teardown", lambda value: value["cleanup"].__setitem__("status", "failed")),
         ("pre/post path gate", lambda value: value["path_gate"].__setitem__("post", "derp")),
         ("manifest_sha256", lambda value: value.__setitem__("manifest_sha256", "0" * 64)),
+        ("repeat dispersion", lambda value: value["throughput"][0].__setitem__("max_mbps", 99.0)),
+        ("process-set scope", lambda value: [sample.__setitem__("included_processes", []) for sample in value["resources"]["client"]["series"]]),
+    ):
+        changed = json.loads(json.dumps(original_ts_user)); mutate(changed); ts_user_path.write_text(json.dumps(changed))
+        assert expected_error in run("python3", GCP / "aggregate.py", matched_root, ok=False).stderr
+    ts_user_path.write_text(json.dumps(original_ts_user))
+    for expected_error, mutate in (
+        ("incomplete RSB1 lifecycle", lambda value: value["throughput_trials"][0].__setitem__("completed", 0)),
+        ("positive RTT", lambda value: value["latency"]["samples_ns"].__setitem__(0, 0)),
+        ("CPU/RSS", lambda value: value["resources"]["client"].__setitem__("cpu_avg_pct", None)),
+        ("binary identity", lambda value: value["resources"]["server"].__setitem__("binary_identities", [])),
+        ("primary binary identity", lambda value: value["binary"].__setitem__("sha256", "8" * 64)),
     ):
         changed = json.loads(json.dumps(original_ts_user)); mutate(changed); ts_user_path.write_text(json.dumps(changed))
         assert expected_error in run("python3", GCP / "aggregate.py", matched_root, ok=False).stderr
@@ -340,7 +392,7 @@ with tempfile.TemporaryDirectory() as tmp:
     for field in ("requested", "transmitted", "received", "count"):
         partial_latency["latency"][field] = 1
     write_cell(root, partial_latency)
-    assert "all 50 requested replies" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
+    assert "all 200 requested replies" in run("python3", GCP / "aggregate.py", root, ok=False).stderr
     # Schema-v3 history is aggregate-only. Raw-series fields, when present,
     # are not reinterpreted as a modern monotonic process-set contract.
     historical_series = valid(); historical_series["footprint"].pop("series"); historical_series["footprint"].pop("series_truncated"); historical_series["footprint"].pop("sample_cadence_s"); write_cell(root, historical_series)
@@ -363,6 +415,16 @@ with tempfile.TemporaryDirectory() as tmp:
     run("python3", GCP / "provenance.py", "select-observed", selected, "--input", base, "--config", "rs-tun", "--topology", "same-zone", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--machine", "n1-standard-4")
     assert {Path(x["path"]).name for x in json.loads(selected.read_text())["product"]["server"]} == {"rustscale", "rustscaled", "rustscale-bench"}
     assert {x["version_source"] for x in observed()["product"]["server"]} == {"executable --version"}
+    go_observed = observed()
+    go_entry = {"path": "/opt/rustscale/bin/go-tsnet-rsb1", "version": "go-tsnet-rsb1 tailscale.com/v1.100.0",
+                "version_source": "executable --version", "sha256": "9" * 64}
+    for endpoint in ("server", "client"):
+        go_observed["product"][endpoint].append(go_entry)
+    base.write_text(json.dumps(go_observed))
+    run("python3", GCP / "provenance.py", "select-observed", selected, "--input", base, "--config", "ts-embedded", "--topology", "same-zone", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--machine", "n1-standard-4")
+    assert {Path(x["path"]).name for x in json.loads(selected.read_text())["product"]["server"]} == {"go-tsnet-rsb1"}
+    base.write_text(json.dumps(observed()))
+    run("python3", GCP / "provenance.py", "select-observed", selected, "--input", base, "--config", "rs-tun", "--topology", "same-zone", "--server-zone", "us-central1-a", "--client-zone", "us-central1-b", "--machine", "n1-standard-4")
 
     # Machine type is an exact, per-run provenance constraint. Keep the
     # normal fixture on the deterministic n1 default, then prove a supported

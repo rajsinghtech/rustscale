@@ -733,7 +733,7 @@
   "generator_version": 1,
   "guards": {
     "local_shape": {
-      "count": 305,
+      "count": 306,
       "ids": [
         "constant:DEFAULT_CONTROL_URL@37057fc84d9638e3e63fc7f3a94b95da2f5f82a9128fcad55d8a93cc2d54501c",
         "constant:FUNNEL_PORTS@41574d4d902320787c1667247d50b7ed334fff56c710c97b7b61c8acfbbb72bc",
@@ -854,6 +854,7 @@
         "method:Server.control_cert_provider@3cf119e4b66d904afc1f0546bff55f9d1b7b49b5fd6377eb14f29ad65cd7d967",
         "method:Server.control_knobs@195f87b39f82dc4d23da0d5a529ae53f313db4de94851a5bb15f6e3301867469",
         "method:Server.dial@1b6a3aa782de24626170e45879967deb23f19ff57afa8025dbc6b6548921500b",
+        "method:Server.dial_many@4c871ec0e3135c9501334182bd0bbb453521d308c96818b6ea0ed739d422eca0",
         "method:Server.ensure_up@21822e88f01fc227d147abf43924042f65829af2d93fc04a2e4234ddbc9cde1e",
         "method:Server.exit_node@81c4ec62020a2ed8afee5d7d123adbb9e6167377b2ae9e882e9c7940b31ee464",
         "method:Server.extension_host@d36ea144a1aceb8df205056286279a3e94caa95f8a63f79ecdf814180c39dadd",
@@ -1041,7 +1042,7 @@
         "type:Logger@24c245d95b078ec5dc8d385afc50221d47b3c52620470f605de81c5c7b43d8be",
         "type:SharedOverrides@e36a74a2fc1c72a26e18dc9497e134c6b6dfa049ab56f229f6433c3632791123"
       ],
-      "sha256": "b34d85fc5a5a85a2be1a463f060147a441039ebaac6b1a3e8d2f98701c0b9495"
+      "sha256": "3d7372543522930c548c2c00f251c119562960509bfdc215b0b4f1e8c48190cf"
     },
     "local_targets": {
       "count": 35,
@@ -2136,6 +2137,14 @@
         "name": "dial",
         "owner": "Server",
         "signature": "pub async fn dial(&mut self, addr: &str) -> Result<NetstackStream, TsnetError>",
+        "source": "rustdoc:struct.Server.html"
+      },
+      {
+        "id": "method:Server.dial_many",
+        "kind": "method",
+        "name": "dial_many",
+        "owner": "Server",
+        "signature": "pub async fn dial_many( &mut self, addr: &str, requested: usize, setup_timeout: Duration, ) -> Result<Vec<NetstackStream>, TsnetError>",
         "source": "rustdoc:struct.Server.html"
       },
       {

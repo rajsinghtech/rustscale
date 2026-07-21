@@ -2209,6 +2209,56 @@ async fn cli_ping_with_unknown_derp_region_uses_fanout() {
 }
 
 #[tokio::test]
+async fn authenticated_wg_transport_publishes_direct_activity() {
+    let peer_key = NodePrivate::generate().public();
+    let peer_disco = DiscoPrivate::generate().public();
+    let direct_addr: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+    let (magicsock, _rx) = Magicsock::new(MagicsockConfig {
+        private_key: NodePrivate::generate(),
+        disco_key: DiscoPrivate::generate(),
+        derp_client: None,
+        derp_map: None,
+        home_derp_region: 0,
+        udp_bind: None,
+        udp_socket: None,
+        portmapper: None,
+        health: None,
+        disable_direct_paths: false,
+        peer_relay_server: false,
+        relay_server_config: None,
+        sockstats: None,
+        control_knobs: None,
+    })
+    .await
+    .unwrap();
+    magicsock
+        .set_netmap(vec![make_peer(
+            peer_key.clone(),
+            peer_disco,
+            vec![direct_addr.to_string()],
+            0,
+        )])
+        .await
+        .unwrap();
+
+    assert_eq!(magicsock.peer_path_class(&peer_key), PathClass::None);
+    let generation = magicsock.authorization_generation(&peer_key).unwrap();
+    let datagram = WgDatagram {
+        peer: peer_key.clone(),
+        data: WgCiphertext::from(vec![1, 2, 3])
+            .authorized(generation)
+            .received_via(WgTransportEvidence::Direct(direct_addr)),
+    };
+    // Production calls this only after boringtun accepted the ciphertext.
+    magicsock.note_authenticated_wg_transport(&datagram);
+
+    let telemetry = magicsock.peer_path_telemetry(&peer_key);
+    assert_eq!(telemetry.class, PathClass::Direct);
+    assert_eq!(telemetry.addr, Some(direct_addr));
+    assert!(telemetry.fresh);
+}
+
+#[tokio::test]
 async fn derp_or_none_send_starts_rate_limited_direct_discovery() {
     // No UDP socket and no DERP client keeps this deterministic in the test
     // sandbox: send() has no usable data path, but it must still start direct

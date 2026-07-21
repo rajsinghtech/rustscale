@@ -13,6 +13,171 @@ use rustscale_wg::WgTunn;
 
 use crate::{DialStats, Netstack, DEFAULT_MTU, TCP_BUF, TCP_DIAL_TIMEOUT};
 
+#[tokio::test]
+async fn full_app_channel_cannot_lose_close_ownership() {
+    use tokio::io::AsyncWriteExt;
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let stats = Arc::new(crate::ConnectionStatsInner::default());
+    let (mut stream, mut conn) =
+        crate::make_stream_and_conn(notify, Arc::clone(&stats), None, None, None);
+
+    // Fill the exact bounded app->smoltcp channel without running a poll loop.
+    // The former in-band empty marker was lost at this boundary.
+    for _ in 0..64 {
+        stream.write_all(&[7]).await.expect("fill app channel");
+    }
+    assert_eq!(conn.app_rx.len(), 64);
+    let mut canceled_write = Box::pin(stream.write_all(&[8]));
+    assert!(futures_util::poll!(&mut canceled_write).is_pending());
+    drop(canceled_write);
+
+    // A durable ownership transfer must complete even though no poll loop can
+    // drain this full channel. The predecessor blocked here indefinitely.
+    stream.shutdown().await.expect("publish durable close");
+    assert!(conn
+        .lifecycle
+        .close_requested
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        conn.lifecycle
+            .abort_requested
+            .load(std::sync::atomic::Ordering::Acquire),
+        "a saturated shutdown must retire its unowned backlog"
+    );
+    assert_eq!(
+        conn.app_rx.len(),
+        64,
+        "close must not consume channel capacity"
+    );
+    assert_eq!(
+        stats
+            .pending_closes
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        stats
+            .close_requests
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        stream
+            .write(&[8])
+            .await
+            .expect_err("write after shutdown")
+            .kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+
+    let mut drained = 0;
+    while conn.app_rx.try_recv().is_ok() {
+        drained += 1;
+    }
+    assert_eq!(
+        drained, 64,
+        "all accepted data remains ordered before close"
+    );
+    conn.lifecycle.complete_close();
+    assert_eq!(
+        stats
+            .pending_closes
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(
+        stats
+            .close_completions
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    conn.lifecycle.complete_close();
+    assert_eq!(
+        stats
+            .close_completions
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_app_channel_shutdown_aborts_and_drop_is_idempotent() {
+    use tokio::io::AsyncWriteExt;
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let stats = Arc::new(crate::ConnectionStatsInner::default());
+    let (mut stream, mut conn) =
+        crate::make_stream_and_conn(notify, Arc::clone(&stats), None, None, None);
+
+    for _ in 0..64 {
+        stream.write_all(&[0xA5]).await.expect("fill app channel");
+    }
+    let mut canceled_write = Box::pin(stream.write_all(&[0x5A]));
+    assert!(futures_util::poll!(&mut canceled_write).is_pending());
+    drop(canceled_write);
+    tokio::time::timeout(std::time::Duration::from_millis(50), stream.shutdown())
+        .await
+        .expect("full-channel shutdown retained the application task")
+        .expect("publish durable close");
+    assert!(conn
+        .lifecycle
+        .abort_requested
+        .load(std::sync::atomic::Ordering::Acquire));
+
+    drop(stream);
+    assert!(conn
+        .lifecycle
+        .abort_requested
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(conn.app_rx.len(), 64, "drop must not need channel capacity");
+    assert_eq!(
+        stats
+            .close_requests
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "shutdown and drop share one close owner"
+    );
+    assert_eq!(
+        stats
+            .duplicate_close_requests
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "drop repeats the already durable abort idempotently"
+    );
+
+    while conn.app_rx.try_recv().is_ok() {}
+    conn.lifecycle.retire();
+    assert_eq!(
+        stats
+            .pending_closes
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(
+        stats
+            .close_completions
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+}
+
+#[test]
+fn tcp_ephemeral_allocator_wraps_skips_live_ports_and_exhausts() {
+    let mut allocated = std::collections::HashSet::from([u16::MAX, 49152]);
+    let mut next = u16::MAX;
+    assert_eq!(
+        crate::allocate_ephemeral_tcp_port(&mut allocated, &mut next).unwrap(),
+        49153
+    );
+    assert_eq!(next, 49154);
+
+    allocated.extend(49152..=u16::MAX);
+    let error = crate::allocate_ephemeral_tcp_port(&mut allocated, &mut next)
+        .expect_err("a full client port range must fail closed");
+    assert!(error.to_string().contains("port range exhausted"));
+}
+
 #[test]
 fn constructor_without_runtime_is_typed_error() {
     let result = std::panic::catch_unwind(|| Netstack::new(Ipv4Addr::LOCALHOST, DEFAULT_MTU));
@@ -191,6 +356,70 @@ async fn back_to_back_dial_and_echo() {
         .await
         .expect("A shutdown");
 
+    pump.abort();
+}
+
+/// A full app channel must still turn shutdown into a peer-visible FIN. This
+/// regression uses the real TCP and WireGuard path and is intentionally
+/// compatible with the predecessor implementation, where it times out because
+/// the in-band empty close marker cannot enter the full channel.
+#[tokio::test]
+async fn full_app_channel_shutdown_reaches_peer_eof() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+    let a_addr = Ipv4Addr::new(100, 64, 0, 1);
+    let b_addr = Ipv4Addr::new(100, 64, 0, 2);
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
+    let a_tunn = Arc::new(Mutex::new(WgTunn::new(&a_priv, &b_pub, 1).unwrap()));
+    let b_tunn = Arc::new(Mutex::new(WgTunn::new(&b_priv, &a_pub, 2).unwrap()));
+
+    let pump = {
+        let a_tunn = a_tunn.clone();
+        let b_tunn = b_tunn.clone();
+        let a_net = a_net.clone();
+        let b_net = b_net.clone();
+        tokio::spawn(async move {
+            let a_tx = a_net.tx_notify();
+            let b_tx = b_net.tx_notify();
+            loop {
+                if !pump_cycle(&a_tunn, &b_tunn, &a_net, &b_net) {
+                    tokio::select! {
+                        () = a_tx.notified() => {}
+                        () = b_tx.notified() => {}
+                        () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
+                }
+            }
+        })
+    };
+
+    let mut listener = b_net.listen(12346).await.unwrap();
+    let mut client = a_net
+        .dial(SocketAddr::new(b_addr.into(), 12346))
+        .await
+        .unwrap();
+    let mut server = listener.accept().await.unwrap();
+    for _ in 0..64 {
+        server.write_all(&[0xA5]).await.unwrap();
+    }
+    server.shutdown().await.unwrap();
+
+    let mut received = [0; 64];
+    client.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, [0xA5; 64]);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut [0; 1]),)
+            .await
+            .expect("full-channel shutdown never reached the peer")
+            .unwrap(),
+        0,
+        "peer received data but not the shutdown FIN"
+    );
     pump.abort();
 }
 
@@ -450,35 +679,86 @@ async fn latency_small_message_round_trip() {
 }
 
 #[tokio::test]
-async fn canceled_pending_dial_releases_socket_and_buffers_promptly() {
+async fn repeated_canceled_dials_release_sockets_and_buffers_promptly() {
     let net = Arc::new(
         Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).expect("create netstack"),
     );
-    let dial_net = Arc::clone(&net);
-    let dial = tokio::spawn(async move {
-        dial_net
-            .dial(SocketAddr::from(([100, 64, 0, 254], 9)))
+
+    for round in 1..=3 {
+        let dial_net = Arc::clone(&net);
+        let dial = tokio::spawn(async move {
+            dial_net
+                .dial(SocketAddr::from(([100, 64, 0, 254], 9)))
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while net.dial_stats().pending_dials != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round} pending dial was not registered"));
+        assert_eq!(net.dial_stats().pending_buffer_bytes, TCP_BUF * 2);
+
+        dial.abort();
+        let _ = dial.await;
+        net.reclaim_pending_dials()
             .await
-    });
+            .unwrap_or_else(|_| panic!("round {round} reclaim barrier failed"));
+        assert_eq!(
+            net.dial_stats(),
+            DialStats::default(),
+            "round {round} retained a canceled dial or its buffers"
+        );
+    }
+}
+
+/// The reclaim command follows all preceding dial/cancel commands in the
+/// bounded command channel. Even when cancellation fills that channel and
+/// `try_send` drops some CancelDial commands, closed reply channels are swept
+/// before the barrier acknowledgement. This checks socket-buffer, port, and
+/// application-channel ownership together: no pending dial buffers or port
+/// may remain, and no established stream channel may have been created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaim_barrier_drains_a_saturated_cancellation_queue() {
+    const DIALS: usize = 65; // command channel capacity is 64
+    let net = Arc::new(
+        Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).expect("create netstack"),
+    );
+    let mut dials = Vec::with_capacity(DIALS);
+    for _ in 0..DIALS {
+        let dial_net = Arc::clone(&net);
+        dials.push(tokio::spawn(async move {
+            dial_net
+                .dial(SocketAddr::from(([100, 64, 0, 254], 9)))
+                .await
+        }));
+    }
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while net.dial_stats().pending_dials != 1 {
+        while net.dial_stats().pending_dials == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("pending dial was not registered");
-    assert_eq!(net.dial_stats().pending_buffer_bytes, TCP_BUF * 2);
+    .expect("no dial reached poll-loop ownership");
+    for dial in &dials {
+        dial.abort();
+    }
+    for dial in dials {
+        let _ = dial.await;
+    }
 
-    dial.abort();
-    let _ = dial.await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while net.dial_stats() != DialStats::default() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        net.reclaim_pending_dials(),
+    )
     .await
-    .expect("canceled dial retained pending socket buffers");
+    .expect("reclaim barrier deadlocked behind canceled commands")
+    .expect("poll loop stopped during reclaim");
+    assert_eq!(net.dial_stats(), DialStats::default());
+    assert_eq!(net.connection_stats(), crate::ConnectionStats::default());
 }
 
 #[tokio::test(start_paused = true)]
@@ -501,7 +781,10 @@ async fn pending_dial_has_an_internal_deadline() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("deadline exceeded"));
+    // The error reply itself is the ownership boundary: no follow-up yield or
+    // reclaim command is required to observe socket-buffer reclamation.
     assert_eq!(net.dial_stats(), DialStats::default());
+    assert_eq!(net.connection_stats(), crate::ConnectionStats::default());
 }
 
 /// Verify that multiple peers can connect simultaneously. Before the backlog
@@ -596,6 +879,215 @@ async fn concurrent_connections_all_succeed() {
     assert_eq!(
         dial_succeeded, NUM_CONCURRENT,
         "only {dial_succeeded}/{NUM_CONCURRENT} dials succeeded"
+    );
+}
+
+/// Exercise the production netstack and WireGuard data path at an explicit
+/// setup scale. The in-memory link is credential-free; it only replaces the
+/// UDP underlay, not dial admission, packet ownership, TCP, or WireGuard.
+async fn assert_bounded_bulk_dial_phases(phases: &[(usize, bool)]) {
+    // Each production-sized P1000 case can own roughly 4 GiB across both
+    // in-process endpoints. Keep the three high-scale cases from overlapping
+    // under libtest's default parallel scheduling.
+    static HIGH_SCALE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    let _high_scale_guard = HIGH_SCALE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    let a_priv = NodePrivate::generate();
+    let b_priv = NodePrivate::generate();
+    let a_pub = a_priv.public();
+    let b_pub = b_priv.public();
+    let a_addr = Ipv4Addr::new(100, 64, 0, 1);
+    let b_addr = Ipv4Addr::new(100, 64, 0, 2);
+    let a_net = Arc::new(Netstack::new(a_addr, DEFAULT_MTU).unwrap());
+    let b_net = Arc::new(Netstack::new(b_addr, DEFAULT_MTU).unwrap());
+    let a_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&a_priv, &b_pub, 1).expect("A tunnel"),
+    ));
+    let b_tunn = Arc::new(Mutex::new(
+        WgTunn::new(&b_priv, &a_pub, 2).expect("B tunnel"),
+    ));
+
+    let pump = {
+        let a_tunn = a_tunn.clone();
+        let b_tunn = b_tunn.clone();
+        let a_net = a_net.clone();
+        let b_net = b_net.clone();
+        tokio::spawn(async move {
+            let a_tx = a_net.tx_notify();
+            let b_tx = b_net.tx_notify();
+            loop {
+                if !pump_cycle(&a_tunn, &b_tunn, &a_net, &b_net) {
+                    tokio::select! {
+                        () = a_tx.notified() => {}
+                        () = b_tx.notified() => {}
+                        () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                    }
+                }
+            }
+        })
+    };
+
+    let mut listener = b_net.listen(41000).await.expect("listen");
+    let mut expected_closes = 0;
+    for &(streams, fill_server_app_channel) in phases {
+        let accept = tokio::spawn(async move {
+            let mut accepted = Vec::with_capacity(streams);
+            for _ in 0..streams {
+                accepted.push(listener.accept().await.expect("accept"));
+            }
+            (accepted, listener)
+        });
+        let dial = {
+            let a_net = a_net.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    a_net.dial_many(
+                        SocketAddr::new(b_addr.into(), 41000),
+                        streams,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(25),
+                    ),
+                )
+                .await
+            })
+        };
+        let mut maximum = 0;
+        while !dial.is_finished() {
+            maximum = maximum.max(a_net.dial_stats().pending_dials);
+            tokio::task::yield_now().await;
+        }
+        let client_streams = dial
+            .await
+            .expect("dial worker")
+            .expect("bulk setup outer deadline")
+            .expect("bulk dial");
+        let (mut server_streams, returned_listener) = accept.await.expect("accept worker");
+        listener = returned_listener;
+
+        assert_eq!(client_streams.len(), streams);
+        assert_eq!(server_streams.len(), streams);
+        assert!(
+            maximum <= crate::TCP_DIAL_WINDOW,
+            "maximum in flight: {maximum}"
+        );
+        // The final dial reply is a production reclamation acknowledgement:
+        // the poll-loop owner publishes removal before waking dial_many.
+        // Its socket buffers are no longer pending, while every established
+        // stream owns one distinct client port and its bounded app channels.
+        assert_eq!(a_net.dial_stats(), DialStats::default());
+        assert_eq!(a_net.connection_stats().allocated_tcp_ports, streams);
+        if fill_server_app_channel {
+            use tokio::io::AsyncWriteExt;
+
+            // This is the exact production boundary from the down trial:
+            // fill all 64 app→smoltcp slots without yielding, then publish a
+            // shutdown. The old empty in-band marker was lost for every
+            // stream here. One-byte chunks keep the P500 proof bounded to
+            // 32 KiB rather than allocating firehose-sized payloads.
+            for stream in &mut server_streams {
+                for _ in 0..64 {
+                    stream.write_all(&[0xA5]).await.expect("fill app channel");
+                }
+                stream.shutdown().await.expect("durable server close");
+            }
+        }
+        drop(client_streams);
+        drop(server_streams);
+        expected_closes += streams;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let a = a_net.connection_stats();
+                let b = b_net.connection_stats();
+                if a.live_connections == 0
+                    && b.live_connections == 0
+                    && a.allocated_tcp_ports == 0
+                    && b.allocated_tcp_ports == 0
+                    && a.pending_closes == 0
+                    && b.pending_closes == 0
+                {
+                    assert_eq!(a.close_requests, expected_closes);
+                    assert_eq!(a.close_completions, expected_closes);
+                    assert_eq!(b.close_requests, expected_closes);
+                    assert_eq!(b.close_completions, expected_closes);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bulk teardown leaked a connection or close request");
+    }
+    pump.abort();
+}
+
+/// Production bulk dialing retains every P500 stream while never exceeding
+/// the peer's listener-sized admission window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_bulk_dial_establishes_and_retains_p500() {
+    assert_bounded_bulk_dial_phases(&[(500, false)]).await;
+}
+
+/// P1000 setup takes the same production bounded path as P500: all streams
+/// must remain established without widening the handshake window or deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_bulk_dial_establishes_and_retains_p1000() {
+    assert_bounded_bulk_dial_phases(&[(1000, false)]).await;
+}
+
+/// Reproduce the benchmark's long-lived-server boundary: P500 must retire
+/// bilaterally before an unchanged P1000 setup starts on the same stacks,
+/// tunnels, listener, channel limits, and four-dial admission window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p500_teardown_then_p1000_has_no_stale_connections() {
+    assert_bounded_bulk_dial_phases(&[(500, true), (1000, false)]).await;
+}
+
+/// A P1000 request that cannot connect still owns at most one bounded window,
+/// and common-deadline cancellation reclaims every pending socket and buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_bulk_dial_p1000_cancels_without_task_pileup() {
+    const STREAMS: usize = 1000;
+    let net = Arc::new(Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).unwrap());
+    let dial = {
+        let net = net.clone();
+        tokio::spawn(async move {
+            net.dial_many(
+                SocketAddr::from(([100, 64, 0, 254], 9)),
+                STREAMS,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(500),
+            )
+            .await
+        })
+    };
+    let mut maximum = 0;
+    while !dial.is_finished() {
+        maximum = maximum.max(net.dial_stats().pending_dials);
+        tokio::task::yield_now().await;
+    }
+    let error = match dial.await.expect("dial worker") {
+        Ok(_) => panic!("unreachable P1000 dial must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("established 0 of 1000"),
+        "{error}"
+    );
+    assert!(maximum > 0);
+    assert!(
+        maximum <= crate::TCP_DIAL_WINDOW,
+        "maximum in flight: {maximum}"
+    );
+    net.reclaim_pending_dials()
+        .await
+        .expect("cancelled P1000 reclaim barrier");
+    assert_eq!(
+        net.dial_stats(),
+        DialStats::default(),
+        "cancelled P1000 dials leaked resources"
     );
 }
 

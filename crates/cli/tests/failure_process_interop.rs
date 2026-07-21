@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{Read, Seek, Write};
+use std::io::{ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -347,7 +347,20 @@ async fn serve_wait(mode: &str, listener: &Listener, control: &Path) {
                 )
                 .await;
             }
-            request.stream.shutdown().await.unwrap();
+            match request.stream.shutdown().await {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::NotConnected | ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    // The successful CLI wait may close first. On macOS,
+                    // shutting down that already-disconnected Unix stream
+                    // reports ENOTCONN instead of succeeding idempotently.
+                }
+                Err(error) => panic!("wait response shutdown failed: {error}"),
+            }
         }
         other => panic!("unknown wait mode {other}"),
     }

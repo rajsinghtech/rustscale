@@ -260,7 +260,20 @@ sleep 3
 # ---------------------------------------------------------------------------
 echo "[interop] running isolated application UDP cadence gate" >&2
 cargo test -p rustscale-tsnet tests::interop_application_udp_cadence -- \
-  --ignored --exact --nocapture --test-threads=1
+  --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$STATE_DIR/udp-cadence.log"
+if [[ "${RUSTSCALE_REMOTE_EVIDENCE:-0}" == 1 ]]; then
+  python3 - "$STATE_DIR/udp-cadence.log" <<'PY'
+import pathlib, sys
+allowed = {"path", "cadence_ms", "count", "send_span_ms", "arrival_span_ms", "max_one_way_ms"}
+lines = [line for line in pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+         if line.startswith("UDP_CADENCE\t")]
+assert len(lines) == 1, lines
+values = dict(field.split("=", 1) for field in lines[0].split("\t")[1:])
+assert set(values) == allowed
+for name in sorted(allowed):
+    print(f"RUSTSCALE_REMOTE\tfact.udp_cadence_{name}\t{values[name]}")
+PY
+fi
 
 echo "[interop] running remaining cargo test -p rustscale-tsnet -- --ignored interop_" >&2
 cargo test -p rustscale-tsnet -- --ignored interop_ \

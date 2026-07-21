@@ -293,6 +293,52 @@ EOF
   assert_contains "$(cat "$result")" '"open_files_hard"'
 }
 
+test_remote_validation_opted_in_credentials_do_not_leak() {
+  local output result
+  new_repo remote-credentials
+  make_remote_fakes
+  FAKE_SSH_ARGS="$REPO/args"
+  FAKE_SSH_BUNDLE="$REPO/expected"
+  FAKE_TAR_LOG="$REPO/tar.log"
+  FAKE_TIMEOUT_LOG="$REPO/timeout.log"
+  : >"$FAKE_TAR_LOG"; : >"$FAKE_TIMEOUT_LOG"
+  for command_name in cargo rustc pkg-config cmake jq curl; do
+    cat >"$FAKE_REMOTE_BIN/$command_name" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in --version|-V|-Vv) echo 'fake version' ;; *) exit 0 ;; esac
+EOF
+    chmod +x "$FAKE_REMOTE_BIN/$command_name"
+  done
+  mkdir -p "$REPO/tools/bench"
+  cat >"$REPO/tools/bench/run-native-baseline.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$TS_ORG_CLIENT_ID" == fixture-client ]]
+[[ "$TS_ORG_CLIENT_SECRET" == fixture-secret-never-print ]]
+printf 'RUSTSCALE_REMOTE\tfact.baseline_p1_mbps\t1.0\n'
+EOF
+  chmod +x "$REPO/tools/bench/run-native-baseline.sh"
+  git -C "$REPO" add tools/bench/run-native-baseline.sh
+
+  output=$(expect_success env PATH="$FAKE_LOCAL_BIN:$PATH" \
+    TS_ORG_CLIENT_ID=fixture-client TS_ORG_CLIENT_SECRET=fixture-secret-never-print \
+    RUSTSCALE_REMOTE_TARGET=builder@fake-host RUSTSCALE_REMOTE_MIN_MEMORY_MIB=1 \
+    RUSTSCALE_REMOTE_MIN_DISK_MIB=1 FAKE_SSH_ARGS="$FAKE_SSH_ARGS" \
+    FAKE_SSH_BUNDLE="$FAKE_SSH_BUNDLE" FAKE_TAR_LOG="$FAKE_TAR_LOG" \
+    FAKE_TIMEOUT_LOG="$FAKE_TIMEOUT_LOG" FAKE_LOCAL_BIN="$FAKE_LOCAL_BIN" \
+    FAKE_REMOTE_BIN="$FAKE_REMOTE_BIN" FAKE_REMOTE_HOME="$FAKE_REMOTE_HOME" \
+    FAKE_REMOTE_TMP="$FAKE_REMOTE_TMP" REAL_TAR="$REAL_TAR" REAL_SHASUM="$REAL_SHASUM" \
+    "$REPO/tools/agent/remote-validate.sh" baseline --allow-local-tailnet-credentials)
+  assert_contains "$output" $'RUSTSCALE_REMOTE\tfact.baseline_p1_mbps\t1.0'
+  assert_not_contains "$output" 'fixture-secret-never-print'
+  result=$(find "$REPO/.agent-runs/remote-validation" -type f -name '*.json' -print | sed -n '1p')
+  assert_contains "$(cat "$result")" '"local_tailnet_credentials_opt_in": true'
+  assert_not_contains "$(cat "$result")" 'fixture-secret-never-print'
+  if find "$FAKE_REMOTE_TMP" -maxdepth 1 -name 'rustscale-remote.*' | grep -q .; then
+    fail 'remote temporary directory survived credentialed baseline'
+  fi
+}
+
 test_remote_validation_disable_privilege_and_timeout_guards() {
   local output result
   new_repo remote-guards
@@ -309,11 +355,18 @@ test_remote_validation_disable_privilege_and_timeout_guards() {
     FAKE_TAR_LOG="$FAKE_TAR_LOG" FAKE_TIMEOUT_LOG="$FAKE_TIMEOUT_LOG" \
     "$REPO/tools/agent/remote-validate.sh" preflight)
   assert_contains "$output" 'explicitly disabled'
+  output=$(expect_success env PATH="$FAKE_LOCAL_BIN:$PATH" RUSTSCALE_REMOTE_DISABLE=1 \
+    FAKE_SSH_ARGS="$FAKE_SSH_ARGS" FAKE_SSH_BUNDLE="$FAKE_SSH_BUNDLE" \
+    FAKE_TAR_LOG="$FAKE_TAR_LOG" FAKE_TIMEOUT_LOG="$FAKE_TIMEOUT_LOG" \
+    "$REPO/tools/agent/remote-validate.sh" baseline)
+  assert_contains "$output" 'explicitly disabled'
   [[ ! -e "$FAKE_SSH_ARGS" ]] || fail 'disabled remote validation invoked ssh'
   [[ ! -s "$FAKE_TAR_LOG" ]] || fail 'disabled remote validation invoked tar'
   result=$(find "$REPO/.agent-runs/remote-validation" -type f -name '*.json' -print | sed -n '1p')
   assert_contains "$(cat "$result")" '"status": "disabled"'
 
+  output=$(expect_failure "$REPO/tools/agent/remote-validate.sh" baseline --allow-local-tailnet-credentials)
+  assert_contains "$output" 'requires loaded Tailscale org credentials'
   output=$(expect_failure "$REPO/tools/agent/remote-validate.sh" tun)
   assert_contains "$output" 'requires the explicit --allow-privileged flag'
   output=$(expect_failure "$REPO/tools/agent/remote-validate.sh" install --allow-privileged)
@@ -883,6 +936,7 @@ test_production_wrappers_are_executable
 test_check_failure_runs_once
 test_remote_validation_is_hermetic_and_fail_closed
 test_remote_validation_runs_focused_check
+test_remote_validation_opted_in_credentials_do_not_leak
 test_remote_validation_disable_privilege_and_timeout_guards
 test_remote_validation_rejects_tracked_secrets
 test_pi_arguments_and_model_override

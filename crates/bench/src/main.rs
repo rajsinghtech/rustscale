@@ -32,8 +32,11 @@ enum Command {
         #[arg(long, value_enum, default_value = "userspace")]
         transport: Transport,
         /// Required only for --transport userspace.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "authkey_file")]
         authkey: Option<String>,
+        /// Owner-only file containing the auth key (preferred for automation).
+        #[arg(long, conflicts_with = "authkey")]
+        authkey_file: Option<PathBuf>,
         #[arg(long, default_value = "5201")]
         port: u16,
         #[arg(long, default_value = "0.0.0.0")]
@@ -49,8 +52,11 @@ enum Command {
         #[arg(long, value_enum, default_value = "userspace")]
         transport: Transport,
         /// Required only for --transport userspace.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "authkey_file")]
         authkey: Option<String>,
+        /// Owner-only file containing the auth key (preferred for automation).
+        #[arg(long, conflicts_with = "authkey")]
+        authkey_file: Option<PathBuf>,
         #[arg(long)]
         target: String,
         #[arg(long, default_value="10", value_parser=clap::value_parser!(u64).range(1..))]
@@ -70,8 +76,11 @@ enum Command {
         #[arg(long, value_enum, default_value = "userspace")]
         transport: Transport,
         /// Required only for --transport userspace.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "authkey_file")]
         authkey: Option<String>,
+        /// Owner-only file containing the auth key (preferred for automation).
+        #[arg(long, conflicts_with = "authkey")]
+        authkey_file: Option<PathBuf>,
         #[arg(long)]
         target: String,
         #[arg(long, default_value="1000", value_parser=parse_positive_usize)]
@@ -106,16 +115,58 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     }
 }
 
-fn require_auth(transport: Transport, authkey: Option<String>) -> Result<Option<String>, String> {
-    match (transport, authkey) {
+fn require_auth(
+    transport: Transport,
+    authkey: Option<String>,
+    authkey_file: Option<PathBuf>,
+) -> Result<Option<String>, String> {
+    let auth = match (authkey, authkey_file) {
+        (Some(value), None) => Some(value),
+        (None, Some(path)) => Some(read_private_authkey(&path)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err("--authkey and --authkey-file are mutually exclusive".into())
+        }
+    };
+    match (transport, auth) {
         (Transport::Userspace, None) => {
-            Err("--authkey is required for --transport userspace".into())
+            Err("--authkey or --authkey-file is required for --transport userspace".into())
         }
         (Transport::KernelTcp, Some(_)) => {
-            Err("--authkey is not applicable to --transport kernel-tcp".into())
+            Err("authentication is not applicable to --transport kernel-tcp".into())
         }
         (_, value) => Ok(value),
     }
+}
+
+fn read_private_authkey(path: &std::path::Path) -> Result<String, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect --authkey-file: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err("--authkey-file must be a regular, non-symlink file".into());
+    }
+    validate_private_permissions(&metadata)?;
+    let value = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read --authkey-file: {error}"))?;
+    let value = value.trim_end_matches(['\r', '\n']).to_owned();
+    if value.is_empty() || value.contains(['\r', '\n']) {
+        return Err("--authkey-file must contain exactly one non-empty line".into());
+    }
+    Ok(value)
+}
+
+#[cfg(unix)]
+fn validate_private_permissions(metadata: &std::fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.mode() & 0o077 != 0 {
+        return Err("--authkey-file must not be accessible by group or other users".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_permissions(_: &std::fs::Metadata) -> Result<(), String> {
+    Err("--authkey-file is unsupported without Unix owner-only permissions".into())
 }
 
 fn main() {
@@ -138,18 +189,27 @@ fn main() {
 fn validate_contract(cli: &Cli) -> Result<(), String> {
     let (transport, has_auth) = match &cli.command {
         Command::Server {
-            transport, authkey, ..
+            transport,
+            authkey,
+            authkey_file,
+            ..
         }
         | Command::Client {
-            transport, authkey, ..
+            transport,
+            authkey,
+            authkey_file,
+            ..
         }
         | Command::Latency {
-            transport, authkey, ..
-        } => (*transport, authkey.is_some()),
+            transport,
+            authkey,
+            authkey_file,
+            ..
+        } => (*transport, authkey.is_some() || authkey_file.is_some()),
     };
     match (transport, has_auth) {
         (Transport::Userspace, false) => {
-            Err("--authkey is required for --transport userspace".into())
+            Err("--authkey or --authkey-file is required for --transport userspace".into())
         }
         (Transport::KernelTcp, true) => {
             Err("--authkey is not applicable to --transport kernel-tcp".into())
@@ -164,13 +224,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Server {
             transport,
             authkey,
+            authkey_file,
             port,
             bind,
             hostname,
             control_url,
             state_dir,
         } => {
-            let auth = require_auth(transport, authkey)?;
+            let auth = require_auth(transport, authkey, authkey_file)?;
             match transport {
                 Transport::Userspace => {
                     server::run_userspace(auth.unwrap(), port, hostname, control_url, state_dir)
@@ -182,6 +243,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Client {
             transport,
             authkey,
+            authkey_file,
             target,
             duration,
             direction,
@@ -190,7 +252,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             control_url,
             state_dir,
         } => {
-            let auth = require_auth(transport, authkey)?;
+            let auth = require_auth(transport, authkey, authkey_file)?;
             let result = match transport {
                 Transport::Userspace => {
                     throughput::run_userspace(
@@ -222,13 +284,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Latency {
             transport,
             authkey,
+            authkey_file,
             target,
             count,
             hostname,
             control_url,
             state_dir,
         } => {
-            let auth = require_auth(transport, authkey)?;
+            let auth = require_auth(transport, authkey, authkey_file)?;
             let result = match transport {
                 Transport::Userspace => {
                     latency::run_userspace(
@@ -311,11 +374,12 @@ mod tests {
             transport, authkey, ..
         } = cli.command
         {
-            assert_eq!(require_auth(transport, authkey).unwrap(), None);
+            assert_eq!(require_auth(transport, authkey, None).unwrap(), None);
             assert!(validate_contract(&Cli {
                 command: Command::Client {
                     transport,
                     authkey: None,
+                    authkey_file: None,
                     target: "127.0.0.1:1".into(),
                     duration: 1,
                     direction: "down".into(),
@@ -338,14 +402,32 @@ mod tests {
             transport, authkey, ..
         } = cli.command
         {
-            assert!(require_auth(transport, authkey).is_err());
+            assert!(require_auth(transport, authkey, None).is_err());
         } else {
             panic!()
         }
     }
     #[test]
     fn kernel_rejects_auth() {
-        assert!(require_auth(Transport::KernelTcp, Some("secret".into())).is_err());
+        assert!(require_auth(Transport::KernelTcp, Some("secret".into()), None).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn userspace_reads_only_owner_only_auth_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "rustscale-bench-authkey-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "fixture-secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            require_auth(Transport::Userspace, None, Some(path.clone())).unwrap(),
+            Some("fixture-secret".into())
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(require_auth(Transport::Userspace, None, Some(path.clone())).is_err());
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn default_bind_is_safe_all_interfaces() {

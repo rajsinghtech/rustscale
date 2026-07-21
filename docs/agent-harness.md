@@ -57,12 +57,15 @@ Available journeys are:
 tools/agent/remote-validate.sh check                 # bounded tools/check.sh
 tools/agent/remote-validate.sh check rustscale-wg    # focused package gate
 tools/agent/remote-validate.sh interop               # tools/interop.sh
+tools/agent/remote-validate.sh baseline              # native embedded Rust P1/P10/P100
+# Only after explicitly loading the local org credential file:
+tools/agent/remote-validate.sh baseline --allow-local-tailnet-credentials
 tools/agent/remote-validate.sh tun --allow-privileged
 tools/agent/remote-validate.sh install \
   --allow-privileged --allow-install
 ```
 
-`interop` and `tun` never copy local credentials or `.secrets`; they can consume only Tailscale credentials separately provisioned in the remote SSH environment. The TUN journey additionally requires passwordless `sudo` and `/dev/net/tun`. `install` runs the fail-closed Linux replacement journey with its required-mode setting and can mutate standard install/systemd/TUN paths, so it requires two explicit flags and must be used only on a disposable, unoccupied builder. None of these commands forwards AI-provider, cloud, GitHub, SSH-agent, or local filesystem credentials.
+By default, `interop`, `baseline`, and `tun` never copy local credentials or `.secrets`; they consume only Tailscale credentials separately provisioned in the remote SSH environment. For an explicitly authorized disposable builder, `--allow-local-tailnet-credentials` additionally requires already-loaded org credentials and sends only those values in a mode-0600 envelope inside the encrypted SSH bundle. Values never enter the SSH command, process arguments, source archive, output, or provenance; the remote launcher deletes the envelope before executing the journey and cleanup removes the enclosing directory. The flag is rejected for credential-free modes. `baseline` runs the isolated embedded-Rust RSB1 P1/P10/P100 runner, stores only bounded metric/path/binary-hash facts in local provenance, and deletes its temporary tailnet, processes, state, and remote source tree. The TUN journey additionally requires passwordless `sudo` and `/dev/net/tun`. `install` runs the fail-closed Linux replacement journey with its required-mode setting and can mutate standard install/systemd/TUN paths, so it requires two explicit flags and must be used only on a disposable, unoccupied builder. None of these commands forwards AI-provider, cloud, GitHub, SSH-agent, or local filesystem credentials.
 
 Machine-readable provenance is written atomically under the ignored `.agent-runs/remote-validation/` directory. It contains hashes, bounded resource facts, missing prerequisite names, bootstrap commands, status, and cleanup evidence, but no command log, environment values, credential values, or absolute local path. Terminal and SSH output is intentionally not retained by the harness. The builder or access layer may independently record SSH sessions; assume remote commands and terminal output are observable and never print or transfer secrets.
 

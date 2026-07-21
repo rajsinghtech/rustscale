@@ -43,6 +43,9 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_util::sync::PollSender;
 
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
+use futures_util::{FutureExt, StreamExt};
+use rand::Rng;
 use rustscale_key::NodePublic;
 use rustscale_packet::{Parsed, TCPFlag, TCP};
 
@@ -51,11 +54,9 @@ use device::LoopbackDevice;
 /// Default MTU (Tailscale tailnet MTU is 1280).
 pub const DEFAULT_MTU: usize = 1280;
 
-/// TCP send/recv buffer size. Tuned up from 65 KB to 256 KB so the socket
-/// can absorb more in-flight data per ACK round-trip, raising throughput
-/// before backpressure kicks in. (Go's gVisor netstack uses similar or
-/// larger defaults.)
-const TCP_BUF: usize = 256 * 1024;
+/// TCP send/receive buffer size, matched to the pinned Tailscale/gVisor
+/// `DefaultSendBufferSize` and `DefaultReceiveBufferSize` values.
+const TCP_BUF: usize = 1024 * 1024;
 
 /// Hard bound for a userspace TCP handshake even when the caller remains
 /// alive. LocalAPI applies its own whole-operation deadline as well.
@@ -68,6 +69,13 @@ const TCP_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 /// listening sockets allows N simultaneous handshakes — the same role as
 /// the OS `listen(backlog)` parameter.
 const LISTEN_BACKLOG: usize = 32;
+
+/// Maximum number of TCP handshakes submitted by [`Netstack::dial_many`].
+///
+/// This stays below the passive listener pool so bulk setup cannot create a
+/// SYN burst larger than a peer can admit and leaves room while established
+/// passive sockets are replenished.
+pub const TCP_DIAL_WINDOW: usize = LISTEN_BACKLOG / 8;
 
 /// Depth of the accept channel between the poll loop and the application's
 /// `Listener::accept()` call. Large enough to buffer a burst of accepted
@@ -104,6 +112,13 @@ pub enum NetstackError {
     ListenFailed(String),
     #[error("dial failed: {0}")]
     DialFailed(String),
+    #[error("established {established} of {requested} requested connections: {source}")]
+    DialCapacity {
+        established: usize,
+        requested: usize,
+        #[source]
+        source: Box<NetstackError>,
+    },
     #[error("udp listen failed: {0}")]
     UdpListenFailed(String),
     #[error("tls error: {0}")]
@@ -127,6 +142,7 @@ pub struct Netstack {
     tx_notify: Arc<Notify>,
     next_dial_id: AtomicU64,
     dial_stats: Arc<DialStatsInner>,
+    connection_stats: Arc<ConnectionStatsInner>,
 }
 
 /// Live resource counts for pending userspace TCP dials.
@@ -140,8 +156,111 @@ pub struct DialStats {
 
 #[derive(Default)]
 struct DialStatsInner {
+    // A single source of truth makes a DialStats read a coherent ownership
+    // snapshot. Buffer ownership is fixed per pending socket and is derived
+    // from this count rather than racing a second atomic publication.
     pending_dials: std::sync::atomic::AtomicUsize,
-    pending_buffer_bytes: std::sync::atomic::AtomicUsize,
+}
+
+/// TCP connection lifecycle counters from the netstack poll loop.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectionStats {
+    /// Established sockets currently owned by the poll loop.
+    pub live_connections: usize,
+    /// Ephemeral TCP ports owned by pending or established outbound sockets.
+    pub allocated_tcp_ports: usize,
+    /// Durable local close requests not yet applied to smoltcp.
+    pub pending_closes: usize,
+    /// First close requests published by shutdown or drop.
+    pub close_requests: usize,
+    /// Close requests applied to smoltcp or resolved by socket teardown.
+    pub close_completions: usize,
+    /// Idempotent shutdown/drop requests after the first request.
+    pub duplicate_close_requests: usize,
+}
+
+#[derive(Default)]
+struct ConnectionStatsInner {
+    live_connections: std::sync::atomic::AtomicUsize,
+    allocated_tcp_ports: std::sync::atomic::AtomicUsize,
+    pending_closes: std::sync::atomic::AtomicUsize,
+    close_requests: std::sync::atomic::AtomicUsize,
+    close_completions: std::sync::atomic::AtomicUsize,
+    duplicate_close_requests: std::sync::atomic::AtomicUsize,
+}
+
+struct ConnectionLifecycle {
+    close_requested: std::sync::atomic::AtomicBool,
+    abort_requested: std::sync::atomic::AtomicBool,
+    close_completed: std::sync::atomic::AtomicBool,
+    retired: std::sync::atomic::AtomicBool,
+    remote_closed: std::sync::atomic::AtomicBool,
+    read_waker: std::sync::Mutex<Option<std::task::Waker>>,
+    notify: Arc<Notify>,
+    stats: Arc<ConnectionStatsInner>,
+}
+
+impl ConnectionLifecycle {
+    fn request_close(&self) {
+        self.publish_close(false);
+    }
+
+    fn request_abort(&self) {
+        self.publish_close(true);
+    }
+
+    fn publish_close(&self, abort: bool) {
+        if abort {
+            // Dropping the application owner is an ownership boundary, not a
+            // request to keep retransmitting buffered data indefinitely. An
+            // earlier graceful shutdown may therefore be escalated to abort.
+            self.abort_requested.store(true, Ordering::Release);
+        }
+        if self
+            .close_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.stats.close_requests.fetch_add(1, Ordering::Relaxed);
+            self.stats.pending_closes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats
+                .duplicate_close_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self.retired.load(Ordering::Acquire) {
+            self.complete_close();
+        } else {
+            self.notify.notify_one();
+        }
+    }
+
+    fn complete_close(&self) {
+        if self.close_requested.load(Ordering::Acquire)
+            && self
+                .close_completed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.stats.pending_closes.fetch_sub(1, Ordering::Relaxed);
+            self.stats.close_completions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.complete_close();
+    }
+
+    fn publish_remote_close(&self) {
+        if !self.remote_closed.swap(true, Ordering::AcqRel) {
+            if let Ok(mut waker) = self.read_waker.lock() {
+                if let Some(waker) = waker.take() {
+                    waker.wake();
+                }
+            }
+        }
+    }
 }
 
 struct PendingDialGuard {
@@ -170,6 +289,7 @@ impl Drop for PendingDialGuard {
 pub struct Listener {
     accept_rx: mpsc::Receiver<Result<NetstackStream, NetstackError>>,
     cmd_tx: mpsc::Sender<Command>,
+    notify: Arc<Notify>,
     key: (IpAddr, u16),
     close_on_drop: bool,
 }
@@ -197,6 +317,9 @@ impl Drop for Listener {
     fn drop(&mut self) {
         if self.close_on_drop {
             let _ = self.cmd_tx.try_send(Command::CloseTcp { key: self.key });
+            // Channel closure is the durable fallback if the command queue is
+            // full; wake the poll loop so it observes that ownership change.
+            self.notify.notify_one();
         }
     }
 }
@@ -265,6 +388,8 @@ impl UdpListener {
 impl Drop for UdpListener {
     fn drop(&mut self) {
         let _ = self.cmd_tx.try_send(Command::CloseUdp { key: self.key });
+        // recv_tx closure is the durable fallback for a full command queue.
+        self.notify.notify_one();
     }
 }
 
@@ -274,7 +399,9 @@ pub struct NetstackStream {
     rx: mpsc::Receiver<Bytes>,
     tx: PollSender<Bytes>,
     read_buf: Bytes,
-    remote_closed: bool,
+    lifecycle: Arc<ConnectionLifecycle>,
+    shutdown_requested: bool,
+    write_backpressured: bool,
     notify: Arc<Notify>,
     remote_addr: Option<SocketAddr>,
     peer_node_key: Option<NodePublic>,
@@ -284,6 +411,7 @@ impl NetstackStream {
     fn new(
         rx: mpsc::Receiver<Bytes>,
         tx: PollSender<Bytes>,
+        lifecycle: Arc<ConnectionLifecycle>,
         notify: Arc<Notify>,
         remote_addr: Option<SocketAddr>,
         peer_node_key: Option<NodePublic>,
@@ -292,7 +420,9 @@ impl NetstackStream {
             rx,
             tx,
             read_buf: Bytes::new(),
-            remote_closed: false,
+            lifecycle,
+            shutdown_requested: false,
+            write_backpressured: false,
             notify,
             remote_addr,
             peer_node_key,
@@ -325,15 +455,11 @@ impl AsyncRead for NetstackStream {
             self.read_buf = self.read_buf.slice(n..);
             return std::task::Poll::Ready(Ok(()));
         }
-        if self.remote_closed {
+        if self.lifecycle.remote_closed.load(Ordering::Acquire) && self.rx.is_empty() {
             return std::task::Poll::Ready(Ok(()));
         }
         match self.rx.poll_recv(cx) {
             std::task::Poll::Ready(Some(data)) => {
-                if data.is_empty() {
-                    self.remote_closed = true;
-                    return std::task::Poll::Ready(Ok(()));
-                }
                 let n = data.len().min(buf.remaining());
                 buf.put_slice(&data[..n]);
                 if n < data.len() {
@@ -342,11 +468,17 @@ impl AsyncRead for NetstackStream {
                 self.notify.notify_one();
                 std::task::Poll::Ready(Ok(()))
             }
-            std::task::Poll::Ready(None) => {
-                self.remote_closed = true;
-                std::task::Poll::Ready(Ok(()))
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Pending => {
+                if let Ok(mut waker) = self.lifecycle.read_waker.lock() {
+                    *waker = Some(cx.waker().clone());
+                }
+                if self.lifecycle.remote_closed.load(Ordering::Acquire) {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Pending
+                }
             }
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -357,6 +489,12 @@ impl AsyncWrite for NetstackStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.lifecycle.close_requested.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "connection is shutting down",
+            )));
+        }
         if buf.is_empty() {
             return std::task::Poll::Ready(Ok(0));
         }
@@ -367,6 +505,7 @@ impl AsyncWrite for NetstackStream {
             .is_some_and(|s| s.capacity() == s.max_capacity());
         match self.tx.poll_reserve(cx) {
             std::task::Poll::Ready(Ok(())) => {
+                self.write_backpressured = false;
                 let _ = self.tx.send_item(Bytes::copy_from_slice(&buf[..chunk_len]));
                 if was_empty {
                     self.notify.notify_one();
@@ -377,7 +516,10 @@ impl AsyncWrite for NetstackStream {
                 std::io::ErrorKind::ConnectionReset,
                 "connection closed",
             ))),
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Pending => {
+                self.write_backpressured = true;
+                std::task::Poll::Pending
+            }
         }
     }
 
@@ -389,20 +531,38 @@ impl AsyncWrite for NetstackStream {
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if let Some(sender) = self.tx.get_ref() {
-            let _ = sender.try_send(Bytes::new());
+        if !self.shutdown_requested {
+            // A pending write followed directly by shutdown means that write
+            // was canceled at the backpressure boundary. No further owner can
+            // account for the accepted backlog, so retire it instead of
+            // retransmitting it into a later workload. A write that is polled
+            // through to success clears this latch and remains graceful.
+            if self.write_backpressured {
+                self.lifecycle.request_abort();
+            } else {
+                self.lifecycle.request_close();
+            }
+            self.shutdown_requested = true;
         }
+        // Publishing the out-of-band request transfers close ownership to the
+        // poll loop. It remains durable even when the data channel is full.
         std::task::Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for NetstackStream {
     fn drop(&mut self) {
-        if let Some(sender) = self.tx.get_ref() {
-            let _ = sender.try_send(Bytes::new());
+        if self.shutdown_requested {
+            // Preserve a graceful explicit shutdown unless poll_shutdown
+            // already classified a full-channel backlog for abort.
+            self.lifecycle.request_close();
+        } else {
+            // Once the application owner disappears without shutdown there is
+            // nobody left to observe a graceful drain or terminal error.
+            self.lifecycle.request_abort();
         }
     }
 }
@@ -429,6 +589,8 @@ impl Netstack {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let inbound_flows = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let dial_stats = Arc::new(DialStatsInner::default());
+        let connection_stats = Arc::new(ConnectionStatsInner::default());
+        let tcp_ephemeral_start = rand::thread_rng().gen_range(49152..=u16::MAX);
 
         let device =
             LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu, tx_notify.clone());
@@ -439,6 +601,8 @@ impl Netstack {
             notify.clone(),
             inbound_flows.clone(),
             Arc::clone(&dial_stats),
+            Arc::clone(&connection_stats),
+            tcp_ephemeral_start,
         ));
 
         Ok(Self {
@@ -451,6 +615,7 @@ impl Netstack {
             tx_notify,
             next_dial_id: AtomicU64::new(1),
             dial_stats,
+            connection_stats,
         })
     }
 
@@ -501,6 +666,15 @@ impl Netstack {
         self.tx_queue.lock().is_ok_and(|queue| !queue.is_empty())
     }
 
+    /// Current plaintext data-plane queue depths for bounded runtime
+    /// diagnostics. Values are instantaneous and must not be used for flow
+    /// control.
+    pub fn data_plane_queue_depths(&self) -> (usize, usize) {
+        let rx = self.rx_queue.lock().map_or(0, |queue| queue.len());
+        let tx = self.tx_queue.lock().map_or(0, |queue| queue.len());
+        (rx, tx)
+    }
+
     #[cfg(test)]
     pub(crate) fn push_tx_for_test(&self, packet: Vec<u8>) {
         self.tx_queue
@@ -525,6 +699,7 @@ impl Netstack {
         Ok(Listener {
             accept_rx,
             cmd_tx: self.cmd_tx.clone(),
+            notify: Arc::clone(&self.notify),
             key: (IpAddr::V4(self.addr), port),
             close_on_drop: true,
         })
@@ -548,6 +723,7 @@ impl Netstack {
         Ok(Listener {
             accept_rx,
             cmd_tx: self.cmd_tx.clone(),
+            notify: Arc::clone(&self.notify),
             key: (addr, port),
             close_on_drop: true,
         })
@@ -595,11 +771,121 @@ impl Netstack {
         result
     }
 
-    /// Return current pending-dial socket and buffer ownership counts.
+    /// Dial `requested` streams to one resolved address with bounded admission.
+    ///
+    /// At most [`TCP_DIAL_WINDOW`] handshakes are in flight. Results retain
+    /// request order. The operation is atomic: a failure or `deadline` drops
+    /// completed streams and cancels every pending dial.
+    pub async fn dial_many(
+        &self,
+        remote: SocketAddr,
+        requested: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<NetstackStream>, NetstackError> {
+        if requested == 0 {
+            return Ok(Vec::new());
+        }
+
+        type DialFuture<'a> = BoxFuture<'a, (usize, Result<NetstackStream, NetstackError>)>;
+        let mut pending = futures_util::stream::FuturesUnordered::<DialFuture<'_>>::new();
+        let mut next = 0;
+        while next < requested && pending.len() < TCP_DIAL_WINDOW {
+            let index = next;
+            pending.push(async move { (index, self.dial(remote).await) }.boxed());
+            next += 1;
+        }
+
+        let mut established = 0;
+        let mut ordered: Vec<Option<NetstackStream>> =
+            std::iter::repeat_with(|| None).take(requested).collect();
+        while !pending.is_empty() {
+            let completed = match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(Some(completed)) => completed,
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(NetstackError::DialCapacity {
+                        established,
+                        requested,
+                        source: Box::new(NetstackError::DialFailed(
+                            "common setup deadline exceeded".into(),
+                        )),
+                    });
+                }
+            };
+            let (index, stream) = completed;
+            match stream {
+                Ok(stream) => {
+                    ordered[index] = Some(stream);
+                    established += 1;
+                }
+                Err(source) => {
+                    return Err(NetstackError::DialCapacity {
+                        established,
+                        requested,
+                        source: Box::new(source),
+                    });
+                }
+            }
+            if next < requested {
+                let index = next;
+                pending.push(async move { (index, self.dial(remote).await) }.boxed());
+                next += 1;
+            }
+        }
+
+        Ok(ordered
+            .into_iter()
+            .map(|stream| stream.expect("every bounded dial completed"))
+            .collect())
+    }
+
+    /// Wait until the poll loop has reclaimed every canceled dial visible
+    /// before this call.
+    ///
+    /// This is an ownership barrier, not an eventual-idle wait: live dials
+    /// remain live, while dropped callers and closed reply channels are
+    /// removed before the acknowledgement is published.
+    pub async fn reclaim_pending_dials(&self) -> Result<(), NetstackError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ReclaimPendingDials { reply: reply_tx })
+            .await
+            .map_err(|_| NetstackError::ShuttingDown)?;
+        reply_rx.await.map_err(|_| NetstackError::ShuttingDown)
+    }
+
+    /// Return a coherent pending-dial socket and buffer ownership snapshot.
+    /// Successful and failed dial replies are published only after the poll
+    /// loop has removed that dial's socket and released its port ownership.
     pub fn dial_stats(&self) -> DialStats {
+        let pending_dials = self.dial_stats.pending_dials.load(Ordering::Acquire);
         DialStats {
-            pending_dials: self.dial_stats.pending_dials.load(Ordering::Acquire),
-            pending_buffer_bytes: self.dial_stats.pending_buffer_bytes.load(Ordering::Acquire),
+            pending_dials,
+            pending_buffer_bytes: pending_dials.saturating_mul(TCP_BUF.saturating_mul(2)),
+        }
+    }
+
+    /// Return established-connection close ownership counters.
+    pub fn connection_stats(&self) -> ConnectionStats {
+        ConnectionStats {
+            live_connections: self
+                .connection_stats
+                .live_connections
+                .load(Ordering::Acquire),
+            allocated_tcp_ports: self
+                .connection_stats
+                .allocated_tcp_ports
+                .load(Ordering::Acquire),
+            pending_closes: self.connection_stats.pending_closes.load(Ordering::Acquire),
+            close_requests: self.connection_stats.close_requests.load(Ordering::Acquire),
+            close_completions: self
+                .connection_stats
+                .close_completions
+                .load(Ordering::Acquire),
+            duplicate_close_requests: self
+                .connection_stats
+                .duplicate_close_requests
+                .load(Ordering::Acquire),
         }
     }
 
@@ -676,6 +962,9 @@ enum Command {
     CancelDial {
         id: u64,
     },
+    ReclaimPendingDials {
+        reply: oneshot::Sender<()>,
+    },
     ListenPacket {
         addr: IpAddr,
         port: u16,
@@ -694,6 +983,9 @@ struct ConnState {
     app_tx: mpsc::Sender<Bytes>,
     app_rx: mpsc::Receiver<Bytes>,
     pending_write: Vec<u8>,
+    lifecycle: Arc<ConnectionLifecycle>,
+    /// Client-side ephemeral port owned until this socket is removed.
+    local_port: Option<u16>,
 }
 
 /// A TCP listener's socket backlog + accept channel sender.
@@ -713,6 +1005,7 @@ struct PendingDial {
     id: u64,
     reply: oneshot::Sender<Result<NetstackStream, NetstackError>>,
     remote: SocketAddr,
+    local_port: u16,
     deadline: tokio::time::Instant,
 }
 
@@ -775,17 +1068,26 @@ fn allocate_ephemeral_udp_port(allocated: &HashSet<u16>) -> u16 {
     }
 }
 
-/// Simple monotonic ephemeral port allocator.
-fn ephemeral_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(49152);
-    let p = NEXT.fetch_add(1, Ordering::Relaxed);
-    if p < 49152 {
-        NEXT.store(49152, Ordering::Relaxed);
-        49152
-    } else {
-        p
+/// Allocate a client TCP port without colliding with any pending or
+/// established outbound socket. Each netstack starts at a random offset so a
+/// restarted embedded process does not immediately reuse the prior process's
+/// live/TIME_WAIT four-tuples on a long-lived peer.
+fn allocate_ephemeral_tcp_port(
+    allocated: &mut HashSet<u16>,
+    next: &mut u16,
+) -> Result<u16, NetstackError> {
+    const MIN: u16 = 49152;
+    const COUNT: usize = 16_384;
+    for _ in 0..COUNT {
+        let port = *next;
+        *next = if port == u16::MAX { MIN } else { port + 1 };
+        if allocated.insert(port) {
+            return Ok(port);
+        }
     }
+    Err(NetstackError::DialFailed(
+        "ephemeral TCP port range exhausted".into(),
+    ))
 }
 
 /// Convert an Ipv4Addr to a smoltcp IpAddress.
@@ -802,17 +1104,39 @@ fn to_smoltcp_v4(addr: Ipv4Addr) -> IpAddress {
 /// Returns (stream, ConnState).
 fn make_stream_and_conn(
     notify: Arc<Notify>,
+    stats: Arc<ConnectionStatsInner>,
     remote_addr: Option<SocketAddr>,
     peer_node_key: Option<NodePublic>,
+    local_port: Option<u16>,
 ) -> (NetstackStream, ConnState) {
     let (app_tx, stream_rx) = mpsc::channel(64);
     let (stream_tx, app_rx) = mpsc::channel(64);
     let poll_sender = PollSender::new(stream_tx);
-    let stream = NetstackStream::new(stream_rx, poll_sender, notify, remote_addr, peer_node_key);
+    let lifecycle = Arc::new(ConnectionLifecycle {
+        close_requested: std::sync::atomic::AtomicBool::new(false),
+        abort_requested: std::sync::atomic::AtomicBool::new(false),
+        close_completed: std::sync::atomic::AtomicBool::new(false),
+        retired: std::sync::atomic::AtomicBool::new(false),
+        remote_closed: std::sync::atomic::AtomicBool::new(false),
+        read_waker: std::sync::Mutex::new(None),
+        notify: Arc::clone(&notify),
+        stats: Arc::clone(&stats),
+    });
+    stats.live_connections.fetch_add(1, Ordering::Relaxed);
+    let stream = NetstackStream::new(
+        stream_rx,
+        poll_sender,
+        Arc::clone(&lifecycle),
+        notify,
+        remote_addr,
+        peer_node_key,
+    );
     let conn = ConnState {
         app_tx,
         app_rx,
         pending_write: Vec::new(),
+        lifecycle,
+        local_port,
     };
     (stream, conn)
 }
@@ -825,6 +1149,8 @@ async fn poll_loop(
     notify: Arc<Notify>,
     inbound_flows: Arc<std::sync::Mutex<HashMap<TcpFlow, NodePublic>>>,
     dial_stats: Arc<DialStatsInner>,
+    connection_stats: Arc<ConnectionStatsInner>,
+    mut next_tcp_port: u16,
 ) {
     let start = std::time::Instant::now();
     let smol_now = || SmolInstant::from_millis(start.elapsed().as_millis() as i64);
@@ -841,6 +1167,11 @@ async fn poll_loop(
     let mut sockets: SocketSet<'static> = SocketSet::new(vec![]);
     let mut conns: HashMap<SocketHandle, ConnState> = HashMap::new();
     let mut pending_dials: HashMap<SocketHandle, PendingDial> = HashMap::new();
+    // Reclaim acknowledgements are deferred until after the pending-dial pass
+    // in the same iteration. Replying in the command arm would only prove
+    // command receipt, racing closed-reply reclamation below.
+    let mut dial_reclaim_waiters: Vec<oneshot::Sender<()>> = Vec::new();
+    let mut tcp_allocated_ports: HashSet<u16> = HashSet::new();
     // (ip, port) -> (listener_socket_handle, accept_sender)
     let mut listeners: HashMap<(IpAddr, u16), ListenerEntry> = HashMap::new();
     // UDP listener state: (ip, port) -> UdpSocketState
@@ -888,11 +1219,15 @@ async fn poll_loop(
                                 &mut iface,
                                 &mut sockets,
                                 &mut pending_dials,
+                                &mut tcp_allocated_ports,
+                                &mut next_tcp_port,
                                 addr,
                                 id,
                                 remote,
                                 reply,
                             );
+                            publish_dial_stats(&dial_stats, &pending_dials);
+                            publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                         }
                     }
                     Some(Command::CancelDial { id }) => {
@@ -900,9 +1235,16 @@ async fn poll_loop(
                             .iter()
                             .find_map(|(handle, pending)| (pending.id == id).then_some(*handle))
                         {
-                            pending_dials.remove(&handle);
+                            if let Some(pending) = pending_dials.remove(&handle) {
+                                tcp_allocated_ports.remove(&pending.local_port);
+                            }
                             let _ = sockets.remove(handle);
+                            publish_dial_stats(&dial_stats, &pending_dials);
+                            publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                         }
+                    }
+                    Some(Command::ReclaimPendingDials { reply }) => {
+                        dial_reclaim_waiters.push(reply);
                     }
                     Some(Command::ListenPacket { addr: bind_addr, port, reply }) => {
                         let result = do_listen_packet(
@@ -1003,8 +1345,13 @@ async fn poll_loop(
                             local: SocketAddr::new(listen_ip, port),
                         })
                     });
-                    let (stream, conn) =
-                        make_stream_and_conn(notify.clone(), remote_addr, peer_node_key);
+                    let (stream, conn) = make_stream_and_conn(
+                        notify.clone(),
+                        Arc::clone(&connection_stats),
+                        remote_addr,
+                        peer_node_key,
+                        None,
+                    );
                     conns.insert(conn_handle, conn);
 
                     if let Some(entry) = listeners.get(&key) {
@@ -1045,8 +1392,12 @@ async fn poll_loop(
                 .get(&handle)
                 .is_some_and(|pending| pending.reply.is_closed())
             {
-                pending_dials.remove(&handle);
+                if let Some(pending) = pending_dials.remove(&handle) {
+                    tcp_allocated_ports.remove(&pending.local_port);
+                }
                 let _ = sockets.remove(handle);
+                publish_dial_stats(&dial_stats, &pending_dials);
+                publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                 continue;
             }
             if pending_dials
@@ -1054,44 +1405,67 @@ async fn poll_loop(
                 .is_some_and(|pending| tokio::time::Instant::now() >= pending.deadline)
             {
                 if let Some(pending) = pending_dials.remove(&handle) {
+                    tcp_allocated_ports.remove(&pending.local_port);
+                    // Remove the physical socket before publishing or waking
+                    // the caller. The reply is an ownership acknowledgement,
+                    // not merely a map/accounting acknowledgement.
+                    let _ = sockets.remove(handle);
+                    publish_dial_stats(&dial_stats, &pending_dials);
+                    publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                     let _ = pending.reply.send(Err(NetstackError::DialFailed(
                         "dial deadline exceeded".into(),
                     )));
                 }
-                let _ = sockets.remove(handle);
                 continue;
             }
             let state = sockets.get::<tcp::Socket>(handle).state();
             match state {
                 State::Established => {
                     if let Some(pd) = pending_dials.remove(&handle) {
-                        let (stream, conn) =
-                            make_stream_and_conn(notify.clone(), Some(pd.remote), None);
+                        let local_port = pd.local_port;
+                        let (stream, conn) = make_stream_and_conn(
+                            notify.clone(),
+                            Arc::clone(&connection_stats),
+                            Some(pd.remote),
+                            None,
+                            Some(local_port),
+                        );
                         conns.insert(handle, conn);
+                        // A returned stream must never race stale pending-dial
+                        // accounting from its own socket.
+                        publish_dial_stats(&dial_stats, &pending_dials);
                         if pd.reply.send(Ok(stream)).is_err() {
-                            conns.remove(&handle);
+                            if let Some(conn) = conns.remove(&handle) {
+                                conn.lifecycle.retire();
+                                conn.lifecycle
+                                    .stats
+                                    .live_connections
+                                    .fetch_sub(1, Ordering::Relaxed);
+                            }
+                            tcp_allocated_ports.remove(&local_port);
                             let _ = sockets.remove(handle);
+                            publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                         }
                     }
                 }
                 State::Closed | State::TimeWait => {
                     if let Some(pd) = pending_dials.remove(&handle) {
+                        tcp_allocated_ports.remove(&pd.local_port);
+                        // As with deadlines, a refused-dial reply is only
+                        // observable after its socket and port are gone.
+                        let _ = sockets.remove(handle);
+                        publish_dial_stats(&dial_stats, &pending_dials);
+                        publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
                         let _ = pd.reply.send(Err(NetstackError::ConnectionRefused));
                     }
-                    let _ = sockets.remove(handle);
                 }
                 _ => {}
             }
         }
-        dial_stats
-            .pending_dials
-            .store(pending_dials.len(), Ordering::Release);
-        dial_stats.pending_buffer_bytes.store(
-            pending_dials
-                .len()
-                .saturating_mul(TCP_BUF.saturating_mul(2)),
-            Ordering::Release,
-        );
+        publish_dial_stats(&dial_stats, &pending_dials);
+        for waiter in dial_reclaim_waiters.drain(..) {
+            let _ = waiter.send(());
+        }
 
         // Pass 3: pump data for established connections.
         let conn_handles: Vec<SocketHandle> = conns.keys().copied().collect();
@@ -1114,10 +1488,30 @@ async fn poll_loop(
         }
 
         // Pass 5: clean up closed connections.
-        cleanup_closed(&mut sockets, &mut conns, &mut listeners);
+        cleanup_closed(
+            &mut sockets,
+            &mut conns,
+            &mut listeners,
+            &mut tcp_allocated_ports,
+        );
+        publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
     }
     dial_stats.pending_dials.store(0, Ordering::Release);
-    dial_stats.pending_buffer_bytes.store(0, Ordering::Release);
+    connection_stats
+        .allocated_tcp_ports
+        .store(0, Ordering::Release);
+}
+
+fn publish_dial_stats(stats: &DialStatsInner, pending_dials: &HashMap<SocketHandle, PendingDial>) {
+    stats
+        .pending_dials
+        .store(pending_dials.len(), Ordering::Release);
+}
+
+fn publish_tcp_port_stats(stats: &ConnectionStatsInner, allocated_ports: &HashSet<u16>) {
+    stats
+        .allocated_tcp_ports
+        .store(allocated_ports.len(), Ordering::Release);
 }
 
 /// Create a listening socket for `addr:port`.
@@ -1181,15 +1575,13 @@ fn do_dial(
     iface: &mut Interface,
     sockets: &mut SocketSet<'static>,
     pending_dials: &mut HashMap<SocketHandle, PendingDial>,
+    allocated_ports: &mut HashSet<u16>,
+    next_port: &mut u16,
     local_addr: Ipv4Addr,
     id: u64,
     remote: SocketAddr,
     reply: oneshot::Sender<Result<NetstackStream, NetstackError>>,
 ) {
-    let mut socket = new_tcp_socket();
-    let local_port = ephemeral_port();
-    let local_ep = IpListenEndpoint::from((to_smoltcp_v4(local_addr), local_port));
-
     let remote_ip = match remote.ip() {
         IpAddr::V4(v4) => to_smoltcp_v4(v4),
         IpAddr::V6(_) => {
@@ -1197,10 +1589,20 @@ fn do_dial(
             return;
         }
     };
+    let local_port = match allocate_ephemeral_tcp_port(allocated_ports, next_port) {
+        Ok(port) => port,
+        Err(error) => {
+            let _ = reply.send(Err(error));
+            return;
+        }
+    };
+    let mut socket = new_tcp_socket();
+    let local_ep = IpListenEndpoint::from((to_smoltcp_v4(local_addr), local_port));
     let remote_ep = IpEndpoint::new(remote_ip, remote.port());
 
     let cx = iface.context();
     if let Err(e) = socket.connect(cx, remote_ep, local_ep) {
+        allocated_ports.remove(&local_port);
         let _ = reply.send(Err(NetstackError::DialFailed(format!("{e:?}"))));
         return;
     }
@@ -1211,6 +1613,7 @@ fn do_dial(
             id,
             reply,
             remote,
+            local_port,
             deadline: tokio::time::Instant::now() + TCP_DIAL_TIMEOUT,
         },
     );
@@ -1392,7 +1795,7 @@ fn pump_connection(
     let may_recv = socket.may_recv();
     if !may_recv && !can_recv {
         if let Some(conn) = conns.get(&handle) {
-            let _ = conn.app_tx.try_send(Bytes::new());
+            conn.lifecycle.publish_remote_close();
         }
     }
 
@@ -1404,8 +1807,15 @@ fn pump_connection(
     // backpressure up the mpsc chain — the bounded app_rx fills, which
     // makes `NetstackStream::poll_write` return Pending to the app.
     let can_send = sockets.get::<tcp::Socket>(handle).can_send();
-    if can_send {
-        if let Some(conn) = conns.get_mut(&handle) {
+    if let Some(conn) = conns.get_mut(&handle) {
+        if conn.lifecycle.abort_requested.load(Ordering::Acquire) {
+            conn.pending_write.clear();
+            while conn.app_rx.try_recv().is_ok() {}
+            sockets.get_mut::<tcp::Socket>(handle).abort();
+            return true;
+        }
+
+        if can_send {
             // 1. Flush a previously-stored unwritten tail.
             if !conn.pending_write.is_empty() {
                 let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -1421,14 +1831,10 @@ fn pump_connection(
                 }
             }
 
-            // 2. Drain newly-arrived app data.
+            // 2. Drain newly-arrived app data. Close ownership is out of band:
+            // a full channel cannot discard shutdown, while data accepted
+            // before shutdown remains ordered ahead of the FIN.
             while let Ok(data) = conn.app_rx.try_recv() {
-                if data.is_empty() {
-                    // App signaled close.
-                    let socket = sockets.get_mut::<tcp::Socket>(handle);
-                    socket.close();
-                    break;
-                }
                 let socket = sockets.get_mut::<tcp::Socket>(handle);
                 let written = socket.send_slice(&data).unwrap_or(0);
                 if written > 0 {
@@ -1442,6 +1848,19 @@ fn pump_connection(
                 }
             }
         }
+
+        // A peer can make the socket non-sendable while a local shutdown is
+        // pending. Once all application bytes already accepted by this stream
+        // are drained, closing must not wait for `can_send` to become true.
+        if conn.pending_write.is_empty()
+            && conn.app_rx.is_empty()
+            && conn.lifecycle.close_requested.load(Ordering::Acquire)
+        {
+            sockets.get_mut::<tcp::Socket>(handle).close();
+            // Completion belongs to cleanup_closed after a terminal socket
+            // state; poll_shutdown already transferred durable ownership.
+            did_work = true;
+        }
     }
     did_work
 }
@@ -1451,6 +1870,7 @@ fn cleanup_closed(
     sockets: &mut SocketSet<'static>,
     conns: &mut HashMap<SocketHandle, ConnState>,
     listeners: &mut HashMap<(IpAddr, u16), ListenerEntry>,
+    tcp_allocated_ports: &mut HashSet<u16>,
 ) {
     // Connections.
     let dead: Vec<SocketHandle> = conns
@@ -1462,7 +1882,16 @@ fn cleanup_closed(
         .copied()
         .collect();
     for h in dead {
-        conns.remove(&h);
+        if let Some(conn) = conns.remove(&h) {
+            conn.lifecycle.retire();
+            conn.lifecycle
+                .stats
+                .live_connections
+                .fetch_sub(1, Ordering::Relaxed);
+            if let Some(port) = conn.local_port {
+                tcp_allocated_ports.remove(&port);
+            }
+        }
         let _ = sockets.remove(h);
     }
 

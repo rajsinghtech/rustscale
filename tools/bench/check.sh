@@ -29,7 +29,19 @@ expect_status() {
 }
 
 cd "$ROOT"
-run bash -n tools/bench/gcp/lib.sh tools/bench/gcp/run-config.sh tools/bench/gcp/run-matrix.sh tools/bench/check.sh
+run bash -n tools/bench/gcp/lib.sh tools/bench/gcp/run-config.sh tools/bench/gcp/run-matrix.sh tools/bench/check.sh tools/bench/run-native-baseline.sh tools/bench/run-tailscaled.sh
+run bash -c 'test -z "$(gofmt -l tools/bench/go-tsnet/*.go)"'
+run bash -c 'cd tools/bench/go-tsnet && go mod verify && go test ./... && go vet ./...'
+run grep -Fx 'require tailscale.com v1.100.0' tools/bench/go-tsnet/go.mod
+run grep -Fx 'tailscale.com v1.100.0 h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=' tools/bench/go-tsnet/go.sum
+run grep -Fq "GO_TOOLCHAIN_ARCHIVE_SHA256 = \"1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f\"" tools/bench/gcp/provenance.py
+run grep -Fq "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f  /tmp/go1.26.4.linux-amd64.tar.gz" tools/bench/gcp/lib.sh
+run grep -Fq 'fixed 1 MiB TCP send and' docs/benchmarks.md
+run grep -Fq 'matching the pinned gVisor send and receive' docs/benchmarks.md
+run grep -Fq 'const TCP_BUF: usize = 1024 * 1024;' crates/netstack/src/lib.rs
+run grep -Fq 'PARALLELS=(1 10 100 500 1000)' tools/bench/run-native-baseline.sh
+run grep -Fq 'bench_mint_authkey true' tools/bench/run-native-baseline.sh
+run tools/bench/run-native-baseline.sh --self-test
 run tools/bench/gcp/run-config.sh --self-test
 run tools/bench/gcp/run-matrix.sh --self-test
 # GCP_MACHINE is an input to immutable provenance, so supported overrides must
@@ -50,14 +62,14 @@ import json, pathlib, sys
 root = next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json")).parent
 m = json.load(open(root / "matrix.json"))
 assert (m["topologies"], m["paths"], m["configs"]) == (
-    ["same-zone"], ["direct"], ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"])
-assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 4
-assert m["schema_version"] == 3 and m["selection"]["preset"] == "normal-v1" and m["load"]["preset"] == "routine-v1" and root.name == m["run"]["id"]
+    ["same-zone"], ["direct"], ["rs-userspace", "rs-tun", "ts-embedded", "ts-userspace", "ts-tun"])
+assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 5
+assert m["schema_version"] == 4 and m["selection"]["preset"] == "normal-v1" and m["load"]["preset"] == "routine-v1" and root.name == m["run"]["id"]
 assert m["run"]["cloud"]["requested_machine_type"] == "n1-standard-4"
 assert m["run"]["runtime"] == {"rs_tun_inbound_pipeline": False, "rs_tun_outbound_send_pipeline": False, "linux_udp_batch": True, "linux_udp_gro": True, "linux_udp_gso": True}
 for cell in (root / "same-zone" / "direct").glob("*.json"):
     r = json.load(open(cell))
-    assert r["schema_version"] == 5 and r["run"] == m["run"] and r["observed"]["resolved_image"] == "dry-run"
+    assert r["schema_version"] == 6 and r["run"] == m["run"] and r["observed"]["resolved_image"] == "dry-run"
 PYEOF
 run env GCP_MACHINE=n2-standard-4 MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/machine-n2" tools/bench/gcp/run-matrix.sh --dry-run --config rs-tun
 run python3 - "$tmp/machine-n2" <<'PYEOF'
@@ -127,15 +139,15 @@ expect_status 2 env RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GSO=1 tools/bench/gcp/run-
 expect_status 2 env RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GRO=1 tools/bench/gcp/run-matrix.sh --dry-run
 expect_status 2 env RS_LINUX_UDP_BATCH=0 RS_LINUX_UDP_GRO=1 tools/bench/gcp/run-config.sh --self-test
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/scale" tools/bench/gcp/run-matrix.sh --dry-run \
-  --config rs-userspace,rs-tun,ts-userspace,ts-tun --scale-streams --duration 20 --peer-count 250
+  --config rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun --scale-streams --duration 20 --peer-count 250
 run python3 - "$tmp/scale" <<'PYEOF'
 import json, pathlib, sys
 root = next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json")).parent
 m = json.load(open(root / "matrix.json"))
-assert m["parallelism"] == [1,2,4,8,16,32,64,100,200,500,1000]
+assert m["parallelism"] == [1,10,100,500,1000]
 assert m["duration_s"] == 20 and m["sample_cadence_s"] == 1
 assert m["peer_count_requested"] == 250
-assert m["configs"] == ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"]
+assert m["configs"] == ["rs-userspace", "rs-tun", "ts-embedded", "ts-userspace", "ts-tun"]
 for cell in (root / "same-zone" / "direct").glob("*.json"):
     r = json.load(open(cell))
     assert r["parallelism_requested"] == m["parallelism"]
@@ -167,8 +179,8 @@ run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/full" tools/bench/gcp/run
 run python3 - "$tmp/full" <<'PYEOF'
 import json, pathlib, sys
 m = json.load(open(next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json"))))
-assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 16
-assert m["schema_version"] == 3 and m["selection"]["preset"] == "full-v1"
+assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 20
+assert m["schema_version"] == 4 and m["selection"]["preset"] == "full-v1"
 PYEOF
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/focused-filter" tools/bench/gcp/run-matrix.sh --dry-run --topology cross-region --path derp --config rs-userspace
 run env MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/full-filter" tools/bench/gcp/run-matrix.sh --full --dry-run --topology same-zone --path direct --config ts-tun

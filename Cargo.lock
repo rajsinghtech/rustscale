@@ -3458,6 +3458,7 @@ version = "0.1.4"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-util",
  "hex",
  "if-addrs",
  "libc",
@@ -3565,6 +3566,8 @@ name = "rustscale-netstack"
 version = "0.1.4"
 dependencies = [
  "bytes",
+ "futures-util",
+ "rand 0.8.7",
  "rustscale-key",
  "rustscale-packet",
  "rustscale-wg",

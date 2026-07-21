@@ -313,6 +313,128 @@ pub const WG_RECEIVE_BATCH_MAX_PACKETS: usize = 128;
 /// transports batches.
 const WG_RECEIVE_PACKET_CAPACITY: usize = 256;
 
+/// Process-local Linux handoff diagnostics. They are deliberately bounded and
+/// credential-free so benchmark failure artifacts can retain the first
+/// backpressure point without copying general process logs.
+#[cfg(target_os = "linux")]
+struct WgHandoffStats {
+    batches: AtomicU64,
+    packets: AtomicU64,
+    credit_wait_events: AtomicU64,
+    credit_wait_ns: AtomicU64,
+    pool_wait_events: AtomicU64,
+    pool_wait_ns: AtomicU64,
+    receive_to_publish_ns: AtomicU64,
+    receive_to_publish_max_ns: AtomicU64,
+    channel_high_water: AtomicU64,
+    pool_high_water: AtomicU64,
+    next_snapshot_packets: AtomicU64,
+}
+
+#[cfg(target_os = "linux")]
+static WG_HANDOFF_STATS: WgHandoffStats = WgHandoffStats {
+    batches: AtomicU64::new(0),
+    packets: AtomicU64::new(0),
+    credit_wait_events: AtomicU64::new(0),
+    credit_wait_ns: AtomicU64::new(0),
+    pool_wait_events: AtomicU64::new(0),
+    pool_wait_ns: AtomicU64::new(0),
+    receive_to_publish_ns: AtomicU64::new(0),
+    receive_to_publish_max_ns: AtomicU64::new(0),
+    channel_high_water: AtomicU64::new(0),
+    pool_high_water: AtomicU64::new(0),
+    next_snapshot_packets: AtomicU64::new(WG_RECEIVE_PACKET_CAPACITY as u64),
+};
+
+#[cfg(target_os = "linux")]
+impl WgHandoffStats {
+    fn duration_ns(duration: Duration) -> u64 {
+        u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn update_max(target: &AtomicU64, value: u64) {
+        let _ = target.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (value > current).then_some(value)
+        });
+    }
+
+    fn note_credit_wait(&self, elapsed: Duration) {
+        let events = self
+            .credit_wait_events
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.credit_wait_ns
+            .fetch_add(Self::duration_ns(elapsed), Ordering::Relaxed);
+        if events.is_power_of_two() {
+            self.emit("credit_wait");
+        }
+    }
+
+    fn note_pool_wait(&self, elapsed: Duration) {
+        let events = self
+            .pool_wait_events
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.pool_wait_ns
+            .fetch_add(Self::duration_ns(elapsed), Ordering::Relaxed);
+        if events.is_power_of_two() {
+            self.emit("pool_wait");
+        }
+    }
+
+    fn note_publication(
+        &self,
+        packets: usize,
+        received_at: std::time::Instant,
+        channel_in_use: usize,
+        pool_in_use: usize,
+    ) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        let total = self
+            .packets
+            .fetch_add(packets as u64, Ordering::Relaxed)
+            .saturating_add(packets as u64);
+        let age = Self::duration_ns(received_at.elapsed());
+        self.receive_to_publish_ns.fetch_add(age, Ordering::Relaxed);
+        Self::update_max(&self.receive_to_publish_max_ns, age);
+        Self::update_max(&self.channel_high_water, channel_in_use as u64);
+        Self::update_max(&self.pool_high_water, pool_in_use as u64);
+        loop {
+            let next = self.next_snapshot_packets.load(Ordering::Relaxed);
+            if next == 0 || total < next {
+                break;
+            }
+            let following = next.checked_mul(2).unwrap_or(0);
+            if self
+                .next_snapshot_packets
+                .compare_exchange_weak(next, following, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.emit("periodic");
+                break;
+            }
+        }
+    }
+
+    fn emit(&self, event: &str) {
+        eprintln!(
+            "rustscale: wg_handoff_stats event={event} batches={} packets={} credit_wait_events={} credit_wait_ns={} pool_wait_events={} pool_wait_ns={} receive_to_publish_ns={} receive_to_publish_max_ns={} channel_high_water={} channel_capacity={} pool_high_water={} pool_capacity={}",
+            self.batches.load(Ordering::Relaxed),
+            self.packets.load(Ordering::Relaxed),
+            self.credit_wait_events.load(Ordering::Relaxed),
+            self.credit_wait_ns.load(Ordering::Relaxed),
+            self.pool_wait_events.load(Ordering::Relaxed),
+            self.pool_wait_ns.load(Ordering::Relaxed),
+            self.receive_to_publish_ns.load(Ordering::Relaxed),
+            self.receive_to_publish_max_ns.load(Ordering::Relaxed),
+            self.channel_high_water.load(Ordering::Relaxed),
+            WG_RECEIVE_PACKET_CAPACITY,
+            self.pool_high_water.load(Ordering::Relaxed),
+            udp_batch::RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY,
+        );
+    }
+}
+
 /// Publish an owned receive batch. The permit is stored in the item until the
 /// consumer takes or drops it, so cancellation and closed-channel paths return
 /// packet credits without bespoke cleanup.
@@ -490,7 +612,8 @@ fn detach_linux_wg_datagrams(
                     pool_reservation.clone(),
                     identified.generations[index]
                         .expect("only authorized packets reserve and detach storage"),
-                ),
+                )
+                .received_via(WgTransportEvidence::Direct(addr)),
             });
         } else if let Some((node, destination, packets, bytes)) = physical_run.take() {
             record_phys_rx(node, destination, packets, bytes);
@@ -686,6 +809,14 @@ pub struct MagicsockConfig {
 pub struct WgCiphertext {
     storage: WgCiphertextStorage,
     authorization_generation: u64,
+    transport: Option<WgTransportEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WgTransportEvidence {
+    Direct(SocketAddr),
+    Derp(i32),
+    Relay(SocketAddr),
 }
 
 enum WgCiphertextStorage {
@@ -713,14 +844,27 @@ struct PoolInventoryReservation {
 
 #[cfg(any(target_os = "linux", test))]
 impl PoolInventoryReservation {
-    async fn acquire(inventory: Arc<Semaphore>, count: usize) -> Option<Arc<Self>> {
+    /// Reserve detachable fixed-buffer inventory and report whether capacity
+    /// backpressure delayed admission. The receive path consumes this result
+    /// directly so its diagnostics and ownership boundary cannot diverge.
+    async fn acquire_measured(
+        inventory: Arc<Semaphore>,
+        count: usize,
+    ) -> Option<(Arc<Self>, bool, Duration)> {
         let count = u32::try_from(count).expect("pool reservation count fits u32");
-        let permit = match inventory.clone().try_acquire_many_owned(count) {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => inventory.acquire_many_owned(count).await.ok()?,
+        let started = std::time::Instant::now();
+        let (permit, waited) = match inventory.clone().try_acquire_many_owned(count) {
+            Ok(permit) => (permit, false),
+            Err(TryAcquireError::NoPermits) => {
+                (inventory.acquire_many_owned(count).await.ok()?, true)
+            }
             Err(TryAcquireError::Closed) => return None,
         };
-        Some(Arc::new(Self { _permit: permit }))
+        Some((
+            Arc::new(Self { _permit: permit }),
+            waited,
+            started.elapsed(),
+        ))
     }
 }
 
@@ -734,6 +878,7 @@ impl WgCiphertext {
         Self {
             storage: WgCiphertextStorage::Vec { bytes, range },
             authorization_generation: 0,
+            transport: None,
         }
     }
 
@@ -749,11 +894,17 @@ impl WgCiphertext {
                 _pool_reservation: pool_reservation,
             },
             authorization_generation,
+            transport: None,
         }
     }
 
     fn authorized(mut self, generation: u64) -> Self {
         self.authorization_generation = generation;
+        self
+    }
+
+    fn received_via(mut self, transport: WgTransportEvidence) -> Self {
+        self.transport = Some(transport);
         self
     }
 
@@ -764,11 +915,17 @@ impl WgCiphertext {
         match &self.storage {
             WgCiphertextStorage::Vec { bytes, range } => Some(
                 Self::from_vec_range(bytes.clone(), range.clone())
-                    .authorized(self.authorization_generation),
+                    .authorized(self.authorization_generation)
+                    .with_optional_transport(self.transport),
             ),
             #[cfg(target_os = "linux")]
             WgCiphertextStorage::Pooled { .. } => None,
         }
+    }
+
+    fn with_optional_transport(mut self, transport: Option<WgTransportEvidence>) -> Self {
+        self.transport = transport;
+        self
     }
 }
 
@@ -2301,6 +2458,32 @@ impl Magicsock {
         self.inner.peer_authorization.is_current(peer, generation)
     }
 
+    /// Publish path activity only after WireGuard authenticated this exact
+    /// ciphertext. Reverse address maps alone are not transport evidence.
+    pub fn note_authenticated_wg_transport(&self, datagram: &WgDatagram) {
+        if !self.is_authorization_current(&datagram.peer, datagram.authorization_generation()) {
+            return;
+        }
+        let Some(transport) = datagram.data.transport else {
+            return;
+        };
+        let mut endpoints = self
+            .inner
+            .endpoints
+            .write()
+            .expect("endpoints lock poisoned");
+        let Some(endpoint) = endpoints.get_mut(&datagram.peer) else {
+            return;
+        };
+        match transport {
+            WgTransportEvidence::Direct(addr) => {
+                endpoint.confirm_direct(addr, std::time::Instant::now());
+            }
+            WgTransportEvidence::Derp(region) => endpoint.note_derp_transport(region, true),
+            WgTransportEvidence::Relay(addr) => endpoint.note_relay_transport(addr, true),
+        }
+    }
+
     /// Acquire the delivery side of the map-commit barrier. Revalidate while
     /// this guard is held, then keep it through the final plaintext handoff.
     pub async fn authorization_delivery_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
@@ -3210,20 +3393,24 @@ impl Magicsock {
             return Err(MagicsockError::NoPath);
         }
 
-        let mut accounting_region = 0;
-        for r in all_regions {
-            if self
-                .inner
+        // Do not serialize lazy region connects here. The caller's netstack
+        // pump also drains inbound WG responses; waiting on every region in
+        // sequence can strand the first valid handshake response behind tens
+        // of seconds of unrelated connects. Send the bootstrap copies in
+        // parallel, then return in bounded single-connect time.
+        let sends = all_regions.iter().map(|&region| {
+            self.inner
                 .derp
-                .send_packet(r, peer.clone(), datagram.to_vec())
-                .await
-                && accounting_region == 0
-            {
-                // Fanout is bootstrap duplication of one logical packet.
-                // Attribute it once, to the first region that accepted it.
-                accounting_region = r;
-            }
-        }
+                .send_packet(region, peer.clone(), datagram.to_vec())
+        });
+        let results = futures_util::future::join_all(sends).await;
+        // Fanout is bootstrap duplication of one logical packet. Attribute it
+        // once, to the first region that accepted it.
+        let accounting_region = all_regions
+            .into_iter()
+            .zip(results)
+            .find_map(|(region, sent)| sent.then_some(region))
+            .unwrap_or(0);
         if accounting_region > 0 {
             self.note_peer_derp_transport(&peer, accounting_region, false);
         }
@@ -4208,19 +4395,46 @@ impl Inner {
         // No ReceiveBatch slice borrow or endpoint/address lock survives
         // either await. Channel backpressure keeps its established queued
         // lifetime; fixed-buffer inventory is a separate 384-slot limit.
-        let Ok(channel_permit) = self
+        let credit_count = u32::try_from(known).expect("known batch count fits u32");
+        let credit_started = std::time::Instant::now();
+        let (channel_permit, credit_waited) = match self
             .wg_receive_credits
             .clone()
-            .acquire_many_owned(u32::try_from(known).expect("known batch count fits u32"))
-            .await
-        else {
-            return false;
+            .try_acquire_many_owned(credit_count)
+        {
+            Ok(permit) => (permit, false),
+            Err(TryAcquireError::NoPermits) => {
+                let Ok(permit) = self
+                    .wg_receive_credits
+                    .clone()
+                    .acquire_many_owned(credit_count)
+                    .await
+                else {
+                    return false;
+                };
+                (permit, true)
+            }
+            Err(TryAcquireError::Closed) => return false,
         };
+        if credit_waited {
+            WG_HANDOFF_STATS.note_credit_wait(credit_started.elapsed());
+        }
+
         let pool_inventory = batch.pool_inventory();
-        let Some(pool_reservation) = PoolInventoryReservation::acquire(pool_inventory, known).await
+        let Some((pool_reservation, pool_waited, pool_wait)) =
+            PoolInventoryReservation::acquire_measured(pool_inventory.clone(), known).await
         else {
             return false;
         };
+        if pool_waited {
+            WG_HANDOFF_STATS.note_pool_wait(pool_wait);
+        }
+        WG_HANDOFF_STATS.note_publication(
+            known,
+            received_at,
+            WG_RECEIVE_PACKET_CAPACITY - self.wg_receive_credits.available_permits(),
+            udp_batch::RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY - pool_inventory.available_permits(),
+        );
 
         pending.clear();
         {
@@ -4318,7 +4532,9 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer: source,
-                    data: WgCiphertext::from_vec_range(frame, payload).authorized(generation),
+                    data: WgCiphertext::from_vec_range(frame, payload)
+                        .authorized(generation)
+                        .received_via(WgTransportEvidence::Derp(region_id)),
                 }],
                 Some((
                     &self.peer_authorization,
@@ -4390,7 +4606,9 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer,
-                    data: WgCiphertext::from(data.to_vec()).authorized(generation),
+                    data: WgCiphertext::from(data.to_vec())
+                        .authorized(generation)
+                        .received_via(WgTransportEvidence::Direct(src)),
                 }],
                 Some((
                     &self.peer_authorization,
@@ -4561,7 +4779,9 @@ impl Inner {
                 &self.wg_receive_credits,
                 vec![WgDatagram {
                     peer,
-                    data: WgCiphertext::from(data.to_vec()).authorized(generation),
+                    data: WgCiphertext::from(data.to_vec())
+                        .authorized(generation)
+                        .received_via(WgTransportEvidence::Relay(src)),
                 }],
                 Some((
                     &self.peer_authorization,
@@ -5110,9 +5330,11 @@ mod linux_batch_tests {
         let channel_credits = Arc::new(Semaphore::new(1));
         let pool_inventory = Arc::new(Semaphore::new(1));
         let channel_permit = channel_credits.clone().try_acquire_owned().unwrap();
-        let pool_reservation = PoolInventoryReservation::acquire(pool_inventory.clone(), 1)
-            .await
-            .expect("open pool inventory reserves one buffer");
+        let (pool_reservation, waited, _) =
+            PoolInventoryReservation::acquire_measured(pool_inventory.clone(), 1)
+                .await
+                .expect("open pool inventory reserves one buffer");
+        assert!(!waited);
         let batch = WgReceiveBatch::new(pending(1), channel_permit);
 
         let datagrams = batch.into_datagrams();
@@ -5128,9 +5350,11 @@ mod linux_batch_tests {
     async fn pool_inventory_reservation_acquires_immediately_or_waits_for_capacity() {
         let inventory = Arc::new(Semaphore::new(2));
 
-        let immediate = PoolInventoryReservation::acquire(inventory.clone(), 2)
-            .await
-            .expect("available inventory acquires immediately");
+        let (immediate, waited, _) =
+            PoolInventoryReservation::acquire_measured(inventory.clone(), 2)
+                .await
+                .expect("available inventory acquires immediately");
+        assert!(!waited);
         assert_eq!(inventory.available_permits(), 0);
         drop(immediate);
         assert_eq!(inventory.available_permits(), 2);
@@ -5140,25 +5364,26 @@ mod linux_batch_tests {
             .try_acquire_many_owned(2)
             .expect("test inventory has capacity to hold");
         let waiting_inventory = inventory.clone();
-        let waiting =
-            tokio::spawn(
-                async move { PoolInventoryReservation::acquire(waiting_inventory, 1).await },
-            );
+        let waiting = tokio::spawn(async move {
+            PoolInventoryReservation::acquire_measured(waiting_inventory, 1).await
+        });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished(), "unavailable inventory waits fairly");
         drop(held);
 
-        let waited = tokio::time::timeout(Duration::from_secs(1), waiting)
+        let (reservation, waited, elapsed) = tokio::time::timeout(Duration::from_secs(1), waiting)
             .await
             .expect("released inventory wakes the waiter")
             .expect("waiter task completes")
             .expect("open inventory reserves capacity");
+        assert!(waited);
+        assert!(!elapsed.is_zero());
         assert_eq!(inventory.available_permits(), 1);
-        drop(waited);
+        drop(reservation);
         assert_eq!(inventory.available_permits(), 2);
 
         inventory.close();
-        assert!(PoolInventoryReservation::acquire(inventory, 1)
+        assert!(PoolInventoryReservation::acquire_measured(inventory, 1)
             .await
             .is_none());
     }

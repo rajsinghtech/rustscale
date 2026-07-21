@@ -998,7 +998,8 @@ pub(crate) fn spawn_map_update_task(
                     // commit gate. Unchanged verified keys keep WG state;
                     // stable-ID rotations and TKA withdrawals cannot.
                     let old_tunnels = wg_tunnels.read().await;
-                    let next_tunnels = build_peer_tunnels(&node_key, &next_peers, &old_tunnels);
+                    let next_tunnels =
+                        build_peer_tunnels(&node_key, &current_peers, &next_peers, &old_tunnels);
                     drop(old_tunnels);
                     let mut next_routes =
                         RouteTable::from_peers_with_opts(&next_peers, accept_routes);
@@ -1577,21 +1578,35 @@ fn rotated_peer_key(current: &[Node], next: &[Node], selected: &NodePublic) -> O
 
 fn build_peer_tunnels(
     node_key: &NodePrivate,
+    current_peers: &[Node],
     peers: &[Node],
     current: &HashMap<NodePublic, Arc<Mutex<WgTunn>>>,
 ) -> HashMap<NodePublic, Arc<Mutex<WgTunn>>> {
     peers
         .iter()
         .filter_map(|peer| {
-            current
-                .get(&peer.Key)
-                .cloned()
-                .or_else(|| {
-                    WgTunn::new(node_key, &peer.Key, rand_index())
-                        .ok()
-                        .map(|tunnel| Arc::new(Mutex::new(tunnel)))
-                })
-                .map(|tunnel| (peer.Key.clone(), tunnel))
+            // Disco identity is process-local. A definite non-zero rotation
+            // means the durable node key now fronts a new WG engine; retaining
+            // its old session can make stale server traffic race the new
+            // handshake forever. A transient zero-key control delta is not
+            // enough evidence to reset a live tunnel.
+            let same_process = current_peers.iter().any(|old| {
+                old.Key == peer.Key
+                    && (old.DiscoKey.is_zero()
+                        || peer.DiscoKey.is_zero()
+                        || old.DiscoKey == peer.DiscoKey)
+            });
+            (if same_process {
+                current.get(&peer.Key).cloned()
+            } else {
+                None
+            })
+            .or_else(|| {
+                WgTunn::new(node_key, &peer.Key, rand_index())
+                    .ok()
+                    .map(|tunnel| Arc::new(Mutex::new(tunnel)))
+            })
+            .map(|tunnel| (peer.Key.clone(), tunnel))
         })
         .collect()
 }
@@ -1611,7 +1626,7 @@ fn send_health_notify(health: &Tracker, ipn_backend: &IpnBackend) {
 mod tests {
     use super::*;
     use rustscale_ipn::Prefs;
-    use rustscale_key::{DiscoPrivate, MachinePrivate, NLPrivate, NodePrivate};
+    use rustscale_key::{DiscoPrivate, DiscoPublic, MachinePrivate, NLPrivate, NodePrivate};
     use rustscale_tailcfg::{PeerChange, TKAInfo};
     use rustscale_tka::{disablement_kdf, Key, KeyKind};
     #[cfg(unix)]
@@ -2704,8 +2719,15 @@ mod tests {
             WgTunn::new(&local, &old_key, 1).expect("old tunnel"),
         ));
         let current = HashMap::from([(old_key.clone(), old_tunnel)]);
+        let old_peer = Node {
+            ID: 10,
+            Key: old_key.clone(),
+            Addresses: vec!["100.64.0.2/32".into()],
+            ..Default::default()
+        };
         let rotated = build_peer_tunnels(
             &local,
+            &[old_peer],
             &[Node {
                 ID: 10,
                 Key: new_key.clone(),
@@ -2716,6 +2738,47 @@ mod tests {
         );
         assert!(!rotated.contains_key(&old_key));
         assert!(rotated.contains_key(&new_key));
+    }
+
+    #[test]
+    fn disco_rotation_replaces_stale_wg_session_but_zero_delta_does_not() {
+        let local = NodePrivate::generate();
+        let peer_key = NodePrivate::generate().public();
+        let old_peer = Node {
+            ID: 10,
+            Key: peer_key.clone(),
+            DiscoKey: DiscoPrivate::generate().public(),
+            ..Default::default()
+        };
+        let current_tunnel = Arc::new(Mutex::new(
+            WgTunn::new(&local, &peer_key, 1).expect("current tunnel"),
+        ));
+        let current = HashMap::from([(peer_key.clone(), current_tunnel.clone())]);
+
+        let transient_zero = Node {
+            DiscoKey: DiscoPublic::default(),
+            ..old_peer.clone()
+        };
+        let retained = build_peer_tunnels(
+            &local,
+            std::slice::from_ref(&old_peer),
+            &[transient_zero],
+            &current,
+        );
+        assert!(Arc::ptr_eq(
+            retained.get(&peer_key).expect("retained tunnel"),
+            &current_tunnel
+        ));
+
+        let restarted_peer = Node {
+            DiscoKey: DiscoPrivate::generate().public(),
+            ..old_peer.clone()
+        };
+        let restarted = build_peer_tunnels(&local, &[old_peer], &[restarted_peer], &current);
+        assert!(!Arc::ptr_eq(
+            restarted.get(&peer_key).expect("replacement tunnel"),
+            &current_tunnel
+        ));
     }
 
     #[test]

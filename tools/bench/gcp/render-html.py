@@ -25,18 +25,20 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-CONFIGS = ["rs-userspace", "rs-tun", "ts-userspace", "ts-tun"]
+CONFIGS = ["rs-userspace", "ts-embedded", "ts-userspace", "rs-tun", "ts-tun"]
 CONFIG_COLORS = {
     "rs-userspace": "#3b82f6",  # blue
-    "rs-tun": "#22c55e",        # green
+    "ts-embedded": "#a855f7",   # purple
     "ts-userspace": "#f97316",  # orange
+    "rs-tun": "#22c55e",        # green
     "ts-tun": "#ef4444",        # red
 }
 CONFIG_LABELS = {
-    "rs-userspace": "rustscale (userspace)",
-    "rs-tun": "rustscale (TUN)",
-    "ts-userspace": "tailscaled (userspace)",
-    "ts-tun": "tailscaled (TUN)",
+    "rs-userspace": "RustScale embedded tsnet",
+    "ts-embedded": "Go embedded tsnet",
+    "ts-userspace": "tailscaled daemon proxy",
+    "rs-tun": "RustScale TUN",
+    "ts-tun": "tailscaled TUN",
 }
 TOPOLOGIES = ["same-zone", "cross-region"]
 PATHS = ["direct", "derp"]
@@ -45,7 +47,7 @@ DEFAULT_MATRIX = {"topologies": TOPOLOGIES, "paths": PATHS, "configs": CONFIGS}
 
 def valid_matrix(data: dict) -> dict | None:
     try:
-        if data.get("schema_version") not in (1, 2, 3):
+        if data.get("schema_version") not in (1, 2, 3, 4):
             return None
         matrix = {key: data[key] for key in DEFAULT_MATRIX}
         for key, values in matrix.items():
@@ -78,7 +80,7 @@ def load_summary() -> tuple[list, dict]:
     if isinstance(payload, dict) and payload.get("summary_schema_version") == 1:
         matrix = valid_matrix(payload.get("manifest"))
         cells = payload.get("cells")
-        if matrix is None or payload["manifest"].get("schema_version") != 3 or not isinstance(cells, list):
+        if matrix is None or payload["manifest"].get("schema_version") not in (3, 4) or not isinstance(cells, list):
             raise SystemExit("invalid self-contained current benchmark summary")
         matrix["completeness"] = payload.get("completeness", {})
         return cells, matrix
@@ -146,6 +148,11 @@ def fmt_mbps(n: float) -> str:
     return f"{n:.1f} Mbps"
 
 
+def config_mode(config: str) -> str:
+    return {"rs-userspace": "embedded", "ts-embedded": "embedded",
+            "ts-userspace": "daemon-proxy", "rs-tun": "tun", "ts-tun": "tun"}.get(config, "historical")
+
+
 # ---------------------------------------------------------------------------
 # Bar-chart data preparation.
 # ---------------------------------------------------------------------------
@@ -210,13 +217,16 @@ def footprint_rows(runs_idx: dict, matrix: dict) -> list:
                 for endpoint, foot in endpoints:
                     scope = foot.get("scope") if isinstance(foot.get("scope"), dict) else None
                     subjects = ",".join(foot.get("subjects") or [])
-                    scope_label = (f'{scope.get("kind")}; subjects={subjects or "unspecified"}; descendants={scope.get("includes_descendants")}; kernel={scope.get("includes_kernel")}'
+                    identities = foot.get("binary_identities") if isinstance(foot.get("binary_identities"), list) else []
+                    identity_label = ",".join(f'{Path(item.get("path", "?")).name}@{str(item.get("sha256", ""))[:12]}' for item in identities if isinstance(item, dict))
+                    scope_label = (f'{scope.get("kind")}; subjects={subjects or "unspecified"}; binaries={identity_label or "historical/unspecified"}; descendants={scope.get("includes_descendants")}; kernel={scope.get("includes_kernel")}'
                                    if scope else "legacy/unscoped")
+                    primary = run.get("binary") if endpoint == "server" and isinstance(run.get("binary"), dict) else {}
                     rows.append({
                         "topo": topo, "path": path, "config": cfg, "endpoint": endpoint,
                         "scope": scope_label,
                         "error": run.get("error", "") or ("failed" if run.get("status") == "failed" else ""),
-                        "binary_bytes": int(foot["binary_size_bytes"]) if isinstance(foot.get("binary_size_bytes"), (int, float)) else None,
+                        "binary_bytes": int(primary["size_bytes"]) if isinstance(primary.get("size_bytes"), (int, float)) else (int(foot["binary_size_bytes"]) if isinstance(foot.get("binary_size_bytes"), (int, float)) else None),
                         "rss_peak_kb": int(foot["rss_peak_kb"]) if isinstance(foot.get("rss_peak_kb"), (int, float)) else None,
                         "rss_avg_kb": int(foot["rss_avg_kb"]) if isinstance(foot.get("rss_avg_kb"), (int, float)) else None,
                         "cpu_peak_pct": float(foot["cpu_peak_pct"]) if isinstance(foot.get("cpu_peak_pct"), (int, float)) else None,
@@ -409,8 +419,10 @@ def throughput_groups(configs: list[str], runs_idx: dict, topo: str, path: str) 
     for cfg in configs:
         run = runs_idx.get((topo, path, cfg)) or {}
         workload = run.get("workload") if isinstance(run.get("workload"), dict) else {}
-        if run.get("schema_version") == 5 and workload.get("implementation") == "rustscale-bench" and workload.get("protocol") == "RSB1":
-            label = "Matched four-way RSB1 workload"
+        if run.get("schema_version") == 6 and workload.get("implementation") in {"rustscale-bench", "go-tsnet-rsb1"} and workload.get("protocol") == "RSB1":
+            label = "Matched five-cell RSB1 workload"
+        elif run.get("schema_version") == 5 and workload.get("implementation") == "rustscale-bench" and workload.get("protocol") == "RSB1":
+            label = "Historical matched four-cell RSB1 workload"
         elif workload.get("implementation") == "rustscale-bench" and workload.get("protocol") == "RSB1":
             label = "Historical RustScale RSB1 parity (not merged)"
         elif cfg.startswith("ts-"):
@@ -442,6 +454,47 @@ def emit_throughput_charts(runs_idx: dict, parallels: list[int], matrix: dict) -
         parts.append(f'<div class="item"><span class="swatch" style="background:{CONFIG_COLORS[cfg]}"></span>{html.escape(CONFIG_LABELS[cfg])}</div>')
     parts.append("</div>")
     return "".join(parts) + "".join(scripts)
+
+
+def emit_repeat_dispersion(runs_idx: dict, matrix: dict) -> str:
+    rows = []
+    for topo in matrix["topologies"]:
+        for path in matrix["paths"]:
+            for config in matrix["configs"]:
+                run = runs_idx.get((topo, path, config)) or {}
+                if run.get("status") != "ok" or run.get("error"):
+                    continue
+                for point in run.get("throughput") or []:
+                    samples = point.get("samples_mbps")
+                    if isinstance(samples, list) and samples:
+                        rows.append((topo, path, config, point))
+    if not rows:
+        return '<div class="empty">No repeat-dispersion data.</div>'
+    out = [
+        '<table class="footprint" id="repeat-dispersion-table">',
+        '<thead><tr><th class="label">topology / path</th><th class="label">cell</th>',
+        '<th>streams</th><th>repeats</th><th>samples Mbps</th><th>median</th>',
+        '<th>min</th><th>max</th><th>population σ</th><th>CV %</th></tr></thead><tbody>',
+    ]
+    for topo, path, config, point in rows:
+        samples = point["samples_mbps"]
+        sample_text = ", ".join(f"{float(value):.1f}" for value in samples)
+        def value(name):
+            item = point.get(name)
+            return "—" if not isinstance(item, (int, float)) else f"{float(item):.2f}"
+        out.append(
+            f'<tr class="dispersion-row" data-topo="{html.escape(topo)}" data-path="{html.escape(path)}" '
+            f'data-config="{html.escape(config)}" data-mode="{config_mode(config)}">'
+            f'<td class="label">{html.escape(topo)} / {html.escape(path)}</td>'
+            f'<td class="label" style="color:{CONFIG_COLORS[config]}">{html.escape(CONFIG_LABELS[config])}</td>'
+            f'<td>{point.get("parallel", "—")}</td><td>{len(samples)}</td>'
+            f'<td>{html.escape(sample_text)}</td><td>{value("mbps")}</td>'
+            f'<td>{value("min_mbps")}</td><td>{value("max_mbps")}</td>'
+            f'<td>{value("population_stddev_mbps")}</td>'
+            f'<td>{value("coefficient_of_variation_pct")}</td></tr>'
+        )
+    out.append('</tbody></table>')
+    return "".join(out)
 
 
 def emit_latency_chart(runs_idx: dict, matrix: dict) -> str:
@@ -486,7 +539,7 @@ def emit_footprint_table(runs_idx: dict, matrix: dict) -> str:
             status_text = "OK"
         out.append(
             f'<tr class="footprint-row" data-topo="{r["topo"]}" data-path="{r["path"]}" '
-            f'data-config="{r["config"]}" data-mode="{"tun" if r["config"].endswith("tun") else "userspace"}">'
+            f'data-config="{r["config"]}" data-mode="{config_mode(r["config"])}">'
             f'<td class="label">{r["topo"]} / {r["path"]}</td>'
             f'<td class="label" style="color:{CONFIG_COLORS[r["config"]]}">{html.escape(CONFIG_LABELS[r["config"]])}</td>'
             f'<td>{html.escape(r["endpoint"])}</td><td>{html.escape(r["scope"])}</td>'
@@ -540,7 +593,7 @@ def emit_resource_trends(runs: list) -> str:
            '<table class="footprint"><thead><tr><th class="label">cell</th><th>configured peer load</th><th>sample coverage</th><th>elapsed</th><th>CPU %</th><th>RSS</th></tr></thead><tbody>']
     for run, endpoint, footprint, displayed in cells:
         topo, path, config = (run.get("topology", "?"), run.get("path", "?"), run.get("config", "?"))
-        mode = "tun" if str(config).endswith("tun") else "userspace"
+        mode = config_mode(str(config))
         retained_count = len(footprint.get("series") or [])
         total_count = footprint.get("samples", retained_count)
         truncated = footprint.get("series_truncated") is True
@@ -549,7 +602,9 @@ def emit_resource_trends(runs: list) -> str:
             coverage += " (source truncated)"
         scope = footprint.get("scope") or {}
         subjects = ",".join(footprint.get("subjects") or [])
-        scope_label = (f'{scope.get("kind")}; subjects={subjects or "unspecified"}; descendants={scope.get("includes_descendants")}; kernel={scope.get("includes_kernel")}'
+        identities = footprint.get("binary_identities") if isinstance(footprint.get("binary_identities"), list) else []
+        identity_label = ",".join(f'{Path(item.get("path", "?")).name}@{str(item.get("sha256", ""))[:12]}' for item in identities if isinstance(item, dict))
+        scope_label = (f'{scope.get("kind")}; subjects={subjects or "unspecified"}; binaries={identity_label or "historical/unspecified"}; descendants={scope.get("includes_descendants")}; kernel={scope.get("includes_kernel")}'
                        if scope else "legacy/unscoped")
         cell = f'{topo} / {path} / {config} / {endpoint} / {scope_label}'
         for sample in displayed:
@@ -573,7 +628,7 @@ def emit_detail_cards(runs: list) -> str:
         cfg = r.get("config", "?")
         topo = r.get("topology", "?")
         path = r.get("path", "?")
-        mode = "tun" if cfg.endswith("tun") else "userspace"
+        mode = config_mode(cfg)
         err = r.get("error", "")
         card_class = "detail-card detail-row"
         if err:
@@ -755,7 +810,8 @@ def emit_filters(matrix: dict) -> str:
   <div class="group">
     <label>mode</label>
     <button data-filter="mode" data-value="all" class="active">all</button>
-    <button data-filter="mode" data-value="userspace">userspace</button>
+    <button data-filter="mode" data-value="embedded">embedded</button>
+    <button data-filter="mode" data-value="daemon-proxy">daemon proxy</button>
     <button data-filter="mode" data-value="tun">TUN</button>
   </div>
   <div class="group theme-toggle">
@@ -773,12 +829,13 @@ CHART_JS = r"""
 //   latency    data: { combos: ["topo/path", ...], series: {config: [{p50,p95,p99}, ...]} }
 const CONFIG_COLORS = {
   "rs-userspace": "#3b82f6",
-  "rs-tun": "#22c55e",
+  "ts-embedded": "#a855f7",
   "ts-userspace": "#f97316",
+  "rs-tun": "#22c55e",
   "ts-tun": "#ef4444"
 };
 const LAT_COLORS = { p50: "#3b82f6", p95: "#f59e0b", p99: "#ef4444" };
-const CONFIGS = ["rs-userspace","rs-tun","ts-userspace","ts-tun"];
+const CONFIGS = ["rs-userspace","ts-embedded","ts-userspace","rs-tun","ts-tun"];
 
 function drawGroupedBars(canvas, data, kind) {
   const ctx = canvas.getContext("2d");
@@ -937,7 +994,7 @@ function applyFilters() {
     const okP = f.path === "all" || card.dataset.path === f.path;
     card.classList.toggle("hidden", !(okT && okP));
   });
-  document.querySelectorAll(".footprint-row, .resource-row, .detail-row").forEach(row => {
+  document.querySelectorAll(".dispersion-row, .footprint-row, .resource-row, .detail-row").forEach(row => {
     const okT = f.topo === "all" || row.dataset.topo === f.topo;
     const okP = f.path === "all" || row.dataset.path === f.path;
     const okM = f.mode === "all" || row.dataset.mode === f.mode;
@@ -1004,6 +1061,9 @@ def main() -> int:
     out.append('<section class="block" id="throughput">')
     out.append("<h2>Throughput — per-configuration TCP workload (download)</h2>")
     out.append(emit_throughput_charts(runs_idx, parallels, matrix))
+    out.append("<h2>Repeat dispersion</h2>")
+    out.append('<p class="empty">Every successful current cell retains each repeat and reports min/max, population standard deviation, and coefficient of variation; medians alone are not treated as stability evidence.</p>')
+    out.append(emit_repeat_dispersion(runs_idx, matrix))
     out.append("</section>")
 
     # Latency.

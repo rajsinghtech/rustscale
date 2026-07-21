@@ -5,6 +5,145 @@ use super::*;
 // Data-plane pumps
 // ---------------------------------------------------------------------------
 
+type TcpSegmentSignature = ([u8; 4], [u8; 4], u16, u16, u32, u8, u16);
+
+#[derive(Default)]
+struct NetstackPumpStats {
+    inbound_batches: u64,
+    inbound_packets: u64,
+    outbound_packets: u64,
+    tcp_syn: u64,
+    tcp_syn_ack: u64,
+    tcp_ack: u64,
+    tcp_fin: u64,
+    tcp_rst: u64,
+    tcp_retransmit: u64,
+    rx_queue_high_water: usize,
+    tx_queue_high_water: usize,
+    live_connections: usize,
+    pending_closes: usize,
+    close_requests: usize,
+    close_completions: usize,
+    duplicate_close_requests: usize,
+    next_snapshot_packets: u64,
+    seen_segments: std::collections::HashSet<TcpSegmentSignature>,
+    segment_order: std::collections::VecDeque<TcpSegmentSignature>,
+}
+
+impl NetstackPumpStats {
+    fn new() -> Self {
+        Self {
+            next_snapshot_packets: 256,
+            ..Self::default()
+        }
+    }
+
+    fn note_batch(&mut self) {
+        self.inbound_batches = self.inbound_batches.saturating_add(1);
+    }
+
+    fn note_connections(&mut self, stats: rustscale_netstack::ConnectionStats) {
+        self.live_connections = stats.live_connections;
+        self.pending_closes = stats.pending_closes;
+        self.close_requests = stats.close_requests;
+        self.close_completions = stats.close_completions;
+        self.duplicate_close_requests = stats.duplicate_close_requests;
+    }
+
+    fn note_packet(&mut self, inbound: bool, packet: &[u8], queues: (usize, usize)) {
+        if inbound {
+            self.inbound_packets = self.inbound_packets.saturating_add(1);
+        } else {
+            self.outbound_packets = self.outbound_packets.saturating_add(1);
+        }
+        self.rx_queue_high_water = self.rx_queue_high_water.max(queues.0);
+        self.tx_queue_high_water = self.tx_queue_high_water.max(queues.1);
+        self.note_tcp(packet);
+        let total = self.inbound_packets.saturating_add(self.outbound_packets);
+        if self.next_snapshot_packets != 0 && total >= self.next_snapshot_packets {
+            self.emit("periodic");
+            self.next_snapshot_packets = self.next_snapshot_packets.checked_mul(2).unwrap_or(0);
+        }
+    }
+
+    fn note_tcp(&mut self, packet: &[u8]) {
+        if packet.len() < 40 || packet[0] >> 4 != 4 || packet[9] != 6 {
+            return;
+        }
+        let ip_header = usize::from(packet[0] & 0x0f) * 4;
+        if ip_header < 20 || packet.len() < ip_header + 20 {
+            return;
+        }
+        let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]])).min(packet.len());
+        let tcp = &packet[ip_header..];
+        let tcp_header = usize::from(tcp[12] >> 4) * 4;
+        if tcp_header < 20 || total_len < ip_header + tcp_header {
+            return;
+        }
+        let flags = tcp[13];
+        let syn = flags & 0x02 != 0;
+        let ack = flags & 0x10 != 0;
+        if syn && ack {
+            self.tcp_syn_ack = self.tcp_syn_ack.saturating_add(1);
+        } else if syn {
+            self.tcp_syn = self.tcp_syn.saturating_add(1);
+        }
+        if ack {
+            self.tcp_ack = self.tcp_ack.saturating_add(1);
+        }
+        if flags & 0x01 != 0 {
+            self.tcp_fin = self.tcp_fin.saturating_add(1);
+        }
+        if flags & 0x04 != 0 {
+            self.tcp_rst = self.tcp_rst.saturating_add(1);
+        }
+        let payload_len = total_len - ip_header - tcp_header;
+        if syn || flags & 0x01 != 0 || payload_len != 0 {
+            let signature = (
+                packet[12..16].try_into().unwrap(),
+                packet[16..20].try_into().unwrap(),
+                u16::from_be_bytes([tcp[0], tcp[1]]),
+                u16::from_be_bytes([tcp[2], tcp[3]]),
+                u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+                flags,
+                u16::try_from(payload_len).unwrap_or(u16::MAX),
+            );
+            if self.seen_segments.insert(signature) {
+                self.segment_order.push_back(signature);
+                if self.segment_order.len() > 32_768 {
+                    if let Some(expired) = self.segment_order.pop_front() {
+                        self.seen_segments.remove(&expired);
+                    }
+                }
+            } else {
+                self.tcp_retransmit = self.tcp_retransmit.saturating_add(1);
+            }
+        }
+    }
+
+    fn emit(&self, event: &str) {
+        eprintln!(
+            "rustscale: netstack_pump_stats event={event} inbound_batches={} inbound_packets={} outbound_packets={} tcp_syn={} tcp_syn_ack={} tcp_ack={} tcp_retransmit={} tcp_fin={} tcp_rst={} rx_queue_high_water={} tx_queue_high_water={} live_connections={} pending_closes={} close_requests={} close_completions={} duplicate_close_requests={}",
+            self.inbound_batches,
+            self.inbound_packets,
+            self.outbound_packets,
+            self.tcp_syn,
+            self.tcp_syn_ack,
+            self.tcp_ack,
+            self.tcp_retransmit,
+            self.tcp_fin,
+            self.tcp_rst,
+            self.rx_queue_high_water,
+            self.tx_queue_high_water,
+            self.live_connections,
+            self.pending_closes,
+            self.close_requests,
+            self.close_completions,
+            self.duplicate_close_requests,
+        );
+    }
+}
+
 /// Netstack data-plane pump: netstack <-> WG <-> magicsock.
 ///
 /// Inbound: magicsock recv → WG decapsulate → netstack.push_rx.
@@ -25,17 +164,20 @@ pub(crate) async fn run_netstack_pump(
     let tx_notify = netstack.tx_notify();
     let mut wg_timer = tokio::time::interval(std::time::Duration::from_millis(250));
     wg_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pump_stats = NetstackPumpStats::new();
 
     loop {
         if cancel.is_cancelled() {
             break;
         }
+        pump_stats.note_connections(netstack.connection_stats());
 
+        let mut handled_inbound = false;
         // A Notify retains at most one permit. After a bounded outbound
-        // drain, more than one batch can remain even though its notification
+        // drain, more than one packet can remain even though its notification
         // was consumed, so do not sleep while the queue is still non-empty.
         if netstack.has_tx_packets() {
-            if let Ok(batch) = wg_recv.try_recv() {
+            if let Some(batch) = take_one_ready_receive_batch(&mut wg_recv) {
                 handle_inbound_wg_batch(
                     &magicsock,
                     &wg_tunnels,
@@ -45,10 +187,11 @@ pub(crate) async fn run_netstack_pump(
                     &packet_drops,
                     &capture,
                     &peer_map,
+                    &mut pump_stats,
                 )
                 .await;
+                handled_inbound = true;
             }
-            tokio::task::yield_now().await;
         } else {
             tokio::select! {
                 () = tx_notify.notified() => {}
@@ -57,24 +200,22 @@ pub(crate) async fn run_netstack_pump(
                     if let Some(batch) = result {
                         handle_inbound_wg_batch(
                             &magicsock, &wg_tunnels, batch, &netstack, &filter,
-                            &packet_drops, &capture, &peer_map,
+                            &packet_drops, &capture, &peer_map, &mut pump_stats,
                         ).await;
-
-                        // Preserve the former scheduler-turn burst drain, now in
-                        // receive-batch units. Each batch retains scalar packet
-                        // handling and ordering internally.
-                        while let Ok(more) = wg_recv.try_recv() {
-                            handle_inbound_wg_batch(
-                                &magicsock, &wg_tunnels, more, &netstack, &filter,
-                                &packet_drops, &capture, &peer_map,
-                            ).await;
-                        }
+                        handled_inbound = true;
                     } else {
                         log::warn!("tsnet: magicsock wg channel closed");
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
             }
+        }
+
+        // push_rx_from only queues plaintext and notifies smoltcp. Give that
+        // task one scheduler handoff after exactly one receive batch so TCP
+        // ACK/SYN output can become visible before admitting another burst.
+        if handled_inbound {
+            tokio::task::yield_now().await;
         }
 
         // Drain outbound IP packets from netstack → route → WG → magicsock.
@@ -85,6 +226,7 @@ pub(crate) async fn run_netstack_pump(
         let mut drained = 0;
         while drained < DRAIN_BATCH {
             let Some(pkt) = netstack.pop_tx() else { break };
+            pump_stats.note_packet(false, &pkt, netstack.data_plane_queue_depths());
             {
                 let mut filt = filter.lock().unwrap();
                 filt.update_outbound(&pkt);
@@ -104,6 +246,13 @@ pub(crate) async fn run_netstack_pump(
     }
 }
 
+/// Take at most one immediately-ready receive batch for this scheduler turn.
+fn take_one_ready_receive_batch(
+    receiver: &mut mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
+) -> Option<rustscale_magicsock::WgReceiveBatch> {
+    receiver.try_recv().ok()
+}
+
 /// Process one ordered receive-batch with the same per-datagram semantics as
 /// the former scalar channel consumer.
 async fn handle_inbound_wg_batch(
@@ -115,9 +264,11 @@ async fn handle_inbound_wg_batch(
     packet_drops: &AtomicU64,
     capture: &crate::capture::CaptureSlot,
     peer_map: &crate::peer_map::Runtime,
+    pump_stats: &mut NetstackPumpStats,
 ) {
     let _map = peer_map.gate.read().await;
     let datagrams = batch.into_datagrams();
+    pump_stats.note_batch();
     handle_inbound_wg_datagrams(magicsock, wg_tunnels, &datagrams, |peer, pt| {
         if !peer_map.packet_source_matches(&peer, &pt) {
             packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -136,75 +287,99 @@ async fn handle_inbound_wg_batch(
             crate::capture::CapturePath::SynthesizedToLocal,
             &pt,
         );
+        let (rx_depth, tx_depth) = netstack.data_plane_queue_depths();
+        pump_stats.note_packet(true, &pt, (rx_depth.saturating_add(1), tx_depth));
         netstack.push_rx_from(pt, peer);
     })
     .await;
 }
 
-/// Run the scalar decapsulation semantics over one ordered receive burst.
-/// Keeping this seam independent from the delivery target lets the batch path
-/// remain exactly equivalent to delivering every item from the old channel.
+/// Decapsulate contiguous same-peer/same-generation runs while acquiring the
+/// tunnel map, tunnel mutex, and authorization delivery guard once per run.
+/// Per-packet authorization and delivery decisions remain ordered. Protocol
+/// replies are sent only after all guards have been dropped.
 async fn handle_inbound_wg_datagrams(
     magicsock: &Magicsock,
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
     datagrams: &[rustscale_magicsock::WgDatagram],
-    deliver: impl Fn(NodePublic, Vec<u8>),
+    mut deliver: impl FnMut(NodePublic, Vec<u8>),
 ) {
-    for dgram in datagrams {
-        handle_inbound_wg(magicsock, wg_tunnels, dgram, |peer, pt| {
-            deliver(peer, pt);
-        })
-        .await;
+    let mut start = 0;
+    while start < datagrams.len() {
+        let peer = datagrams[start].peer.clone();
+        let generation = datagrams[start].authorization_generation();
+        let end = contiguous_receive_run_end(datagrams, start);
+
+        if magicsock.is_authorization_current(&peer, generation) {
+            let tunnel = {
+                let tunnels = wg_tunnels.read().await;
+                tunnels.get(&peer).cloned()
+            };
+            if let Some(tunnel) = tunnel {
+                let mut replies = Vec::new();
+                let mut authenticated = Vec::new();
+                {
+                    // The caller holds peer_map.gate. This second guard keeps
+                    // magicsock's generation stable through the entire ordered
+                    // plaintext handoff for this run. Acquire it before the
+                    // peer tunnel mutex so no mutex is held across this await.
+                    let _delivery = magicsock.authorization_delivery_guard().await;
+                    if magicsock.is_authorization_current(&peer, generation) {
+                        let mut tunnel = tunnel.lock().await;
+                        for (offset, datagram) in datagrams[start..end].iter().enumerate() {
+                            if !magicsock.is_authorization_current(&peer, generation) {
+                                break;
+                            }
+                            if let Ok(decap) = tunnel.decapsulate(&datagram.data) {
+                                authenticated.push(start + offset);
+                                if let Some(plaintext) = decap.plaintext {
+                                    deliver(peer.clone(), plaintext);
+                                }
+                                replies.extend(decap.replies);
+                            }
+                        }
+                    }
+                }
+                for index in authenticated {
+                    magicsock.note_authenticated_wg_transport(&datagrams[index]);
+                }
+                for reply in replies {
+                    if !magicsock.is_authorization_current(&peer, generation) {
+                        break;
+                    }
+                    let _ = magicsock.send(peer.clone(), &reply).await;
+                }
+            }
+        }
+        start = end;
     }
 }
-/// Handle an inbound WG datagram: decapsulate, deliver plaintext via `deliver`,
-/// and send any WG protocol replies back over magicsock.
+
+fn contiguous_receive_run_end(
+    datagrams: &[rustscale_magicsock::WgDatagram],
+    start: usize,
+) -> usize {
+    let peer = &datagrams[start].peer;
+    let generation = datagrams[start].authorization_generation();
+    let mut end = start + 1;
+    while end < datagrams.len()
+        && datagrams[end].peer == *peer
+        && datagrams[end].authorization_generation() == generation
+    {
+        end += 1;
+    }
+    end
+}
+
+/// Handle one datagram through the same grouped implementation.
+#[cfg(test)]
 async fn handle_inbound_wg(
     magicsock: &Magicsock,
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
     dgram: &rustscale_magicsock::WgDatagram,
-    deliver: impl Fn(NodePublic, Vec<u8>),
+    deliver: impl FnMut(NodePublic, Vec<u8>),
 ) {
-    if !magicsock.is_authorization_current(&dgram.peer, dgram.authorization_generation()) {
-        return;
-    }
-    let tunn = {
-        let tunnels = wg_tunnels.read().await;
-        tunnels.get(&dgram.peer).cloned()
-    };
-    if let Some(tunn) = tunn {
-        // Lock the tunnel, decapsulate (synchronous), then drop the lock
-        // before any async I/O (magicsock.send). This prevents packet drops
-        // from try_lock failures and avoids holding the lock across .await.
-        let decap_result = {
-            let mut t = tunn.lock().await;
-            t.decapsulate(&dgram.data)
-        };
-        if let Ok(decap) = decap_result {
-            {
-                // Keep both provenance authorities stable through plaintext
-                // handoff: the caller holds peer_map.gate, and this guard
-                // prevents a magicsock generation commit from crossing it.
-                let _delivery = magicsock.authorization_delivery_guard().await;
-                if !magicsock
-                    .is_authorization_current(&dgram.peer, dgram.authorization_generation())
-                {
-                    return;
-                }
-                if let Some(pt) = decap.plaintext {
-                    deliver(dgram.peer.clone(), pt);
-                }
-            }
-            for reply in decap.replies {
-                if !magicsock
-                    .is_authorization_current(&dgram.peer, dgram.authorization_generation())
-                {
-                    break;
-                }
-                let _ = magicsock.send(dgram.peer.clone(), &reply).await;
-            }
-        }
-    }
+    handle_inbound_wg_datagrams(magicsock, wg_tunnels, std::slice::from_ref(dgram), deliver).await;
 }
 
 /// Decapsulate one TUN-bound datagram and retain accepted plaintext and
@@ -320,6 +495,55 @@ mod tests {
     use super::*;
     use rustscale_key::{DiscoPrivate, NodePrivate};
 
+    #[test]
+    fn pump_diagnostics_classify_duplicate_tcp_control_segments() {
+        let mut syn = vec![0u8; 40];
+        syn[0] = 0x45;
+        syn[2..4].copy_from_slice(&40u16.to_be_bytes());
+        syn[9] = 6;
+        syn[12..16].copy_from_slice(&[100, 64, 0, 1]);
+        syn[16..20].copy_from_slice(&[100, 64, 0, 2]);
+        syn[20..22].copy_from_slice(&49152u16.to_be_bytes());
+        syn[22..24].copy_from_slice(&5201u16.to_be_bytes());
+        syn[24..28].copy_from_slice(&7u32.to_be_bytes());
+        syn[32] = 5 << 4;
+        syn[33] = 0x02;
+
+        let mut stats = NetstackPumpStats::new();
+        stats.note_packet(true, &syn, (1, 0));
+        stats.note_packet(true, &syn, (2, 0));
+        assert_eq!(stats.tcp_syn, 2);
+        assert_eq!(stats.tcp_retransmit, 1);
+        assert_eq!(stats.rx_queue_high_water, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_turn_services_ready_outbound_before_second_batch() {
+        let (send, mut receive) = mpsc::channel(2);
+        send.try_send(rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(Vec::new()))
+            .unwrap();
+        send.try_send(rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(Vec::new()))
+            .unwrap();
+        let (outbound_send, mut outbound_receive) = mpsc::channel(1);
+        let mut order = Vec::new();
+
+        let _first = take_one_ready_receive_batch(&mut receive).expect("first receive batch");
+        order.push("inbound-1");
+        outbound_send.try_send(vec![1]).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            receive.len(),
+            1,
+            "one receive turn must leave the second batch queued"
+        );
+        assert_eq!(outbound_receive.try_recv(), Ok(vec![1]));
+        order.push("outbound");
+        let _second = take_one_ready_receive_batch(&mut receive).expect("second receive batch");
+        order.push("inbound-2");
+
+        assert_eq!(order, ["inbound-1", "outbound", "inbound-2"]);
+    }
+
     async fn establish_tunnels(a: &Arc<Mutex<WgTunn>>, b: &Arc<Mutex<WgTunn>>) {
         let a_init = { a.lock().await.force_handshake() };
         for packet in &a_init {
@@ -362,14 +586,32 @@ mod tests {
         ));
         establish_tunnels(&sender, &receiver).await;
 
-        let plaintext = vec![
-            vec![
-                0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
-            ],
-            vec![
-                0x45, 0, 0, 20, 0, 2, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
-            ],
-        ];
+        let plaintext: Vec<Vec<u8>> = (0..rustscale_magicsock::WG_RECEIVE_BATCH_MAX_PACKETS)
+            .map(|id| {
+                vec![
+                    0x45,
+                    0,
+                    0,
+                    20,
+                    (id >> 8) as u8,
+                    id as u8,
+                    0,
+                    0,
+                    64,
+                    17,
+                    0,
+                    0,
+                    100,
+                    64,
+                    0,
+                    1,
+                    100,
+                    64,
+                    0,
+                    2,
+                ]
+            })
+            .collect();
         let mut batch = Vec::new();
         let mut scalar = Vec::new();
         for packet in &plaintext {
@@ -426,6 +668,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
+        assert_eq!(contiguous_receive_run_end(&batch, 0), batch.len());
         let tunnels = RwLock::new(HashMap::from([(source_public, receiver)]));
         let batched_plaintext = Arc::new(std::sync::Mutex::new(Vec::new()));
         let batched_delivery = batched_plaintext.clone();
@@ -450,6 +693,165 @@ mod tests {
 
         assert_eq!(*batched_plaintext.lock().unwrap(), plaintext);
         assert_eq!(*scalar_plaintext.lock().unwrap(), plaintext);
+    }
+
+    /// Exercise the production direct-UDP handoff end to end at the benchmark
+    /// scale. Unlike the netstack-only rig, this owns real loopback UDP
+    /// sockets, Magicsock receive credits, authenticated WG batches, route
+    /// lookup, and the production netstack pump.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_udp_wg_netstack_retains_p1000_connections() {
+        const STREAMS: usize = 1000;
+        let a_private = NodePrivate::generate();
+        let b_private = NodePrivate::generate();
+        let a_ip = Ipv4Addr::new(100, 64, 0, 1);
+        let b_ip = Ipv4Addr::new(100, 64, 0, 2);
+        let config = |private_key| MagicsockConfig {
+            private_key,
+            disco_key: DiscoPrivate::generate(),
+            derp_client: None,
+            derp_map: None,
+            home_derp_region: 0,
+            udp_bind: Some("127.0.0.1:0".parse().unwrap()),
+            udp_socket: None,
+            portmapper: None,
+            health: None,
+            disable_direct_paths: false,
+            peer_relay_server: false,
+            relay_server_config: None,
+            sockstats: None,
+            control_knobs: None,
+        };
+        let (a_magic, a_recv) = Magicsock::new(config(a_private.clone())).await.unwrap();
+        let (b_magic, b_recv) = Magicsock::new(config(b_private.clone())).await.unwrap();
+        let a_magic = Arc::new(a_magic);
+        let b_magic = Arc::new(b_magic);
+        let a_udp_addr = a_magic.bound_udp_addr().unwrap();
+        let b_udp_addr = b_magic.bound_udp_addr().unwrap();
+        let a_node = Node {
+            ID: 1,
+            Key: a_magic.node_public(),
+            DiscoKey: a_magic.disco_public(),
+            Addresses: vec![format!("{a_ip}/32")],
+            Endpoints: vec![a_udp_addr.to_string()],
+            ..Default::default()
+        };
+        let b_node = Node {
+            ID: 2,
+            Key: b_magic.node_public(),
+            DiscoKey: b_magic.disco_public(),
+            Addresses: vec![format!("{b_ip}/32")],
+            Endpoints: vec![b_udp_addr.to_string()],
+            ..Default::default()
+        };
+        a_magic.set_netmap(vec![b_node.clone()]).await.unwrap();
+        b_magic.set_netmap(vec![a_node.clone()]).await.unwrap();
+        // The first A→B probe can precede B's initial map installation.
+        // Reapplying the unchanged map is the production refresh path and
+        // gives both peers an authenticated direct pong.
+        a_magic.set_netmap(vec![b_node.clone()]).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if a_magic.peer_direct_trusted(&b_node.Key)
+                    && b_magic.peer_direct_trusted(&a_node.Key)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("loopback UDP direct paths were not authenticated");
+
+        let a_net = Arc::new(Netstack::new(a_ip, DEFAULT_MTU).unwrap());
+        let b_net = Arc::new(Netstack::new(b_ip, DEFAULT_MTU).unwrap());
+        let a_tunnels = Arc::new(RwLock::new(HashMap::from([(
+            b_node.Key.clone(),
+            Arc::new(Mutex::new(WgTunn::new(&a_private, &b_node.Key, 1).unwrap())),
+        )])));
+        let b_tunnels = Arc::new(RwLock::new(HashMap::from([(
+            a_node.Key.clone(),
+            Arc::new(Mutex::new(WgTunn::new(&b_private, &a_node.Key, 2).unwrap())),
+        )])));
+        let a_cancel = Arc::new(CancelToken::new());
+        let b_cancel = Arc::new(CancelToken::new());
+        let a_pump = tokio::spawn(run_netstack_pump(
+            a_magic.clone(),
+            a_recv,
+            a_net.clone(),
+            a_tunnels,
+            Arc::new(RwLock::new(RouteTable::from_peers(&[b_node.clone()]))),
+            Arc::new(std::sync::Mutex::new(Filter::allow_all())),
+            Arc::new(AtomicU64::new(0)),
+            a_cancel.clone(),
+            crate::capture::new_slot(),
+            crate::peer_map::Runtime::new(&[b_node.clone()]).unwrap(),
+        ));
+        let b_pump = tokio::spawn(run_netstack_pump(
+            b_magic.clone(),
+            b_recv,
+            b_net.clone(),
+            b_tunnels,
+            Arc::new(RwLock::new(RouteTable::from_peers(&[a_node.clone()]))),
+            Arc::new(std::sync::Mutex::new(Filter::allow_all())),
+            Arc::new(AtomicU64::new(0)),
+            b_cancel.clone(),
+            crate::capture::new_slot(),
+            crate::peer_map::Runtime::new(&[a_node.clone()]).unwrap(),
+        ));
+
+        let mut listener = b_net.listen(41001).await.unwrap();
+        let accept = tokio::spawn(async move {
+            let mut streams = Vec::with_capacity(STREAMS);
+            for _ in 0..STREAMS {
+                streams.push(listener.accept().await.unwrap());
+            }
+            streams
+        });
+        let clients = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            a_net.dial_many(
+                SocketAddr::new(b_ip.into(), 41001),
+                STREAMS,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(25),
+            ),
+        )
+        .await
+        .expect("P1000 direct-UDP setup deadline")
+        .expect("P1000 direct-UDP setup");
+        let servers = accept.await.unwrap();
+        assert_eq!(clients.len(), STREAMS);
+        assert_eq!(servers.len(), STREAMS);
+        assert!(a_magic.peer_direct_trusted(&b_node.Key));
+        assert!(b_magic.peer_direct_trusted(&a_node.Key));
+        assert!(a_net.dial_stats().pending_dials <= rustscale_netstack::TCP_DIAL_WINDOW);
+
+        drop(clients);
+        drop(servers);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let a = a_net.connection_stats();
+                let b = b_net.connection_stats();
+                if a.live_connections == 0
+                    && b.live_connections == 0
+                    && a.pending_closes == 0
+                    && b.pending_closes == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("P1000 direct-UDP teardown leaked connection ownership");
+        a_cancel.cancel();
+        b_cancel.cancel();
+        a_pump.abort();
+        b_pump.abort();
+        let _ = a_pump.await;
+        let _ = b_pump.await;
+        drop(a_magic);
+        drop(b_magic);
     }
 
     #[tokio::test]

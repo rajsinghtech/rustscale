@@ -33,39 +33,72 @@ pub async fn run_userspace(
     control_url: String,
     state_dir: Option<std::path::PathBuf>,
 ) -> Result<LatencyResult, Box<dyn Error>> {
+    // A supplied state directory is a restart-stable node identity. Its disco
+    // identity remains process-local so peers invalidate the prior UDP path.
+    let ephemeral = state_dir.is_none();
     let mut builder = Server::builder()
         .hostname(hostname)
         .auth_key(authkey)
-        .ephemeral(true)
+        .ephemeral(ephemeral)
         .disable_portmapping(true)
         .control_url(control_url);
     if let Some(ref d) = state_dir {
         builder = builder.state_dir(d);
     }
     let mut server = builder.build()?;
-    Box::pin(server.up()).await?;
-    let my_ip = server
-        .status()
-        .tailscale_ips
-        .iter()
-        .find_map(|ip| match ip {
-            std::net::IpAddr::V4(v4) => Some(v4.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    if let Some(ip) = super::throughput::extract_target_ip(&target) {
-        super::throughput::wait_for_peer(&server, ip, Duration::from_secs(90)).await;
+    let operation: Result<LatencyResult, Box<dyn Error>> = async {
+        Box::pin(server.up()).await?;
+        super::throughput::log_userspace_identity(&server, "latency-client")?;
+        let my_ip = server
+            .status()
+            .tailscale_ips
+            .iter()
+            .find_map(|ip| match ip {
+                std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if let Some(ip) = super::throughput::extract_target_ip(&target) {
+            super::throughput::wait_for_peer(&server, ip, Duration::from_secs(90)).await?;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // A measured latency process gets one connection attempt. Retrying
+        // would add unreported setup work to the resource window.
+        let stream = tokio::time::timeout(Duration::from_secs(180), server.dial(&target))
+            .await
+            .map_err(|_| "RSB1 latency connection setup timeout")??;
+        // Keep the Rust and pinned-Go embedded clients on the same evidence
+        // boundary: retain the path after the complete latency exchange, not
+        // the fresh process's immediately post-dial convergence snapshot.
+        let mut result = measure(
+            stream,
+            "userspace-tsnet",
+            target.clone(),
+            count,
+            "unknown".into(),
+            my_ip,
+        )
+        .await?;
+        result.path_class = super::throughput::current_userspace_path(&server, &target).await;
+        eprintln!(
+            "BENCH_PATH role=latency-client phase=post-measurement class={}",
+            result.path_class
+        );
+        Ok(result)
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    // A measured latency process gets one connection attempt. Retrying here
-    // would add unreported setup work to the endpoint resource window.
-    let stream = tokio::time::timeout(Duration::from_secs(180), server.dial(&target))
-        .await
-        .map_err(|_| "RSB1 latency connection setup timeout")??;
-    let path = super::throughput::extract_path_class(&server.status(), &target);
-    let result = measure(stream, "userspace-tsnet", target, count, path, my_ip).await?;
-    super::throughput::close_userspace(&mut server).await?;
-    Ok(result)
+    .await;
+    let shutdown = super::throughput::close_userspace(&mut server).await;
+    match (operation, shutdown) {
+        (Ok(result), Ok(())) => {
+            eprintln!("BENCH_SHUTDOWN role=latency-client status=clean");
+            Ok(result)
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => {
+            Err(format!("{error}; userspace shutdown also failed: {shutdown_error}").into())
+        }
+    }
 }
 
 pub async fn run_kernel(target: String, count: usize) -> Result<LatencyResult, Box<dyn Error>> {

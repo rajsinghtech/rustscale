@@ -4686,7 +4686,7 @@ async fn interop_application_udp_cadence() {
         .await
         .expect("warmup send_to");
     let (warmup, warmup_src) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv_from())
+        tokio::time::timeout(std::time::Duration::from_secs(20), receiver.recv_from())
             .await
             .expect("UDP cadence warmup timed out")
             .expect("UDP cadence warmup receive failed");
@@ -4789,11 +4789,22 @@ async fn interop_application_udp_cadence() {
         max_one_way.as_millis()
     );
     log::debug!("interop_application_udp_cadence: {diagnostics}");
+    println!(
+        "UDP_CADENCE\tpath={path}\tcadence_ms={CADENCE_MS}\tcount={PACKET_COUNT}\t\
+         send_span_ms={}\tarrival_span_ms={}\tmax_one_way_ms={}",
+        send_span.as_millis(),
+        arrival_span.as_millis(),
+        max_one_way.as_millis()
+    );
 
     drop(sender);
     let sender_close = sender_server.close().await;
     let receiver_close = receiver_server.close().await;
 
+    assert!(
+        path != "missing" && path != "None",
+        "one-way application UDP lacks a classified peer path; {diagnostics}"
+    );
     assert!(
         max_one_way <= MAX_ONE_WAY,
         "one-way application UDP exceeded the generous {MAX_ONE_WAY:?} bound; {diagnostics}"

@@ -4,9 +4,13 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -113,5 +117,255 @@ func TestPersistentStateIsNonEphemeral(t *testing.T) {
 	}
 	if got, want := server.Hostname, "fixture"; got != want {
 		t.Fatalf("hostname = %q, want %q", got, want)
+	}
+}
+
+func TestDialAllUsesBoundedAdmission(t *testing.T) {
+	const total = 11
+	started := make(chan struct{}, total)
+	release := make(chan struct{})
+	peers := make(chan net.Conn, total)
+	var active atomic.Int32
+	var maximum atomic.Int32
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for observed := maximum.Load(); current > observed && !maximum.CompareAndSwap(observed, current); observed = maximum.Load() {
+		}
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		server, client := net.Pipe()
+		peers <- server
+		return client, nil
+	}
+
+	type outcome struct {
+		connections []net.Conn
+		err         error
+	}
+	finished := make(chan outcome, 1)
+	go func() {
+		connections, err := dialAllWith(context.Background(), "100.64.0.1:5201", total, dial)
+		finished <- outcome{connections, err}
+	}()
+
+	for range clientSetupWindow {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("initial dial window was not filled")
+		}
+	}
+	if got := maximum.Load(); got != clientSetupWindow {
+		t.Fatalf("maximum concurrent dials = %d, want %d", got, clientSetupWindow)
+	}
+	select {
+	case <-started:
+		t.Fatal("dial admission exceeded the window")
+	default:
+	}
+	for launched := clientSetupWindow; launched < total; launched++ {
+		release <- struct{}{}
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("next bounded dial was not admitted")
+		}
+	}
+	for range clientSetupWindow {
+		release <- struct{}{}
+	}
+
+	var result outcome
+	select {
+	case result = <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("bounded dials did not finish")
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if len(result.connections) != total {
+		t.Fatalf("connections = %d, want %d", len(result.connections), total)
+	}
+	for index, conn := range result.connections {
+		if conn == nil {
+			t.Fatalf("connection %d is nil", index)
+		}
+		conn.Close()
+	}
+	for range total {
+		(<-peers).Close()
+	}
+}
+
+type closeTrackingConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+func TestDialAllFailureCancelsPendingAndClosesCompleted(t *testing.T) {
+	started := make(chan struct{}, clientSetupWindow+1)
+	allowSuccess := make(chan struct{})
+	allowFailure := make(chan struct{})
+	var calls atomic.Int32
+	var completed *closeTrackingConn
+	var peer net.Conn
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		call := calls.Add(1)
+		started <- struct{}{}
+		switch call {
+		case 1:
+			select {
+			case <-allowSuccess:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			peerSide, clientSide := net.Pipe()
+			peer = peerSide
+			completed = &closeTrackingConn{Conn: clientSide}
+			return completed, nil
+		case 2:
+			select {
+			case <-allowFailure:
+				return nil, errors.New("fixture dial failure")
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		default:
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
+
+	finished := make(chan error, 1)
+	go func() {
+		_, err := dialAllWith(context.Background(), "100.64.0.1:5201", 20, dial)
+		finished <- err
+	}()
+	for range clientSetupWindow {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("initial dial window was not filled")
+		}
+	}
+	close(allowSuccess)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("successful dial did not admit its successor")
+	}
+	close(allowFailure)
+
+	var err error
+	select {
+	case err = <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("failed bounded dials did not cancel")
+	}
+	if err == nil || !strings.Contains(err.Error(), "established 1 of 20") || !strings.Contains(err.Error(), "fixture dial failure") {
+		t.Fatalf("unexpected capacity error: %v", err)
+	}
+	if got := calls.Load(); got != clientSetupWindow+1 {
+		t.Fatalf("dial calls = %d, want exactly %d without retries", got, clientSetupWindow+1)
+	}
+	if completed == nil || !completed.closed.Load() {
+		t.Fatal("completed connection was not closed after atomic setup failure")
+	}
+	if peer != nil {
+		peer.Close()
+	}
+}
+
+func TestHandshakeAllUsesBoundedAdmission(t *testing.T) {
+	const total = 11
+	clients := make([]net.Conn, 0, total)
+	servers := make([]net.Conn, 0, total)
+	started := make(chan int, total)
+	release := make(chan struct{})
+	serverDone := make(chan error, total)
+	for index := range total {
+		server, client := net.Pipe()
+		servers = append(servers, server)
+		clients = append(clients, client)
+		go func() {
+			_, err := readHeader(server)
+			if err == nil {
+				started <- index
+				<-release
+				err = writeAck(server)
+			}
+			serverDone <- err
+		}()
+	}
+
+	type outcome struct {
+		connections []net.Conn
+		err         error
+	}
+	finished := make(chan outcome, 1)
+	go func() {
+		connections, err := handshakeAll(clients, rsb1Header{mode: modeThroughput, direction: directionDown, durationSeconds: 1})
+		finished <- outcome{connections, err}
+	}()
+	for range clientSetupWindow {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("initial handshake window was not filled")
+		}
+	}
+	select {
+	case index := <-started:
+		t.Fatalf("handshake %d exceeded the admission window", index)
+	default:
+	}
+	for launched := clientSetupWindow; launched < total; launched++ {
+		release <- struct{}{}
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("next bounded handshake was not admitted")
+		}
+	}
+	for range clientSetupWindow {
+		release <- struct{}{}
+	}
+
+	var result outcome
+	select {
+	case result = <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("bounded handshakes did not finish")
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if len(result.connections) != total {
+		t.Fatalf("connections = %d, want %d", len(result.connections), total)
+	}
+	for index, conn := range result.connections {
+		if conn != clients[index] {
+			t.Fatalf("connection %d was reordered", index)
+		}
+		conn.Close()
+	}
+	for range total {
+		if err := <-serverDone; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, server := range servers {
+		server.Close()
 	}
 }

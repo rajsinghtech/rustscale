@@ -190,15 +190,19 @@ Certification accepts exactly the ordered stream set
 or silently truncated. Every measured trial must report exactly
 the requested `established`, `handshaken`, and `completed` counts after all
 connections finish the RSB1 ready/GO barrier under one bounded setup deadline.
-Embedded Rust resolves the target once and admits TCP plus RSB1 setup in a
-bounded listener-safe window; it does not retry, serialize, truncate, or submit
-an unbounded P500/P1000 SYN/header burst. Outbound TCP ports start at a fresh
-process offset and remain collision-owned through socket teardown, preventing
-restarted trial processes from immediately reusing live peer four-tuples.
-Credential-free Rust regressions retain
-all P500 netstack streams, bound a failing P1000 request's pending ownership, and
-exercise the complete P500 RSB1 lifecycle. The Go package has a hermetic P100
-lifecycle gate; Rust also retains its local P1000 kernel setup gate. Paid P1000
+The embedded Rust and pinned Go clients admit TCP plus RSB1 setup through the
+same four-stream listener-safe window. Every requested stream is submitted
+exactly once, retained until the common GO barrier, and returned in request
+order; neither client truncates the request or submits an unbounded P500/P1000
+SYN/header burst. Embedded Rust also resolves the target once. Its outbound TCP
+ports start at a fresh process offset and remain collision-owned through socket
+teardown, preventing restarted trial processes from immediately reusing live
+peer four-tuples.
+Credential-free Rust regressions retain all P500 netstack streams, bound a
+failing P1000 request's pending ownership, and exercise the complete P500 RSB1
+lifecycle. The Go package proves its dial and header/ACK admission ceiling,
+one-attempt cancellation cleanup, ordered retention, and a complete hermetic
+P100 lifecycle; Rust also retains its local P1000 kernel setup gate. Paid P1000
 publication still requires all selected cells to complete the requested point.
 
 The warmup, each measured throughput trial, and latency are each attempted

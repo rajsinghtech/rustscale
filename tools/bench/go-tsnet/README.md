@@ -18,7 +18,10 @@ throughput result reports exact `established`, `handshaken`, and `completed`
 counts. Timing starts only after all streams receive RSB1 ready and cross the
 common GO barrier. Latency succeeds only with every requested, byte-exact
 8-byte reply. Path class comes from the exact target peer in the embedded local
-status.
+status. TCP dials and RSB1 header/ACK exchanges use the same four-stream setup
+window as RustScale. Each requested stream is attempted once, results retain
+request order, and any failure cancels pending setup and closes every completed
+connection without publishing partial measurements.
 
 Credential-free checks:
 

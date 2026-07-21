@@ -22,7 +22,13 @@ import (
 	"tailscale.com/tsnet"
 )
 
-const clientSetupTimeout = 180 * time.Second
+const (
+	clientSetupTimeout = 180 * time.Second
+	// Match rustscale-netstack's TCP_DIAL_WINDOW. Setup is outside the
+	// measured interval, and bounding admission prevents a SYN or RSB1-header
+	// burst larger than either userspace listener can reliably absorb.
+	clientSetupWindow = 4
+)
 
 type throughputSample struct {
 	ElapsedSeconds uint64  `json:"elapsed_secs"`
@@ -92,12 +98,18 @@ type indexedConnection struct {
 }
 
 func dialAll(ctx context.Context, server *tsnet.Server, target string, parallel int) ([]net.Conn, error) {
+	return dialAllWith(ctx, target, parallel, server.Dial)
+}
+
+type dialConnection func(context.Context, string, string) (net.Conn, error)
+
+func dialAllWith(ctx context.Context, target string, parallel int, dial dialConnection) ([]net.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, clientSetupTimeout)
 	defer cancel()
-	results := make(chan indexedConnection, parallel)
-	for index := range parallel {
+	results := make(chan indexedConnection, clientSetupWindow)
+	launch := func(index int) {
 		go func() {
-			conn, err := server.Dial(ctx, "tcp", target)
+			conn, err := dial(ctx, "tcp", target)
 			if ctx.Err() != nil && conn != nil {
 				_ = conn.Close()
 				conn = nil
@@ -108,39 +120,52 @@ func dialAll(ctx context.Context, server *tsnet.Server, target string, parallel 
 			results <- indexedConnection{index: index, conn: conn, err: err}
 		}()
 	}
-	indexed := make([]indexedConnection, 0, parallel)
+	ordered := make([]net.Conn, parallel)
+	next := 0
+	active := 0
+	for next < parallel && active < clientSetupWindow {
+		launch(next)
+		next++
+		active++
+	}
+	established := 0
 	var firstError error
-	for received := 0; received < parallel; received++ {
+	for active > 0 {
 		// tsnet.Dial is required to honor the shared bounded context. Drain every
 		// result so a connection that races with cancellation is never leaked.
 		result := <-results
+		active--
 		if result.err != nil {
 			if firstError == nil {
 				firstError = fmt.Errorf("connection %d: %w", result.index, result.err)
 				cancel()
 			}
-			continue
+		} else {
+			ordered[result.index] = result.conn
+			established++
 		}
-		indexed = append(indexed, result)
+		if firstError == nil && next < parallel {
+			launch(next)
+			next++
+			active++
+		}
 	}
 	if firstError != nil {
-		for _, opened := range indexed {
-			_ = opened.conn.Close()
+		for _, opened := range ordered {
+			if opened != nil {
+				_ = opened.Close()
+			}
 		}
-		return nil, fmt.Errorf("capacity error: established %d of %d requested connections: %w", len(indexed), parallel, firstError)
+		return nil, fmt.Errorf("capacity error: established %d of %d requested connections: %w", established, parallel, firstError)
 	}
-	sort.Slice(indexed, func(i, j int) bool { return indexed[i].index < indexed[j].index })
-	connections := make([]net.Conn, 0, parallel)
-	for _, opened := range indexed {
-		connections = append(connections, opened.conn)
-	}
-	return connections, nil
+	return ordered, nil
 }
 
 func handshakeAll(connections []net.Conn, header rsb1Header) ([]net.Conn, error) {
 	deadline := time.Now().Add(clientSetupTimeout)
-	results := make(chan indexedConnection, len(connections))
-	for index, conn := range connections {
+	results := make(chan indexedConnection, clientSetupWindow)
+	launch := func(index int) {
+		conn := connections[index]
 		go func() {
 			if err := conn.SetDeadline(deadline); err != nil {
 				results <- indexedConnection{index: index, conn: conn, err: err}
@@ -161,16 +186,36 @@ func handshakeAll(connections []net.Conn, header rsb1Header) ([]net.Conn, error)
 			results <- indexedConnection{index: index, conn: conn}
 		}()
 	}
+	next := 0
+	active := 0
+	for next < len(connections) && active < clientSetupWindow {
+		launch(next)
+		next++
+		active++
+	}
 	ready := make([]indexedConnection, 0, len(connections))
-	for range connections {
+	var firstError error
+	for active > 0 {
 		result := <-results
+		active--
 		if result.err != nil {
-			for _, conn := range connections {
-				conn.Close()
+			if firstError == nil {
+				firstError = fmt.Errorf("stream %d protocol setup: %w", result.index, result.err)
 			}
-			return nil, fmt.Errorf("stream %d protocol setup: %w", result.index, result.err)
+		} else {
+			ready = append(ready, result)
 		}
-		ready = append(ready, result)
+		if firstError == nil && next < len(connections) {
+			launch(next)
+			next++
+			active++
+		}
+	}
+	if firstError != nil {
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+		return nil, firstError
 	}
 	sort.Slice(ready, func(i, j int) bool { return ready[i].index < ready[j].index })
 	result := make([]net.Conn, 0, len(ready))

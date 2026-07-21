@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustscale_tailcfg::{DERPMap, DERPNode, DERPRegion};
@@ -146,6 +148,34 @@ async fn prober_runs_captive_portal_on_full_probe() {
     assert!(report.udp, "the STUN probe should have worked");
     assert_eq!(report.captive_portal, Some(false));
     assert!(!health.is_unhealthy(WARN_CAPTIVE_PORTAL));
+}
+
+#[tokio::test]
+async fn endpoint_refresh_skips_icmp_and_captive_portal_work() {
+    let stun = FakeStunServer::start(None, Duration::ZERO).await.unwrap();
+    let mut dm = map_from_servers(&[(1, stun)]);
+    add_captive_endpoint(&mut dm);
+    let detector_calls = Arc::new(AtomicUsize::new(0));
+    let calls = detector_calls.clone();
+    let detector = crate::captivedetection::Detector::with_dialer(move |_, _| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(TcpStream::connect("127.0.0.1:1"))
+    });
+
+    let report = Prober
+        .run_endpoint_refresh(
+            &dm,
+            &ProberOpts {
+                captive_detector: detector,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("endpoint report");
+
+    assert!(report.udp, "the STUN endpoint probe should have worked");
+    assert_eq!(report.captive_portal, None);
+    assert_eq!(detector_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

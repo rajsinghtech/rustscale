@@ -13,6 +13,9 @@ evidence.
 - Reported peer paths only from fresh observed transport evidence.
 - Fixed embedded userspace P500/P1000 setup, receive scheduling, cancellation,
   and cleanup limits, with deterministic high-load regressions.
+- Randomized periodic endpoint-refresh timing and limited maintenance probes to
+  STUN endpoint discovery so colocated embedded peers do not phase-lock full
+  netchecks and stall active application datagrams.
 - Added a pinned Go embedded-tsnet comparator and published a credential-free,
   checksum-verified five-mode canonical benchmark. The result discloses high
   Rust embedded variance at several concurrency levels and makes no stable

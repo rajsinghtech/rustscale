@@ -137,10 +137,16 @@ tun_job=$(awk '
     job { print }
 ' .github/workflows/e2e.yml)
 preflight_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'tools/interop-tun-preflight.sh' | cut -d: -f1)
+build_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'Build TUN interop binaries (credential-free)' | cut -d: -f1)
 token_line=$(printf '%s\n' "$tun_job" | grep -n -m1 'Mint Tailscale org token' | cut -d: -f1)
 test -n "$preflight_line"
+test -n "$build_line"
 test -n "$token_line"
 test "$preflight_line" -lt "$token_line"
+test "$preflight_line" -lt "$build_line"
+test "$build_line" -lt "$token_line"
+printf '%s\n' "$tun_job" | grep -Fq 'timeout-minutes: 50'
+printf '%s\n' "$tun_job" | grep -Fq 'tools/agent/run-with-deadline.py 1800'
 grep -Fq -- 'cargo test -p rustscale-tsnet --lib --no-run' tools/interop-tun.sh
 grep -Fq -- "target.get('name') == 'rustscale_tsnet'" tools/interop-tun.sh
 grep -Fq -- "'lib' in target.get('kind', [])" tools/interop-tun.sh

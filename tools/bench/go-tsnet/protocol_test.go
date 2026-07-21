@@ -73,13 +73,17 @@ func TestLatencyExchangeIsComplete(t *testing.T) {
 }
 
 func TestServerCancellationClosesListener(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	listeners := make([]net.Listener, 0, 2)
+	for range 2 {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners = append(listeners, listener)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan error, 1)
-	go func() { finished <- serveUntilCanceled(ctx, listener) }()
+	go func() { finished <- serveUntilCanceled(ctx, listeners) }()
 	cancel()
 	select {
 	case err := <-finished:
@@ -89,9 +93,32 @@ func TestServerCancellationClosesListener(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("server did not exit after cancellation")
 	}
-	if conn, err := net.DialTimeout("tcp", listener.Addr().String(), 50*time.Millisecond); err == nil {
-		conn.Close()
-		t.Fatal("listener still accepted connections after cancellation")
+	for _, listener := range listeners {
+		if conn, err := net.DialTimeout("tcp", listener.Addr().String(), 50*time.Millisecond); err == nil {
+			conn.Close()
+			t.Fatal("listener still accepted connections after cancellation")
+		}
+	}
+}
+
+func TestValidatePortRange(t *testing.T) {
+	for _, test := range []struct {
+		port  uint
+		count uint
+		valid bool
+	}{
+		{5201, 17, true},
+		{65535, 1, true},
+		{0, 1, false},
+		{5201, 0, false},
+		{65000, 536, true},
+		{65000, 537, false},
+		{5201, 1025, false},
+	} {
+		err := validatePortRange(test.port, test.count)
+		if (err == nil) != test.valid {
+			t.Errorf("validatePortRange(%d, %d) = %v, valid=%v", test.port, test.count, err, test.valid)
+		}
 	}
 }
 

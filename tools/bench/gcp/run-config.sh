@@ -644,9 +644,9 @@ rs_userspace_client_command() {
 }
 
 go_tsnet_server_start_command() {
-  local authfile="$1" port="$2" hostname="$3" statedir="$4" logfile="$5" pidfile="$6"
+  local authfile="$1" port="$2" hostname="$3" statedir="$4" logfile="$5" pidfile="$6" port_count="${7:-1}"
   nohup_background_command "" \
-    "prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey-file $authfile --port $port --hostname $hostname --state-dir $statedir" \
+    "prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey-file $authfile --port $port --port-count $port_count --hostname $hostname --state-dir $statedir" \
     "$logfile" "$pidfile"
 }
 
@@ -780,8 +780,8 @@ command_shape_self_test() {
   [[ "$rs_userspace_server" == 'RUSTSCALE_DISABLE_UDP_GSO=1 nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench server --authkey-file /tmp/rustscale-bench-authkey --port 7777 --hostname srv --state-dir /tmp/rs-srv > /tmp/rs-srv.log 2>&1 & echo $! > /tmp/rs-srv.pid' ]] || return 1
   rs_userspace_client=$(rs_userspace_client_command 1 1 0 /tmp/rustscale-bench-authkey 100.64.0.1:7777 10 1 cli /tmp/rs-cli /tmp/rs-cli.log)
   [[ "$rs_userspace_client" == 'RUSTSCALE_DISABLE_UDP_GSO=1 /opt/rustscale/target/release/rustscale-bench client --authkey-file /tmp/rustscale-bench-authkey --target 100.64.0.1:7777 --duration 10 --parallel 1 --hostname cli --state-dir /tmp/rs-cli --json 2>/tmp/rs-cli.log' ]] || return 1
-  go_server=$(go_tsnet_server_start_command /tmp/rustscale-bench-authkey 7777 srv /tmp/go-srv /tmp/go-srv.log /tmp/go-srv.pid)
-  [[ "$go_server" == 'nohup prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey-file /tmp/rustscale-bench-authkey --port 7777 --hostname srv --state-dir /tmp/go-srv > /tmp/go-srv.log 2>&1 & echo $! > /tmp/go-srv.pid' ]] || return 1
+  go_server=$(go_tsnet_server_start_command /tmp/rustscale-bench-authkey 7777 srv /tmp/go-srv /tmp/go-srv.log /tmp/go-srv.pid 17)
+  [[ "$go_server" == 'nohup prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey-file /tmp/rustscale-bench-authkey --port 7777 --port-count 17 --hostname srv --state-dir /tmp/go-srv > /tmp/go-srv.log 2>&1 & echo $! > /tmp/go-srv.pid' ]] || return 1
   go_client=$(go_tsnet_client_command throughput /tmp/rustscale-bench-authkey 100.64.0.1:7777 10 100 cli /tmp/go-cli /tmp/go-client.log)
   [[ "$go_client" == '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey-file /tmp/rustscale-bench-authkey --target 100.64.0.1:7777 --duration 10 --parallel 100 --direction down --hostname cli --state-dir /tmp/go-cli --json 2>/tmp/go-client.log' ]] || return 1
   go_latency=$(go_tsnet_client_command latency /tmp/rustscale-bench-authkey 100.64.0.1:7777 50 1 cli /tmp/go-cli /tmp/go-latency.log)
@@ -2406,6 +2406,26 @@ rsb1_client_command() {
   esac
 }
 
+# A fresh embedded-Go process owns a fresh userspace TCP stack and therefore
+# cannot remember the prior process's ephemeral source ports while the peer may
+# still retain those four-tuples. Keep every stream single-attempt and avoid
+# cross-process four-tuple reuse by assigning one destination port per process
+# trial. Other transports retain their fixed per-cell destination.
+rsb1_trial_target() {
+  local client_kind="$1" target="$2" offset="$3" host port
+  [[ "$offset" =~ ^[0-9]+$ ]] || return 2
+  if [[ "$client_kind" != go-userspace ]]; then
+    printf '%s' "$target"
+    return 0
+  fi
+  host="${target%:*}"
+  port="${target##*:}"
+  [[ "$host" != "$target" && "$port" =~ ^[1-9][0-9]*$ && "$port" -le 65535 ]] || return 2
+  port=$((port + offset))
+  (( port <= 65535 )) || return 2
+  printf '%s:%s' "$host" "$port"
+}
+
 # Run one configuration-neutral RSB1 suite after the caller has prepared its
 # transport, endpoint, path gate, process subjects, and teardown function. The
 # warmup and every measured throughput/latency process are each invoked exactly
@@ -2439,12 +2459,13 @@ rsb1_measure() {
   # measured trial, and latency trial gets a new benchmark process. Embedded
   # clients reopen durable keys under one stable hostname; Rust also discards
   # its prior process-local netmap cache before waiting for a fresh snapshot.
-  local client_state_dir=/tmp/rsb1-client-state command
+  local client_state_dir=/tmp/rsb1-client-state command trial_target
   RS_PARITY_FAILURE_LOG=/tmp/rsb1-warmup.log
-  command=$(rsb1_client_command "$client_kind" throughput "$target" 3 1 "$client_state_dir" /tmp/rsb1-warmup.log) || return 2
+  trial_target=$(rsb1_trial_target "$client_kind" "$target" 0) || return 2
+  command=$(rsb1_client_command "$client_kind" throughput "$trial_target" 3 1 "$client_state_dir" /tmp/rsb1-warmup.log) || return 2
   warmup_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
   path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,tool=sys.argv[1:]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1 and d["established"]==1 and d["handshaken"]==1 and d["completed"]==1; value=float(d["total_mbps"]); assert math.isfinite(value) and value>0; print(d["path_class"])' "$reported_transport" "$expected_client_tool") || return 1
-  warmup_evidence=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in ("transport","protocol","direction","duration_secs","parallel","established","handshaken","completed","total_mbps","path_class")}))') || return 1
+  warmup_evidence=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in ("transport","protocol","direction","duration_secs","parallel","established","handshaken","completed","total_mbps","path_class","target")}))') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && path_class="$gated_path"
   [[ "$PATH_TAG" == direct && "$path_class" == direct || "$PATH_TAG" == derp && "$path_class" == derp ]] || {
     echo "[gcp] RSB1 warmup observed wrong path: $path_class" >&2
@@ -2463,11 +2484,12 @@ rsb1_measure() {
     for ((sample_index=1; sample_index<=REPEAT; sample_index++)); do
       echo "[gcp] $CONFIG: RSB1 N=$N sample=$sample_index/$REPEAT" >&2
       RS_PARITY_FAILURE_LOG=/tmp/rsb1-$N-$sample_index.log
-      command=$(rsb1_client_command "$client_kind" throughput "$target" "$DURATION" "$N" "$client_state_dir" "/tmp/rsb1-$N-$sample_index.log") || return 2
+      trial_target=$(rsb1_trial_target "$client_kind" "$target" "$((sample_number + 1))") || return 2
+      command=$(rsb1_client_command "$client_kind" throughput "$trial_target" "$DURATION" "$N" "$client_state_dir" "/tmp/rsb1-$N-$sample_index.log") || return 2
       sample_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
       mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected,tool=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$reported_transport" "$N" "$PATH_TAG" "$expected_client_tool") || return 1
       samples+=("$mbps")
-      trial_json=$(printf '%s' "$sample_json" | python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); d=json.load(sys.stdin); rows.append({"parallel":d["parallel"],"repeat_index":int(sys.argv[2]),"transport":d["transport"],"protocol":d["protocol"],"direction":d["direction"],"duration_s":d["duration_secs"],"established":d["established"],"handshaken":d["handshaken"],"completed":d["completed"],"total_mbps":d["total_mbps"],"path_class":d["path_class"]}); print(json.dumps(rows))' "$trial_json" "$sample_index") || return 1
+      trial_json=$(printf '%s' "$sample_json" | python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); d=json.load(sys.stdin); rows.append({"parallel":d["parallel"],"repeat_index":int(sys.argv[2]),"transport":d["transport"],"protocol":d["protocol"],"direction":d["direction"],"duration_s":d["duration_secs"],"established":d["established"],"handshaken":d["handshaken"],"completed":d["completed"],"total_mbps":d["total_mbps"],"path_class":d["path_class"],"target":d["target"]}); print(json.dumps(rows))' "$trial_json" "$sample_index") || return 1
       sample_number=$((sample_number+1))
       (( sample_number == total_samples )) || sleep 3
     done
@@ -2477,7 +2499,8 @@ rsb1_measure() {
   # Latency is the final measured trial and receives the same inter-trial gap.
   sleep 3
   RS_PARITY_FAILURE_LOG=/tmp/rsb1-latency.log
-  command=$(rsb1_client_command "$client_kind" latency "$target" "$LATENCY_COUNT" 1 "$client_state_dir" /tmp/rsb1-latency.log) || return 2
+  trial_target=$(rsb1_trial_target "$client_kind" "$target" "$((total_samples + 1))") || return 2
+  command=$(rsb1_client_command "$client_kind" latency "$trial_target" "$LATENCY_COUNT" 1 "$client_state_dir" /tmp/rsb1-latency.log) || return 2
   lat_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
   lat_json=$(printf '%s' "$lat_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,n,expected,tool=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1-tcp-pingpong" and d["requested"]==n and d["successful"]==n and d["timed_out"]==0 and d["malformed"]==0 and len(d["samples_ns"])==n and all(type(v) is int and v>0 for v in d["samples_ns"]); values=[d[k] for k in ("min_ns","mean_ns","p50_ns","p95_ns","p99_ns","max_ns","min_us","mean_us","p50_us","p95_us","p99_us","max_us")]; assert all(isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and v>0 for v in values) and d["p50_ns"]<=d["p95_ns"]<=d["p99_ns"]; assert transport=="kernel-tcp" or d["path_class"]==expected; print(json.dumps(d))' "$reported_transport" "$LATENCY_COUNT" "$PATH_TAG" "$expected_client_tool") || return 1
   RSB1_MEASURE_PATH_POST=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path_class"])') || return 1
@@ -2517,6 +2540,13 @@ transport_path = {
 }[config]
 portmapping = {"rs-userspace":"disabled", "ts-embedded":"upstream-default"}.get(config, "not-applicable")
 tool = {"rs-userspace":"rustscale", "rs-tun":"rustscale", "ts-embedded":"go-tsnet-rsb1", "ts-userspace":"tailscaled", "ts-tun":"tailscaled"}[config]
+warmup_evidence, trials, latency = json.loads(warmup_evidence), json.loads(trials), json.loads(lat)
+destination_targets = [warmup_evidence["target"], *(trial["target"] for trial in trials), latency["target"]]
+destination_lifecycle = "unique-per-process-trial" if config == "ts-embedded" else "fixed-per-cell"
+if config == "ts-embedded":
+    assert len(set(destination_targets)) == len(destination_targets)
+else:
+    assert len(set(destination_targets)) == 1
 obj={"schema_version":6,"status":"ok","tool":tool,
  "implementation":implementation,"mode":mode,"topology":topo,"path":requested_path,"config":config,
  "repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],"error":"","log_tail":"",
@@ -2526,9 +2556,10 @@ obj={"schema_version":6,"status":"ok","tool":tool,
              "client_lifecycle":"new_benchmark_process_per_trial",
              "transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,
              "latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,
-             "latency_count":200,"transport_path":transport_path,"userspace_portmapping":portmapping},
- "warmup_evidence":json.loads(warmup_evidence),"throughput":json.loads(tp),
- "throughput_trials":json.loads(trials),"latency":json.loads(lat),
+             "latency_count":200,"transport_path":transport_path,"userspace_portmapping":portmapping,
+             "destination_target_lifecycle":destination_lifecycle,"destination_targets":destination_targets},
+ "warmup_evidence":warmup_evidence,"throughput":json.loads(tp),
+ "throughput_trials":trials,"latency":latency,
  "runtime_stats":{"server":runtime_server,"client":runtime_client},
  "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,
               "server":dict(server,endpoint="server",subjects=subject_sets[0],scope=scope),
@@ -2614,6 +2645,10 @@ rsb1_lifecycle_self_test() {
     && "$rust_trial" == *'/rustscale-bench client '* \
     && "$go_trial" == "timeout --signal=TERM --kill-after=5s ${RSB1_TRIAL_TIMEOUT_SECONDS}s prlimit "* \
     && "$go_trial" == *'/go-tsnet-rsb1 latency '* ]] || return 1
+  [[ "$(rsb1_trial_target go-userspace 100.64.0.1:5201 0)" == 100.64.0.1:5201 \
+    && "$(rsb1_trial_target go-userspace 100.64.0.1:5201 16)" == 100.64.0.1:5217 \
+    && "$(rsb1_trial_target rust-userspace 100.64.0.1:5201 16)" == 100.64.0.1:5201 ]] || return 1
+  if rsb1_trial_target go-userspace 100.64.0.1:65535 1 >/dev/null 2>&1; then return 1; fi
 
   event=$(mktemp "$RDIR/cell-exit-test.XXXXXX") || return 1
   if ( set +e; CELL_MUTATED=1; CELL_CLEANED=0; CELL_CLEANUP_FN=self_test_cleanup; self_test_cleanup() { printf clean >"$event"; return 0; }; false; cell_exit_cleanup ); then
@@ -2782,8 +2817,9 @@ run_rs_tun() {
 run_ts_embedded() {
   arm_cell_cleanup cleanup_ts_embedded
   echo "[gcp] ts-embedded: starting pinned Go tsnet RSB1 server on $SVM" >&2
+  local go_port_count=$((1 + ${#PARALLELS[@]} * REPEAT + 1))
   if ! ssh_cmd "$SVM" "$SZONE" \
-      "rm -rf /tmp/go-tsnet-srv; rm -f /tmp/go-tsnet-srv.{log,pid}; $(go_tsnet_server_start_command "$REMOTE_AUTHKEY_FILE" "$PORT" "$SHOST" /tmp/go-tsnet-srv /tmp/go-tsnet-srv.log /tmp/go-tsnet-srv.pid)"; then
+      "rm -rf /tmp/go-tsnet-srv; rm -f /tmp/go-tsnet-srv.{log,pid}; $(go_tsnet_server_start_command "$REMOTE_AUTHKEY_FILE" "$PORT" "$SHOST" /tmp/go-tsnet-srv /tmp/go-tsnet-srv.log /tmp/go-tsnet-srv.pid "$go_port_count")"; then
     fail_userspace_config cleanup_ts_embedded "ts-embedded-server-start-failed"
     return 1
   fi
@@ -2792,7 +2828,7 @@ run_ts_embedded() {
   [[ "$PATH_TAG" == derp ]] && timeout=300
   local elapsed=0
   while (( elapsed < timeout )); do
-    if ssh_cmd "$SVM" "$SZONE" 'pid=$(cat /tmp/go-tsnet-srv.pid 2>/dev/null); kill -0 "$pid" 2>/dev/null && grep -q "BENCH_READY 1" /tmp/go-tsnet-srv.log' >/dev/null 2>&1; then
+    if ssh_cmd "$SVM" "$SZONE" "pid=\$(cat /tmp/go-tsnet-srv.pid 2>/dev/null); kill -0 \"\$pid\" 2>/dev/null && grep -q 'BENCH_READY 1' /tmp/go-tsnet-srv.log && grep -qx 'BENCH_PORT_COUNT $go_port_count' /tmp/go-tsnet-srv.log" >/dev/null 2>&1; then
       break
     fi
     sleep 5

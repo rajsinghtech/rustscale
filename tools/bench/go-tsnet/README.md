@@ -8,7 +8,7 @@ kernel-TCP bridge.
 The CLI mirrors the userspace portion of `rustscale-bench`:
 
 ```text
-go-tsnet-rsb1 server  --authkey KEY --port 5201 --hostname NAME --state-dir DIR
+go-tsnet-rsb1 server  --authkey KEY --port 5201 --port-count 1 --hostname NAME --state-dir DIR
 go-tsnet-rsb1 client  --authkey KEY --target IP:PORT --duration 10 --direction down --parallel 100 --hostname NAME --state-dir DIR --json
 go-tsnet-rsb1 latency --authkey KEY --target IP:PORT --count 50 --hostname NAME --state-dir DIR --json
 ```
@@ -22,6 +22,12 @@ status. TCP dials and RSB1 header/ACK exchanges use the same four-stream setup
 window as RustScale. Each requested stream is attempted once, results retain
 request order, and any failure cancels pending setup and closes every completed
 connection without publishing partial measurements.
+
+The matrix starts the long-lived server with one consecutive destination port
+for the warmup, every measured process trial, and latency. Each restarted
+client process receives a unique target, preventing its fresh userspace TCP
+stack from reusing a four-tuple that the peer still owns. `--port-count`
+defaults to one for ordinary standalone use and accepts at most 1024 ports.
 
 Credential-free checks:
 

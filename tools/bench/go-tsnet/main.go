@@ -75,7 +75,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage:
-  %[1]s server --authkey-file FILE [--port 5201] [--hostname NAME] [--state-dir DIR]
+  %[1]s server --authkey-file FILE [--port 5201] [--port-count 1] [--hostname NAME] [--state-dir DIR]
   %[1]s client --authkey-file FILE --target IP:PORT --duration SECONDS --direction down --parallel N --json [--hostname NAME] [--state-dir DIR]
   %[1]s latency --authkey-file FILE --target IP:PORT --count N --json [--hostname NAME] [--state-dir DIR]
   %[1]s --version
@@ -164,13 +164,17 @@ func runServerCommand(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("server", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	options := addCommonFlags(flags, "bench-go-tsnet-server")
-	port := flags.Uint("port", 5201, "RSB1 listen port")
+	port := flags.Uint("port", 5201, "first RSB1 listen port")
+	portCount := flags.Uint("port-count", 1, "consecutive RSB1 listen ports")
 	jsonOutput := flags.Bool("json", false, "reserved for CLI compatibility")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *port == 0 || *port > 65535 || *jsonOutput {
+	if flags.NArg() != 0 || *jsonOutput {
 		return errors.New("invalid server arguments")
+	}
+	if err := validatePortRange(*port, *portCount); err != nil {
+		return err
 	}
 	if err := validateCommon(options); err != nil {
 		return err
@@ -196,13 +200,24 @@ func runServerCommand(ctx context.Context, args []string) error {
 	if !ip.IsValid() {
 		return errors.New("tsnet is running without an IPv4 tailnet address")
 	}
-	listener, err := server.Listen("tcp", fmt.Sprintf(":%d", *port))
-	if err != nil {
-		return fmt.Errorf("tsnet listen: %w", err)
+	listeners := make([]net.Listener, 0, *portCount)
+	for offset := range *portCount {
+		listener, err := server.Listen("tcp", fmt.Sprintf(":%d", *port+offset))
+		if err != nil {
+			for _, opened := range listeners {
+				_ = opened.Close()
+			}
+			return fmt.Errorf("tsnet listen port %d: %w", *port+offset, err)
+		}
+		listeners = append(listeners, listener)
 	}
-	defer listener.Close()
-	fmt.Fprintf(os.Stderr, "BENCH_IP %s\nBENCH_PORT %d\nBENCH_READY 1\n", ip, *port)
-	serveErr := serveUntilCanceled(ctx, listener)
+	defer func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+	}()
+	fmt.Fprintf(os.Stderr, "BENCH_IP %s\nBENCH_PORT %d\nBENCH_PORT_COUNT %d\nBENCH_READY 1\n", ip, *port, *portCount)
+	serveErr := serveUntilCanceled(ctx, listeners)
 	closeErr := server.Close()
 	serverClosed = true
 	if serveErr != nil {
@@ -214,19 +229,53 @@ func runServerCommand(ctx context.Context, args []string) error {
 	return nil
 }
 
-func serveUntilCanceled(ctx context.Context, listener net.Listener) error {
-	serveResult := make(chan error, 1)
-	go func() { serveResult <- serveRSB1(listener) }()
+func validatePortRange(port, count uint) error {
+	if port == 0 || port > 65535 || count == 0 || count > 1024 || port+count-1 > 65535 {
+		return errors.New("--port and --port-count must describe 1..1024 consecutive TCP ports within 1..65535")
+	}
+	return nil
+}
+
+func serveUntilCanceled(ctx context.Context, listeners []net.Listener) error {
+	if len(listeners) == 0 {
+		return errors.New("no RSB1 listeners")
+	}
+	serveResults := make(chan error, len(listeners))
+	for _, listener := range listeners {
+		go func() { serveResults <- serveRSB1(listener) }()
+	}
+	closeAll := func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+	}
 	select {
-	case err := <-serveResult:
-		return err
-	case <-ctx.Done():
-		_ = listener.Close()
-		err := <-serveResult
-		if errors.Is(err, net.ErrClosed) {
+	case err := <-serveResults:
+		closeAll()
+		unexpected := error(nil)
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			unexpected = err
+		}
+		for range len(listeners) - 1 {
+			if candidate := <-serveResults; unexpected == nil && candidate != nil && !errors.Is(candidate, net.ErrClosed) {
+				unexpected = candidate
+			}
+		}
+		if unexpected != nil {
+			return unexpected
+		}
+		if ctx.Err() != nil {
 			return nil
 		}
 		return err
+	case <-ctx.Done():
+		closeAll()
+		for range listeners {
+			if err := <-serveResults; err != nil && !errors.Is(err, net.ErrClosed) {
+				return err
+			}
+		}
+		return nil
 	}
 }
 

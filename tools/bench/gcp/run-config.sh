@@ -2382,6 +2382,91 @@ PYEOF
   unset -f ssh_sudo run_tun_command scp_from
 }
 
+rsb1_result_payload_cleanup() {
+  local directory="$1"
+  rm -f "$directory/throughput.json" "$directory/trials.json" \
+    "$directory/warmup.json" "$directory/latency.json" \
+    "$directory/server-footprint.json" "$directory/client-footprint.json" \
+    "$directory/runtime-server.json" "$directory/runtime-client.json"
+  rmdir "$directory"
+}
+
+# Keep measured series and runtime snapshots out of argv. At P1000 their
+# combined size exceeds macOS ARG_MAX even though each JSON document is valid.
+assemble_rsb1_result() {
+  local payload_dir="$1" output="$2"
+  shift 2
+  python3 - "$payload_dir" "$@" >"$output" <<'PYEOF'
+import json, math, pathlib, sys
+payload_dir, config, topo, requested_path, observed_path, transport, size, repeat, server_subjects, client_subjects, primary_subject, primary_path, workload_implementation, *parallels = sys.argv[1:]
+payload_dir = pathlib.Path(payload_dir)
+def load_json(name):
+    with (payload_dir / name).open() as source:
+        return json.load(source)
+def load_text(name):
+    return (payload_dir / name).read_text()
+tp = load_json("throughput.json")
+trials = load_json("trials.json")
+warmup_evidence = load_json("warmup.json")
+latency = load_json("latency.json")
+server = load_json("server-footprint.json")
+client = load_json("client-footprint.json")
+runtime_server = load_text("runtime-server.json")
+runtime_client = load_text("runtime-client.json")
+subject_sets = [server_subjects.split(","), client_subjects.split(",")]
+for endpoint, subjects in zip((server, client), subject_sets):
+    assert endpoint["samples"] > 0 and endpoint["samples"] > endpoint["missing_samples"]
+    assert all(isinstance(endpoint.get(name), (int, float)) and not isinstance(endpoint.get(name), bool) and math.isfinite(endpoint[name]) for name in ("rss_peak_kb", "rss_avg_kb", "cpu_peak_pct", "cpu_avg_pct"))
+    assert endpoint["rss_peak_kb"] > 0 and endpoint["rss_avg_kb"] > 0 and endpoint["cpu_peak_pct"] >= 0 and endpoint["cpu_avg_pct"] >= 0
+    assert endpoint["series"] and any(sample.get("rss_kb") is not None for sample in endpoint["series"]) and any(sample.get("cpu_pct") is not None for sample in endpoint["series"])
+    observed = {item.rsplit(":", 1)[-1] for sample in endpoint["series"] for item in sample.get("included_processes", []) if isinstance(item, str) and ":" in item}
+    assert set(subjects) <= observed
+scope = {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
+implementation = "rustscale" if config.startswith("rs-") else "tailscale"
+mode = {"rs-userspace":"embedded", "rs-tun":"tun", "ts-embedded":"embedded", "ts-userspace":"daemon-proxy", "ts-tun":"tun"}[config]
+transport_path = {
+    "rs-userspace":"embedded-rust-tsnet",
+    "rs-tun":"kernel-tcp-via-rustscaled-tun",
+    "ts-embedded":"embedded-go-tsnet",
+    "ts-userspace":"kernel-tcp-via-loopback-ncat-socks5-tailscaled-serve",
+    "ts-tun":"kernel-tcp-via-tailscaled-tun",
+}[config]
+portmapping = {"rs-userspace":"disabled", "ts-embedded":"upstream-default"}.get(config, "not-applicable")
+tool = {"rs-userspace":"rustscale", "rs-tun":"rustscale", "ts-embedded":"go-tsnet-rsb1", "ts-userspace":"tailscaled", "ts-tun":"tailscaled"}[config]
+destination_targets = [warmup_evidence["target"], *(trial["target"] for trial in trials), latency["target"]]
+client_shutdown_modes = [warmup_evidence["shutdown"], *(trial["shutdown"] for trial in trials), latency["shutdown"]]
+destination_lifecycle = "unique-per-process-trial" if config == "ts-embedded" else "fixed-per-cell"
+if config == "ts-embedded":
+    assert len(set(destination_targets)) == len(destination_targets)
+    assert set(client_shutdown_modes) <= {"graceful", "process-exit-after-close-timeout"}
+else:
+    assert len(set(destination_targets)) == 1
+    assert set(client_shutdown_modes) == {"process-return-after-complete"}
+obj={"schema_version":6,"status":"ok","tool":tool,
+ "implementation":implementation,"mode":mode,"topology":topo,"path":requested_path,"config":config,
+ "repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],"error":"","log_tail":"",
+ "path_class_reported":observed_path,"transport":transport,
+ "workload":{"implementation":workload_implementation,"protocol":"RSB1","direction":"down","payload_bytes":1280,
+             "warmup":{"parallel":1,"duration_s":3,"max_attempts":1},
+             "client_lifecycle":"new_benchmark_process_per_trial",
+             "transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,
+             "latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,
+             "latency_count":200,"transport_path":transport_path,"userspace_portmapping":portmapping,
+             "destination_target_lifecycle":destination_lifecycle,"destination_targets":destination_targets,
+             "client_shutdown_lifecycle":"bounded-api-close-then-process-exit" if config == "ts-embedded" else "process-return-after-complete",
+             "client_shutdown_modes":client_shutdown_modes},
+ "warmup_evidence":warmup_evidence,"throughput":tp,
+ "throughput_trials":trials,"latency":latency,
+ "runtime_stats":{"server":runtime_server,"client":runtime_client},
+ "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,
+              "server":dict(server,endpoint="server",subjects=subject_sets[0],scope=scope),
+              "client":dict(client,endpoint="client",subjects=subject_sets[1],scope=scope)},
+ "footprint":dict(server,binary_size_bytes=int(size),subject=primary_subject,endpoint="server",scope=scope),
+ "binary":{"subject":primary_subject,"path":primary_path,"size_bytes":int(size)}}
+print(json.dumps(obj,indent=2))
+PYEOF
+}
+
 # Run one configuration-neutral RSB1 suite after the caller has prepared its
 # transport, endpoint, path gate, process subjects, and teardown function. The
 # warmup and every measured throughput/latency process are each invoked exactly
@@ -2520,63 +2605,32 @@ rsb1_measure() {
   server_subjects=$(IFS=,; printf '%s' "${RSB1_SERVER_SUBJECTS[*]}")
   client_subjects=$(IFS=,; printf '%s' "${RSB1_CLIENT_SUBJECTS[*]}")
 
-  python3 - "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$reported_transport" "$bin_size" "$tp_json" "$trial_json" "$warmup_evidence" "$lat_json" "$server_foot" "$client_foot" "$REPEAT" "$server_subjects" "$client_subjects" "$primary_subject" "$primary_path" "$workload_implementation" "$runtime_server" "$runtime_client" "${PARALLELS[@]}" >"$PENDING_OUT" <<'PYEOF'
-import json, math, sys
-config, topo, requested_path, observed_path, transport, size, tp, trials, warmup_evidence, lat, server, client, repeat, server_subjects, client_subjects, primary_subject, primary_path, workload_implementation, runtime_server, runtime_client, *parallels = sys.argv[1:]
-server, client = json.loads(server), json.loads(client)
-subject_sets = [server_subjects.split(","), client_subjects.split(",")]
-for endpoint, subjects in zip((server, client), subject_sets):
-    assert endpoint["samples"] > 0 and endpoint["samples"] > endpoint["missing_samples"]
-    assert all(isinstance(endpoint.get(name), (int, float)) and not isinstance(endpoint.get(name), bool) and math.isfinite(endpoint[name]) for name in ("rss_peak_kb", "rss_avg_kb", "cpu_peak_pct", "cpu_avg_pct"))
-    assert endpoint["rss_peak_kb"] > 0 and endpoint["rss_avg_kb"] > 0 and endpoint["cpu_peak_pct"] >= 0 and endpoint["cpu_avg_pct"] >= 0
-    assert endpoint["series"] and any(sample.get("rss_kb") is not None for sample in endpoint["series"]) and any(sample.get("cpu_pct") is not None for sample in endpoint["series"])
-    observed = {item.rsplit(":", 1)[-1] for sample in endpoint["series"] for item in sample.get("included_processes", []) if isinstance(item, str) and ":" in item}
-    assert set(subjects) <= observed
-scope = {"kind":"dynamic_process_set","includes_descendants":False,"includes_kernel":False}
-implementation = "rustscale" if config.startswith("rs-") else "tailscale"
-mode = {"rs-userspace":"embedded", "rs-tun":"tun", "ts-embedded":"embedded", "ts-userspace":"daemon-proxy", "ts-tun":"tun"}[config]
-transport_path = {
-    "rs-userspace":"embedded-rust-tsnet",
-    "rs-tun":"kernel-tcp-via-rustscaled-tun",
-    "ts-embedded":"embedded-go-tsnet",
-    "ts-userspace":"kernel-tcp-via-loopback-ncat-socks5-tailscaled-serve",
-    "ts-tun":"kernel-tcp-via-tailscaled-tun",
-}[config]
-portmapping = {"rs-userspace":"disabled", "ts-embedded":"upstream-default"}.get(config, "not-applicable")
-tool = {"rs-userspace":"rustscale", "rs-tun":"rustscale", "ts-embedded":"go-tsnet-rsb1", "ts-userspace":"tailscaled", "ts-tun":"tailscaled"}[config]
-warmup_evidence, trials, latency = json.loads(warmup_evidence), json.loads(trials), json.loads(lat)
-destination_targets = [warmup_evidence["target"], *(trial["target"] for trial in trials), latency["target"]]
-client_shutdown_modes = [warmup_evidence["shutdown"], *(trial["shutdown"] for trial in trials), latency["shutdown"]]
-destination_lifecycle = "unique-per-process-trial" if config == "ts-embedded" else "fixed-per-cell"
-if config == "ts-embedded":
-    assert len(set(destination_targets)) == len(destination_targets)
-    assert set(client_shutdown_modes) <= {"graceful", "process-exit-after-close-timeout"}
-else:
-    assert len(set(destination_targets)) == 1
-    assert set(client_shutdown_modes) == {"process-return-after-complete"}
-obj={"schema_version":6,"status":"ok","tool":tool,
- "implementation":implementation,"mode":mode,"topology":topo,"path":requested_path,"config":config,
- "repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],"error":"","log_tail":"",
- "path_class_reported":observed_path,"transport":transport,
- "workload":{"implementation":workload_implementation,"protocol":"RSB1","direction":"down","payload_bytes":1280,
-             "warmup":{"parallel":1,"duration_s":3,"max_attempts":1},
-             "client_lifecycle":"new_benchmark_process_per_trial",
-             "transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,
-             "latency_protocol":"RSB1-tcp-pingpong","latency_payload_bytes":8,
-             "latency_count":200,"transport_path":transport_path,"userspace_portmapping":portmapping,
-             "destination_target_lifecycle":destination_lifecycle,"destination_targets":destination_targets,
-             "client_shutdown_lifecycle":"bounded-api-close-then-process-exit" if config == "ts-embedded" else "process-return-after-complete",
-             "client_shutdown_modes":client_shutdown_modes},
- "warmup_evidence":warmup_evidence,"throughput":json.loads(tp),
- "throughput_trials":trials,"latency":latency,
- "runtime_stats":{"server":runtime_server,"client":runtime_client},
- "resources":{"phase_set":["measured_client_process_lifecycle","inter_trial_gap","latency"],"sample_cadence_ms":1000,
-              "server":dict(server,endpoint="server",subjects=subject_sets[0],scope=scope),
-              "client":dict(client,endpoint="client",subjects=subject_sets[1],scope=scope)},
- "footprint":dict(server,binary_size_bytes=int(size),subject=primary_subject,endpoint="server",scope=scope),
- "binary":{"subject":primary_subject,"path":primary_path,"size_bytes":int(size)}}
-print(json.dumps(obj,indent=2))
-PYEOF
+  local assembly_dir assembly_status=0
+  assembly_dir=$(mktemp -d "${TMPDIR:-/tmp}/rustscale-rsb1-result.XXXXXX") || return 1
+  RSB1_RESULT_PAYLOAD_DIR="$assembly_dir"
+  chmod 700 "$assembly_dir" || {
+    rsb1_result_payload_cleanup "$assembly_dir"
+    RSB1_RESULT_PAYLOAD_DIR=""
+    return 1
+  }
+  printf '%s' "$tp_json" >"$assembly_dir/throughput.json" || assembly_status=$?
+  printf '%s' "$trial_json" >"$assembly_dir/trials.json" || assembly_status=$?
+  printf '%s' "$warmup_evidence" >"$assembly_dir/warmup.json" || assembly_status=$?
+  printf '%s' "$lat_json" >"$assembly_dir/latency.json" || assembly_status=$?
+  printf '%s' "$server_foot" >"$assembly_dir/server-footprint.json" || assembly_status=$?
+  printf '%s' "$client_foot" >"$assembly_dir/client-footprint.json" || assembly_status=$?
+  printf '%s' "$runtime_server" >"$assembly_dir/runtime-server.json" || assembly_status=$?
+  printf '%s' "$runtime_client" >"$assembly_dir/runtime-client.json" || assembly_status=$?
+  if (( assembly_status == 0 )); then
+    assemble_rsb1_result "$assembly_dir" "$PENDING_OUT" \
+      "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$reported_transport" \
+      "$bin_size" "$REPEAT" "$server_subjects" "$client_subjects" \
+      "$primary_subject" "$primary_path" "$workload_implementation" \
+      "${PARALLELS[@]}" || assembly_status=$?
+  fi
+  rsb1_result_payload_cleanup "$assembly_dir" || return 1
+  RSB1_RESULT_PAYLOAD_DIR=""
+  (( assembly_status == 0 )) || return "$assembly_status"
 }
 # Publish only after a post-suite path gate and verified clean teardown. The
 # pending file is never considered by aggregate.py's three-level cell scan.
@@ -2601,6 +2655,7 @@ PYEOF
 CELL_CLEANUP_FN=""
 CELL_MUTATED=0
 CELL_CLEANED=1
+RSB1_RESULT_PAYLOAD_DIR=""
 arm_cell_cleanup() {
   CELL_CLEANUP_FN="$1"
   CELL_MUTATED=1
@@ -2619,6 +2674,10 @@ cell_exit_cleanup() {
     (( cleanup_status == 0 )) || status=$FATAL_HANDOFF_STATUS
   fi
   cleanup_remote_authkeys || { (( status == 0 )) && status=1; }
+  if [[ -n "$RSB1_RESULT_PAYLOAD_DIR" ]]; then
+    rsb1_result_payload_cleanup "$RSB1_RESULT_PAYLOAD_DIR" || { (( status == 0 )) && status=1; }
+    RSB1_RESULT_PAYLOAD_DIR=""
+  fi
   rm -f "$PENDING_OUT"
   exit "$status"
 }
@@ -2666,7 +2725,7 @@ rsb1_lifecycle_self_test() {
   # No workload process is retried. Both embedded clients use the stable
   # state/hostname contract, while only Rust's process-local netmap cache is
   # explicitly discarded between processes.
-  definition="$(declare -f rsb1_measure)$(declare -f rsb1_client_command)$(declare -f go_tsnet_client_command)"
+  definition="$(declare -f rsb1_measure)$(declare -f assemble_rsb1_result)$(declare -f rsb1_client_command)$(declare -f go_tsnet_client_command)"
   [[ "$definition" != *'retry'* \
     && "$definition" == *'client_state_dir=/tmp/rsb1-client-state'* \
     && "$definition" == *'netmap-cache.json'* \
@@ -2685,6 +2744,52 @@ rsb1_lifecycle_self_test() {
     && "$(rsb1_trial_target go-userspace 100.64.0.1:5201 16)" == 100.64.0.1:5217 \
     && "$(rsb1_trial_target rust-userspace 100.64.0.1:5201 16)" == 100.64.0.1:5201 ]] || return 1
   if rsb1_trial_target go-userspace 100.64.0.1:65535 1 >/dev/null 2>&1; then return 1; fi
+
+  # A synthetic resource/runtime payload larger than normal macOS ARG_MAX
+  # must assemble through private files and leave no payload directory behind.
+  local assembly_parent assembly_payload assembly_output
+  assembly_parent=$(mktemp -d "$RDIR/rsb1-assembly-selftest.XXXXXX") || return 1
+  assembly_payload="$assembly_parent/payload"
+  assembly_output="$assembly_parent/result.json"
+  mkdir -m 700 "$assembly_payload" || return 1
+  python3 - "$assembly_payload" <<'PYEOF'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+target = "100.64.0.1:5201"
+shutdown = "process-return-after-complete"
+warmup = {"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_secs":3,"parallel":1,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"direct","target":target,"shutdown":shutdown}
+trial = {"parallel":1,"repeat_index":1,"transport":"kernel-tcp","protocol":"RSB1","direction":"down","duration_s":1,"established":1,"handshaken":1,"completed":1,"total_mbps":1.0,"path_class":"direct","target":target,"shutdown":shutdown}
+latency = {"target":target,"shutdown":shutdown}
+padding = "x" * 300_000
+footprint = {"samples":1,"missing_samples":0,"rss_peak_kb":1,"rss_avg_kb":1,"cpu_peak_pct":0,"cpu_avg_pct":0,"series":[{"rss_kb":1,"cpu_pct":0,"included_processes":["1:tailscaled"],"padding":padding}]}
+payloads = {
+    "throughput.json": [{"parallel":1,"duration_s":1,"samples_mbps":[1.0],"median_mbps":1.0}],
+    "trials.json": [trial],
+    "warmup.json": warmup,
+    "latency.json": latency,
+    "server-footprint.json": footprint,
+    "client-footprint.json": footprint,
+    "runtime-server.json": {"padding": padding},
+    "runtime-client.json": {"padding": padding},
+}
+for name, value in payloads.items():
+    (root / name).write_text(json.dumps(value))
+PYEOF
+  assemble_rsb1_result "$assembly_payload" "$assembly_output" \
+    ts-userspace same-zone direct direct kernel-tcp 123 1 \
+    tailscaled tailscaled tailscaled /usr/sbin/tailscaled rustscale-bench 1 || return 1
+  python3 - "$assembly_output" <<'PYEOF'
+import json, sys
+result = json.load(open(sys.argv[1]))
+assert result["status"] == "ok" and result["config"] == "ts-userspace"
+assert len(result["resources"]["server"]["series"][0]["padding"]) == 300_000
+assert len(result["runtime_stats"]["client"]) > 300_000
+PYEOF
+  rsb1_result_payload_cleanup "$assembly_payload" || return 1
+  [[ ! -e "$assembly_payload" ]] || return 1
+  rm -f "$assembly_output"
+  rmdir "$assembly_parent" || return 1
+  if compgen -G "$RDIR/rsb1-assembly-selftest.*" >/dev/null; then return 1; fi
 
   event=$(mktemp "$RDIR/cell-exit-test.XXXXXX") || return 1
   if ( set +e; CELL_MUTATED=1; CELL_CLEANED=0; CELL_CLEANUP_FN=self_test_cleanup; self_test_cleanup() { printf clean >"$event"; return 0; }; false; cell_exit_cleanup ); then

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustscale_tsnet::{Server, ServerStatus};
+use rustscale_tsnet::Server;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -118,7 +118,11 @@ pub async fn run_userspace(
             my_ip,
         )
         .await?;
-        result.path_class = extract_path_class(&server.status(), &target);
+        result.path_class = current_userspace_path(&server, &target).await;
+        eprintln!(
+            "BENCH_PATH role=client phase=post-measurement class={}",
+            result.path_class
+        );
         Ok(result)
     }
     .await;
@@ -514,30 +518,41 @@ pub(crate) async fn wait_for_peer(
         "peer-map readiness timeout: target={target_ip} peers=[{peers}]"
     ))
 }
-pub(crate) fn extract_path_class(status: &ServerStatus, target: &str) -> String {
+fn classify_path_fields(cur_addr: &str, peer_relay: &str, relay: &str) -> &'static str {
+    if !cur_addr.is_empty() {
+        "direct"
+    } else if !peer_relay.is_empty() {
+        "relay"
+    } else if !relay.is_empty() {
+        "derp"
+    } else {
+        "none"
+    }
+}
+
+pub(crate) async fn current_userspace_path(server: &Server, target: &str) -> String {
     let Some(target_ip) = extract_target_ip(target) else {
         return "unknown".into();
     };
-    status
-        .peers
-        .iter()
-        .find(|peer| {
-            peer.ips
-                .iter()
-                .any(|ip| matches!(ip, std::net::IpAddr::V4(v4) if *v4 == target_ip))
-        })
-        .map_or_else(
-            || "unknown".into(),
-            |peer| {
-                match peer.path_class {
-                    rustscale_magicsock::PathClass::Direct => "direct",
-                    rustscale_magicsock::PathClass::Derp => "derp",
-                    rustscale_magicsock::PathClass::Relay => "relay",
-                    rustscale_magicsock::PathClass::None => "none",
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = server.ipn_status().await {
+            if let Some(peer) = status.Peer.values().find(|peer| {
+                peer.TailscaleIPs
+                    .iter()
+                    .any(|ip| matches!(ip, std::net::IpAddr::V4(v4) if *v4 == target_ip))
+            }) {
+                let path = classify_path_fields(&peer.CurAddr, &peer.PeerRelay, &peer.Relay);
+                if !matches!(path, "unknown" | "none") {
+                    return path.into();
                 }
-                .into()
-            },
-        )
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return "unknown".into();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[cfg(test)]
@@ -545,6 +560,22 @@ mod tests {
     use super::*;
     use crate::protocol::{read_go, read_header, write_ack};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn path_field_classification_matches_ipnstate_precedence() {
+        assert_eq!(classify_path_fields("198.51.100.7:41641", "", ""), "direct");
+        assert_eq!(classify_path_fields("", "203.0.113.7:3478", ""), "relay");
+        assert_eq!(classify_path_fields("", "", "derp-1"), "derp");
+        assert_eq!(classify_path_fields("", "", ""), "none");
+        assert_eq!(
+            classify_path_fields("198.51.100.7:41641", "203.0.113.7:3478", "derp-1"),
+            "direct"
+        );
+        assert_eq!(
+            classify_path_fields("", "203.0.113.7:3478", "derp-1"),
+            "relay"
+        );
+    }
 
     async fn synthetic_rsb1_round(parallel: usize) -> ThroughputResult {
         let mut clients = Vec::with_capacity(parallel);

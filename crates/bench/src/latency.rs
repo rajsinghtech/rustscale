@@ -79,7 +79,11 @@ pub async fn run_userspace(
             my_ip,
         )
         .await?;
-        result.path_class = super::throughput::extract_path_class(&server.status(), &target);
+        result.path_class = super::throughput::current_userspace_path(&server, &target).await;
+        eprintln!(
+            "BENCH_PATH role=latency-client phase=post-measurement class={}",
+            result.path_class
+        );
         Ok(result)
     }
     .await;

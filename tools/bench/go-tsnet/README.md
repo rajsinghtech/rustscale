@@ -18,10 +18,15 @@ throughput result reports exact `established`, `handshaken`, and `completed`
 counts. Timing starts only after all streams receive RSB1 ready and cross the
 common GO barrier. Latency succeeds only with every requested, byte-exact
 8-byte reply. Path class comes from the exact target peer in the embedded local
-status. TCP dials and RSB1 header/ACK exchanges use the same four-stream setup
-window as RustScale. Each requested stream is attempted once, results retain
-request order, and any failure cancels pending setup and closes every completed
-connection without publishing partial measurements.
+status. On RustScale, TCP dials and RSB1 header/ACK exchanges each use the
+four-stream setup window. Pinned Go uses a bounded sixteen-stream window, far
+below pinned gVisor `gonet`'s 4096-connection listen backlog, so P1000 setup
+has room to finish inside the process deadline without recreating the failed
+unbounded burst. Paid acceptance still requires exact P1000 completion. Setup
+is outside the timed RSB1 data phase. Each requested stream is attempted once,
+results retain request order, and any failure cancels pending
+setup and closes every completed connection without publishing partial
+measurements.
 
 The matrix starts the long-lived server with one consecutive destination port
 for the warmup, every measured process trial, and latency. Each restarted

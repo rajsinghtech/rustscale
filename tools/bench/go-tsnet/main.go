@@ -317,16 +317,24 @@ func runClientCommand(ctx context.Context, args []string) error {
 	}()
 	ip, client, err := bringUp(ctx, server, target.Addr())
 	if err != nil {
+		log.Printf("BENCH_SETUP phase=transport status=failed requested=%d error=%q", *parallel, err)
 		return err
 	}
+	log.Printf("BENCH_SETUP phase=transport status=complete requested=%d", *parallel)
+	log.Printf("BENCH_SETUP phase=tcp status=started requested=%d window=%d", *parallel, clientSetupWindow)
 	connections, err := dialAll(ctx, server, target.String(), *parallel)
 	if err != nil {
+		log.Printf("BENCH_SETUP phase=tcp status=failed requested=%d error=%q", *parallel, err)
 		return err
 	}
+	log.Printf("BENCH_SETUP phase=tcp status=complete established=%d requested=%d", len(connections), *parallel)
+	log.Printf("BENCH_SETUP phase=rsb1 status=started established=%d requested=%d window=%d", len(connections), *parallel, clientSetupWindow)
 	result, err := measureThroughput(connections, target.String(), *direction, *duration, "unknown", ip.String())
 	if err != nil {
+		log.Printf("BENCH_SETUP phase=rsb1 status=failed established=%d requested=%d error=%q", len(connections), *parallel, err)
 		return err
 	}
+	log.Printf("BENCH_SETUP phase=rsb1 status=complete established=%d handshaken=%d requested=%d", result.Established, result.Handshaken, *parallel)
 	result.PathClass = currentPath(ctx, client, target.Addr())
 	closeErr := server.Close()
 	serverClosed = true

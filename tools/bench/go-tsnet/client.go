@@ -24,10 +24,12 @@ import (
 
 const (
 	clientSetupTimeout = 180 * time.Second
-	// Match rustscale-netstack's TCP_DIAL_WINDOW. Setup is outside the
-	// measured interval, and bounding admission prevents a SYN or RSB1-header
-	// burst larger than either userspace listener can reliably absorb.
-	clientSetupWindow = 4
+	// Setup is outside the measured interval. Pinned gVisor's gonet listener
+	// owns a 4096-connection backlog, but an unbounded P100/P1000 burst proved
+	// unreliable in the paid harness. Sixteen keeps admission far below that
+	// listener capacity while giving P1000 setup room to finish inside the
+	// setup and whole-process deadlines.
+	clientSetupWindow = 16
 )
 
 type throughputSample struct {

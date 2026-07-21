@@ -121,7 +121,7 @@ func TestPersistentStateIsNonEphemeral(t *testing.T) {
 }
 
 func TestDialAllUsesBoundedAdmission(t *testing.T) {
-	const total = 11
+	const total = clientSetupWindow + 7
 	started := make(chan struct{}, total)
 	release := make(chan struct{})
 	peers := make(chan net.Conn, total)
@@ -288,7 +288,7 @@ func TestDialAllFailureCancelsPendingAndClosesCompleted(t *testing.T) {
 }
 
 func TestHandshakeAllUsesBoundedAdmission(t *testing.T) {
-	const total = 11
+	const total = clientSetupWindow + 7
 	clients := make([]net.Conn, 0, total)
 	servers := make([]net.Conn, 0, total)
 	started := make(chan int, total)

@@ -189,19 +189,23 @@ Certification accepts exactly the ordered stream set
 `--scale-streams` is a compatibility alias for that same set. No cell is capped
 or silently truncated. Every measured trial must report exactly
 the requested `established`, `handshaken`, and `completed` counts after all
-connections finish the RSB1 ready/GO barrier under one bounded setup deadline.
-The embedded Rust and pinned Go clients admit TCP plus RSB1 setup through the
-same four-stream listener-safe window. Every requested stream is submitted
-exactly once, retained until the common GO barrier, and returned in request
-order; neither client truncates the request or submits an unbounded P500/P1000
-SYN/header burst. Embedded Rust also resolves the target once. Its outbound TCP
-ports start at a fresh process offset and remain collision-owned through socket
-teardown, preventing restarted trial processes from immediately reusing live
-peer four-tuples. Pinned Go tsnet does not expose a source-port bind API, so its
-long-lived server opens one consecutive destination port per process trial and
-the harness selects each exactly once. This gives every restarted Go client a
-fresh four-tuple without retrying a stream or changing the timed RSB1 phase;
-the exact target sequence is retained in the result.
+connections finish the RSB1 ready/GO barrier under bounded setup deadlines.
+The clients use transport-specific listener-safe admission windows: four for
+RustScale's 32 passive sockets and sixteen for pinned Go, far below pinned
+gVisor `gonet`'s 4096-connection listen backlog. The Go bound gives P1000 setup
+room inside the whole-process deadline without recreating the failed unbounded
+burst; paid acceptance still requires exact completion. Setup remains outside
+the timed RSB1 data phase. Every requested stream is submitted exactly once,
+retained until the common GO barrier, and returned
+in request order; neither client truncates the request or submits an unbounded
+P500/P1000 SYN/header burst. Embedded Rust also resolves the target once. Its
+outbound TCP ports start at a fresh process offset and remain collision-owned
+through socket teardown, preventing restarted trial processes from immediately
+reusing live peer four-tuples. Pinned Go tsnet does not expose a source-port
+bind API, so its long-lived server opens one consecutive destination port per
+process trial and the harness selects each exactly once. This gives every
+restarted Go client a fresh four-tuple without retrying a stream or changing
+the timed RSB1 phase; the exact target sequence is retained in the result.
 
 Credential-free Rust regressions retain all P500 netstack streams, bound a
 failing P1000 request's pending ownership, and exercise the complete P500 RSB1

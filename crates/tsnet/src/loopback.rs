@@ -581,6 +581,7 @@ impl Server {
             user_profiles: inner.user_profiles.clone(),
             health: inner.health.clone(),
             dns_config: inner.dns_config.clone(),
+            dns_manager: inner.dns_manager.clone(),
             packet_drops: inner.packet_drops.clone(),
             capture: inner.capture.clone(),
             metrics: crate::localapi::default_metric_registry(),
@@ -702,17 +703,13 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
     let localapi_admission = Arc::new(localapi::LocalApiAdmission::default());
     let mut children = tokio::task::JoinSet::new();
     loop {
-        if cancel.is_cancelled() {
+        let accepted = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((mut stream, _peer)) = accepted else {
             break;
-        }
-        let accept = tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
-        let (mut stream, _peer) = match accept {
-            Ok(Ok(s)) => s,
-            Ok(Err(_)) => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-            Err(_) => continue,
         };
 
         let Ok(connection_permit) = connection_admission.clone().try_acquire_owned() else {
@@ -724,16 +721,20 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
         let proxy_cred = proxy_cred.clone();
         let localapi_cred = localapi_cred.clone();
         let localapi_admission = localapi_admission.clone();
+        let child_cancel = Arc::clone(&cancel);
         children.spawn(async move {
             let _connection_permit = connection_permit;
             // Sniff inside the owned child so an idle connection cannot block
-            // acceptance or lifecycle cancellation.
+            // acceptance. It also observes lifecycle cancellation directly,
+            // so central close releases accepted sockets before it returns.
             let mut peek_buf = [0u8; 1];
-            let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut peek_buf))
-                .await
-            {
-                Ok(Ok(n)) => n,
-                Ok(Err(_)) | Err(_) => return,
+            let n = tokio::select! {
+                biased;
+                () = child_cancel.cancelled() => return,
+                result = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut peek_buf)) => match result {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(_)) | Err(_) => return,
+                },
             };
             if n == 0 {
                 return;
@@ -741,8 +742,14 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
             if peek_buf[0] == super::socks5::SOCKS5_VERSION {
                 let prefixed = PrefixedStream::new(peek_buf[0], stream);
                 let auth = Some(("tsnet", &proxy_cred[..]));
-                if let Err(e) = super::socks5::handle_conn_generic(prefixed, d, auth).await {
-                    log::debug!("loopback: socks5 connection ended: {e}");
+                tokio::select! {
+                    biased;
+                    () = child_cancel.cancelled() => {}
+                    result = super::socks5::handle_conn_generic(prefixed, d, auth) => {
+                        if let Err(e) = result {
+                            log::debug!("loopback: socks5 connection ended: {e}");
+                        }
+                    }
                 }
             } else {
                 let mut prefixed = PrefixedStream::new(peek_buf[0], stream);
@@ -760,15 +767,24 @@ async fn serve_loopback<D: super::socks5::SocksDialer + 'static>(
                         return;
                     }
                 };
-                if let Err(e) =
-                    handle_localapi_http(prefixed, state, &localapi_cred, identity, permit).await
-                {
-                    log::debug!("loopback: localapi connection ended: {e}");
+                tokio::select! {
+                    biased;
+                    () = child_cancel.cancelled() => {}
+                    result = handle_localapi_http(prefixed, state, &localapi_cred, identity, permit) => {
+                        if let Err(e) = result {
+                            log::debug!("loopback: localapi connection ended: {e}");
+                        }
+                    }
                 }
             }
         });
         while children.try_join_next().is_some() {}
     }
+
+    // The listener must be released before waiting for accepted children.
+    // Otherwise a child stuck in protocol parsing can keep a rebinding caller
+    // behind lifecycle shutdown even though cancellation has been requested.
+    drop(listener);
     let drain = async { while children.join_next().await.is_some() {} };
     if tokio::time::timeout(Duration::from_secs(1), drain)
         .await

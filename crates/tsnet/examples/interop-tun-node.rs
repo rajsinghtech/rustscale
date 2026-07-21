@@ -26,10 +26,10 @@
 //! ```sh
 //! sudo interop-tun-node server --authkey-file /run/oops-auth --hostname rs-oops-s \
 //!   --state-dir /tmp/oops-s --tun-name tun0 --port 18282 --udp-port 18283 \
-//!   --ready-fifo /tmp/oops-ready
+//!   --ready-fifo /tmp/oops-ready --peer-ready-fifo /tmp/oops-peer-ready
 //! sudo interop-tun-node client --authkey-file /run/oops-auth --hostname rs-oops-c \
 //!   --state-dir /tmp/oops-c --tun-name tun0 --peer 100.64.0.1 \
-//!   --port 18282 --udp-port 18283
+//!   --port 18282 --udp-port 18283 --peer-ready-fifo /tmp/oops-peer-ready
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -89,6 +89,7 @@ struct Args {
     udp_port: u16,
     peer: Option<Ipv4Addr>,
     ready_fifo: Option<String>,
+    peer_ready_fifo: Option<String>,
     phase_fifo: Option<String>,
 }
 
@@ -115,7 +116,8 @@ impl Args {
 fn usage() -> ! {
     eprintln!(
         "usage: interop-tun-node <server|client> (--authkey K|--authkey-file F) --hostname H \
-         --state-dir D --tun-name N [--port P] [--udp-port U] [--peer V4] [--ready-fifo F] [--phase-fifo F]"
+         --state-dir D --tun-name N [--port P] [--udp-port U] [--peer V4] [--ready-fifo F] \
+         [--peer-ready-fifo F] [--phase-fifo F]"
     );
     std::process::exit(2);
 }
@@ -150,6 +152,7 @@ fn parse_args() -> Args {
         udp_port: 18283,
         peer: None,
         ready_fifo: None,
+        peer_ready_fifo: None,
         phase_fifo: None,
     };
     let mut i = 1;
@@ -186,6 +189,10 @@ fn parse_args() -> Args {
             "--ready-fifo" => {
                 parsed.ready_fifo = Some(take_value(&args, &mut i, "--ready-fifo").to_string());
             }
+            "--peer-ready-fifo" => {
+                parsed.peer_ready_fifo =
+                    Some(take_value(&args, &mut i, "--peer-ready-fifo").to_string());
+            }
             "--phase-fifo" => {
                 parsed.phase_fifo = Some(take_value(&args, &mut i, "--phase-fifo").to_string());
             }
@@ -214,6 +221,10 @@ fn parse_args() -> Args {
     }
     if parsed.role == Role::Client && parsed.ready_fifo.is_some() {
         eprintln!("client role must not receive --ready-fifo");
+        usage();
+    }
+    if parsed.peer_ready_fifo.is_none() {
+        eprintln!("--peer-ready-fifo is required");
         usage();
     }
     if parsed.role == Role::Server && parsed.phase_fifo.is_some() {
@@ -374,6 +385,13 @@ fn assert_kernel_state(tun_name: &str, expected_mtu: usize) -> u32 {
         tailnet_route.is_some(),
         "real TUN gate: table 52 is missing 100.64.0.0/10 via {tun_name}\n{routes}"
     );
+    assert!(
+        routes.lines().any(|line| {
+            line.split_whitespace().next() == Some("100.100.100.100")
+                && line.contains(&format!("dev {tun_name}"))
+        }),
+        "real TUN gate: table 52 is missing the MagicDNS service route via {tun_name}\n{routes}"
+    );
 
     ifindex
 }
@@ -407,7 +425,7 @@ fn tun_counters(_tun_name: &str) -> (u64, u64) {
 
 /// Verify that an ordinary socket's destination lookup selects this endpoint's
 /// TUN. Kernel route existence alone is insufficient evidence of the path.
-fn assert_tun_route(tun_name: &str, peer: Ipv4Addr) -> String {
+fn assert_tun_route(tun_name: &str, peer: Ipv4Addr, local: Ipv4Addr) -> String {
     let destination = peer.to_string();
     let route = command_output(
         "ip",
@@ -415,10 +433,14 @@ fn assert_tun_route(tun_name: &str, peer: Ipv4Addr) -> String {
         "real TUN gate route lookup",
     );
     assert!(
-        route
-            .lines()
-            .any(|line| line.contains(&format!("dev {tun_name}"))),
-        "real TUN gate: route to {peer} does not select {tun_name}: {route}"
+        route.lines().any(|line| {
+            line.contains(&format!("dev {tun_name}")) && line.contains(&format!("src {local}"))
+        }),
+        "real TUN gate: route to {peer} must select {tun_name} with node source {local}: {route}"
+    );
+    assert!(
+        !route.contains("src 100.100.100.100"),
+        "real TUN gate: MagicDNS service VIP contaminated peer source selection: {route}"
     );
     route.trim().to_owned()
 }
@@ -500,6 +522,39 @@ async fn up_tun_node(
             IpAddr::V4(v4) => Some(*v4),
             IpAddr::V6(_) => None,
         }) {
+            let tun_addrs = command_output(
+                "ip",
+                &["-4", "-o", "addr", "show", "dev", &tun.name],
+                "real TUN gate node address ownership",
+            );
+            assert!(
+                tun_addrs.contains(&format!("inet {v4}/32")),
+                "real TUN gate: node address {v4}/32 is missing from {}: {tun_addrs}",
+                tun.name
+            );
+            assert!(
+                !tun_addrs.contains("100.100.100.100"),
+                "real TUN gate: MagicDNS service VIP is incorrectly owned by {}: {tun_addrs}",
+                tun.name
+            );
+            let loopback_addrs = command_output(
+                "ip",
+                &["-4", "-o", "addr", "show", "dev", "lo"],
+                "real TUN gate MagicDNS loopback ownership",
+            );
+            assert!(
+                loopback_addrs.contains("inet 100.100.100.100/32"),
+                "real TUN gate: loopback does not own MagicDNS service VIP: {loopback_addrs}"
+            );
+            line(
+                start,
+                args.role,
+                &format!(
+                    "OOPS_SOURCE_OWNERSHIP_OK role={} node={v4} dev={} magicdns=100.100.100.100 dev=lo",
+                    args.role.as_str(),
+                    tun.name
+                ),
+            );
             return Ok((server, v4));
         }
         if Instant::now() >= deadline {
@@ -512,6 +567,52 @@ async fn up_tun_node(
             .into());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Wait until this endpoint's own control view contains exactly one IPv4 peer.
+/// The protected harness creates a fresh two-node tailnet, so this proves the
+/// reverse netmap publication boundary instead of relying on repeated data
+/// probes to infer whether the server has learned the client.
+async fn wait_for_single_ipv4_peer(
+    server: &Server,
+    start: Instant,
+    role: Role,
+) -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + PEER_DEADLINE;
+    loop {
+        let status = server.status();
+        let peers: Vec<Ipv4Addr> = status
+            .peers
+            .iter()
+            .flat_map(|peer| peer.ips.iter())
+            .filter_map(|ip| match ip {
+                IpAddr::V4(v4) => Some(*v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        match peers.as_slice() {
+            [peer] => {
+                line(start, role, &format!("OOPS_SERVER_PEER_OK ip={peer}"));
+                return Ok(*peer);
+            }
+            [] if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            [] => {
+                return Err(format!(
+                    "server control view remained empty for {}s",
+                    PEER_DEADLINE.as_secs()
+                )
+                .into());
+            }
+            _ => {
+                return Err(format!(
+                    "fresh two-node tailnet exposed multiple IPv4 peers to server: {peers:?}"
+                )
+                .into());
+            }
+        }
     }
 }
 
@@ -536,6 +637,24 @@ async fn run_server(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
             .ok_or("server role requires --ready-fifo")?,
         &ready,
     )?;
+
+    // Do not let the client infer reverse control-plane publication from a
+    // series of dropped application packets. Rendezvous only after the server
+    // itself sees the client's IPv4 identity, then admit the real TUN probes.
+    let client_ip = wait_for_single_ipv4_peer(&server, start, args.role).await?;
+    let peer_ready_fifo = args
+        .peer_ready_fifo
+        .clone()
+        .ok_or("server role requires --peer-ready-fifo")?;
+    tokio::task::spawn_blocking(move || {
+        signal_ready(
+            &peer_ready_fifo,
+            &format!("OOPS_SERVER_PEER_OK ip={client_ip}"),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("server peer-ready handoff task failed: {error}"))??;
 
     // UDP echo loop: one evidence line per datagram until aborted.
     let udp_start = start;
@@ -580,7 +699,7 @@ async fn run_server(args: &Args, start: Instant) -> Result<(), Box<dyn std::erro
         IpAddr::V4(v4) => v4,
         IpAddr::V6(_) => return Err("server accepted a non-IPv4 tailnet peer".into()),
     };
-    let route = assert_tun_route(&args.tun_name, peer_v4);
+    let route = assert_tun_route(&args.tun_name, peer_v4, v4);
     line(
         start,
         args.role,
@@ -647,16 +766,34 @@ async fn wait_for_peer(
 
 async fn run_client(args: &Args, start: Instant) -> Result<(), Box<dyn std::error::Error>> {
     let peer = args.peer.ok_or("client role requires --peer")?;
-    let (mut server, _v4) = up_tun_node(args, start).await?;
+    let (mut server, v4) = up_tun_node(args, start).await?;
 
     wait_for_peer(&server, peer, start, args.role).await?;
     let tun_before = tun_counters(&args.tun_name);
-    let route = assert_tun_route(&args.tun_name, peer);
+    let route = assert_tun_route(&args.tun_name, peer, v4);
     line(
         start,
         args.role,
         &format!("OOPS_CLIENT_TUN_ROUTE peer={peer} route={route}"),
     );
+
+    let peer_ready_fifo = args
+        .peer_ready_fifo
+        .clone()
+        .ok_or("client role requires --peer-ready-fifo")?;
+    let reverse_ready =
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(peer_ready_fifo))
+            .await
+            .map_err(|error| format!("reverse peer-ready handoff task failed: {error}"))??;
+    let expected_reverse = format!("OOPS_SERVER_PEER_OK ip={v4}");
+    if reverse_ready.trim() != expected_reverse {
+        return Err(format!(
+            "server learned unexpected reverse peer: expected {expected_reverse:?}, got {:?}",
+            reverse_ready.trim()
+        )
+        .into());
+    }
+    line(start, args.role, "OOPS_CLIENT_REVERSE_PEER_READY");
 
     // A peer can be published to the netmap before the control plane has
     // relayed its recently announced namespace-local UDP endpoint. Establish

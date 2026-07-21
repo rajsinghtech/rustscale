@@ -851,6 +851,39 @@ async fn responder_uses_longest_suffix_failover_and_live_reconfiguration() {
     default_task.abort();
 }
 
+/// The production TUN lifecycle transfers responder task ownership to its
+/// outer supervisor. The transfer itself must not cancel the live listeners.
+#[tokio::test]
+async fn transferred_responder_task_serves_udp_and_tcp() {
+    let handle = DnsResponder::with_forwarder(
+        local_resolver("handoff.test", Ipv4Addr::new(100, 64, 0, 42)),
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(Forwarder::new(vec![])),
+    )
+    .spawn()
+    .await
+    .expect("start DNS responder");
+    let address = handle.local_addr();
+
+    // Mirror StartupRollback ownership in the TUN lifecycle.
+    let task = handle.into_join_handle();
+    let query = make_query(0x5001, "handoff.test", qtype::A);
+    assert_eq!(
+        response_v4(&udp_round_trip(address, &query).await),
+        Ipv4Addr::new(100, 64, 0, 42)
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect DNS/TCP after task transfer");
+    write_tcp_frame(&mut stream, &query).await;
+    let response = read_tcp_frame(&mut stream).await;
+    assert_eq!(response_v4(&response), Ipv4Addr::new(100, 64, 0, 42));
+
+    task.abort();
+    let _ = task.await;
+}
+
 /// Framing and same-session reconfiguration vectors ported from
 /// tailscale.com@v1.100.0 net/dns/manager_tcp_test.go::TestDNSOverTCP.
 #[tokio::test]

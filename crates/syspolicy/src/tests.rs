@@ -1144,9 +1144,12 @@ fn watched_json_retries_pending_error_with_bounded_backoff_until_recovery() {
 
     // The failed observation remains pending, but exponential backoff bounds
     // retries and failed attempts never publish a stale generation.
-    thread::sleep(Duration::from_millis(80));
+    // The failure may be observed at any point in the retry backoff. Wait for
+    // the next retry instead of assuming a fixed wall-clock phase; this keeps
+    // the regression deterministic on slower runners while preserving the
+    // bounded-attempt assertion.
+    wait_until(|| engine.reload_attempt_count() > attempts);
     let retried_attempts = engine.reload_attempt_count();
-    assert!(retried_attempts > attempts);
     assert!(retried_attempts <= attempts + 5);
     assert_eq!(engine.snapshot().generation(), generation);
 

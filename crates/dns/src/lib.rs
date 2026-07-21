@@ -34,6 +34,10 @@ pub use osconfig::{
 };
 #[cfg(target_os = "macos")]
 pub use osconfig_darwin::DarwinConfigurator;
+#[cfg(target_os = "linux")]
+mod osconfig_linux;
+#[cfg(target_os = "linux")]
+pub use osconfig_linux::LinuxResolvedConfigurator;
 pub use wire::{
     build_a_response, build_aaaa_response, build_format_error_response, build_nxdomain,
     build_ptr_response, build_rcode_response, check_response_size_and_set_tc, parse_question,
@@ -860,7 +864,11 @@ pub fn system_nameservers() -> Vec<SocketAddr> {
             if let Some(rest) = line.strip_prefix("nameserver ") {
                 let ip = rest.trim();
                 if let Ok(addr) = ip.parse::<IpAddr>() {
-                    servers.push(SocketAddr::new(addr, 53));
+                    // resolved's local stub and our own service VIP would loop
+                    // once the host routes global DNS through MagicDNS.
+                    if !addr.is_loopback() && addr != rustscale_tsaddr::tailscale_service_ip() {
+                        servers.push(SocketAddr::new(addr, 53));
+                    }
                 }
             }
         }
@@ -1016,8 +1024,9 @@ impl DnsResponderHandle {
         }
     }
 
-    /// Transfer task ownership to an outer supervisor. Aborting the returned
-    /// task drops both listeners and aborts every child query/session.
+    /// Transfer task ownership to an outer supervisor. This leaves the
+    /// responder running; aborting the returned task drops both listeners and
+    /// aborts every child query/session.
     pub fn into_join_handle(mut self) -> JoinHandle<()> {
         self.task
             .take()
@@ -1027,8 +1036,11 @@ impl DnsResponderHandle {
 
 impl Drop for DnsResponderHandle {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        // A transferred task retains the cancellation token. Do not cancel it
+        // here: dropping `self` after `into_join_handle` is the ownership
+        // handoff to the outer supervisor, not a responder shutdown.
         if let Some(task) = self.task.take() {
+            self.cancel.cancel();
             task.abort();
         }
     }
@@ -1044,30 +1056,16 @@ struct ResponderContext {
 async fn bind_dns_sockets(
     requested: SocketAddr,
 ) -> std::io::Result<(tokio::net::UdpSocket, tokio::net::TcpListener, SocketAddr)> {
-    let mut candidates = vec![
-        requested,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-    ];
-    candidates.dedup();
-
-    let mut last_error = None;
-    for candidate in candidates {
-        let tcp = match tokio::net::TcpListener::bind(candidate).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-        let local_addr = tcp.local_addr()?;
-        match tokio::net::UdpSocket::bind(local_addr).await {
-            Ok(udp) => return Ok((udp, tcp, local_addr)),
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| std::io::Error::other("all DNS bind addresses failed")))
+    // MagicDNS is reachable only when both transports own the advertised VIP.
+    // Do not hide a failed TUN/privilege setup behind localhost or an ephemeral
+    // port: callers use this failure to report degraded DNS truthfully.
+    let tcp = tokio::net::TcpListener::bind(requested).await?;
+    let local_addr = tcp.local_addr()?;
+    // A zero port is test-only caller-selected allocation. Once selected,
+    // UDP still binds that exact address; production passes the service VIP
+    // and port 53 and gets no alternative address.
+    let udp = tokio::net::UdpSocket::bind(local_addr).await?;
+    Ok((udp, tcp, local_addr))
 }
 
 async fn run_responder(

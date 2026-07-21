@@ -33,6 +33,7 @@ mod api;
 mod appc;
 mod c2n;
 mod capture;
+mod dns_manager;
 mod dns_resolve;
 mod drive;
 mod filter_build;
@@ -359,10 +360,12 @@ pub struct ServerBuilder {
     /// defaults to `<state_dir>/rustscale.sock`.
     pub(crate) localapi_path: Option<PathBuf>,
     /// Whether to configure the OS DNS resolver in TUN mode. When true,
-    /// `up_tun` writes `/etc/resolver/` entries (macOS) pointing at
-    /// `100.100.100.100` for the MagicDNS suffix and split-DNS routes.
-    /// **Requires root** (writing `/etc/resolver` needs privileged access).
-    /// Default `false`. Ignored in netstack mode (`up()`).
+    /// `up_tun` installs per-link DNS pointing at `100.100.100.100` for the
+    /// MagicDNS suffix and split-DNS routes. macOS owns marked
+    /// `/etc/resolver/` entries; Linux uses systemd-resolved's per-link API
+    /// and reverts that link on shutdown. It never replaces foreign DNS state.
+    /// **Requires root** and a supported platform DNS manager. Default
+    /// `false`. Ignored in netstack mode (`up()`).
     pub(crate) configure_os_dns: bool,
     /// Test-only factory for exercising the real TUN startup contract when
     /// the platform DNS configurator fails after making a partial change.
@@ -802,17 +805,11 @@ impl ServerBuilder {
 
     /// Enable OS-level DNS configuration in TUN mode (default: `false`).
     ///
-    /// When enabled, [`Server::up_tun`] writes `/etc/resolver/` entries on
-    /// macOS (or calls the platform-appropriate configurator) pointing at
-    /// `100.100.100.100` for the MagicDNS suffix and any split-DNS routes
-    /// from the control-plane DNS config. Search domains from the netmap are
-    /// also installed.
-    ///
-    /// **Requires root** — writing `/etc/resolver` needs privileged access.
-    /// A setup failure leaves `up_tun` usable only when its independent TUN
-    /// data plane commits; status immediately reports the DNS degradation and
-    /// retains the configurator for cleanup rather than silently looking
-    /// healthy.
+    /// On Linux this programs systemd-resolved only for the TUN link; on macOS
+    /// it owns marked `/etc/resolver/` entries. Both preserve foreign resolver
+    /// state and are reverted on shutdown. If configuration or the exact
+    /// MagicDNS VIP listener fails, TUN startup remains available but status
+    /// reports MagicDNS as disabled with degraded DNS health.
     ///
     /// Ignored in netstack mode ([`Server::up`]).
     pub fn configure_os_dns(mut self, on: bool) -> Self {
@@ -984,10 +981,11 @@ pub(crate) struct RunningState {
     /// `NodeKeyExpired` in a MapResponse. The client should transition to
     /// a "NeedsLogin" state; un-expiring clears it.
     pub(crate) key_expired: Arc<std::sync::atomic::AtomicBool>,
-    /// OS DNS configurator, active only in TUN mode when
-    /// `configure_os_dns` is enabled. `close()` is called on server
-    /// shutdown to remove `/etc/resolver` entries.
-    pub(crate) os_dns_configurator: Option<Box<dyn OsConfigurator + Send>>,
+    /// Serialized TUN DNS generation owner. It retains the OS configurator
+    /// until RevertLink is confirmed and coordinates live map/prefs updates.
+    pub(crate) dns_manager: Option<Arc<dns_manager::DnsManager>>,
+    /// Kept reachable until OS DNS no longer routes queries to the VIP.
+    pub(crate) dns_responder_task: Option<JoinHandle<()>>,
     /// IPN state machine backend — tracks the current IPN state, holds
     /// the notification bus, and drives state transitions.
     pub(crate) ipn_backend: Arc<IpnBackend>,

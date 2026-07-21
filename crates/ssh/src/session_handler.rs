@@ -1694,16 +1694,33 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[cfg(unix)]
     #[tokio::test]
     async fn recorder_rejection_does_not_leak_pty_descriptors() {
+        const CHILD_ENV: &str = "RUSTSCALE_SSH_RECORDER_FD_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "session_handler::tests::recorder_rejection_does_not_leak_pty_descriptors",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated descriptor test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
         fn fd_count() -> usize {
             std::fs::read_dir("/dev/fd").map_or(0, Iterator::count)
         }
 
-        // Other SSH tests also open PTYs and sockets. Let those parallel tests
-        // settle before taking the process-wide descriptor baseline.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let baseline = fd_count();
         let dial: DialFn = std::sync::Arc::new(|_| {
             Box::pin(async { Err(io::Error::other("injected recorder rejection")) })

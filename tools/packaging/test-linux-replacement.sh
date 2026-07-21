@@ -1156,13 +1156,16 @@ NODE_IDENTITY_AFTER=$(curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
   | python3 -c 'import json,sys; wanted=sys.argv[1]; nodes=json.load(sys.stdin)["nodes"]; matches=[node for node in nodes if (node.get("ip") or "").split("/",1)[0] == wanted]; assert len(matches) == 1; node=matches[0]; print("{}|{}|{}".format(node["key"], node["id"], node["ip"]))' "$RUST_IP")
 [[ "$NODE_IDENTITY_AFTER" == "$NODE_IDENTITY_BEFORE" ]]
 # `tailscale up` returned Running only after this generation committed every
-# public resource above; one immediate roundtrip is therefore the assertion.
-run_bounded 5 lifecycle-restored-roundtrip \
+# public resource above; one immediate connect/roundtrip is therefore the
+# assertion. The connect remains a single kernel TCP operation, but its bound
+# permits the protocol's own SYN retransmission while a lazy WireGuard
+# handshake completes; do not replace this with an application retry or sleep.
+run_bounded 8 lifecycle-restored-roundtrip \
   python3 - "$GO_IP" "$PEER_PORT" <<'PY'
 import socket
 import sys
 payload = b"public-down-up-roundtrip\n"
-with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2) as connection:
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5) as connection:
     connection.settimeout(2)
     connection.sendall(payload)
     received = connection.recv(len(payload))

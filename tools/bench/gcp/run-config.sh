@@ -1145,6 +1145,9 @@ cleanup_ts_tun() {
 userspace_cleanup_command() {
   local role="$1" socket pidfile
   if [[ "$role" == srv ]]; then socket=/tmp/ts-srv.sock; pidfile=/tmp/ts-srv.pid; else socket=/tmp/ts-cli.sock; pidfile=/tmp/ts-cli.pid; fi
+  # Both TERM and KILL are asynchronous relative to remote observation. Keep
+  # the final postconditions fail-closed, but give escalated processes time to
+  # disappear before deciding that the endpoint requires a VM reset.
   printf '%s\n' \
 "socket=$socket" "pidfile=$pidfile" \
 'tailscale --socket="$socket" serve reset 2>/dev/null || true' \
@@ -1158,6 +1161,7 @@ userspace_cleanup_command() {
 'is_clear() { ! pgrep -x rustscale-bench >/dev/null 2>&1 && ! pgrep -x go-tsnet-rsb1 >/dev/null 2>&1 && ! pgrep -x ncat >/dev/null 2>&1 && ! pgrep -x socat >/dev/null 2>&1 && ! pgrep -x tailscaled >/dev/null 2>&1 && ! ip link show dev tailscale0 >/dev/null 2>&1 && ! ss -H -ltn | grep -Eq ":(5201|5300|11080)[[:space:]]"; }' \
 'elapsed=0; while (( elapsed < 15 )); do is_clear && break; sleep 1; elapsed=$((elapsed + 1)); done' \
 'if ! is_clear; then pkill -KILL -x rustscale-bench 2>/dev/null || true; pkill -KILL -x go-tsnet-rsb1 2>/dev/null || true; pkill -KILL -x ncat 2>/dev/null || true; pkill -KILL -x socat 2>/dev/null || true; pkill -KILL -x tailscaled 2>/dev/null || true; fi' \
+'elapsed=0; while (( elapsed < 10 )); do is_clear && break; sleep 1; elapsed=$((elapsed + 1)); done' \
 'rm -rf /tmp/rs-srv /tmp/rs-cli-* /tmp/rs-parity-client /tmp/go-tsnet-srv /tmp/ts-srv /tmp/ts-cli /tmp/rsb1-*' \
 'rm -f /tmp/rs-srv.* /tmp/go-tsnet-srv.* /tmp/ts-srv.* /tmp/ts-cli.* /tmp/ncat.* /tmp/socat.* /tmp/ts-socks-connect /tmp/rs-footprint-set.py' \
 'is_clear'
@@ -2620,7 +2624,7 @@ cell_exit_cleanup() {
 }
 
 rsb1_lifecycle_self_test() {
-  local command event status definition rust_trial go_trial
+  local command event kill_requested cleared status definition rust_trial go_trial
   command=$(ts_tun_cleanup_command srv) || return 1
   bash -n <<<"$command" || return 1
   [[ "$command" == *'tailscale --socket="$socket" down'* \
@@ -2633,6 +2637,31 @@ rsb1_lifecycle_self_test() {
     && "$command" == *'pkill -KILL -x go-tsnet-rsb1'* \
     && "$command" == *'/tmp/ts-socks-connect'* && "$command" == *'11080'* \
     && "$command" == *'ip link show dev tailscale0'* ]] || return 1
+
+  # SIGKILL is asynchronous from the observer's perspective. Prove cleanup
+  # waits for process disappearance after escalation instead of immediately
+  # latching a false unsafe-handoff result.
+  event=$(mktemp "$RDIR/userspace-kill-test.XXXXXX") || return 1
+  rm -f "$event"
+  kill_requested="$event.kill"
+  cleared="$event.clear"
+  if ! (
+    tailscale() { return 0; }
+    cat() { return 0; }
+    kill() { return 0; }
+    pkill() { [[ "$1" == -KILL ]] && : >"$kill_requested"; return 0; }
+    pgrep() { [[ -e "$cleared" ]] && return 1; return 0; }
+    ip() { return 1; }
+    ss() { return 0; }
+    sleep() { [[ -e "$kill_requested" ]] && : >"$cleared"; return 0; }
+    rm() { return 0; }
+    eval "$command"
+  ); then
+    rm -f "$event" "$kill_requested" "$cleared"
+    return 1
+  fi
+  [[ -e "$kill_requested" && -e "$cleared" ]] || { rm -f "$event" "$kill_requested" "$cleared"; return 1; }
+  rm -f "$event" "$kill_requested" "$cleared"
 
   # No workload process is retried. Both embedded clients use the stable
   # state/hostname contract, while only Rust's process-local netmap cache is

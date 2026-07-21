@@ -107,6 +107,28 @@ fi
 grep -q 'timeout-minutes: 50' .github/workflows/ci.yml
 grep -q 'TESTCONTROL_GO_CLIENT_DIR' tools/testcontrol/build.sh
 
+# TSan changes crate ABI, so std and every dependency must be rebuilt together
+# for one explicit target in an isolated sanitizer target directory.
+grep -Fq 'components: rust-src' .github/workflows/sanitizer.yml
+grep -Fq 'targets: x86_64-unknown-linux-gnu' .github/workflows/sanitizer.yml
+# shellcheck disable=SC2016 # Literal GitHub matrix expression contract.
+grep -Fq 'CARGO_TARGET_DIR: target/tsan/${{ matrix.crate }}' .github/workflows/sanitizer.yml
+grep -Fq 'cargo +nightly test -Zbuild-std' .github/workflows/sanitizer.yml
+grep -Fq -- '--target x86_64-unknown-linux-gnu' .github/workflows/sanitizer.yml
+grep -Fq -- '--locked --lib --tests' .github/workflows/sanitizer.yml
+grep -Fq -- '-- --test-threads=1' .github/workflows/sanitizer.yml
+grep -Fq 'TSAN_OPTIONS: halt_on_error=1' .github/workflows/sanitizer.yml
+grep -Fq 'set -euo pipefail' .github/workflows/sanitizer.yml
+grep -Fq 'TSan executed zero tests' .github/workflows/sanitizer.yml
+if grep -Fq 'continue-on-error' .github/workflows/sanitizer.yml; then
+    echo "TSan workflow must fail when a sanitizer job fails" >&2
+    exit 1
+fi
+if grep -Fq -- '-Cunsafe-allow-abi-mismatch=sanitizer' .github/workflows/sanitizer.yml; then
+    echo "TSan workflow must rebuild std, not permit sanitizer ABI mismatch" >&2
+    exit 1
+fi
+
 # The privileged TUN job must establish local kernel prerequisites before it
 # mints any external credential, then run one exact serial fail-closed test.
 tun_job=$(awk '

@@ -596,7 +596,21 @@ require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_UDP_ROUNDTRIP_OK count=$UD
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TCP_ROUNDTRIP_OK" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_DONE" client
 
-require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_DIRECT_PROBE_ECHO" server
+# The client deliberately retries its readiness probe and discards stale
+# replies. A slow first direct path may therefore produce one server echo per
+# unique attempt before the single accepted reply. Correlate the accepted
+# attempt instead of falsely requiring that no retry reached the server.
+CLIENT_DIRECT_ATTEMPT=$(sed -n 's/.*OOPS_CLIENT_DIRECT_PROBE_OK attempt=\([0-9][0-9]*\).*/\1/p' "$CLIENT_LOG")
+[[ "$CLIENT_DIRECT_ATTEMPT" =~ ^[1-9][0-9]*$ ]] \
+  || fail "client direct-probe success did not identify one positive attempt"
+SERVER_DIRECT_ATTEMPTS=$(sed -n 's/.*OOPS_SERVER_DIRECT_PROBE_ECHO .*attempt=\([0-9][0-9]*\).*/\1/p' "$SERVER_LOG")
+SERVER_DIRECT_COUNT=$(printf '%s\n' "$SERVER_DIRECT_ATTEMPTS" | sed '/^$/d' | wc -l | tr -d ' ')
+SERVER_DIRECT_UNIQUE_COUNT=$(printf '%s\n' "$SERVER_DIRECT_ATTEMPTS" | sed '/^$/d' | sort -nu | wc -l | tr -d ' ')
+[[ "$SERVER_DIRECT_COUNT" -ge 1 && "$SERVER_DIRECT_COUNT" -eq "$SERVER_DIRECT_UNIQUE_COUNT" ]] \
+  || fail "server direct-probe echoes were missing or duplicated: count=$SERVER_DIRECT_COUNT unique=$SERVER_DIRECT_UNIQUE_COUNT"
+[[ "$SERVER_DIRECT_COUNT" -le "$CLIENT_DIRECT_ATTEMPT" ]] \
+  || fail "server echoed more unique probes than the client's accepted attempt"
+require_marker "$SERVER_LOG" "payload=\"interop-tun-oops-direct-probe attempt=$CLIENT_DIRECT_ATTEMPT\"" server
 SERVER_UDP_COUNT=$(grep -cF "OOPS_SERVER_UDP_ECHO" "$SERVER_LOG" || true)
 [[ "$SERVER_UDP_COUNT" -eq "$UDP_DATAGRAMS" ]] \
   || fail "server echoed $SERVER_UDP_COUNT cadenced UDP datagrams, expected $UDP_DATAGRAMS"

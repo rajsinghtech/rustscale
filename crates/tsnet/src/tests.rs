@@ -408,8 +408,7 @@ async fn drop_retries_final_extension_owner_instead_of_discarding_it() {
 
 #[test]
 fn close_owner_survives_caller_runtime_destruction() {
-    let first_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let first_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -459,8 +458,7 @@ fn close_owner_survives_caller_runtime_destruction() {
 
     assert!(!extension_closed.load(Ordering::SeqCst));
     assert!(!router_closed.load(Ordering::SeqCst));
-    let retry_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let retry_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -637,7 +635,13 @@ async fn localapi_handoff_rolls_back_on_cancellation_and_failure_then_retries() 
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The caller only drives admission and assertions. Logout cleanup still runs
+// concurrently on the process-owned multi-thread lifecycle runtime, so this
+// preserves the ownership race under test without registering the caller's
+// bootstrap UDP socket concurrently with its own Tokio I/O driver. TSan cannot
+// observe epoll's publication edge and otherwise reports Tokio ScheduledIo
+// initialization as a race when a fresh worker sees the socket become ready.
+#[tokio::test]
 async fn cancelled_logout_transaction_blocks_retry_until_owned_cleanup_finishes() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();
@@ -717,8 +721,7 @@ fn logout_transaction_survives_caller_runtime_destruction_and_resumes_phase() {
     let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let control_worker = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
@@ -753,8 +756,7 @@ fn logout_transaction_survives_caller_runtime_destruction_and_resumes_phase() {
         .extension_registry(registry)
         .build()
         .unwrap();
-    let first_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let first_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -783,8 +785,7 @@ fn logout_transaction_survives_caller_runtime_destruction_and_resumes_phase() {
     });
     first_runtime.shutdown_background();
 
-    let retry_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let retry_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -1040,7 +1041,12 @@ async fn loopback_credential_never_grants_drive_root_authority_or_debug_disclosu
     server.close().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The caller only bootstraps the server, opens the loopback connection, and
+// awaits close. Central close still drains the dropped handle concurrently on
+// the process-owned lifecycle runtime, preserving the product ownership
+// regression without a second multi-thread I/O driver publishing the freshly
+// registered bootstrap socket to its own worker.
+#[tokio::test]
 async fn dropped_loopback_handle_is_joined_by_central_close() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();
@@ -3404,8 +3410,13 @@ fn whois_lookup_from_fake_netmap() {
 // ---------------------------------------------------------------------------
 // Cache restart readiness: fresh control wins; offline fallback is explicit.
 // ---------------------------------------------------------------------------
+//
+// These tests exercise ordered lifecycle transitions, not caller-worker
+// parallelism.  Keep their caller I/O driver single-threaded: Server cleanup
+// still runs on the process-owned lifecycle runtime, while avoiding Tokio's
+// overlapping fresh-driver readiness publication under TSan.
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn validated_cache_restart_is_degraded_offline_and_fresh_control_wins() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();
@@ -3473,7 +3484,10 @@ async fn validated_cache_restart_is_degraded_offline_and_fresh_control_wins() {
     offline.close().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// This exercises ordered control-stream state transitions, not scheduler
+// parallelism. A current-thread runtime also avoids racing Tokio's I/O-driver
+// registration initialization with a freshly spawned worker under TSan.
+#[tokio::test]
 async fn cached_map_stays_degraded_through_keepalive_until_fresh_snapshot() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();
@@ -3627,7 +3641,7 @@ async fn invalid_cached_map_cannot_start_offline(
     assert!(!restart.is_up());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn expired_cached_map_cannot_start_when_control_is_offline() {
     invalid_cached_map_cannot_start_offline("expired-cache", |cached| {
         cached.Node.as_mut().unwrap().KeyExpiry =
@@ -3636,7 +3650,7 @@ async fn expired_cached_map_cannot_start_when_control_is_offline() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn empty_ip_cached_map_cannot_start_when_control_is_offline() {
     invalid_cached_map_cannot_start_offline("empty-ip-cache", |cached| {
         cached.Node.as_mut().unwrap().Addresses.clear();
@@ -3644,7 +3658,7 @@ async fn empty_ip_cached_map_cannot_start_when_control_is_offline() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn stale_cache_cannot_start_when_control_is_offline() {
     let mut control = rustscale_testcontrol::Server::new();
     control.start().await.unwrap();

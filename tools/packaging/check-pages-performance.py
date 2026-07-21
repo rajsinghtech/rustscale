@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from html.parser import HTMLParser
@@ -13,8 +14,9 @@ DATA = ROOT / "docs/performance/benchmarks-2026-07-15.json"
 PAGE = ROOT / "site/index.html"
 PERFORMANCE = ROOT / "PERFORMANCE.md"
 USERSPACE = ROOT / "docs/benchmarks.md"
-PARITY_RUN_ID = "gcp-20260717-100908-a708151c79"
-PARITY_DIR = ROOT / "docs/performance" / PARITY_RUN_ID
+CANONICAL_RUN_ID = "gcp-20260721-080637-4aca6f6c1e"
+CANONICAL_SOURCE_COMMIT = "395bf8db6648e67f61bc571e1a755b27cd714e12"
+CANONICAL_DIR = ROOT / "docs/performance" / CANONICAL_RUN_ID
 
 HOST_RUN_IDS = {
     "rustscale": "gcp-20260715-085022-076e87bd41",
@@ -24,14 +26,11 @@ HOST_RUN_IDS = {
 PANEL_CONTRACTS = {
     "performance": {
         "data-environment": "gcp-host-vm",
-        "data-mode": "userspace-and-kernel-tun",
+        "data-mode": "five-config-rsb1",
         "data-evidence-status": "measured",
-        "data-comparison": "separate-evidence-sets",
-        "data-run": PARITY_RUN_ID,
-        "data-rustscale-run": HOST_RUN_IDS["rustscale"],
-        "data-tailscaled-run": HOST_RUN_IDS["tailscaled"],
-        "data-rustscale-profile": "opt-in-outbound-pipeline",
-        "data-tailscaled-profile": "default",
+        "data-comparison": "matched-evidence-without-winner",
+        "data-run": CANONICAL_RUN_ID,
+        "data-source-commit": CANONICAL_SOURCE_COMMIT,
         "data-provenance": "docs/performance",
     },
     "container-tun": {
@@ -566,32 +565,144 @@ def validate_evidence_docs(selected: dict[str, dict], performance: str) -> None:
             raise SystemExit(f"PERFORMANCE.md is missing graph source value {value}")
 
 
-def validate_parity_evidence(parser: PerformanceParser) -> None:
-    manifest = json.loads((PARITY_DIR / "matrix.json").read_text(encoding="utf-8"))
-    if (manifest.get("run", {}).get("id") != PARITY_RUN_ID or manifest.get("repeat") != 3
-            or manifest.get("duration_s") != 10 or manifest.get("parallelism") != [1, 10, 100, 500, 1000]
-            or manifest.get("peer_count_requested") != 1):
-        raise SystemExit("tracked RSB1 parity manifest drifted")
-    parity = panel(parser, "performance")
-    for config in ("rs-userspace", "rs-tun"):
-        result = json.loads((PARITY_DIR / f"{config}.json").read_text(encoding="utf-8"))
-        if result.get("status") != "ok" or result.get("path_class_reported") != "direct":
-            raise SystemExit(f"tracked {config} parity result is not successful direct evidence")
+def validate_canonical_evidence(parser: PerformanceParser, performance: str) -> None:
+    configs = ("rs-userspace", "ts-embedded", "rs-tun", "ts-userspace", "ts-tun")
+    parallelism = (1, 10, 100, 500, 1000)
+    manifest = json.loads((CANONICAL_DIR / "matrix.json").read_text(encoding="utf-8"))
+    source = manifest.get("run", {}).get("source", {})
+    if (
+        manifest.get("schema_version") != 4
+        or manifest.get("run", {}).get("id") != CANONICAL_RUN_ID
+        or source.get("commit") != CANONICAL_SOURCE_COMMIT
+        or source.get("launch_worktree_dirty") is not False
+        or source.get("includes_uncommitted_changes") is not False
+        or manifest.get("configs") != list(configs)
+        or manifest.get("repeat") != 3
+        or manifest.get("duration_s") != 10
+        or manifest.get("parallelism") != list(parallelism)
+        or manifest.get("peer_count_requested") != 1
+        or manifest.get("paths") != ["direct"]
+        or manifest.get("topologies") != ["same-zone"]
+    ):
+        raise SystemExit("tracked canonical RSB1 manifest drifted")
+
+    checksum_lines = (CANONICAL_DIR / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+    if len(checksum_lines) != 20:
+        raise SystemExit("canonical SHA256SUMS does not cover the complete result tree")
+    for line in checksum_lines:
+        digest, relative = line.split(maxsplit=1)
+        path = CANONICAL_DIR / relative.removeprefix("./")
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise SystemExit(f"canonical artifact checksum drifted: {relative}")
+
+    canonical = panel(parser, "performance")
+    facts = canonical["facts"]
+    assert isinstance(facts, list)
+    actual_facts = {
+        fact["attrs"].get("data-config", ""): fact
+        for fact in facts
+        if "canonical-config" in fact["attrs"].get("class", "").split()
+    }
+    if actual_facts.keys() != set(configs):
+        raise SystemExit("Pages canonical facts do not contain the exact five configurations")
+
+    for config in configs:
+        result_path = CANONICAL_DIR / "same-zone" / "direct" / f"{config}.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        gate = result.get("path_gate", {})
+        cleanup = result.get("cleanup", {})
+        if (
+            result.get("schema_version") != 6
+            or result.get("status") != "ok"
+            or result.get("path_class_reported") != "direct"
+            or gate != {"requested": "direct", "pre": "direct", "post": "direct", "matched": True}
+            or not cleanup
+            or not all(cleanup.values())
+            or result.get("workload", {}).get("measured_trial_attempts") != 1
+        ):
+            raise SystemExit(f"tracked {config} result is not successful direct evidence")
+        trials = result.get("throughput_trials", [])
+        if len(trials) != 15:
+            raise SystemExit(f"tracked {config} does not contain 15 exact trials")
+        for streams in parallelism:
+            rows = [trial for trial in trials if trial.get("parallel") == streams]
+            if len(rows) != 3 or any(
+                row.get("established") != streams
+                or row.get("handshaken") != streams
+                or row.get("completed") != streams
+                for row in rows
+            ):
+                raise SystemExit(f"tracked {config} P{streams} lifecycle is incomplete")
+
+        fact = actual_facts[config]
+        attrs = fact["attrs"]
+        text = str(fact["text"])
         points = {row.get("parallel"): row for row in result.get("throughput", [])}
-        for streams in manifest["parallelism"]:
+        for streams in parallelism:
             row = points.get(streams, {})
-            if len(row.get("samples_mbps", [])) != 3 or not all(value > 0 for value in row["samples_mbps"]):
+            samples = row.get("samples_mbps", [])
+            if len(samples) != 3 or not all(value > 0 for value in samples):
                 raise SystemExit(f"tracked {config} P{streams} samples are incomplete")
-            if f"{row['mbps']:.1f} Mbps" not in str(parity["text"]):
-                raise SystemExit(f"Pages is missing tracked {config} P{streams}")
-        for endpoint in ("server", "client"):
-            series = result.get("resources", {}).get(endpoint, {}).get("series", [])
+            if abs(float(attrs[f"data-p{streams}-mbps"]) - float(row["mbps"])) > 1e-9:
+                raise SystemExit(f"Pages {config} P{streams} value drifted")
+            displayed = f"P{streams} {row['mbps']:.1f} ({row['coefficient_of_variation_pct']:.1f}%)"
+            if displayed not in text:
+                raise SystemExit(f"Pages is missing {config} display value {displayed}")
+
+        latency = result.get("latency", {})
+        if (
+            latency.get("requested") != 200
+            or latency.get("successful") != 200
+            or latency.get("timed_out") != 0
+            or latency.get("malformed") != 0
+            or len(latency.get("samples_ns", [])) != 200
+        ):
+            raise SystemExit(f"tracked {config} latency distribution is incomplete")
+        for attr, key in (("data-p50-us", "p50_us"), ("data-p95-us", "p95_us"), ("data-p99-us", "p99_us")):
+            if abs(float(attrs[attr]) - float(latency[key])) > 1e-9:
+                raise SystemExit(f"Pages {config} {key} drifted")
+            if f"{latency[key]:.3f} us" not in text:
+                raise SystemExit(f"Pages is missing {config} {key}")
+        if attrs.get("data-latency-count") != "200" or "200/200" not in text:
+            raise SystemExit(f"Pages {config} latency count drifted")
+
+        for endpoint in ("client", "server"):
+            resources = result.get("resources", {}).get(endpoint, {})
+            series = resources.get("series", [])
             if not series or not any(sample.get("cpu_pct") is not None and sample.get("rss_kb") is not None for sample in series):
                 raise SystemExit(f"tracked {config} {endpoint} resource series is empty")
-        latency = result.get("latency", {})
-        if latency.get("count") != 50 or len(latency.get("samples_ns", [])) != 50:
-            raise SystemExit(f"tracked {config} latency distribution is incomplete")
-    require_text(parity, "Matched RustScale modes", "not a RustScale-versus-Tailscale result", "Requested peer load: 1", "observed peer membership was not instrumented", "raw evidence and methodology")
+            for suffix, key in (
+                ("cpu-avg", "cpu_avg_pct"),
+                ("cpu-peak", "cpu_peak_pct"),
+                ("rss-avg-kb", "rss_avg_kb"),
+                ("rss-peak-kb", "rss_peak_kb"),
+            ):
+                if abs(float(attrs[f"data-{endpoint}-{suffix}"]) - float(resources[key])) > 1e-9:
+                    raise SystemExit(f"Pages {config} {endpoint} {key} drifted")
+
+    summary = json.loads((CANONICAL_DIR / "summary.json").read_text(encoding="utf-8"))
+    completeness = summary.get("completeness", {})
+    if (
+        not completeness.get("complete")
+        or completeness.get("expected") != 5
+        or completeness.get("ok") != 5
+        or completeness.get("failed") != 0
+        or completeness.get("missing") != 0
+    ):
+        raise SystemExit("canonical summary is not complete")
+    require_text(
+        canonical,
+        "Complete matched evidence",
+        "no winner is declared",
+        "53–60% CV",
+        "exclude kernel CPU",
+        "double-count shared pages",
+        "complete raw evidence",
+        "full generated dashboard",
+    )
+    for value in (CANONICAL_RUN_ID, CANONICAL_SOURCE_COMMIT):
+        if value not in performance:
+            raise SystemExit(f"PERFORMANCE.md is missing canonical evidence {value}")
 
 
 def main() -> None:
@@ -621,7 +732,7 @@ def main() -> None:
 
     validate_panel_contracts(parser)
     validate_matched_runs(selected)
-    validate_parity_evidence(parser)
+    validate_canonical_evidence(parser, performance)
 
     container = panel(parser, "container-tun")
     if container["bars"] or container["facts"]:

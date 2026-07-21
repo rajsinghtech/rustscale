@@ -104,12 +104,47 @@
         <p>Environment and evidence status are part of every result</p>
       </div>
 
-      <article class="performance-panel" data-benchmark="performance" data-environment="gcp-host-vm" data-mode="userspace-and-kernel-tun" data-evidence-status="measured" data-comparison="separate-evidence-sets" data-run="gcp-20260717-100908-a708151c79" data-rustscale-run="gcp-20260715-085022-076e87bd41" data-tailscaled-run="gcp-20260715-090601-02788a10b4" data-rustscale-profile="opt-in-outbound-pipeline" data-tailscaled-profile="default" data-provenance="docs/performance">
+      <article class="performance-panel" data-benchmark="performance" data-environment="gcp-host-vm" data-mode="five-config-rsb1" data-evidence-status="measured" data-comparison="matched-evidence-without-winner" data-run="gcp-20260721-080637-4aca6f6c1e" data-source-commit="395bf8db6648e67f61bc571e1a755b27cd714e12" data-provenance="docs/performance">
         <div class="panel-heading">
-          <h3>Performance · userspace and kernel TUN</h3>
-          <span class="status status-measured">Measured evidence</span>
+          <h3>Canonical RSB1 · five configurations</h3>
+          <span class="status status-measured">Complete matched evidence</span>
         </div>
-        <p class="scope">The visible five-point RSB1 run compares two RustScale modes only. The earlier RustScale-versus-tailscaled kernel-TUN comparison below is a separate three-repeat evidence set.</p>
+        <p class="scope">Direct path on matched GCP <code>n1-standard-4</code> endpoints in <code>us-central1-a/b</code>. Every configuration completed P1/P10/P100/P500/P1000 three times for 10 seconds, plus 200/200 latency exchanges. Values below are medians with population coefficient of variation (CV); no winner is declared.</p>
+        <div class="facts canonical-results">
+          <div class="fact canonical-config" data-config="rs-userspace" data-p1-mbps="83.9519232" data-p10-mbps="328.45249920000003" data-p100-mbps="124.723872" data-p500-mbps="19.614815999999998" data-p1000-mbps="59.6936" data-p50-us="1069.747" data-p95-us="1167.274" data-p99-us="1218.603" data-latency-count="200" data-client-cpu-avg="62.59" data-client-cpu-peak="219.16" data-client-rss-avg-kb="39467.99" data-client-rss-peak-kb="209016" data-server-cpu-avg="70.18" data-server-cpu-peak="276.89" data-server-rss-avg-kb="2144364.93" data-server-rss-peak-kb="9158072">
+            <h4>RustScale · embedded tsnet</h4>
+            <p>Median Mbps (CV): P1 84.0 (53.2%) · P10 328.5 (11.0%) · P100 124.7 (1.2%) · P500 19.6 (57.8%) · P1000 59.7 (60.5%).</p>
+            <p>Latency: p50 1069.747 us · p95 1167.274 us · p99 1218.603 us · 200/200.</p>
+            <p>Client CPU avg/peak 62.59/219.16%; RSS 38.54/204.12 MiB. Server CPU 70.18/276.89%; RSS 2094.11/8943.43 MiB.</p>
+          </div>
+          <div class="fact canonical-config" data-config="ts-embedded" data-p1-mbps="1395.868876" data-p10-mbps="1564.8284159999998" data-p100-mbps="1430.5026560000001" data-p500-mbps="1289.1252479999998" data-p1000-mbps="1178.8644736" data-p50-us="1142.742" data-p95-us="1322.729" data-p99-us="1651.217" data-latency-count="200" data-client-cpu-avg="156.81" data-client-cpu-peak="322.14" data-client-rss-avg-kb="287581.53" data-client-rss-peak-kb="873148" data-server-cpu-avg="161.56" data-server-cpu-peak="401.68" data-server-rss-avg-kb="2221622.94" data-server-rss-peak-kb="6588056">
+            <h4>Tailscale · embedded Go tsnet</h4>
+            <p>Median Mbps (CV): P1 1395.9 (0.3%) · P10 1564.8 (0.3%) · P100 1430.5 (4.8%) · P500 1289.1 (2.3%) · P1000 1178.9 (6.4%).</p>
+            <p>Latency: p50 1142.742 us · p95 1322.729 us · p99 1651.217 us · 200/200.</p>
+            <p>Client CPU avg/peak 156.81/322.14%; RSS 280.84/852.68 MiB. Server CPU 161.56/401.68%; RSS 2169.55/6433.65 MiB.</p>
+          </div>
+          <div class="fact canonical-config" data-config="rs-tun" data-p1-mbps="1613.3350328000001" data-p10-mbps="1513.5724192" data-p100-mbps="1215.4660128" data-p500-mbps="511.09385599999996" data-p1000-mbps="366.1974656" data-p50-us="1185.821" data-p95-us="1298.025" data-p99-us="1328.048" data-latency-count="200" data-client-cpu-avg="105.68" data-client-cpu-peak="173.99" data-client-rss-avg-kb="37974.27" data-client-rss-peak-kb="53796" data-server-cpu-avg="112.69" data-server-cpu-peak="173.57" data-server-rss-avg-kb="32604.09" data-server-rss-peak-kb="35448">
+            <h4>RustScale · kernel TUN</h4>
+            <p>Median Mbps (CV): P1 1613.3 (0.6%) · P10 1513.6 (0.3%) · P100 1215.5 (1.6%) · P500 511.1 (0.8%) · P1000 366.2 (9.2%).</p>
+            <p>Latency: p50 1185.821 us · p95 1298.025 us · p99 1328.048 us · 200/200.</p>
+            <p>Client CPU avg/peak 105.68/173.99%; RSS 37.08/52.54 MiB. Server CPU 112.69/173.57%; RSS 31.84/34.62 MiB.</p>
+          </div>
+          <div class="fact canonical-config" data-config="ts-userspace" data-p1-mbps="1332.9690624" data-p10-mbps="1343.4000472" data-p100-mbps="1114.3585416" data-p500-mbps="852.54872" data-p1000-mbps="685.5614367999999" data-p50-us="1551.578" data-p95-us="1660.892" data-p99-us="1700.585" data-latency-count="200" data-client-cpu-avg="143.5" data-client-cpu-peak="386.73" data-client-rss-avg-kb="3023103.76" data-client-rss-peak-kb="11061808" data-server-cpu-avg="132.18" data-server-cpu-peak="403.6" data-server-rss-avg-kb="1215135.29" data-server-rss-peak-kb="2810832">
+            <h4>Tailscale · tailscaled daemon proxy</h4>
+            <p>Median Mbps (CV): P1 1333.0 (1.3%) · P10 1343.4 (1.0%) · P100 1114.4 (3.2%) · P500 852.5 (1.0%) · P1000 685.6 (2.7%).</p>
+            <p>Latency: p50 1551.578 us · p95 1660.892 us · p99 1700.585 us · 200/200.</p>
+            <p>Client CPU avg/peak 143.50/386.73%; RSS 2952.25/10802.55 MiB. Server CPU 132.18/403.60%; RSS 1186.66/2744.95 MiB.</p>
+          </div>
+          <div class="fact canonical-config" data-config="ts-tun" data-p1-mbps="2243.7190368" data-p10-mbps="2185.589536" data-p100-mbps="1902.1785888" data-p500-mbps="1343.4285152" data-p1000-mbps="931.3570655999999" data-p50-us="1321.159" data-p95-us="1444.654" data-p99-us="1493.46" data-latency-count="200" data-client-cpu-avg="208.68" data-client-cpu-peak="327.94" data-client-rss-avg-kb="556339.57" data-client-rss-peak-kb="758408" data-server-cpu-avg="226.15" data-server-cpu-peak="337.22" data-server-rss-avg-kb="102026.62" data-server-rss-peak-kb="164412">
+            <h4>Tailscale · kernel TUN</h4>
+            <p>Median Mbps (CV): P1 2243.7 (1.7%) · P10 2185.6 (1.2%) · P100 1902.2 (0.7%) · P500 1343.4 (2.5%) · P1000 931.4 (1.7%).</p>
+            <p>Latency: p50 1321.159 us · p95 1444.654 us · p99 1493.460 us · 200/200.</p>
+            <p>Client CPU avg/peak 208.68/327.94%; RSS 543.30/740.63 MiB. Server CPU 226.15/337.22%; RSS 99.64/160.56 MiB.</p>
+          </div>
+        </div>
+        <p class="performance-note">All five cells used the identical RSB1 payload and exact lifecycle denominators. CPU/RSS cover declared userspace process sets, exclude kernel CPU, and can double-count shared pages across proxy workers. RustScale embedded throughput had 53–60% CV at P1/P500/P1000, so the medians do not support a stable winner claim.</p>
+        <p class="provenance">Run <code>gcp-20260721-080637-4aca6f6c1e</code> · source <code>395bf8db6648e67f61bc571e1a755b27cd714e12</code> · <a href="https://github.com/rajsinghtech/rustscale/tree/master/docs/performance/gcp-20260721-080637-4aca6f6c1e">complete raw evidence</a> · <a href="https://github.com/rajsinghtech/rustscale/blob/master/docs/performance/gcp-20260721-080637-4aca6f6c1e/dashboard.html">full generated dashboard</a> · <a href="https://github.com/rajsinghtech/rustscale/blob/master/PERFORMANCE.md">methodology and caveats</a>.</p>
+        <div hidden>
         <details hidden>
           <summary>Earlier kernel-TUN comparison with tailscaled</summary>
           <p class="scope">Direct UDP on matched GCP <code>n1-standard-4</code> hosts, Linux 6.8, three 10-second samples per throughput point. This is a host benchmark; neither daemon ran in a container.</p>
@@ -166,6 +201,7 @@
         <div class="legend" aria-hidden="true"><span class="rs">Userspace</span><span class="ts">Kernel TUN</span></div>
         <p class="performance-note">Requested peer load: 1; observed peer membership was not instrumented, so this run makes no peer-scaling claim.</p>
         <p class="provenance">Run <code>gcp-20260717-100908-a708151c79</code> · <a href="https://github.com/rajsinghtech/rustscale/tree/master/docs/performance/gcp-20260717-100908-a708151c79">raw evidence and methodology</a>.</p>
+        </div>
       </article>
 
       <article hidden class="performance-panel" data-benchmark="container-tun" data-environment="container" data-mode="kernel-tun" data-evidence-status="not-measured" data-comparison="none" data-provenance="none">

@@ -1,0 +1,7266 @@
+{
+  "binary": {
+    "path": "/usr/sbin/tailscaled",
+    "sha256": "8da02a9f8fde1847982d28cfc2f1d77849b26633f2250e26f5316c3617e4db18",
+    "size_bytes": 41129586,
+    "subject": "tailscaled",
+    "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+    "version_source": "executable --version"
+  },
+  "cleanup": {
+    "postconditions_verified": true,
+    "samplers_stopped": true,
+    "status": "clean",
+    "transport_stopped": true,
+    "workload_stopped": true
+  },
+  "config": "ts-tun",
+  "duration_s_requested": 10,
+  "error": "",
+  "footprint": {
+    "binary_size_bytes": 41129586,
+    "clock": "monotonic",
+    "cpu_avg_pct": 226.15,
+    "cpu_peak_pct": 337.22,
+    "endpoint": "server",
+    "missing_samples": 1,
+    "rss_avg_kb": 102026.62,
+    "rss_peak_kb": 164412,
+    "sample_cadence_s": 1,
+    "samples": 212,
+    "scope": {
+      "includes_descendants": false,
+      "includes_kernel": false,
+      "kind": "dynamic_process_set"
+    },
+    "series": [
+      {
+        "cpu_pct": null,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 0,
+        "rss_kb": 56052,
+        "status": "partial"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 1006,
+        "rss_kb": 56052,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 2012,
+        "rss_kb": 56052,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 3018,
+        "rss_kb": 56056,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 4023,
+        "rss_kb": 56056,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 176.65,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 5031,
+        "rss_kb": 56580,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 299.17,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 6041,
+        "rss_kb": 56628,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 284.3,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 7050,
+        "rss_kb": 56688,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 267.57,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 8059,
+        "rss_kb": 56780,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 288.65,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 9067,
+        "rss_kb": 57124,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 293.74,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 10078,
+        "rss_kb": 57400,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 289.46,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 11087,
+        "rss_kb": 57652,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 283.17,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 12097,
+        "rss_kb": 57940,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 291.37,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 13106,
+        "rss_kb": 58204,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 292.6,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 14118,
+        "rss_kb": 58488,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 92.02,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 15128,
+        "rss_kb": 58576,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 16134,
+        "rss_kb": 58576,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 17140,
+        "rss_kb": 58576,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 36.78,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 18146,
+        "rss_kb": 58612,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 298.15,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 19156,
+        "rss_kb": 59280,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 295.22,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 20165,
+        "rss_kb": 59868,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 291.62,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 21173,
+        "rss_kb": 60188,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 295.39,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 22182,
+        "rss_kb": 60440,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 295.43,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 23194,
+        "rss_kb": 60724,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 298.03,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 24204,
+        "rss_kb": 60996,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 302.57,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 25212,
+        "rss_kb": 61308,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 291.23,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 26225,
+        "rss_kb": 61592,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 302.27,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 27234,
+        "rss_kb": 61852,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 231.01,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 28243,
+        "rss_kb": 62088,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 29249,
+        "rss_kb": 62088,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 30254,
+        "rss_kb": 62096,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 31260,
+        "rss_kb": 62136,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 201.01,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 32265,
+        "rss_kb": 62364,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 297.35,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 33274,
+        "rss_kb": 62696,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 294.33,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 34283,
+        "rss_kb": 62972,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 296.39,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 35295,
+        "rss_kb": 63276,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 302.6,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 36303,
+        "rss_kb": 63552,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 291.4,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 37312,
+        "rss_kb": 63836,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 290.99,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 38322,
+        "rss_kb": 64096,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 302.66,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 39330,
+        "rss_kb": 64392,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 302.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 40340,
+        "rss_kb": 64668,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 292.38,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 41349,
+        "rss_kb": 64908,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 73.41,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 42357,
+        "rss_kb": 64976,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 43363,
+        "rss_kb": 64976,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 44369,
+        "rss_kb": 64976,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 50.57,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 45377,
+        "rss_kb": 65120,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 310.57,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 46388,
+        "rss_kb": 67932,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 303.24,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 47400,
+        "rss_kb": 68744,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 314.99,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 48410,
+        "rss_kb": 69536,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 315.31,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 49419,
+        "rss_kb": 73040,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 318.95,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 50431,
+        "rss_kb": 73092,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 312.77,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 51448,
+        "rss_kb": 74028,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 308.05,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 52464,
+        "rss_kb": 75256,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 312.23,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 53476,
+        "rss_kb": 77704,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 318.45,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 54484,
+        "rss_kb": 77740,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 232.01,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 55501,
+        "rss_kb": 77780,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 56507,
+        "rss_kb": 77780,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 57513,
+        "rss_kb": 77780,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 58520,
+        "rss_kb": 77780,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 243.83,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 59525,
+        "rss_kb": 77804,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 314.17,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 60534,
+        "rss_kb": 79212,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 315.12,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 61543,
+        "rss_kb": 81192,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 308.93,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 62553,
+        "rss_kb": 81780,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 312.53,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 63561,
+        "rss_kb": 82204,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 309.49,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 64572,
+        "rss_kb": 82584,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 310.21,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 65581,
+        "rss_kb": 82972,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 312.73,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 66595,
+        "rss_kb": 83312,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 315.84,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 67605,
+        "rss_kb": 83664,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 314.89,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 68618,
+        "rss_kb": 84036,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 44.55,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 69628,
+        "rss_kb": 84112,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 70634,
+        "rss_kb": 84124,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 71640,
+        "rss_kb": 84124,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 72645,
+        "rss_kb": 84124,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 290.28,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 73651,
+        "rss_kb": 84472,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 319.03,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 74661,
+        "rss_kb": 84872,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 312.88,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 75671,
+        "rss_kb": 85272,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 316.69,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 76681,
+        "rss_kb": 85636,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 313.81,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 77691,
+        "rss_kb": 85980,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 318.16,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 78703,
+        "rss_kb": 86348,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 318.37,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 79712,
+        "rss_kb": 86692,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 317.43,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 80720,
+        "rss_kb": 87016,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 323.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 81732,
+        "rss_kb": 87376,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 308.28,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 82744,
+        "rss_kb": 88956,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 11.9,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 83753,
+        "rss_kb": 88972,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 84758,
+        "rss_kb": 88980,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 85764,
+        "rss_kb": 88988,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 120.25,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 86770,
+        "rss_kb": 89456,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 322.02,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 87780,
+        "rss_kb": 89980,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 319.95,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 88789,
+        "rss_kb": 90488,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 324.18,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 89801,
+        "rss_kb": 91000,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 317.86,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 90814,
+        "rss_kb": 91464,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 318.56,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 91822,
+        "rss_kb": 91948,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 321.13,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 92830,
+        "rss_kb": 92448,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 318.26,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 93839,
+        "rss_kb": 92944,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 321.3,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 94854,
+        "rss_kb": 93460,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 322.97,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 95863,
+        "rss_kb": 93952,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 183.76,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 96875,
+        "rss_kb": 94280,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 97881,
+        "rss_kb": 94280,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 98887,
+        "rss_kb": 94280,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 99893,
+        "rss_kb": 94280,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 293.6,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 100897,
+        "rss_kb": 94880,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 322.67,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 101908,
+        "rss_kb": 95376,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 321.84,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 102918,
+        "rss_kb": 95844,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 315.3,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 103929,
+        "rss_kb": 96320,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 325.34,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 104940,
+        "rss_kb": 96792,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 322.72,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 105954,
+        "rss_kb": 97340,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 321.15,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 106969,
+        "rss_kb": 97852,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 319.48,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 107980,
+        "rss_kb": 98372,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 318.09,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 108992,
+        "rss_kb": 98880,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 321.73,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 109999,
+        "rss_kb": 99392,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 20.8,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 111009,
+        "rss_kb": 99436,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 112014,
+        "rss_kb": 99436,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 113020,
+        "rss_kb": 99436,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 125.14,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 114027,
+        "rss_kb": 99692,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 328.11,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 115045,
+        "rss_kb": 100272,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 322.35,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 116059,
+        "rss_kb": 100748,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 318.99,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 117072,
+        "rss_kb": 101300,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 320.83,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 118085,
+        "rss_kb": 101808,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 323.48,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 119096,
+        "rss_kb": 102624,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 322.68,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 120103,
+        "rss_kb": 103116,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 323.14,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 121115,
+        "rss_kb": 103676,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 323.82,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 122125,
+        "rss_kb": 104208,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 320.82,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 123138,
+        "rss_kb": 104720,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 181.33,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 124147,
+        "rss_kb": 105052,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 125153,
+        "rss_kb": 105052,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 126159,
+        "rss_kb": 105052,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 127165,
+        "rss_kb": 105052,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 226.7,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 128170,
+        "rss_kb": 109784,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 327.66,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 129184,
+        "rss_kb": 110832,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 334.69,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 130196,
+        "rss_kb": 111252,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 329.69,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 131206,
+        "rss_kb": 112692,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 333.17,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 132218,
+        "rss_kb": 112692,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 330.3,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 133229,
+        "rss_kb": 112692,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 327.62,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 134239,
+        "rss_kb": 112700,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 335.43,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 135253,
+        "rss_kb": 113332,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 331.89,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 136265,
+        "rss_kb": 114136,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 331.03,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 137274,
+        "rss_kb": 114904,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 112.86,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 138285,
+        "rss_kb": 114644,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 139290,
+        "rss_kb": 114656,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 140296,
+        "rss_kb": 114656,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 141302,
+        "rss_kb": 114656,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 209.87,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 142307,
+        "rss_kb": 115864,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 336.72,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 143323,
+        "rss_kb": 116720,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 330.3,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 144334,
+        "rss_kb": 117504,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 334.17,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 145346,
+        "rss_kb": 118584,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 328.86,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 146358,
+        "rss_kb": 119400,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 327.58,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 147369,
+        "rss_kb": 120160,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 329.06,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 148378,
+        "rss_kb": 120912,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 333.44,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 149388,
+        "rss_kb": 121720,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 328.49,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 150405,
+        "rss_kb": 122440,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 328.94,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 151417,
+        "rss_kb": 123216,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 126.54,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 152429,
+        "rss_kb": 122960,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 153435,
+        "rss_kb": 122960,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 154442,
+        "rss_kb": 122960,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 8.95,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 155447,
+        "rss_kb": 123432,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 302.15,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 156453,
+        "rss_kb": 124660,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 326.93,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 157459,
+        "rss_kb": 125436,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 330.15,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 158471,
+        "rss_kb": 126264,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 328.79,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 159484,
+        "rss_kb": 127028,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 332.3,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 160495,
+        "rss_kb": 128404,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 326.08,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 161507,
+        "rss_kb": 129124,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 330.59,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 162517,
+        "rss_kb": 129900,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 331.5,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 163525,
+        "rss_kb": 131228,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 324.75,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 164541,
+        "rss_kb": 131860,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 332.79,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 165551,
+        "rss_kb": 132624,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 29.59,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 166565,
+        "rss_kb": 132212,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 167570,
+        "rss_kb": 132212,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.99,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 168576,
+        "rss_kb": 132484,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 39.81,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 169581,
+        "rss_kb": 133748,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 331.29,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 170589,
+        "rss_kb": 135548,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 336.69,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 171599,
+        "rss_kb": 136540,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 334.63,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 172624,
+        "rss_kb": 137548,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 334.29,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 173641,
+        "rss_kb": 138560,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 337.22,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 174655,
+        "rss_kb": 139492,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 332.04,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 175667,
+        "rss_kb": 140444,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 335.48,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 176678,
+        "rss_kb": 141400,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 328.59,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 177691,
+        "rss_kb": 142348,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 322.3,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 178700,
+        "rss_kb": 143300,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 325.88,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 179709,
+        "rss_kb": 144296,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 7.94,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 180716,
+        "rss_kb": 142544,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 181722,
+        "rss_kb": 142544,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 182728,
+        "rss_kb": 142544,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 63.48,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 183736,
+        "rss_kb": 143940,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 329.4,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 184753,
+        "rss_kb": 145432,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 333.33,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 185761,
+        "rss_kb": 146412,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 330.67,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 186771,
+        "rss_kb": 147368,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 331.18,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 187783,
+        "rss_kb": 148328,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 331.38,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 188794,
+        "rss_kb": 149288,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 327.89,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 189803,
+        "rss_kb": 150280,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 333.34,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 190814,
+        "rss_kb": 151288,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 326.73,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 191824,
+        "rss_kb": 152492,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 325.44,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 192835,
+        "rss_kb": 153464,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 303.37,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 193844,
+        "rss_kb": 154408,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 5.97,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 194849,
+        "rss_kb": 153400,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 195855,
+        "rss_kb": 153400,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 196861,
+        "rss_kb": 153400,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 83.5,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 197867,
+        "rss_kb": 154736,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 333.39,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 198887,
+        "rss_kb": 155708,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 332.99,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 199908,
+        "rss_kb": 156708,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 334.79,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 200918,
+        "rss_kb": 157696,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 336.17,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 201932,
+        "rss_kb": 158736,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 333.66,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 202945,
+        "rss_kb": 159684,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 336.02,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 203957,
+        "rss_kb": 160652,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 331.79,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 204970,
+        "rss_kb": 161664,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 327.55,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 205983,
+        "rss_kb": 162620,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 332.92,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 206998,
+        "rss_kb": 163572,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 279.46,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 208011,
+        "rss_kb": 164412,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.99,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 209018,
+        "rss_kb": 163240,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.0,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 210024,
+        "rss_kb": 163240,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 1.99,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 211030,
+        "rss_kb": 163240,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 8.95,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 212035,
+        "rss_kb": 162772,
+        "status": "observed"
+      },
+      {
+        "cpu_pct": 0.99,
+        "included_processes": [
+          "19709:tailscaled",
+          "20132:rustscale-bench"
+        ],
+        "offset_ms": 213041,
+        "rss_kb": 162772,
+        "status": "observed"
+      }
+    ],
+    "series_truncated": false,
+    "subject": "tailscaled"
+  },
+  "identity": {
+    "cell_id": "ts-tun",
+    "implementation": "tailscale",
+    "key": "same-zone/direct/ts-tun",
+    "mode": "tun",
+    "path": "direct",
+    "topology": "same-zone"
+  },
+  "implementation": "tailscale",
+  "latency": {
+    "count": 200,
+    "malformed": 0,
+    "max_ns": 1528759,
+    "max_us": 1528.759,
+    "mean_ns": 1332469.58,
+    "mean_us": 1332.4695800000002,
+    "min_ns": 1201731,
+    "min_us": 1201.731,
+    "mode": "latency",
+    "p50_ns": 1321159,
+    "p50_us": 1321.159,
+    "p95_ns": 1444654,
+    "p95_us": 1444.654,
+    "p99_ns": 1493460,
+    "p99_us": 1493.46,
+    "path_class": "externally-gated",
+    "payload_bytes": 8,
+    "percentile_method": "nearest-rank-rounded-index",
+    "protocol": "RSB1-tcp-pingpong",
+    "requested": 200,
+    "samples_ns": [
+      1321159,
+      1428056,
+      1434981,
+      1465571,
+      1354755,
+      1312634,
+      1404574,
+      1310258,
+      1307564,
+      1302930,
+      1337121,
+      1307177,
+      1359049,
+      1340595,
+      1421825,
+      1441160,
+      1345593,
+      1327736,
+      1362586,
+      1321824,
+      1407455,
+      1404383,
+      1387470,
+      1353294,
+      1360531,
+      1361152,
+      1327722,
+      1283302,
+      1250318,
+      1300743,
+      1304852,
+      1321571,
+      1482609,
+      1333319,
+      1292645,
+      1318492,
+      1363748,
+      1408161,
+      1278793,
+      1350750,
+      1342093,
+      1420092,
+      1374128,
+      1458135,
+      1312998,
+      1257076,
+      1240366,
+      1284630,
+      1289486,
+      1334242,
+      1373776,
+      1428692,
+      1419172,
+      1393269,
+      1259903,
+      1281301,
+      1385684,
+      1330866,
+      1350036,
+      1236077,
+      1239579,
+      1306584,
+      1278247,
+      1280584,
+      1201731,
+      1313208,
+      1268868,
+      1327109,
+      1493460,
+      1367584,
+      1315430,
+      1353784,
+      1351397,
+      1242449,
+      1385412,
+      1355067,
+      1315902,
+      1349902,
+      1292946,
+      1279893,
+      1277856,
+      1389768,
+      1274945,
+      1419098,
+      1303201,
+      1273458,
+      1320590,
+      1406953,
+      1311297,
+      1409096,
+      1368160,
+      1329384,
+      1433430,
+      1424706,
+      1265721,
+      1241071,
+      1228599,
+      1258909,
+      1233570,
+      1289477,
+      1287018,
+      1341067,
+      1346917,
+      1305505,
+      1461646,
+      1279056,
+      1423928,
+      1346629,
+      1225420,
+      1296012,
+      1273089,
+      1384156,
+      1305928,
+      1277071,
+      1253226,
+      1300141,
+      1299885,
+      1349813,
+      1253156,
+      1274875,
+      1277214,
+      1357033,
+      1304500,
+      1260759,
+      1370131,
+      1394418,
+      1314221,
+      1266544,
+      1316922,
+      1339116,
+      1304099,
+      1296770,
+      1350456,
+      1309327,
+      1489391,
+      1340305,
+      1295330,
+      1284981,
+      1262469,
+      1293640,
+      1357182,
+      1284644,
+      1401582,
+      1341824,
+      1421490,
+      1418030,
+      1301296,
+      1307415,
+      1328547,
+      1442372,
+      1372663,
+      1446242,
+      1332250,
+      1315439,
+      1528759,
+      1464942,
+      1372389,
+      1276932,
+      1334092,
+      1321541,
+      1288051,
+      1285446,
+      1303943,
+      1307726,
+      1233651,
+      1361394,
+      1339885,
+      1276832,
+      1224978,
+      1287855,
+      1329699,
+      1303189,
+      1343817,
+      1296341,
+      1298418,
+      1316611,
+      1380378,
+      1313071,
+      1383828,
+      1367418,
+      1307677,
+      1292760,
+      1371365,
+      1361897,
+      1315210,
+      1322138,
+      1301594,
+      1333962,
+      1290850,
+      1282058,
+      1260466,
+      1279289,
+      1264868,
+      1314249,
+      1365078,
+      1305432,
+      1444654,
+      1494963,
+      1290101,
+      1322074
+    ],
+    "shutdown": "process-return-after-complete",
+    "successful": 200,
+    "tailscale_ip": "",
+    "target": "100.87.204.118:5201",
+    "timed_out": 0,
+    "tool": "rustscale-bench",
+    "transport": "kernel-tcp",
+    "version": "0.1.4"
+  },
+  "load": {
+    "duration_s": 10,
+    "parallelism_requested": [
+      1,
+      10,
+      100,
+      500,
+      1000
+    ],
+    "peer_load": {
+      "effective": null,
+      "observed": null,
+      "requested": 1,
+      "status": "not-applied"
+    },
+    "preset": "custom",
+    "repeat": 3
+  },
+  "log_tail": "",
+  "manifest_sha256": "32ff5d56f5c3d2fd4408a3b801e3f1a4fd72bf6d718afcda307a38bac45ae51f",
+  "mode": "tun",
+  "observed": {
+    "client": {
+      "cpu_model": "Intel(R) Xeon(R) CPU @ 2.30GHz",
+      "cpu_platform": "Intel Haswell",
+      "kernel_release": "6.8.0-1063-gcp",
+      "logical_cpus": 4,
+      "machine_type": "n1-standard-4",
+      "os_pretty_name": "Ubuntu 22.04.5 LTS",
+      "zone": "us-central1-b"
+    },
+    "measurement_tools": {
+      "client": [
+        {
+          "path": "/usr/bin/iperf3",
+          "sha256": "2c54c89b4d9016b9fe59ba83518348477fb290fdb6fc7ae12cb6773ecb9b1910",
+          "version": "iperf 3.9 (cJSON 1.7.13)\nLinux rs-bench-same-zone-cli-20260721-080637-4aca6f6c1e 6.8.0-1063-gcp #69~22.04.1-Ubuntu SMP Tue Jun 30 15:12:15 UTC 2026 x86_64\nOptional features available: CPU affinity setting, IPv6 flow label, SCTP, TCP congestion algorithm setting, sendfile / zerocopy, socket pacing, authentication"
+        },
+        {
+          "path": "/usr/bin/socat",
+          "sha256": "ac1a7165c0ade4dfdab602895cc56ff21d61f8443a80fb676946e4a624c52f68",
+          "version": "socat by Gerhard Rieger and contributors - see www.dest-unreach.org\nsocat version 1.7.4.1 on Mar 25 2022 09:51:32\n   running on Linux version #69~22.04.1-Ubuntu SMP Tue Jun 30 15:12:15 UTC 2026, release 6.8.0-1063-gcp, machine x86_64\nfeatures:\n  #define WITH_STDIO 1\n  #define WITH_FDNUM 1\n  #define WITH_FILE 1\n  #define WITH_CREAT 1\n  #define WITH_GOPEN 1\n  #define WITH_TERMIOS 1\n  #define WITH_PIPE 1\n  #define WITH_UNIX 1\n  #define WITH_ABSTRACT_UNIXSOCKET 1\n  #define WITH_IP4 1\n  #define WITH_IP6 1\n  #define WITH_RAWIP 1\n  #define WITH_GENERICSOCKET 1\n  #define WITH_INTERFACE 1\n  #define WITH_TCP 1\n  #define WITH_UDP 1\n  #define WITH_SCTP 1\n  #define WITH_LISTEN 1\n  #define WITH_SOCKS4 1\n  #define WITH_SOCKS4A 1\n  #define WITH_VSOCK 1\n  #define WITH_PROXY 1\n  #define WITH_SYSTEM 1\n  #define WITH_EXEC 1\n  #undef WITH_READLINE\n  #define WITH_TUN 1\n  #define WITH_PTY 1\n  #define WITH_OPENSSL 1\n  #undef WITH_FIPS\n  #define WITH_LIBWRAP 1\n  #define WITH_SYCLS 1\n  #define WITH_FILAN 1\n  #define WITH_RETRY 1\n  #define WITH_MSGLEVEL 0 /*debug*/"
+        },
+        {
+          "path": "/usr/bin/ncat",
+          "sha256": "f75c3de611ca99e6dc8ebf381eb888df86c008a7eace99207ad2ad614d8dfcda",
+          "version": "Ncat: Version 7.80 ( https://nmap.org/ncat )"
+        },
+        {
+          "path": "/usr/bin/pidstat",
+          "sha256": "bb48ce4dad4beaa9972eb78ba19baeb8338306aa31a1917032cab17f994c392b",
+          "version": "sysstat version 12.5.2\n(C) Sebastien Godard (sysstat <at> orange.fr)"
+        },
+        {
+          "path": "/usr/bin/python3",
+          "sha256": "7d51cd6b48b521277f5caa4610a82126e315fa2be4df069823a8b1eeb5bd4a86",
+          "version": "Python 3.10.12"
+        }
+      ],
+      "server": [
+        {
+          "path": "/usr/bin/iperf3",
+          "sha256": "2c54c89b4d9016b9fe59ba83518348477fb290fdb6fc7ae12cb6773ecb9b1910",
+          "version": "iperf 3.9 (cJSON 1.7.13)\nLinux rs-bench-same-zone-srv-20260721-080637-4aca6f6c1e 6.8.0-1063-gcp #69~22.04.1-Ubuntu SMP Tue Jun 30 15:12:15 UTC 2026 x86_64\nOptional features available: CPU affinity setting, IPv6 flow label, SCTP, TCP congestion algorithm setting, sendfile / zerocopy, socket pacing, authentication"
+        },
+        {
+          "path": "/usr/bin/socat",
+          "sha256": "ac1a7165c0ade4dfdab602895cc56ff21d61f8443a80fb676946e4a624c52f68",
+          "version": "socat by Gerhard Rieger and contributors - see www.dest-unreach.org\nsocat version 1.7.4.1 on Mar 25 2022 09:51:32\n   running on Linux version #69~22.04.1-Ubuntu SMP Tue Jun 30 15:12:15 UTC 2026, release 6.8.0-1063-gcp, machine x86_64\nfeatures:\n  #define WITH_STDIO 1\n  #define WITH_FDNUM 1\n  #define WITH_FILE 1\n  #define WITH_CREAT 1\n  #define WITH_GOPEN 1\n  #define WITH_TERMIOS 1\n  #define WITH_PIPE 1\n  #define WITH_UNIX 1\n  #define WITH_ABSTRACT_UNIXSOCKET 1\n  #define WITH_IP4 1\n  #define WITH_IP6 1\n  #define WITH_RAWIP 1\n  #define WITH_GENERICSOCKET 1\n  #define WITH_INTERFACE 1\n  #define WITH_TCP 1\n  #define WITH_UDP 1\n  #define WITH_SCTP 1\n  #define WITH_LISTEN 1\n  #define WITH_SOCKS4 1\n  #define WITH_SOCKS4A 1\n  #define WITH_VSOCK 1\n  #define WITH_PROXY 1\n  #define WITH_SYSTEM 1\n  #define WITH_EXEC 1\n  #undef WITH_READLINE\n  #define WITH_TUN 1\n  #define WITH_PTY 1\n  #define WITH_OPENSSL 1\n  #undef WITH_FIPS\n  #define WITH_LIBWRAP 1\n  #define WITH_SYCLS 1\n  #define WITH_FILAN 1\n  #define WITH_RETRY 1\n  #define WITH_MSGLEVEL 0 /*debug*/"
+        },
+        {
+          "path": "/usr/bin/ncat",
+          "sha256": "f75c3de611ca99e6dc8ebf381eb888df86c008a7eace99207ad2ad614d8dfcda",
+          "version": "Ncat: Version 7.80 ( https://nmap.org/ncat )"
+        },
+        {
+          "path": "/usr/bin/pidstat",
+          "sha256": "bb48ce4dad4beaa9972eb78ba19baeb8338306aa31a1917032cab17f994c392b",
+          "version": "sysstat version 12.5.2\n(C) Sebastien Godard (sysstat <at> orange.fr)"
+        },
+        {
+          "path": "/usr/bin/python3",
+          "sha256": "7d51cd6b48b521277f5caa4610a82126e315fa2be4df069823a8b1eeb5bd4a86",
+          "version": "Python 3.10.12"
+        }
+      ]
+    },
+    "product": {
+      "client": [
+        {
+          "path": "/opt/rustscale/target/release/rustscale-bench",
+          "sha256": "6c346165fdf17f59544ceb14933c14b0cac77ed6e9061d037f6e8c017365ad98",
+          "version": "rustscale-bench 0.1.4",
+          "version_source": "executable --version"
+        },
+        {
+          "path": "/usr/sbin/tailscaled",
+          "sha256": "8da02a9f8fde1847982d28cfc2f1d77849b26633f2250e26f5316c3617e4db18",
+          "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+          "version_source": "executable --version"
+        },
+        {
+          "path": "/usr/bin/tailscale",
+          "sha256": "061bdadd0d9306ff7fd4368bd5022cdbb068828631cd981ef2163454f136d4b3",
+          "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+          "version_source": "executable --version"
+        }
+      ],
+      "server": [
+        {
+          "path": "/opt/rustscale/target/release/rustscale-bench",
+          "sha256": "6c346165fdf17f59544ceb14933c14b0cac77ed6e9061d037f6e8c017365ad98",
+          "version": "rustscale-bench 0.1.4",
+          "version_source": "executable --version"
+        },
+        {
+          "path": "/usr/sbin/tailscaled",
+          "sha256": "8da02a9f8fde1847982d28cfc2f1d77849b26633f2250e26f5316c3617e4db18",
+          "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+          "version_source": "executable --version"
+        },
+        {
+          "path": "/usr/bin/tailscale",
+          "sha256": "061bdadd0d9306ff7fd4368bd5022cdbb068828631cd981ef2163454f136d4b3",
+          "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+          "version_source": "executable --version"
+        }
+      ]
+    },
+    "resolved_image": "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260713",
+    "server": {
+      "cpu_model": "Intel(R) Xeon(R) CPU @ 2.30GHz",
+      "cpu_platform": "Intel Haswell",
+      "kernel_release": "6.8.0-1063-gcp",
+      "logical_cpus": 4,
+      "machine_type": "n1-standard-4",
+      "os_pretty_name": "Ubuntu 22.04.5 LTS",
+      "zone": "us-central1-a"
+    },
+    "toolchain": {
+      "client_cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+      "client_go": "go version go1.26.4 linux/amd64",
+      "client_rustc_verbose": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6",
+      "server_cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+      "server_go": "go version go1.26.4 linux/amd64",
+      "server_rustc_verbose": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6"
+    }
+  },
+  "parallelism_requested": [
+    1,
+    10,
+    100,
+    500,
+    1000
+  ],
+  "path": "direct",
+  "path_class_reported": "direct",
+  "path_gate": {
+    "matched": true,
+    "post": "direct",
+    "pre": "direct",
+    "requested": "direct"
+  },
+  "peer_count_requested": 1,
+  "repeat": 3,
+  "resources": {
+    "client": {
+      "binary_identities": [
+        {
+          "path": "/usr/sbin/tailscaled",
+          "sha256": "8da02a9f8fde1847982d28cfc2f1d77849b26633f2250e26f5316c3617e4db18",
+          "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+          "version_source": "executable --version"
+        },
+        {
+          "path": "/opt/rustscale/target/release/rustscale-bench",
+          "sha256": "6c346165fdf17f59544ceb14933c14b0cac77ed6e9061d037f6e8c017365ad98",
+          "version": "rustscale-bench 0.1.4",
+          "version_source": "executable --version"
+        }
+      ],
+      "clock": "monotonic",
+      "cpu_avg_pct": 208.68,
+      "cpu_peak_pct": 327.94,
+      "endpoint": "client",
+      "missing_samples": 1,
+      "rss_avg_kb": 556339.57,
+      "rss_peak_kb": 758408,
+      "sample_cadence_s": 1,
+      "samples": 213,
+      "scope": {
+        "includes_descendants": false,
+        "includes_kernel": false,
+        "kind": "dynamic_process_set"
+      },
+      "series": [
+        {
+          "cpu_pct": null,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 0,
+          "rss_kb": 126380,
+          "status": "partial"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 1006,
+          "rss_kb": 126380,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 2011,
+          "rss_kb": 126388,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 3016,
+          "rss_kb": 126388,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 136.35,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 4021,
+          "rss_kb": 147492,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 268.33,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 5031,
+          "rss_kb": 157684,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 256.46,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 6041,
+          "rss_kb": 160068,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 235.3,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 7048,
+          "rss_kb": 161088,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 254.71,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 8057,
+          "rss_kb": 162220,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 260.18,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 9064,
+          "rss_kb": 163060,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 264.12,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 10071,
+          "rss_kb": 163820,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 256.04,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 11079,
+          "rss_kb": 164584,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 260.21,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 12086,
+          "rss_kb": 165496,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 265.12,
+          "included_processes": [
+            "32053:tailscaled",
+            "32807:rustscale-bench"
+          ],
+          "offset_ms": 13093,
+          "rss_kb": 166300,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 94.31,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 14100,
+          "rss_kb": 160164,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 15106,
+          "rss_kb": 160176,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 16111,
+          "rss_kb": 160400,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 10.95,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 17116,
+          "rss_kb": 166976,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 269.57,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 18125,
+          "rss_kb": 167832,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 269.11,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 19132,
+          "rss_kb": 168648,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 265.45,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 20142,
+          "rss_kb": 169460,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 264.97,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 21149,
+          "rss_kb": 170204,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 265.95,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 22157,
+          "rss_kb": 170992,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 266.13,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 23164,
+          "rss_kb": 171796,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 267.88,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 24172,
+          "rss_kb": 172800,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 264.66,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 25181,
+          "rss_kb": 173592,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 265.07,
+          "included_processes": [
+            "32053:tailscaled",
+            "32863:rustscale-bench"
+          ],
+          "offset_ms": 26188,
+          "rss_kb": 174400,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 212.34,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 27196,
+          "rss_kb": 168540,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 28201,
+          "rss_kb": 168588,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 29207,
+          "rss_kb": 168588,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 30211,
+          "rss_kb": 168596,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 141.3,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 31216,
+          "rss_kb": 175644,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 269.21,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 32223,
+          "rss_kb": 176464,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 266.7,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 33231,
+          "rss_kb": 177312,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 270.62,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 34240,
+          "rss_kb": 178144,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 267.17,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 35247,
+          "rss_kb": 179028,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 265.03,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 36254,
+          "rss_kb": 179844,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 265.95,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 37262,
+          "rss_kb": 180648,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 267.88,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 38270,
+          "rss_kb": 181468,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 266.45,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 39276,
+          "rss_kb": 182332,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 263.09,
+          "included_processes": [
+            "32053:tailscaled",
+            "32917:rustscale-bench"
+          ],
+          "offset_ms": 40283,
+          "rss_kb": 183124,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 87.37,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 41290,
+          "rss_kb": 176896,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 42296,
+          "rss_kb": 176896,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 43301,
+          "rss_kb": 176896,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 12.93,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 44307,
+          "rss_kb": 184180,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 292.58,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 45315,
+          "rss_kb": 266656,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 292.24,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 46321,
+          "rss_kb": 321248,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 291.52,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 47330,
+          "rss_kb": 347488,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 286.83,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 48337,
+          "rss_kb": 361640,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 293.42,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 49346,
+          "rss_kb": 373164,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 285.61,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 50354,
+          "rss_kb": 381572,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 290.99,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 51361,
+          "rss_kb": 386480,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 279.4,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 52371,
+          "rss_kb": 391336,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 292.71,
+          "included_processes": [
+            "32053:tailscaled",
+            "32972:rustscale-bench"
+          ],
+          "offset_ms": 53378,
+          "rss_kb": 395288,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 227.28,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 54395,
+          "rss_kb": 391072,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 55400,
+          "rss_kb": 391072,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 56405,
+          "rss_kb": 391104,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 57413,
+          "rss_kb": 391124,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 167.23,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 58418,
+          "rss_kb": 414248,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 288.74,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 59429,
+          "rss_kb": 481936,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 285.15,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 60439,
+          "rss_kb": 520084,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 284.85,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 61447,
+          "rss_kb": 545424,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 293.23,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 62453,
+          "rss_kb": 560264,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 283.88,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 63460,
+          "rss_kb": 571384,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 290.25,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 64466,
+          "rss_kb": 580564,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 278.08,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 65473,
+          "rss_kb": 586948,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 287.9,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 66480,
+          "rss_kb": 593208,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 285.72,
+          "included_processes": [
+            "32053:tailscaled",
+            "33026:rustscale-bench"
+          ],
+          "offset_ms": 67488,
+          "rss_kb": 598160,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 84.35,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 68496,
+          "rss_kb": 592840,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 69501,
+          "rss_kb": 592840,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 70507,
+          "rss_kb": 592840,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 71512,
+          "rss_kb": 592840,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 188.95,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 72517,
+          "rss_kb": 604976,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 290.63,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 73529,
+          "rss_kb": 608976,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 290.44,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 74538,
+          "rss_kb": 612460,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 288.71,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 75563,
+          "rss_kb": 616040,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 284.73,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 76571,
+          "rss_kb": 619060,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 288.58,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 77579,
+          "rss_kb": 621924,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 292.96,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 78590,
+          "rss_kb": 624532,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 283.82,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 79615,
+          "rss_kb": 626896,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 285.15,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 80632,
+          "rss_kb": 628880,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 287.13,
+          "included_processes": [
+            "32053:tailscaled",
+            "33090:rustscale-bench"
+          ],
+          "offset_ms": 81639,
+          "rss_kb": 630604,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 48.61,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 82647,
+          "rss_kb": 623720,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 83652,
+          "rss_kb": 623720,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 84657,
+          "rss_kb": 623720,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 51.75,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 85662,
+          "rss_kb": 635068,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 302.7,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 86670,
+          "rss_kb": 637932,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 296.82,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 87677,
+          "rss_kb": 639792,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 293.25,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 88686,
+          "rss_kb": 641152,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 296.72,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 89694,
+          "rss_kb": 642528,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 302.17,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 90703,
+          "rss_kb": 643856,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 300.99,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 91710,
+          "rss_kb": 645216,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 296.92,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 92717,
+          "rss_kb": 646564,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 301.79,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 93731,
+          "rss_kb": 647928,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 294.93,
+          "included_processes": [
+            "32053:tailscaled",
+            "33144:rustscale-bench"
+          ],
+          "offset_ms": 94738,
+          "rss_kb": 649220,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 198.42,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 95746,
+          "rss_kb": 637132,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 96751,
+          "rss_kb": 637132,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 97757,
+          "rss_kb": 637148,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 98762,
+          "rss_kb": 637148,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 182.16,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 99767,
+          "rss_kb": 650816,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 302.68,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 100777,
+          "rss_kb": 652464,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 296.67,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 101785,
+          "rss_kb": 653868,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 297.44,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 102794,
+          "rss_kb": 655248,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 296.89,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 103801,
+          "rss_kb": 656628,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 299.65,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 104809,
+          "rss_kb": 657984,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 307.69,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 105816,
+          "rss_kb": 659408,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 299.81,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 106827,
+          "rss_kb": 660764,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 301.59,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 107835,
+          "rss_kb": 662108,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 303.63,
+          "included_processes": [
+            "32053:tailscaled",
+            "33198:rustscale-bench"
+          ],
+          "offset_ms": 108843,
+          "rss_kb": 663456,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 68.28,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 109853,
+          "rss_kb": 650640,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 110859,
+          "rss_kb": 650640,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 111864,
+          "rss_kb": 650640,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 38.77,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 112870,
+          "rss_kb": 661612,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 305.82,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 113877,
+          "rss_kb": 664488,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 300.22,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 114887,
+          "rss_kb": 665992,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 301.66,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 115894,
+          "rss_kb": 667580,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 300.06,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 116904,
+          "rss_kb": 669176,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 301.86,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 117911,
+          "rss_kb": 670612,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 301.56,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 118919,
+          "rss_kb": 671952,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 303.92,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 119926,
+          "rss_kb": 673336,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 305.76,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 120933,
+          "rss_kb": 674764,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 305.41,
+          "included_processes": [
+            "32053:tailscaled",
+            "33252:rustscale-bench"
+          ],
+          "offset_ms": 121942,
+          "rss_kb": 676176,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 213.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 122951,
+          "rss_kb": 664364,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 123957,
+          "rss_kb": 664364,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 124962,
+          "rss_kb": 664364,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 125967,
+          "rss_kb": 664388,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 105.52,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 126972,
+          "rss_kb": 682724,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 323.1,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 127981,
+          "rss_kb": 687428,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 324.4,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 128989,
+          "rss_kb": 691096,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 317.46,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 129997,
+          "rss_kb": 694156,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 310.49,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 131005,
+          "rss_kb": 697344,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.08,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 132014,
+          "rss_kb": 700340,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.07,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 133023,
+          "rss_kb": 702964,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.08,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 134033,
+          "rss_kb": 705800,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 320.21,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 135041,
+          "rss_kb": 708356,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 316.05,
+          "included_processes": [
+            "32053:tailscaled",
+            "33306:rustscale-bench"
+          ],
+          "offset_ms": 136051,
+          "rss_kb": 710776,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 164.6,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 137059,
+          "rss_kb": 684176,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 138065,
+          "rss_kb": 684184,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 139070,
+          "rss_kb": 684184,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 140075,
+          "rss_kb": 684184,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 84.58,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 141080,
+          "rss_kb": 700432,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 325.03,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 142089,
+          "rss_kb": 705704,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.15,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 143098,
+          "rss_kb": 709708,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 325.54,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 144106,
+          "rss_kb": 712840,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.77,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 145116,
+          "rss_kb": 715600,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.61,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 146123,
+          "rss_kb": 718792,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.46,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 147131,
+          "rss_kb": 721372,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.03,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 148140,
+          "rss_kb": 723968,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.53,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 149148,
+          "rss_kb": 726272,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 320.8,
+          "included_processes": [
+            "32053:tailscaled",
+            "33374:rustscale-bench"
+          ],
+          "offset_ms": 150158,
+          "rss_kb": 728772,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 190.53,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 151166,
+          "rss_kb": 703156,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 152171,
+          "rss_kb": 703164,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 153177,
+          "rss_kb": 703164,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 154182,
+          "rss_kb": 703164,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 160.03,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 155188,
+          "rss_kb": 722468,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 320.71,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 156195,
+          "rss_kb": 726932,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.23,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 157204,
+          "rss_kb": 730472,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.05,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 158213,
+          "rss_kb": 733648,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 312.99,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 159219,
+          "rss_kb": 736248,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.63,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 160227,
+          "rss_kb": 739440,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 316.09,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 161236,
+          "rss_kb": 742160,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 315.14,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 162245,
+          "rss_kb": 744716,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 310.25,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 163254,
+          "rss_kb": 747324,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 312.5,
+          "included_processes": [
+            "32053:tailscaled",
+            "33429:rustscale-bench"
+          ],
+          "offset_ms": 164262,
+          "rss_kb": 749832,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 120.09,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 165270,
+          "rss_kb": 721368,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 2.98,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 166275,
+          "rss_kb": 722292,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 167280,
+          "rss_kb": 722292,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 1.99,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 168285,
+          "rss_kb": 729112,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 223.18,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 169293,
+          "rss_kb": 746416,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.36,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 170301,
+          "rss_kb": 749424,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 326.67,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 171315,
+          "rss_kb": 750944,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 327.94,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 172324,
+          "rss_kb": 752056,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.99,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 173330,
+          "rss_kb": 752668,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.42,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 174338,
+          "rss_kb": 753936,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.47,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 175346,
+          "rss_kb": 754576,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 323.31,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 176355,
+          "rss_kb": 757256,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 310.61,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 177362,
+          "rss_kb": 757632,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 317.53,
+          "included_processes": [
+            "32053:tailscaled",
+            "33483:rustscale-bench"
+          ],
+          "offset_ms": 178370,
+          "rss_kb": 758208,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 105.21,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 179377,
+          "rss_kb": 725328,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 180383,
+          "rss_kb": 725328,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 181388,
+          "rss_kb": 725328,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 9.95,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 182393,
+          "rss_kb": 732796,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 222.2,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 183401,
+          "rss_kb": 749756,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.14,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 184410,
+          "rss_kb": 752040,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 317.27,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 185422,
+          "rss_kb": 753432,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 317.69,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 186429,
+          "rss_kb": 754316,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.18,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 187441,
+          "rss_kb": 755120,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 314.52,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 188455,
+          "rss_kb": 755832,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 320.88,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 189465,
+          "rss_kb": 756528,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.96,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 190475,
+          "rss_kb": 757204,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 316.7,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 191485,
+          "rss_kb": 757804,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.44,
+          "included_processes": [
+            "32053:tailscaled",
+            "33537:rustscale-bench"
+          ],
+          "offset_ms": 192493,
+          "rss_kb": 758408,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 83.32,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 193501,
+          "rss_kb": 725404,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 194507,
+          "rss_kb": 725404,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 195512,
+          "rss_kb": 725404,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 11.95,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 196516,
+          "rss_kb": 733004,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 230.7,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 197522,
+          "rss_kb": 747768,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.4,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 198530,
+          "rss_kb": 750556,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.7,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 199537,
+          "rss_kb": 751884,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 317.54,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 200545,
+          "rss_kb": 752620,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 323.66,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 201552,
+          "rss_kb": 753632,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 317.55,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 202560,
+          "rss_kb": 754704,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.87,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 203567,
+          "rss_kb": 755340,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.3,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 204578,
+          "rss_kb": 755916,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.61,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 205589,
+          "rss_kb": 756688,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 323.33,
+          "included_processes": [
+            "32053:tailscaled",
+            "33591:rustscale-bench"
+          ],
+          "offset_ms": 206603,
+          "rss_kb": 757088,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 76.32,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 207612,
+          "rss_kb": 725500,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 208617,
+          "rss_kb": 725500,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 209623,
+          "rss_kb": 725500,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 210629,
+          "rss_kb": 725500,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 4.97,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 211634,
+          "rss_kb": 725500,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 212640,
+          "rss_kb": 725500,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "32053:tailscaled"
+          ],
+          "offset_ms": 213645,
+          "rss_kb": 725500,
+          "status": "observed"
+        }
+      ],
+      "series_truncated": false,
+      "subjects": [
+        "tailscaled",
+        "rustscale-bench"
+      ]
+    },
+    "phase_set": [
+      "measured_client_process_lifecycle",
+      "inter_trial_gap",
+      "latency"
+    ],
+    "sample_cadence_ms": 1000,
+    "server": {
+      "binary_identities": [
+        {
+          "path": "/usr/sbin/tailscaled",
+          "sha256": "8da02a9f8fde1847982d28cfc2f1d77849b26633f2250e26f5316c3617e4db18",
+          "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+          "version_source": "executable --version"
+        },
+        {
+          "path": "/opt/rustscale/target/release/rustscale-bench",
+          "sha256": "6c346165fdf17f59544ceb14933c14b0cac77ed6e9061d037f6e8c017365ad98",
+          "version": "rustscale-bench 0.1.4",
+          "version_source": "executable --version"
+        }
+      ],
+      "clock": "monotonic",
+      "cpu_avg_pct": 226.15,
+      "cpu_peak_pct": 337.22,
+      "endpoint": "server",
+      "missing_samples": 1,
+      "rss_avg_kb": 102026.62,
+      "rss_peak_kb": 164412,
+      "sample_cadence_s": 1,
+      "samples": 212,
+      "scope": {
+        "includes_descendants": false,
+        "includes_kernel": false,
+        "kind": "dynamic_process_set"
+      },
+      "series": [
+        {
+          "cpu_pct": null,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 0,
+          "rss_kb": 56052,
+          "status": "partial"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 1006,
+          "rss_kb": 56052,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 2012,
+          "rss_kb": 56052,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 3018,
+          "rss_kb": 56056,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 4023,
+          "rss_kb": 56056,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 176.65,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 5031,
+          "rss_kb": 56580,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 299.17,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 6041,
+          "rss_kb": 56628,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 284.3,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 7050,
+          "rss_kb": 56688,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 267.57,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 8059,
+          "rss_kb": 56780,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 288.65,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 9067,
+          "rss_kb": 57124,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 293.74,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 10078,
+          "rss_kb": 57400,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 289.46,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 11087,
+          "rss_kb": 57652,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 283.17,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 12097,
+          "rss_kb": 57940,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 291.37,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 13106,
+          "rss_kb": 58204,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 292.6,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 14118,
+          "rss_kb": 58488,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 92.02,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 15128,
+          "rss_kb": 58576,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 16134,
+          "rss_kb": 58576,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 17140,
+          "rss_kb": 58576,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 36.78,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 18146,
+          "rss_kb": 58612,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 298.15,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 19156,
+          "rss_kb": 59280,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 295.22,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 20165,
+          "rss_kb": 59868,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 291.62,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 21173,
+          "rss_kb": 60188,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 295.39,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 22182,
+          "rss_kb": 60440,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 295.43,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 23194,
+          "rss_kb": 60724,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 298.03,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 24204,
+          "rss_kb": 60996,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 302.57,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 25212,
+          "rss_kb": 61308,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 291.23,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 26225,
+          "rss_kb": 61592,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 302.27,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 27234,
+          "rss_kb": 61852,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 231.01,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 28243,
+          "rss_kb": 62088,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 29249,
+          "rss_kb": 62088,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 30254,
+          "rss_kb": 62096,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 31260,
+          "rss_kb": 62136,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 201.01,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 32265,
+          "rss_kb": 62364,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 297.35,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 33274,
+          "rss_kb": 62696,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 294.33,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 34283,
+          "rss_kb": 62972,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 296.39,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 35295,
+          "rss_kb": 63276,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 302.6,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 36303,
+          "rss_kb": 63552,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 291.4,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 37312,
+          "rss_kb": 63836,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 290.99,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 38322,
+          "rss_kb": 64096,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 302.66,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 39330,
+          "rss_kb": 64392,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 302.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 40340,
+          "rss_kb": 64668,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 292.38,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 41349,
+          "rss_kb": 64908,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 73.41,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 42357,
+          "rss_kb": 64976,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 43363,
+          "rss_kb": 64976,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 44369,
+          "rss_kb": 64976,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 50.57,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 45377,
+          "rss_kb": 65120,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 310.57,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 46388,
+          "rss_kb": 67932,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 303.24,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 47400,
+          "rss_kb": 68744,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 314.99,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 48410,
+          "rss_kb": 69536,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 315.31,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 49419,
+          "rss_kb": 73040,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.95,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 50431,
+          "rss_kb": 73092,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 312.77,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 51448,
+          "rss_kb": 74028,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 308.05,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 52464,
+          "rss_kb": 75256,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 312.23,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 53476,
+          "rss_kb": 77704,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.45,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 54484,
+          "rss_kb": 77740,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 232.01,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 55501,
+          "rss_kb": 77780,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 56507,
+          "rss_kb": 77780,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 57513,
+          "rss_kb": 77780,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 58520,
+          "rss_kb": 77780,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 243.83,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 59525,
+          "rss_kb": 77804,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 314.17,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 60534,
+          "rss_kb": 79212,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 315.12,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 61543,
+          "rss_kb": 81192,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 308.93,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 62553,
+          "rss_kb": 81780,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 312.53,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 63561,
+          "rss_kb": 82204,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 309.49,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 64572,
+          "rss_kb": 82584,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 310.21,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 65581,
+          "rss_kb": 82972,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 312.73,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 66595,
+          "rss_kb": 83312,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 315.84,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 67605,
+          "rss_kb": 83664,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 314.89,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 68618,
+          "rss_kb": 84036,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 44.55,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 69628,
+          "rss_kb": 84112,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 70634,
+          "rss_kb": 84124,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 71640,
+          "rss_kb": 84124,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 72645,
+          "rss_kb": 84124,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 290.28,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 73651,
+          "rss_kb": 84472,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.03,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 74661,
+          "rss_kb": 84872,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 312.88,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 75671,
+          "rss_kb": 85272,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 316.69,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 76681,
+          "rss_kb": 85636,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 313.81,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 77691,
+          "rss_kb": 85980,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.16,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 78703,
+          "rss_kb": 86348,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.37,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 79712,
+          "rss_kb": 86692,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 317.43,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 80720,
+          "rss_kb": 87016,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 323.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 81732,
+          "rss_kb": 87376,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 308.28,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 82744,
+          "rss_kb": 88956,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 11.9,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 83753,
+          "rss_kb": 88972,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 84758,
+          "rss_kb": 88980,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 85764,
+          "rss_kb": 88988,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 120.25,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 86770,
+          "rss_kb": 89456,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.02,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 87780,
+          "rss_kb": 89980,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.95,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 88789,
+          "rss_kb": 90488,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 324.18,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 89801,
+          "rss_kb": 91000,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 317.86,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 90814,
+          "rss_kb": 91464,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.56,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 91822,
+          "rss_kb": 91948,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.13,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 92830,
+          "rss_kb": 92448,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.26,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 93839,
+          "rss_kb": 92944,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.3,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 94854,
+          "rss_kb": 93460,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.97,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 95863,
+          "rss_kb": 93952,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 183.76,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 96875,
+          "rss_kb": 94280,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 97881,
+          "rss_kb": 94280,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 98887,
+          "rss_kb": 94280,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 99893,
+          "rss_kb": 94280,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 293.6,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 100897,
+          "rss_kb": 94880,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.67,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 101908,
+          "rss_kb": 95376,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.84,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 102918,
+          "rss_kb": 95844,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 315.3,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 103929,
+          "rss_kb": 96320,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 325.34,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 104940,
+          "rss_kb": 96792,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.72,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 105954,
+          "rss_kb": 97340,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.15,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 106969,
+          "rss_kb": 97852,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 319.48,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 107980,
+          "rss_kb": 98372,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.09,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 108992,
+          "rss_kb": 98880,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 321.73,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 109999,
+          "rss_kb": 99392,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 20.8,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 111009,
+          "rss_kb": 99436,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 112014,
+          "rss_kb": 99436,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 113020,
+          "rss_kb": 99436,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 125.14,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 114027,
+          "rss_kb": 99692,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 328.11,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 115045,
+          "rss_kb": 100272,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.35,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 116059,
+          "rss_kb": 100748,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 318.99,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 117072,
+          "rss_kb": 101300,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 320.83,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 118085,
+          "rss_kb": 101808,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 323.48,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 119096,
+          "rss_kb": 102624,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.68,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 120103,
+          "rss_kb": 103116,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 323.14,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 121115,
+          "rss_kb": 103676,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 323.82,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 122125,
+          "rss_kb": 104208,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 320.82,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 123138,
+          "rss_kb": 104720,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 181.33,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 124147,
+          "rss_kb": 105052,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 125153,
+          "rss_kb": 105052,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 126159,
+          "rss_kb": 105052,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 127165,
+          "rss_kb": 105052,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 226.7,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 128170,
+          "rss_kb": 109784,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 327.66,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 129184,
+          "rss_kb": 110832,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 334.69,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 130196,
+          "rss_kb": 111252,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 329.69,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 131206,
+          "rss_kb": 112692,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 333.17,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 132218,
+          "rss_kb": 112692,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 330.3,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 133229,
+          "rss_kb": 112692,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 327.62,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 134239,
+          "rss_kb": 112700,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 335.43,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 135253,
+          "rss_kb": 113332,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 331.89,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 136265,
+          "rss_kb": 114136,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 331.03,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 137274,
+          "rss_kb": 114904,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 112.86,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 138285,
+          "rss_kb": 114644,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 139290,
+          "rss_kb": 114656,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 140296,
+          "rss_kb": 114656,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 141302,
+          "rss_kb": 114656,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 209.87,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 142307,
+          "rss_kb": 115864,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 336.72,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 143323,
+          "rss_kb": 116720,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 330.3,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 144334,
+          "rss_kb": 117504,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 334.17,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 145346,
+          "rss_kb": 118584,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 328.86,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 146358,
+          "rss_kb": 119400,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 327.58,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 147369,
+          "rss_kb": 120160,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 329.06,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 148378,
+          "rss_kb": 120912,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 333.44,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 149388,
+          "rss_kb": 121720,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 328.49,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 150405,
+          "rss_kb": 122440,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 328.94,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 151417,
+          "rss_kb": 123216,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 126.54,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 152429,
+          "rss_kb": 122960,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 153435,
+          "rss_kb": 122960,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 154442,
+          "rss_kb": 122960,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 8.95,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 155447,
+          "rss_kb": 123432,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 302.15,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 156453,
+          "rss_kb": 124660,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 326.93,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 157459,
+          "rss_kb": 125436,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 330.15,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 158471,
+          "rss_kb": 126264,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 328.79,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 159484,
+          "rss_kb": 127028,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 332.3,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 160495,
+          "rss_kb": 128404,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 326.08,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 161507,
+          "rss_kb": 129124,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 330.59,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 162517,
+          "rss_kb": 129900,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 331.5,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 163525,
+          "rss_kb": 131228,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 324.75,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 164541,
+          "rss_kb": 131860,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 332.79,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 165551,
+          "rss_kb": 132624,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 29.59,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 166565,
+          "rss_kb": 132212,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 167570,
+          "rss_kb": 132212,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 168576,
+          "rss_kb": 132484,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 39.81,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 169581,
+          "rss_kb": 133748,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 331.29,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 170589,
+          "rss_kb": 135548,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 336.69,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 171599,
+          "rss_kb": 136540,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 334.63,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 172624,
+          "rss_kb": 137548,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 334.29,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 173641,
+          "rss_kb": 138560,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 337.22,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 174655,
+          "rss_kb": 139492,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 332.04,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 175667,
+          "rss_kb": 140444,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 335.48,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 176678,
+          "rss_kb": 141400,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 328.59,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 177691,
+          "rss_kb": 142348,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 322.3,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 178700,
+          "rss_kb": 143300,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 325.88,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 179709,
+          "rss_kb": 144296,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 7.94,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 180716,
+          "rss_kb": 142544,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 181722,
+          "rss_kb": 142544,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 182728,
+          "rss_kb": 142544,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 63.48,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 183736,
+          "rss_kb": 143940,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 329.4,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 184753,
+          "rss_kb": 145432,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 333.33,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 185761,
+          "rss_kb": 146412,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 330.67,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 186771,
+          "rss_kb": 147368,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 331.18,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 187783,
+          "rss_kb": 148328,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 331.38,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 188794,
+          "rss_kb": 149288,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 327.89,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 189803,
+          "rss_kb": 150280,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 333.34,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 190814,
+          "rss_kb": 151288,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 326.73,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 191824,
+          "rss_kb": 152492,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 325.44,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 192835,
+          "rss_kb": 153464,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 303.37,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 193844,
+          "rss_kb": 154408,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 5.97,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 194849,
+          "rss_kb": 153400,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 195855,
+          "rss_kb": 153400,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 196861,
+          "rss_kb": 153400,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 83.5,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 197867,
+          "rss_kb": 154736,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 333.39,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 198887,
+          "rss_kb": 155708,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 332.99,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 199908,
+          "rss_kb": 156708,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 334.79,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 200918,
+          "rss_kb": 157696,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 336.17,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 201932,
+          "rss_kb": 158736,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 333.66,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 202945,
+          "rss_kb": 159684,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 336.02,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 203957,
+          "rss_kb": 160652,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 331.79,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 204970,
+          "rss_kb": 161664,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 327.55,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 205983,
+          "rss_kb": 162620,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 332.92,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 206998,
+          "rss_kb": 163572,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 279.46,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 208011,
+          "rss_kb": 164412,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 209018,
+          "rss_kb": 163240,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.0,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 210024,
+          "rss_kb": 163240,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 1.99,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 211030,
+          "rss_kb": 163240,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 8.95,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 212035,
+          "rss_kb": 162772,
+          "status": "observed"
+        },
+        {
+          "cpu_pct": 0.99,
+          "included_processes": [
+            "19709:tailscaled",
+            "20132:rustscale-bench"
+          ],
+          "offset_ms": 213041,
+          "rss_kb": 162772,
+          "status": "observed"
+        }
+      ],
+      "series_truncated": false,
+      "subjects": [
+        "tailscaled",
+        "rustscale-bench"
+      ]
+    }
+  },
+  "run": {
+    "build": {
+      "cargo_profile_release_codegen_units": "",
+      "cargo_profile_release_lto": "",
+      "command": "export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled",
+      "go_command": "export GOTOOLCHAIN=local; cd /opt/rustscale/tools/bench/go-tsnet && test \"$(go env GOVERSION)\" = go1.26.4 && go mod verify && mkdir -p /opt/rustscale/bin && go build -trimpath -buildvcs=false -ldflags=-buildid= -o /opt/rustscale/bin/go-tsnet-rsb1 .",
+      "go_module": "tailscale.com",
+      "go_module_sum": "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=",
+      "go_module_version": "v1.100.0",
+      "go_toolchain": "go1.26.4",
+      "go_toolchain_archive": "go1.26.4.linux-amd64.tar.gz",
+      "go_toolchain_archive_sha256": "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f",
+      "rustflags": ""
+    },
+    "cloud": {
+      "disk_gb": 200,
+      "disk_type": "pd-standard",
+      "network": "default",
+      "project": "tailscale-sandbox",
+      "provider": "gcp",
+      "requested_image_family": "ubuntu-2204-lts",
+      "requested_image_project": "ubuntu-os-cloud",
+      "requested_machine_type": "n1-standard-4"
+    },
+    "id": "gcp-20260721-080637-4aca6f6c1e",
+    "runtime": {
+      "linux_udp_batch": true,
+      "linux_udp_gro": true,
+      "linux_udp_gso": true,
+      "rs_tun_inbound_pipeline": false,
+      "rs_tun_outbound_send_pipeline": false
+    },
+    "source": {
+      "commit": "395bf8db6648e67f61bc571e1a755b27cd714e12",
+      "delivery": "git-archive-head",
+      "includes_uncommitted_changes": false,
+      "launch_worktree_dirty": false
+    },
+    "started_at_utc": "2026-07-21T08:06:37Z"
+  },
+  "runtime_stats": {
+    "client": "",
+    "server": ""
+  },
+  "sample_cadence_s": 1,
+  "schema_version": 6,
+  "status": "ok",
+  "throughput": [
+    {
+      "coefficient_of_variation_pct": 1.7466617620990383,
+      "duration_s": 10,
+      "max_mbps": 2262.6245664,
+      "mbps": 2243.7190368,
+      "min_mbps": 2172.3263488000002,
+      "parallel": 1,
+      "population_stddev_mbps": 38.88459142279407,
+      "samples_mbps": [
+        2172.3263488000002,
+        2262.6245664,
+        2243.7190368
+      ],
+      "statistic": "median"
+    },
+    {
+      "coefficient_of_variation_pct": 1.2026278273632225,
+      "duration_s": 10,
+      "max_mbps": 2217.5196112000003,
+      "mbps": 2185.589536,
+      "min_mbps": 2153.141756,
+      "parallel": 10,
+      "population_stddev_mbps": 26.282432597878607,
+      "samples_mbps": [
+        2185.589536,
+        2153.141756,
+        2217.5196112000003
+      ],
+      "statistic": "median"
+    },
+    {
+      "coefficient_of_variation_pct": 0.6953871530518877,
+      "duration_s": 10,
+      "max_mbps": 1913.8206848000002,
+      "mbps": 1902.1785888,
+      "min_mbps": 1881.8595392,
+      "parallel": 100,
+      "population_stddev_mbps": 13.207392727748669,
+      "samples_mbps": [
+        1881.8595392,
+        1913.8206848000002,
+        1902.1785888
+      ],
+      "statistic": "median"
+    },
+    {
+      "coefficient_of_variation_pct": 2.4740669611212485,
+      "duration_s": 10,
+      "max_mbps": 1368.8185568000001,
+      "mbps": 1343.4285152,
+      "min_mbps": 1289.6556864,
+      "parallel": 500,
+      "population_stddev_mbps": 33.00325132059143,
+      "samples_mbps": [
+        1289.6556864,
+        1343.4285152,
+        1368.8185568000001
+      ],
+      "statistic": "median"
+    },
+    {
+      "coefficient_of_variation_pct": 1.7153953893645606,
+      "duration_s": 10,
+      "max_mbps": 944.6292127999999,
+      "mbps": 931.3570655999999,
+      "min_mbps": 906.2630176,
+      "parallel": 1000,
+      "population_stddev_mbps": 15.908858714737315,
+      "samples_mbps": [
+        931.3570655999999,
+        906.2630176,
+        944.6292127999999
+      ],
+      "statistic": "median"
+    }
+  ],
+  "throughput_trials": [
+    {
+      "completed": 1,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 1,
+      "handshaken": 1,
+      "parallel": 1,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 1,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 2172.3263488000002,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 1,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 1,
+      "handshaken": 1,
+      "parallel": 1,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 2,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 2262.6245664,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 1,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 1,
+      "handshaken": 1,
+      "parallel": 1,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 3,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 2243.7190368,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 10,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 10,
+      "handshaken": 10,
+      "parallel": 10,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 1,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 2185.589536,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 10,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 10,
+      "handshaken": 10,
+      "parallel": 10,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 2,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 2153.141756,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 10,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 10,
+      "handshaken": 10,
+      "parallel": 10,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 3,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 2217.5196112000003,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 100,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 100,
+      "handshaken": 100,
+      "parallel": 100,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 1,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 1881.8595392,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 100,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 100,
+      "handshaken": 100,
+      "parallel": 100,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 2,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 1913.8206848000002,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 100,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 100,
+      "handshaken": 100,
+      "parallel": 100,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 3,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 1902.1785888,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 500,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 500,
+      "handshaken": 500,
+      "parallel": 500,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 1,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 1289.6556864,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 500,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 500,
+      "handshaken": 500,
+      "parallel": 500,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 2,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 1343.4285152,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 500,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 500,
+      "handshaken": 500,
+      "parallel": 500,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 3,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 1368.8185568000001,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 1000,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 1000,
+      "handshaken": 1000,
+      "parallel": 1000,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 1,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 931.3570655999999,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 1000,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 1000,
+      "handshaken": 1000,
+      "parallel": 1000,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 2,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 906.2630176,
+      "transport": "kernel-tcp"
+    },
+    {
+      "completed": 1000,
+      "direction": "down",
+      "duration_s": 10,
+      "established": 1000,
+      "handshaken": 1000,
+      "parallel": 1000,
+      "path_class": "externally-gated",
+      "protocol": "RSB1",
+      "repeat_index": 3,
+      "shutdown": "process-return-after-complete",
+      "target": "100.87.204.118:5201",
+      "total_mbps": 944.6292127999999,
+      "transport": "kernel-tcp"
+    }
+  ],
+  "tool": "tailscaled",
+  "topology": "same-zone",
+  "transport": "kernel-tcp",
+  "warmup_evidence": {
+    "completed": 1,
+    "direction": "down",
+    "duration_secs": 3,
+    "established": 1,
+    "handshaken": 1,
+    "parallel": 1,
+    "path_class": "externally-gated",
+    "protocol": "RSB1",
+    "shutdown": "process-return-after-complete",
+    "target": "100.87.204.118:5201",
+    "total_mbps": 2186.766016,
+    "transport": "kernel-tcp"
+  },
+  "workload": {
+    "client_lifecycle": "new_benchmark_process_per_trial",
+    "client_shutdown_lifecycle": "process-return-after-complete",
+    "client_shutdown_modes": [
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete",
+      "process-return-after-complete"
+    ],
+    "destination_target_lifecycle": "fixed-per-cell",
+    "destination_targets": [
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201",
+      "100.87.204.118:5201"
+    ],
+    "direction": "down",
+    "implementation": "rustscale-bench",
+    "latency_count": 200,
+    "latency_payload_bytes": 8,
+    "latency_protocol": "RSB1-tcp-pingpong",
+    "measured_trial_attempts": 1,
+    "payload_bytes": 1280,
+    "protocol": "RSB1",
+    "transport_identity_lifecycle": "one_persisted_identity_per_endpoint_cell",
+    "transport_path": "kernel-tcp-via-tailscaled-tun",
+    "userspace_portmapping": "not-applicable",
+    "warmup": {
+      "duration_s": 3,
+      "max_attempts": 1,
+      "parallel": 1
+    }
+  }
+}

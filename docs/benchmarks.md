@@ -314,6 +314,27 @@ upload `bench-results/`. Production runs are explicit local operator actions.
 
 ## Results
 
+### Current canonical matrix
+
+The complete five-configuration same-region/cross-zone direct-path run is
+`gcp-20260721-080637-4aca6f6c1e`, built from clean source commit
+`395bf8db6648e67f61bc571e1a755b27cd714e12`. Every configuration completed
+P1/P10/P100/P500/P1000 three times with exact connection denominators and
+200/200 latency exchanges. The credential-free manifest, raw samples,
+resource timelines, endpoint metadata, summary, dashboard, and hashes are
+tracked under
+[`docs/performance/gcp-20260721-080637-4aca6f6c1e`](performance/gcp-20260721-080637-4aca6f6c1e/).
+See [`PERFORMANCE.md`](../PERFORMANCE.md#canonical-five-configuration-rsb1-matrix-2026-07-21)
+for the compact five-mode tables and interpretation caveats. In particular,
+the high RustScale embedded CV and different daemon-proxy architecture mean
+the project does not declare an overall winner from this run.
+
+The successful `ts-userspace` cell also exercises file-backed local result
+assembly: high-stream resource and trial JSON never cross an operating-system
+argument boundary, so valid P1000 evidence cannot exceed macOS `ARG_MAX`.
+Every temporary payload file is owner-only and is removed on success, ordinary
+failure, or the cell exit trap.
+
 ### Machine
 
 | Field       | Value                                        |

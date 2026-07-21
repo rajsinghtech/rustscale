@@ -236,3 +236,68 @@ The manifest, complete result JSON, and SHA-256 list are tracked in
 The requested peer-load label is 1; observed membership was not instrumented,
 so this evidence does not claim peer-load scaling. The linked Pages dashboard
 renders the retained raw series without publishing failed cells.
+
+## Canonical five-configuration RSB1 matrix (2026-07-21)
+
+Run `gcp-20260721-080637-4aca6f6c1e` is the current matched evidence set for
+RustScale embedded tsnet, pinned Tailscale Go tsnet, RustScale kernel TUN, the
+retained tailscaled SOCKS5/Serve daemon proxy, and tailscaled kernel TUN. It ran
+from clean source commit `395bf8db6648e67f61bc571e1a755b27cd714e12` on matched
+GCP `n1-standard-4` endpoints in `us-central1-a` and `us-central1-b`. Every
+cell observed a direct path and completed three 10-second RSB1 samples at each
+of P1/P10/P100/P500/P1000 with exact connection lifecycle denominators, plus
+200/200 latency exchanges with no timeout or malformed reply.
+
+Median throughput is in Mbps; the parenthesized value is population CV across
+the three retained samples.
+
+| Configuration | P1 | P10 | P100 | P500 | P1000 |
+|---|---:|---:|---:|---:|---:|
+| RustScale embedded tsnet | 84.0 (53.2%) | 328.5 (11.0%) | 124.7 (1.2%) | 19.6 (57.8%) | 59.7 (60.5%) |
+| Tailscale embedded Go tsnet | 1395.9 (0.3%) | 1564.8 (0.3%) | 1430.5 (4.8%) | 1289.1 (2.3%) | 1178.9 (6.4%) |
+| RustScale kernel TUN | 1613.3 (0.6%) | 1513.6 (0.3%) | 1215.5 (1.6%) | 511.1 (0.8%) | 366.2 (9.2%) |
+| tailscaled daemon proxy | 1333.0 (1.3%) | 1343.4 (1.0%) | 1114.4 (3.2%) | 852.5 (1.0%) | 685.6 (2.7%) |
+| tailscaled kernel TUN | 2243.7 (1.7%) | 2185.6 (1.2%) | 1902.2 (0.7%) | 1343.4 (2.5%) | 931.4 (1.7%) |
+
+| Configuration | p50 us | p95 us | p99 us | Successful/requested |
+|---|---:|---:|---:|---:|
+| RustScale embedded tsnet | 1069.747 | 1167.274 | 1218.603 | 200/200 |
+| Tailscale embedded Go tsnet | 1142.742 | 1322.729 | 1651.217 | 200/200 |
+| RustScale kernel TUN | 1185.821 | 1298.025 | 1328.048 | 200/200 |
+| tailscaled daemon proxy | 1551.578 | 1660.892 | 1700.585 | 200/200 |
+| tailscaled kernel TUN | 1321.159 | 1444.654 | 1493.460 | 200/200 |
+
+Resource values cover each endpoint's declared userspace process set from
+after warmup through latency. CPU is average/peak percent and RSS is
+average/peak MiB.
+
+| Configuration | Endpoint | Samples (missing) | CPU avg/peak | RSS avg/peak MiB |
+|---|---|---:|---:|---:|
+| RustScale embedded tsnet | client | 365 (82) | 62.59/219.16% | 38.54/204.12 |
+| RustScale embedded tsnet | server | 365 (1) | 70.18/276.89% | 2094.11/8943.43 |
+| Tailscale embedded Go tsnet | client | 308 (78) | 156.81/322.14% | 280.84/852.68 |
+| Tailscale embedded Go tsnet | server | 306 (1) | 161.56/401.68% | 2169.55/6433.65 |
+| RustScale kernel TUN | client | 215 (1) | 105.68/173.99% | 37.08/52.54 |
+| RustScale kernel TUN | server | 214 (1) | 112.69/173.57% | 31.84/34.62 |
+| tailscaled daemon proxy | client | 300 (1) | 143.50/386.73% | 2952.25/10802.55 |
+| tailscaled daemon proxy | server | 326 (1) | 132.18/403.60% | 1186.66/2744.95 |
+| tailscaled kernel TUN | client | 213 (1) | 208.68/327.94% | 543.30/740.63 |
+| tailscaled kernel TUN | server | 212 (1) | 226.15/337.22% | 99.64/160.56 |
+
+These process-scope resource numbers exclude kernel CPU, and the daemon-proxy
+set can count shared pages in more than one ncat process. They are not total
+system cost. The RustScale embedded throughput samples have 53–60% CV at
+P1/P500/P1000, so this run does not support a stable winner claim or a derived
+performance ratio for that mode. The daemon-proxy cell is also a distinct
+architecture, retained and labeled for continuity rather than presented as
+embedded Go tsnet.
+
+The complete credential-free manifest, five cell results, endpoint metadata,
+summary, generated dashboard, and per-file SHA-256 list are tracked in
+[`docs/performance/gcp-20260721-080637-4aca6f6c1e`](docs/performance/gcp-20260721-080637-4aca6f6c1e/).
+The independently archived run (including its untracked execution log) has
+SHA-256 `fb2ddc6221cc07e70aa19ba592f3cb8319bdbb7b0afb9e4591ad7c164b61f663`.
+The harness exited successfully only after all five cells, aggregate
+validation, and teardown passed; independent postflight found zero remaining
+VMs, disks, addresses, tailnets, benchmark processes, shared tailnet records,
+or auth-key files.

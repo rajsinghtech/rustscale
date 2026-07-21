@@ -16,6 +16,8 @@ cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091
 source tools/bench/lib.sh
+# shellcheck disable=SC1091
+source tools/interop-tun-cleanup.sh
 
 # ---------------------------------------------------------------------------
 # Config
@@ -36,18 +38,25 @@ PIDFILE=""
 # shellcheck disable=SC2329
 # ---------------------------------------------------------------------------
 interop_tun_cleanup() {
+  local original_rc=$? cleanup_rc=0
+  trap - EXIT INT TERM
+  set +e
+
   if [[ -n "$GO_PID" ]]; then
-    kill "$GO_PID" 2>/dev/null || true
-    wait "$GO_PID" 2>/dev/null || true
+    interop_tun_stop_child "$GO_PID" "Go tailscaled" 10 || cleanup_rc=1
   fi
   if [[ -n "$ECHO_BACKEND_PID" ]]; then
-    kill "$ECHO_BACKEND_PID" 2>/dev/null || true
-    wait "$ECHO_BACKEND_PID" 2>/dev/null || true
+    interop_tun_stop_child "$ECHO_BACKEND_PID" "echo backend" 5 || cleanup_rc=1
   fi
   if [[ -n "$STATE_DIR" && -d "$STATE_DIR" ]]; then
-    sudo rm -rf "$STATE_DIR"
+    timeout 10s sudo -n rm -rf "$STATE_DIR" || cleanup_rc=1
   fi
-  bench_cleanup_tailnet
+  bench_cleanup_tailnet || cleanup_rc=1
+
+  if (( original_rc != 0 )); then
+    exit "$original_rc"
+  fi
+  exit "$cleanup_rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -265,7 +274,10 @@ sudo --preserve-env=TS_E2E_AUTHKEY,TS_INTEROP_GO_IP,TS_INTEROP_GO_NAME,TS_INTERO
       exit 1
     fi
     export RUSTSCALE_REQUIRE_TUN_INTEROP=1
-    exec \"\$@\"
+    # An async timeout cannot make progress if cancellation itself blocks in
+    # runtime or TUN teardown. Keep a process-level fail-closed deadline so the
+    # job reports that defect instead of being cancelled by GitHub's job cap.
+    exec timeout --foreground --signal=TERM --kill-after=15s 600s \"\$@\"
   " sh "$TEST_BIN" \
   --ignored --exact tests::interop_tun_rust_dials_go \
   --nocapture --test-threads=1

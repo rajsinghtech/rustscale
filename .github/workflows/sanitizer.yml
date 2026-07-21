@@ -1,7 +1,7 @@
 name: Sanitizers
 
 # Nightly ThreadSanitizer run over concurrency-heavy crates.
-# Allowed to fail without blocking merges — informational only.
+# Each matrix entry must compile and run at least one test under TSan.
 
 on:
   schedule:
@@ -20,7 +20,6 @@ jobs:
     name: ThreadSanitizer (${{ matrix.crate }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -33,11 +32,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: nightly
+          components: rust-src
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: tsan-${{ matrix.crate }}
-      - name: cargo test with TSan
+      - name: compile and run tests with TSan
+        shell: bash
         env:
+          CARGO_TARGET_DIR: target/tsan/${{ matrix.crate }}
+          CARGO_TERM_COLOR: never
           RUSTFLAGS: '-Zsanitizer=thread'
-          TSAN_OPTIONS: 'halt_on_error=0'
-        run: cargo +nightly test -p ${{ matrix.crate }} --locked
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          set -euo pipefail
+          # Doctests are compiled by rustdoc, which does not inherit Cargo's
+          # sanitizer codegen and therefore cannot share this instrumented ABI.
+          # Run every unit/integration test target serially instead; serial
+          # harness execution also avoids overlapping independent Tokio I/O
+          # runtimes, while each concurrency test retains its own workers.
+          cargo +nightly test -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            -p ${{ matrix.crate }} --locked --lib --tests \
+            -- --test-threads=1 2>&1 | tee tsan-test.log
+
+          passed=$(sed -nE 's/^test result: ok\. ([0-9]+) passed;.*$/\1/p' tsan-test.log \
+            | awk '{ total += $1 } END { print total + 0 }')
+          if (( passed == 0 )); then
+            echo "::error title=TSan executed zero tests::${{ matrix.crate }} compiled but ran no tests"
+            exit 1
+          fi
+          echo "TSan executed ${passed} tests for ${{ matrix.crate }}"

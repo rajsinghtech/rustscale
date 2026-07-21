@@ -851,6 +851,39 @@ async fn responder_uses_longest_suffix_failover_and_live_reconfiguration() {
     default_task.abort();
 }
 
+/// The production TUN lifecycle transfers responder task ownership to its
+/// outer supervisor. The transfer itself must not cancel the live listeners.
+#[tokio::test]
+async fn transferred_responder_task_serves_udp_and_tcp() {
+    let handle = DnsResponder::with_forwarder(
+        local_resolver("handoff.test", Ipv4Addr::new(100, 64, 0, 42)),
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(Forwarder::new(vec![])),
+    )
+    .spawn()
+    .await
+    .expect("start DNS responder");
+    let address = handle.local_addr();
+
+    // Mirror StartupRollback ownership in the TUN lifecycle.
+    let task = handle.into_join_handle();
+    let query = make_query(0x5001, "handoff.test", qtype::A);
+    assert_eq!(
+        response_v4(&udp_round_trip(address, &query).await),
+        Ipv4Addr::new(100, 64, 0, 42)
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect DNS/TCP after task transfer");
+    write_tcp_frame(&mut stream, &query).await;
+    let response = read_tcp_frame(&mut stream).await;
+    assert_eq!(response_v4(&response), Ipv4Addr::new(100, 64, 0, 42));
+
+    task.abort();
+    let _ = task.await;
+}
+
 /// Framing and same-session reconfiguration vectors ported from
 /// tailscale.com@v1.100.0 net/dns/manager_tcp_test.go::TestDNSOverTCP.
 #[tokio::test]
@@ -1021,13 +1054,30 @@ async fn spawn_hanging_dual_upstream() -> (
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind hanging upstream TCP");
-    let address = tcp.local_addr().unwrap();
-    let udp = tokio::net::UdpSocket::bind(address)
-        .await
-        .expect("bind hanging upstream UDP");
+    // Binding one protocol to port zero does not reserve the same port for the
+    // other protocol. Another test or process can claim the UDP port between
+    // these calls, particularly on macOS, so retry the complete pair.
+    let (tcp, udp, address) = {
+        let mut pair = None;
+        for _ in 0..32 {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind hanging upstream TCP");
+            let address = tcp.local_addr().unwrap();
+            match tokio::net::UdpSocket::bind(address).await {
+                Ok(udp) => {
+                    pair = Some((tcp, udp, address));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    drop(tcp);
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("bind hanging upstream UDP: {error}"),
+            }
+        }
+        pair.expect("bind hanging upstream TCP/UDP pair after retries")
+    };
     let (started_tx, started_rx) = mpsc::unbounded_channel();
     let udp_started = started_tx.clone();
     let udp_task = tokio::spawn(async move {

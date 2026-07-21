@@ -25,37 +25,11 @@ timestamp() {
   date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
-# `is-system-running --wait` is systemd's native bounded readiness primitive.
-# Do not replace this with an instantaneous state probe or a polling loop: a
-# fresh GitHub runner can still be `starting` while systemd is fully usable.
-wait_for_systemd_manager() {
-  local seconds=$1 scope=$2 state status
-  shift 2
-  echo "$LABEL $(timestamp) wait: systemd manager ($scope, deadline=${seconds}s)" >&2
-  if state=$("$@" timeout --signal=KILL "${seconds}s" \
-      systemctl is-system-running --wait 2>&1); then
-    status=0
-  else
-    status=$?
-  fi
-  state=$(printf '%s' "$state" | tr -d '\r\n')
-  case "$state" in
-    running)
-      if [[ "$status" == 0 ]]; then
-        return 0
-      fi
-      ;;
-    degraded)
-      echo "$LABEL $(timestamp) systemd manager is degraded; collecting bounded failed-unit diagnostics" >&2
-      if ! "$@" timeout --signal=KILL 8s systemctl --failed --no-pager >&2; then
-        echo "$LABEL $(timestamp) systemd failed-unit diagnostics were unavailable" >&2
-      fi
-      echo "$LABEL $(timestamp) accepting degraded systemd manager as an operational final state" >&2
-      return 0
-      ;;
-  esac
-  echo "$LABEL ERROR: systemd manager did not reach an acceptable final state (scope=$scope state=${state:-unknown} status=$status)" >&2
-  return 1
+# Hosted runners can retain a manager-wide `starting` state because of
+# unrelated units even while transient services are fully operational. Probe
+# the exact create/wait/collect lifecycle required by this journey instead.
+probe_systemd_supervisor() {
+  "$ROOT/tools/packaging/probe-systemd-supervisor.sh" "$@"
 }
 
 CURRENT_PHASE=starting
@@ -166,8 +140,8 @@ if [[ "${RUSTSCALE_LINUX_REPLACEMENT_INNER:-0}" != 1 ]]; then
       || { echo "$LABEL ERROR: $value_name must be positive" >&2; exit 2; }
   done
 
-  if ! wait_for_systemd_manager 60 supervisor sudo -n; then
-    skip "systemd manager is unavailable for privileged cgroup supervision"
+  if ! probe_systemd_supervisor 30 supervisor sudo -n; then
+    skip "systemd manager cannot supervise and collect a privileged transient service"
   fi
 
   unit="rustscale-linux-replacement-$(id -u)-$$.service"
@@ -233,8 +207,13 @@ done
 if ! sudo -n true 2>/dev/null; then
   skip "passwordless sudo is unavailable"
 fi
-if ! wait_for_systemd_manager 60 journey; then
-  skip "systemd manager did not become ready for the installed journey"
+# The inner journey intentionally runs as the invoking user inside the
+# root-owned supervisor unit. Starting a second transient service still needs
+# the same passwordless privilege proved by preflight; without this prefix,
+# systemd-run asks for interactive authorization inside the noninteractive
+# unit even though the manager is operational.
+if ! probe_systemd_supervisor 30 journey sudo -n; then
+  skip "systemd manager cannot supervise and collect the installed journey"
 fi
 [[ -c /dev/net/tun ]] || skip "/dev/net/tun is not a character device"
 if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
@@ -1177,34 +1156,21 @@ NODE_IDENTITY_AFTER=$(curl --max-time 2 -fsS "$CONTROL_URL/testapi/nodes" \
   | python3 -c 'import json,sys; wanted=sys.argv[1]; nodes=json.load(sys.stdin)["nodes"]; matches=[node for node in nodes if (node.get("ip") or "").split("/",1)[0] == wanted]; assert len(matches) == 1; node=matches[0]; print("{}|{}|{}".format(node["key"], node["id"], node["ip"]))' "$RUST_IP")
 [[ "$NODE_IDENTITY_AFTER" == "$NODE_IDENTITY_BEFORE" ]]
 # `tailscale up` returned Running only after this generation committed every
-# local public resource above. Peer path convergence remains asynchronous, so
-# require the first successful restored roundtrip within one short bounded
-# readiness interval rather than racing one connect against disco convergence.
-run_bounded 15 lifecycle-restored-roundtrip \
+# public resource above; one immediate connect/roundtrip is therefore the
+# assertion. The connect remains a single kernel TCP operation, but its bound
+# permits the protocol's own SYN retransmission while a lazy WireGuard
+# handshake completes; do not replace this with an application retry or sleep.
+run_bounded 8 lifecycle-restored-roundtrip \
   python3 - "$GO_IP" "$PEER_PORT" <<'PY'
 import socket
 import sys
-import time
 payload = b"public-down-up-roundtrip\n"
-last = None
-for _ in range(20):
-    try:
-        with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=1) as connection:
-            connection.settimeout(1)
-            connection.sendall(payload)
-            received = b""
-            while len(received) < len(payload):
-                chunk = connection.recv(len(payload) - len(received))
-                if not chunk:
-                    break
-                received += chunk
-            if received == payload:
-                raise SystemExit(0)
-            raise RuntimeError(f"post-up Go peer echo mismatch: {received!r}")
-    except (OSError, RuntimeError) as error:
-        last = error
-        time.sleep(0.25)
-raise SystemExit(f"post-up Go peer echo did not recover: {last}")
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5) as connection:
+    connection.settimeout(2)
+    connection.sendall(payload)
+    received = connection.recv(len(payload))
+    if received != payload:
+        raise SystemExit(f"post-up Go peer echo mismatch: {received!r}")
 PY
 
 # Logout is durable before the LocalAPI call returns. Restart=always then starts

@@ -45,6 +45,9 @@ jobs:
       - name: Establish Linux TUN prerequisites (credential-free)
         run: tools/interop-tun-preflight.sh
 
+      - name: Verify Linux node and DNS service source ownership (credential-free)
+        run: tools/packaging/test-linux-tun-source.sh
+
       - name: Mint Tailscale org token via GitHub OIDC (WIF)
         id: tsauth
         run: |

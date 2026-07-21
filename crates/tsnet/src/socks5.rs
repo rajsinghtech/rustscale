@@ -410,6 +410,7 @@ impl<D: SocksDialer + 'static> Socks5Server<D> {
 /// by the serve runner).
 pub struct CancelToken {
     cancelled: std::sync::atomic::AtomicBool,
+    notified: tokio::sync::Notify,
 }
 
 impl CancelToken {
@@ -417,16 +418,38 @@ impl CancelToken {
     pub fn new() -> Self {
         Self {
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            notified: tokio::sync::Notify::new(),
         }
     }
     /// Fire the token.
     pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if !self
+            .cancelled
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.notified.notify_waiters();
+        }
     }
     /// Whether the token has fired.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait for cancellation without polling. The pre/post checks close the
+    /// notification-registration race and make already-cancelled tokens wake
+    /// immediately.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.notified.notified();
+            tokio::pin!(notified);
+            // Register before testing the flag: notify_waiters does not retain
+            // a permit for a future waiter.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 

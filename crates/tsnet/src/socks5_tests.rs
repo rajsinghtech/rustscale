@@ -7,12 +7,39 @@
 use std::io;
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::*;
+
+#[tokio::test]
+async fn cancel_token_wakes_all_registered_waiters_and_late_waiters() {
+    let cancel = Arc::new(CancelToken::new());
+    let first = {
+        let cancel = Arc::clone(&cancel);
+        tokio::spawn(async move { cancel.cancelled().await })
+    };
+    let second = {
+        let cancel = Arc::clone(&cancel);
+        tokio::spawn(async move { cancel.cancelled().await })
+    };
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(1), first)
+        .await
+        .expect("first cancellation waiter did not wake")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), second)
+        .await
+        .expect("second cancellation waiter did not wake")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
+        .await
+        .expect("late cancellation waiter did not wake");
+}
 
 // ---------------------------------------------------------------------------
 // Mock dialer

@@ -38,6 +38,7 @@ UNDERLAY_PCAP=""
 SERVER_LOG=""
 CLIENT_LOG=""
 READY_FIFO=""
+PEER_READY_FIFO=""
 PHASE_FIFO=""
 EGRESS=""
 IP_FORWARD_ORIGINAL=""
@@ -94,6 +95,15 @@ cleanup() {
   local original_rc=$? cleanup_rc=0 tailnet_pid=""
   trap - EXIT INT TERM
   set +e
+
+  # Preserve the complete endpoint evidence for every unexpected shell exit,
+  # not only failures routed through fail(). This makes a failed bounded CLI,
+  # namespace, or lifecycle operation diagnosable before owned state is
+  # removed, while cleanup and its absence checks still run deterministically.
+  if (( original_rc != 0 )) && [[ -n "$SERVER_LOG$CLIENT_LOG" ]]; then
+    echo "[interop-tun-oops] ERROR: workload exited unexpectedly (status=$original_rc)" >&2
+    dump_logs
+  fi
 
   if [[ -n "$CAPTURE_PID" ]]; then
     kill -TERM "$CAPTURE_PID" 2>/dev/null
@@ -330,8 +340,9 @@ chmod 700 "$STATE_DIR"
 SERVER_LOG="$STATE_DIR/server.log"
 CLIENT_LOG="$STATE_DIR/client.log"
 READY_FIFO="$STATE_DIR/server.ready"
+PEER_READY_FIFO="$STATE_DIR/server-peer.ready"
 PHASE_FIFO="$STATE_DIR/client.phase"
-mkfifo -m 600 "$READY_FIFO" "$PHASE_FIFO"
+mkfifo -m 600 "$READY_FIFO" "$PEER_READY_FIFO" "$PHASE_FIFO"
 AUTHKEY_FILE="$STATE_DIR/authkey"
 UNDERLAY_PCAP="$STATE_DIR/underlay.pcap"
 # Capture at the bridge before host NAT. Later assertions correlate each
@@ -380,6 +391,7 @@ timeout --foreground --signal=TERM --kill-after=15s 300s \
     --port "$TCP_PORT" \
     --udp-port "$UDP_PORT" \
     --ready-fifo "$READY_FIFO" \
+    --peer-ready-fifo "$PEER_READY_FIFO" \
   >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 READY_LINE=$(timeout 150s head -n 1 "$READY_FIFO") || fail "server did not signal readiness"
@@ -399,6 +411,7 @@ timeout --foreground --signal=TERM --kill-after=15s 300s \
     --peer "$SERVER_IP" \
     --port "$TCP_PORT" \
     --udp-port "$UDP_PORT" \
+    --peer-ready-fifo "$PEER_READY_FIFO" \
     --phase-fifo "$PHASE_FIFO" \
   >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
@@ -429,7 +442,13 @@ WEB_LOG="$STATE_DIR/web.log"
 WEB_JSON="$STATE_DIR/web-status.json"
 
 run_client_cli() {
-  timeout 20s sudo -n ip netns exec "$NS_CLIENT" "$CLI_BIN" --socket "$CLIENT_SOCKET" "$@"
+  local status
+  if timeout 20s sudo -n ip netns exec "$NS_CLIENT" "$CLI_BIN" --socket "$CLIENT_SOCKET" "$@"; then
+    return 0
+  else
+    status=$?
+    fail "client CLI command failed (status=$status): $*"
+  fi
 }
 peer_for_server() {
   jq -c --arg ip "$SERVER_IP"     '[.Peer[] | select((.TailscaleIPs // []) | index($ip))] | if length == 1 then .[0] else error("server peer cardinality") end' "$1"
@@ -446,9 +465,11 @@ assert_public_web_status() {
   local ready_rc=$?
   set -o pipefail
   (( ready_rc == 0 )) || fail "$phase web output did not become ready"
-  timeout 10s sudo -n ip netns exec "$NS_CLIENT" curl -fsS \
-    -H 'Host: 127.0.0.1:18088' -H 'Origin: http://127.0.0.1:18088' \
-    http://127.0.0.1:18088/api/status >"$WEB_JSON"
+  if ! timeout 10s sudo -n ip netns exec "$NS_CLIENT" curl -fsS \
+      -H 'Host: 127.0.0.1:18088' -H 'Origin: http://127.0.0.1:18088' \
+      http://127.0.0.1:18088/api/status >"$WEB_JSON"; then
+    fail "$phase web status request failed"
+  fi
   kill -TERM "$WEB_PID" 2>/dev/null
   wait "$WEB_PID" 2>/dev/null || true
   WEB_PID=""
@@ -556,14 +577,18 @@ set -e
 (( SERVER_RC == 0 )) || fail "server process exited with status $SERVER_RC"
 
 require_exactly_one_marker "$SERVER_LOG" "OOPS_KERNEL_OK role=server" server
+require_exactly_one_marker "$SERVER_LOG" "OOPS_SOURCE_OWNERSHIP_OK role=server" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_READY" server
+require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_PEER_OK" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TUN_ROUTE" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TUN_TRAFFIC" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TCP_ACCEPT" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_TCP_DONE" server
 require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_DONE" server
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_KERNEL_OK role=client" client
+require_exactly_one_marker "$CLIENT_LOG" "OOPS_SOURCE_OWNERSHIP_OK role=client" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_PEER_OK" client
+require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_REVERSE_PEER_READY" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TUN_ROUTE" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_DIRECT_PROBE_OK" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TUN_TRAFFIC" client
@@ -571,7 +596,21 @@ require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_UDP_ROUNDTRIP_OK count=$UD
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_TCP_ROUNDTRIP_OK" client
 require_exactly_one_marker "$CLIENT_LOG" "OOPS_CLIENT_DONE" client
 
-require_exactly_one_marker "$SERVER_LOG" "OOPS_SERVER_DIRECT_PROBE_ECHO" server
+# The client deliberately retries its readiness probe and discards stale
+# replies. A slow first direct path may therefore produce one server echo per
+# unique attempt before the single accepted reply. Correlate the accepted
+# attempt instead of falsely requiring that no retry reached the server.
+CLIENT_DIRECT_ATTEMPT=$(sed -n 's/.*OOPS_CLIENT_DIRECT_PROBE_OK attempt=\([0-9][0-9]*\).*/\1/p' "$CLIENT_LOG")
+[[ "$CLIENT_DIRECT_ATTEMPT" =~ ^[1-9][0-9]*$ ]] \
+  || fail "client direct-probe success did not identify one positive attempt"
+SERVER_DIRECT_ATTEMPTS=$(sed -n 's/.*OOPS_SERVER_DIRECT_PROBE_ECHO .*attempt=\([0-9][0-9]*\).*/\1/p' "$SERVER_LOG")
+SERVER_DIRECT_COUNT=$(printf '%s\n' "$SERVER_DIRECT_ATTEMPTS" | sed '/^$/d' | wc -l | tr -d ' ')
+SERVER_DIRECT_UNIQUE_COUNT=$(printf '%s\n' "$SERVER_DIRECT_ATTEMPTS" | sed '/^$/d' | sort -nu | wc -l | tr -d ' ')
+[[ "$SERVER_DIRECT_COUNT" -ge 1 && "$SERVER_DIRECT_COUNT" -eq "$SERVER_DIRECT_UNIQUE_COUNT" ]] \
+  || fail "server direct-probe echoes were missing or duplicated: count=$SERVER_DIRECT_COUNT unique=$SERVER_DIRECT_UNIQUE_COUNT"
+[[ "$SERVER_DIRECT_COUNT" -le "$CLIENT_DIRECT_ATTEMPT" ]] \
+  || fail "server echoed more unique probes than the client's accepted attempt"
+require_marker "$SERVER_LOG" "payload=\"interop-tun-oops-direct-probe attempt=$CLIENT_DIRECT_ATTEMPT\"" server
 SERVER_UDP_COUNT=$(grep -cF "OOPS_SERVER_UDP_ECHO" "$SERVER_LOG" || true)
 [[ "$SERVER_UDP_COUNT" -eq "$UDP_DATAGRAMS" ]] \
   || fail "server echoed $SERVER_UDP_COUNT cadenced UDP datagrams, expected $UDP_DATAGRAMS"

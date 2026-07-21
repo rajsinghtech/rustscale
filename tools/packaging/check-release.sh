@@ -79,6 +79,9 @@ grep -q 'RUSTSCALE_RELEASE_DIR' .github/workflows/ci.yml
 grep -q 'tools/interop-tun\*\.sh' .github/workflows/ci.yml
 test -x tools/packaging/assemble-linux-release.sh
 test -x tools/packaging/test-linux-replacement.sh
+test -x tools/packaging/probe-systemd-supervisor.sh
+test -x tools/packaging/test-systemd-supervisor-probe.sh
+tools/packaging/test-systemd-supervisor-probe.sh
 test -s docs/release-first-run.md
 grep -q 'Protected real-control smoke gate' docs/release-first-run.md
 grep -q 'Installed Linux replacement journey' docs/release-first-run.md
@@ -95,13 +98,36 @@ grep -q 'RuntimeMaxSec=' tools/packaging/test-linux-replacement.sh
 # no new workflow context may replace or hide that required journey.
 grep -q 'name: Installed Linux replacement journey' .github/workflows/ci.yml
 grep -Fq 'needs: [check, cross, msrv, testcontrol, linux-release-candidate, linux-replacement, ignore-guard]' .github/workflows/ci.yml
-grep -Fq 'systemctl is-system-running --wait' tools/packaging/test-linux-replacement.sh
-if grep -Fq 'systemd_attempt' tools/packaging/test-linux-replacement.sh; then
-    echo "systemd readiness must use native --wait, not a polling loop" >&2
+grep -Fq 'probe-systemd-supervisor.sh' tools/packaging/test-linux-replacement.sh
+grep -Fq 'systemd-run --quiet --wait --collect' tools/packaging/probe-systemd-supervisor.sh
+if grep -Fq 'systemctl is-system-running --wait' tools/packaging/test-linux-replacement.sh; then
+    echo "manager-wide systemd state must not block an operational transient-service probe" >&2
     exit 1
 fi
 grep -q 'timeout-minutes: 50' .github/workflows/ci.yml
 grep -q 'TESTCONTROL_GO_CLIENT_DIR' tools/testcontrol/build.sh
+
+# TSan changes crate ABI, so std and every dependency must be rebuilt together
+# for one explicit target in an isolated sanitizer target directory.
+grep -Fq 'components: rust-src' .github/workflows/sanitizer.yml
+grep -Fq 'targets: x86_64-unknown-linux-gnu' .github/workflows/sanitizer.yml
+# shellcheck disable=SC2016 # Literal GitHub matrix expression contract.
+grep -Fq 'CARGO_TARGET_DIR: target/tsan/${{ matrix.crate }}' .github/workflows/sanitizer.yml
+grep -Fq 'cargo +nightly test -Zbuild-std' .github/workflows/sanitizer.yml
+grep -Fq -- '--target x86_64-unknown-linux-gnu' .github/workflows/sanitizer.yml
+grep -Fq -- '--locked --lib --tests' .github/workflows/sanitizer.yml
+grep -Fq -- '-- --test-threads=1' .github/workflows/sanitizer.yml
+grep -Fq 'TSAN_OPTIONS: halt_on_error=1' .github/workflows/sanitizer.yml
+grep -Fq 'set -euo pipefail' .github/workflows/sanitizer.yml
+grep -Fq 'TSan executed zero tests' .github/workflows/sanitizer.yml
+if grep -Fq 'continue-on-error' .github/workflows/sanitizer.yml; then
+    echo "TSan workflow must fail when a sanitizer job fails" >&2
+    exit 1
+fi
+if grep -Fq -- '-Cunsafe-allow-abi-mismatch=sanitizer' .github/workflows/sanitizer.yml; then
+    echo "TSan workflow must rebuild std, not permit sanitizer ABI mismatch" >&2
+    exit 1
+fi
 
 # The privileged TUN job must establish local kernel prerequisites before it
 # mints any external credential, then run one exact serial fail-closed test.
@@ -161,7 +187,13 @@ fi
 
 # Match exact source text retaining the escaped child argv.
 # shellcheck disable=SC2016
-grep -Fq -- 'exec \"\$@\"' tools/interop-tun.sh
+grep -Fq -- 'exec timeout --foreground --signal=TERM --kill-after=15s 600s \"\$@\"' tools/interop-tun.sh
+grep -Fq -- 'source tools/interop-tun-cleanup.sh' tools/interop-tun.sh
+# shellcheck disable=SC2016
+grep -Fq -- 'interop_tun_stop_child "$GO_PID" "Go tailscaled" 10' tools/interop-tun.sh
+# shellcheck disable=SC2016
+grep -Fq -- 'interop_tun_stop_child "$ECHO_BACKEND_PID" "echo backend" 5' tools/interop-tun.sh
+tools/packaging/test-interop-tun-cleanup.sh
 grep -Fq -- '--ignored --exact tests::interop_tun_rust_dials_go' tools/interop-tun.sh
 grep -Fq -- '--nocapture --test-threads=1' tools/interop-tun.sh
 grep -Fq 'std::env::var("RUSTSCALE_REQUIRE_TUN_INTEROP")' crates/tsnet/src/tests.rs

@@ -13,7 +13,7 @@ use rustscale_tailcfg::DNSConfig;
 /// `search_domains` are suffixes for expanding single-label queries.
 /// `match_domains` are the suffixes for which `nameservers` should be used
 /// (split DNS). If empty, `nameservers` is installed as the primary resolver.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OsConfig {
     /// IP addresses of the nameservers to use.
     pub nameservers: Vec<IpAddr>,
@@ -61,41 +61,71 @@ impl OsConfigurator for NoopConfigurator {
 /// This mirrors the minimal subset of Go's
 /// `dns.Manager.compileConfig` that applies on macOS (split-DNS capable):
 ///
-/// - `nameservers` is always `100.100.100.100` (the MagicDNS VIP) — the
-///   in-process DNS responder handles resolution and forwards upstream.
-/// - `search_domains` are `DNSConfig.Domains` (single-label expansion).
+/// - `nameservers` is the MagicDNS VIP only when this plan has an explicit
+///   route. Empty control DNS does not capture host DNS.
+/// - `search_domains` are de-duplicated `DNSConfig.Domains`.
 /// - `match_domains` are the MagicDNS suffix (when `Proxied` is true) plus
-///   any split-DNS route suffixes from `DNSConfig.Routes`. When non-empty,
-///   the OS installs a split-DNS resolver for those suffixes pointing at
-///   `100.100.100.100`. When empty, `nameservers` becomes the primary
-///   resolver.
+///   control route suffixes. The root route is retained as `"."`: Linux maps
+///   that to resolved's `~.` and enables the link default route.
 ///
 /// Pure function — does not touch the filesystem. Safe to call in tests.
 pub fn build_os_dns_config(dns_config: &DNSConfig, magic_dns_suffix: &str) -> OsConfig {
-    let nameservers = vec![rustscale_tsaddr::tailscale_service_ip()];
-
-    let search_domains = dns_config
-        .Domains
-        .iter()
-        .map(|d| d.trim_end_matches('.').to_string())
-        .collect();
+    let mut search_domains = Vec::new();
+    for domain in &dns_config.Domains {
+        let domain = domain.trim_end_matches('.');
+        if !domain.is_empty()
+            && !search_domains
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(domain))
+        {
+            search_domains.push(domain.to_string());
+        }
+    }
 
     let mut match_domains: Vec<String> = Vec::new();
-
     if dns_config.Proxied {
         let suffix = magic_dns_suffix.trim_end_matches('.');
-        if !suffix.is_empty() {
+        // A proxied configuration without a tailnet suffix is necessarily a
+        // global plan. Keep that explicit rather than relying on an implicit
+        // DefaultRoute selection.
+        match_domains.push(if suffix.is_empty() {
+            ".".into()
+        } else {
+            suffix.into()
+        });
+    }
+    for suffix in dns_config.Routes.keys() {
+        let suffix = suffix.trim_end_matches('.');
+        let suffix = if suffix.is_empty() { "." } else { suffix };
+        if !match_domains
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(suffix))
+        {
             match_domains.push(suffix.to_string());
         }
     }
-
-    for suffix in dns_config.Routes.keys() {
-        let s = suffix.trim_end_matches('.');
-        if !s.is_empty() && !match_domains.iter().any(|d| d == s) {
-            match_domains.push(s.to_string());
-        }
+    // Resolvers/FallbackResolvers compile to the responder's root route even
+    // when Routes does not spell one out. The OS plan must select the same VIP
+    // globally or those control-selected upstreams are unreachable.
+    let has_default_resolvers = dns_config
+        .Resolvers
+        .iter()
+        .chain(&dns_config.FallbackResolvers)
+        .any(|resolver| !resolver.Addr.is_empty());
+    if has_default_resolvers
+        && !match_domains
+            .iter()
+            .any(|domain| domain.trim_end_matches('.').is_empty())
+    {
+        match_domains.push(".".into());
     }
 
+    // Search-only config must not turn the VIP into a global resolver.
+    let nameservers = if match_domains.is_empty() {
+        Vec::new()
+    } else {
+        vec![rustscale_tsaddr::tailscale_service_ip()]
+    };
     OsConfig {
         nameservers,
         search_domains,
@@ -104,15 +134,41 @@ pub fn build_os_dns_config(dns_config: &DNSConfig, magic_dns_suffix: &str) -> Os
 }
 
 /// Create the platform-appropriate OS DNS configurator.
-#[cfg(target_os = "macos")]
-pub fn new_os_configurator() -> crate::osconfig_darwin::DarwinConfigurator {
-    crate::osconfig_darwin::DarwinConfigurator::default()
+///
+/// Linux is deliberately explicit: MagicDNS in TUN mode requires a real
+/// systemd-resolved per-link configurator, not a successful no-op. Other
+/// unsupported platforms keep the no-op implementation for embedding callers.
+#[cfg(target_os = "linux")]
+pub fn new_os_configurator(
+    interface: Option<&str>,
+) -> std::io::Result<Box<dyn OsConfigurator + Send>> {
+    let interface = interface.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Linux DNS configuration requires a TUN interface",
+        )
+    })?;
+    Ok(Box::new(
+        crate::osconfig_linux::LinuxResolvedConfigurator::new(interface)?,
+    ))
 }
 
 /// Create the platform-appropriate OS DNS configurator.
-#[cfg(not(target_os = "macos"))]
-pub fn new_os_configurator() -> NoopConfigurator {
-    NoopConfigurator
+#[cfg(target_os = "macos")]
+pub fn new_os_configurator(
+    _interface: Option<&str>,
+) -> std::io::Result<Box<dyn OsConfigurator + Send>> {
+    Ok(Box::new(
+        crate::osconfig_darwin::DarwinConfigurator::default(),
+    ))
+}
+
+/// Create the platform-appropriate OS DNS configurator.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn new_os_configurator(
+    _interface: Option<&str>,
+) -> std::io::Result<Box<dyn OsConfigurator + Send>> {
+    Ok(Box::new(NoopConfigurator))
 }
 
 #[cfg(test)]
@@ -164,6 +220,20 @@ mod tests {
     }
 
     #[test]
+    fn build_os_dns_config_default_resolvers_install_root_route() {
+        let cfg = DNSConfig {
+            Resolvers: vec![resolver("9.9.9.9")],
+            ..Default::default()
+        };
+        let os = build_os_dns_config(&cfg, "tailnet.ts.net");
+        assert_eq!(
+            os.nameservers,
+            vec![rustscale_tsaddr::tailscale_service_ip()]
+        );
+        assert_eq!(os.match_domains, vec!["."]);
+    }
+
+    #[test]
     fn build_os_dns_config_not_proxied() {
         let cfg = DNSConfig {
             Domains: vec!["tailnet.ts.net".into()],
@@ -172,6 +242,10 @@ mod tests {
         };
         let os = build_os_dns_config(&cfg, "tailnet.ts.net");
         assert!(os.match_domains.is_empty());
+        assert!(
+            os.nameservers.is_empty(),
+            "search domains must not capture global DNS"
+        );
         assert_eq!(os.search_domains, vec!["tailnet.ts.net"]);
     }
 
@@ -201,14 +275,29 @@ mod tests {
     }
 
     #[test]
-    fn build_os_dns_config_empty() {
+    fn build_os_dns_config_empty_does_not_capture_global_dns() {
         let cfg = DNSConfig::default();
         let os = build_os_dns_config(&cfg, "");
+        assert!(os.nameservers.is_empty());
+        assert!(os.search_domains.is_empty());
+        assert!(os.match_domains.is_empty());
+    }
+
+    #[test]
+    fn build_os_dns_config_preserves_global_root_route() {
+        let mut routes = HashMap::new();
+        routes.insert(".".to_string(), vec![resolver("10.0.0.53")]);
+        let os = build_os_dns_config(
+            &DNSConfig {
+                Routes: routes,
+                ..Default::default()
+            },
+            "",
+        );
+        assert_eq!(os.match_domains, vec!["."]);
         assert_eq!(
             os.nameservers,
             vec![rustscale_tsaddr::tailscale_service_ip()]
         );
-        assert!(os.search_domains.is_empty());
-        assert!(os.match_domains.is_empty());
     }
 }

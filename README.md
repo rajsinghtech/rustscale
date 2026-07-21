@@ -110,7 +110,7 @@ curl -fsSL https://rajsinghtech.github.io/rustscale/install.sh | sh
 Detects your OS and architecture, downloads the matching prebuilt archive from
 the latest GitHub Release, and installs `rustscale`, `rustscaled`, and the C
 library (`librustscale` + `rustscale.h`) to `/usr/local`. Override the prefix
-with `PREFIX=...`, pin a version with `--version v0.1.4`, skip system service
+with `PREFIX=...`, pin a version with `--version v0.1.5`, skip system service
 setup with `--no-service`, or uninstall with `--uninstall`. Downloads are
 verified against the release's `SHA256SUMS` before extraction.
 
@@ -129,7 +129,7 @@ irm https://rajsinghtech.github.io/rustscale/install.ps1 | iex
 
 Installs `rustscale.exe` and `rustscaled.exe` to `%LOCALAPPDATA%\rustscale`
 (user scope, no admin needed) and adds it to your PATH. Use `-Scope System` for
-a machine-wide install, `-Version v0.1.4` to pin, or `-Uninstall` to remove.
+a machine-wide install, `-Version v0.1.5` to pin, or `-Uninstall` to remove.
 The Windows installer also verifies `SHA256SUMS`; `-TailscaleCompatible` adds
 command aliases for replacement deployments.
 
@@ -148,7 +148,7 @@ docker run -d --name rustscale \
   -e TS_AUTHKEY=tskey-... \
   -e TS_HOSTNAME=my-container \
   -v rustscale-state:/var/lib/rustscale \
-  ghcr.io/rajsinghtech/rustscale:v0.1.4
+  ghcr.io/rajsinghtech/rustscale:v0.1.5
 ```
 
 Runs in userspace networking mode by default (no `--privileged` needed).

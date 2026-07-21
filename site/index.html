@@ -71,7 +71,7 @@
     <header>
       <img src="assets/rustscale-logo.svg" alt="rustscale">
       <h1>Install rustscale</h1>
-      <span class="badge">v0.1.4</span>
+      <span class="badge">v0.1.5</span>
       <p class="lede">A Rust implementation of Tailscale's client stack, with familiar CLI and container workflows for drop-in deployments.</p>
     </header>
 
@@ -94,7 +94,7 @@
       <article class="card">
         <h2>Container</h2>
         <p>Multi-architecture image with Tailscale-compatible environment variables and command aliases.</p>
-        <div class="command"><code>docker pull ghcr.io/rajsinghtech/rustscale:v0.1.4</code><button type="button">Copy</button></div>
+        <div class="command"><code>docker pull ghcr.io/rajsinghtech/rustscale:v0.1.5</code><button type="button">Copy</button></div>
       </article>
     </section>
 
@@ -211,7 +211,7 @@
         </div>
         <p class="scope">No reproducible container-TUN result or provenance ID is tracked. The host-VM TUN numbers above must not be read as container results, so this panel intentionally contains no benchmark values.</p>
         <p class="performance-note">Reproduction starting point (run on each Linux benchmark endpoint, then capture the image digest, host provenance, path class, repeats, latency, CPU, and RSS):</p>
-        <pre class="reproduction"><code data-reproduction="container-tun">docker run --rm --privileged --device /dev/net/tun -e TS_USERSPACE=0 -e TS_AUTHKEY=tskey-... ghcr.io/rajsinghtech/rustscale:v0.1.4</code></pre>
+        <pre class="reproduction"><code data-reproduction="container-tun">docker run --rm --privileged --device /dev/net/tun -e TS_USERSPACE=0 -e TS_AUTHKEY=tskey-... ghcr.io/rajsinghtech/rustscale:v0.1.5</code></pre>
         <p class="provenance">Provenance IDs: none. Numbers will remain unpublished until a matched container run is retained as credential-free tracked evidence.</p>
       </article>
 

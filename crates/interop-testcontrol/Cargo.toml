@@ -8,10 +8,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-rustscale-tsnet = { path = "../tsnet", version = "0.1.4" }
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.4" }
-rustscale-key = { path = "../key", version = "0.1.4" }
-rustscale-magicsock = { path = "../magicsock", version = "0.1.4" }
+rustscale-tsnet = { path = "../tsnet", version = "0.1.5" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.5" }
+rustscale-key = { path = "../key", version = "0.1.5" }
+rustscale-magicsock = { path = "../magicsock", version = "0.1.5" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

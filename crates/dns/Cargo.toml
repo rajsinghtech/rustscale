@@ -10,14 +10,14 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.4" }
-rustscale-neterror = { path = "../neterror", version = "0.1.4" }
-rustscale-tsaddr = { path = "../tsaddr", version = "0.1.4" }
-rustscale-bakedroots = { path = "../bakedroots", version = "0.1.4" }
-rustscale-tsdial = { path = "../tsdial", version = "0.1.4" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.5" }
+rustscale-neterror = { path = "../neterror", version = "0.1.5" }
+rustscale-tsaddr = { path = "../tsaddr", version = "0.1.5" }
+rustscale-bakedroots = { path = "../bakedroots", version = "0.1.5" }
+rustscale-tsdial = { path = "../tsdial", version = "0.1.5" }
 rustscale-netns.workspace = true
-rustscale-envknob = { path = "../envknob", version = "0.1.4" }
-rustscale-dnsname = { path = "../dnsname", version = "0.1.4" }
+rustscale-envknob = { path = "../envknob", version = "0.1.5" }
+rustscale-dnsname = { path = "../dnsname", version = "0.1.5" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -27,5 +27,5 @@ webpki-roots = { workspace = true }
 
 [dev-dependencies]
 tokio.workspace = true
-rustscale-key = { path = "../key", version = "0.1.4" }
+rustscale-key = { path = "../key", version = "0.1.5" }
 tempfile = "3"

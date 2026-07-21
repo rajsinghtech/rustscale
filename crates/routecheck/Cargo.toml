@@ -13,8 +13,8 @@ workspace = true
 rustscale-tsaddr.workspace = true
 rustscale-routetable.workspace = true
 rustscale-netmon.workspace = true
-rustscale-tailcfg = { path = "../tailcfg", version = "0.1.4" }
-rustscale-traffic = { path = "../traffic", version = "0.1.4" }
+rustscale-tailcfg = { path = "../tailcfg", version = "0.1.5" }
+rustscale-traffic = { path = "../traffic", version = "0.1.5" }
 async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Limited periodic endpoint refresh to one home-region STUN probe so endpoint
+  publication cannot launch a whole-DERP-map maintenance burst on an active
+  embedded data-plane runtime.
+
 ## 0.1.5
 
 Patch release for lifecycle reliability, Linux replacement behavior, truthful

@@ -441,11 +441,14 @@ pub(crate) async fn spawn_link_monitor(
 ///
 /// Sends a non-streaming MapRequest with `OmitPeers=true` every 4.5–5.5 minutes
 /// so the control server always has fresh endpoint data (local IPs, STUN
-/// results, port-mapped endpoints). Randomizing every interval mirrors Go's
-/// periodic re-STUN anti-synchronization and prevents peers started together
-/// from phase-locking their maintenance work. Go's controlclient publishes
-/// via `setEndpoints`; rustscale previously sent endpoints only at startup and
-/// on link-change (netmon), which could leave them stale in long-lived sessions.
+/// results, port-mapped endpoints). The maintenance probe is limited to the
+/// current home DERP because endpoint publication consumes one reflexive
+/// address; explicit diagnostic netchecks still measure every region.
+/// Randomizing every interval mirrors Go's periodic re-STUN
+/// anti-synchronization and prevents peers started together from phase-locking
+/// their maintenance work. Go's controlclient publishes via `setEndpoints`;
+/// rustscale previously sent endpoints only at startup and on link-change
+/// (netmon), which could leave them stale in long-lived sessions.
 ///
 /// The task is self-contained: it creates its own `ControlClient` per
 /// update (to avoid sharing the streaming map-poll client) and respects

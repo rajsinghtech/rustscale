@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-- Limited periodic endpoint refresh to one home-region STUN probe and runs its
-  STUN/control work on a short-lived isolated runtime so endpoint publication
-  cannot launch a whole-map maintenance burst on the active data plane.
+- Periodic endpoint maintenance now publishes only changed Magicsock-owned
+  local/port-mapped endpoints, never reflexive addresses from short-lived
+  diagnostic STUN sockets, and isolates changed control updates from the active
+  data-plane runtime.
 
 ## 0.1.5
 

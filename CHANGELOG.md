@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Limited periodic endpoint refresh to one home-region STUN probe so endpoint
-  publication cannot launch a whole-DERP-map maintenance burst on an active
-  embedded data-plane runtime.
+- Limited periodic endpoint refresh to one home-region STUN probe and runs its
+  STUN/control work on a short-lived isolated runtime so endpoint publication
+  cannot launch a whole-map maintenance burst on the active data plane.
 
 ## 0.1.5
 

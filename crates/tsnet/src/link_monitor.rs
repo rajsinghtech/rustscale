@@ -453,6 +453,93 @@ pub(crate) async fn spawn_link_monitor(
 /// The task is self-contained: it creates its own `ControlClient` per
 /// update (to avoid sharing the streaming map-poll client) and respects
 /// the shared `CancelToken`.
+#[derive(Clone)]
+struct PeriodicEndpointUpdate {
+    magicsock: Arc<Magicsock>,
+    control_url: String,
+    machine_key: MachinePrivate,
+    server_pub_key: MachinePublic,
+    node_key: NodePrivate,
+    disco_key: DiscoPrivate,
+    hostname: String,
+    advertise_routes: Vec<String>,
+    derp_map: DERPMap,
+    home_derp: i32,
+    peer_relay_server: bool,
+}
+
+impl PeriodicEndpointUpdate {
+    async fn run(&self) {
+        let mut eps = self.magicsock.all_endpoints();
+        if !self.derp_map.Regions.is_empty() {
+            if let Ok(report) = rustscale_netcheck::Prober
+                .run_endpoint_refresh(
+                    &self.derp_map,
+                    &rustscale_netcheck::ProberOpts {
+                        previous_preferred_derp: self.home_derp,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                if let Some(g) = report.global_v4 {
+                    eps.push(g.to_string());
+                }
+            }
+        }
+
+        let req = MapRequest {
+            Version: CAPABILITY_VERSION,
+            KeepAlive: false,
+            NodeKey: self.node_key.public(),
+            DiscoKey: self.disco_key.public(),
+            Stream: false,
+            OmitPeers: true,
+            Endpoints: eps,
+            Hostinfo: Some(Hostinfo {
+                OS: std::env::consts::OS.into(),
+                Hostname: self.hostname.clone(),
+                RoutableIPs: self.advertise_routes.clone(),
+                NetInfo: Some(NetInfo {
+                    PreferredDERP: self.home_derp,
+                    WorkingUDP: OptBool::True,
+                    ..Default::default()
+                }),
+                PeerRelay: self.peer_relay_server,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cc = ControlClient::new(
+            &self.control_url,
+            self.machine_key.clone(),
+            self.server_pub_key.clone(),
+            PROTOCOL_VERSION,
+        );
+        match cc.send_map_request(&req).await {
+            Ok(()) => log::debug!("tsnet: periodic endpoint update sent"),
+            Err(e) => log::warn!("tsnet: periodic endpoint update failed (non-fatal): {e}"),
+        }
+    }
+}
+
+async fn run_periodic_maintenance_isolated<F, Fut>(make_future: F) -> Result<(), String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("isolated endpoint runtime: {error}"))?;
+        runtime.block_on(make_future());
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("isolated endpoint worker: {error}"))?
+}
+
 pub(crate) fn spawn_periodic_endpoint_updates(
     magicsock: Arc<Magicsock>,
     cancel: Arc<CancelToken>,
@@ -467,9 +554,20 @@ pub(crate) fn spawn_periodic_endpoint_updates(
     home_derp: i32,
     peer_relay_server: bool,
 ) -> JoinHandle<()> {
+    let update = PeriodicEndpointUpdate {
+        magicsock,
+        control_url,
+        machine_key,
+        server_pub_key,
+        node_key,
+        disco_key,
+        hostname,
+        advertise_routes,
+        derp_map,
+        home_derp,
+        peer_relay_server,
+    };
     tokio::spawn(async move {
-        let node_pub = node_key.public();
-        let disco_pub = disco_key.public();
         loop {
             let delay = periodic_endpoint_update_delay(OsRng.next_u64());
             tokio::select! {
@@ -477,55 +575,20 @@ pub(crate) fn spawn_periodic_endpoint_updates(
                 () = cancel.cancelled() => break,
             }
 
-            let mut eps = magicsock.all_endpoints();
-            if !derp_map.Regions.is_empty() {
-                if let Ok(report) = rustscale_netcheck::Prober
-                    .run_endpoint_refresh(
-                        &derp_map,
-                        &rustscale_netcheck::ProberOpts {
-                            previous_preferred_derp: home_derp,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    if let Some(g) = report.global_v4 {
-                        eps.push(g.to_string());
-                    }
+            let maintenance = update.clone();
+            let maintenance_cancel = Arc::clone(&cancel);
+            if let Err(error) = run_periodic_maintenance_isolated(move || async move {
+                tokio::select! {
+                    () = maintenance_cancel.cancelled() => {}
+                    () = maintenance.run() => {}
                 }
+            })
+            .await
+            {
+                log::warn!("tsnet: periodic endpoint isolation failed (non-fatal): {error}");
             }
-
-            let req = MapRequest {
-                Version: CAPABILITY_VERSION,
-                KeepAlive: false,
-                NodeKey: node_pub.clone(),
-                DiscoKey: disco_pub.clone(),
-                Stream: false,
-                OmitPeers: true,
-                Endpoints: eps,
-                Hostinfo: Some(Hostinfo {
-                    OS: std::env::consts::OS.into(),
-                    Hostname: hostname.clone(),
-                    RoutableIPs: advertise_routes.clone(),
-                    NetInfo: Some(NetInfo {
-                        PreferredDERP: home_derp,
-                        WorkingUDP: OptBool::True,
-                        ..Default::default()
-                    }),
-                    PeerRelay: peer_relay_server,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            let cc = ControlClient::new(
-                &control_url,
-                machine_key.clone(),
-                server_pub_key.clone(),
-                PROTOCOL_VERSION,
-            );
-            match cc.send_map_request(&req).await {
-                Ok(()) => log::debug!("tsnet: periodic endpoint update sent"),
-                Err(e) => log::warn!("tsnet: periodic endpoint update failed (non-fatal): {e}"),
+            if cancel.is_cancelled() {
+                break;
             }
         }
     })
@@ -789,6 +852,39 @@ mod tests {
             (std::time::Duration::from_secs(270)..=std::time::Duration::from_secs(330))
                 .contains(&delay)
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn periodic_endpoint_work_runs_off_the_data_plane_runtime_thread() {
+        let caller = std::thread::current().id();
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let worker_observed = Arc::clone(&observed);
+
+        run_periodic_maintenance_isolated(move || async move {
+            *worker_observed.lock().unwrap() = Some(std::thread::current().id());
+        })
+        .await
+        .unwrap();
+
+        assert_ne!(*observed.lock().unwrap(), Some(caller));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn periodic_endpoint_worker_honors_cross_runtime_cancellation() {
+        let cancel = Arc::new(CancelToken::new());
+        let worker_cancel = Arc::clone(&cancel);
+        let work = tokio::spawn(run_periodic_maintenance_isolated(move || async move {
+            worker_cancel.cancelled().await;
+        }));
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), work)
+            .await
+            .expect("isolated endpoint worker did not stop after cancellation")
+            .expect("isolated endpoint worker task panicked")
+            .expect("isolated endpoint worker failed");
     }
 
     struct BlockCountingRouter(Arc<AtomicUsize>);

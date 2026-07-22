@@ -122,13 +122,14 @@ impl Prober {
     /// matching response within the configured timeouts. Regions that don't
     /// respond are simply absent from the report's latency maps.
     pub async fn run(&self, dm: &DERPMap, opts: &ProberOpts) -> Result<Report, NetcheckError> {
-        self.run_inner(dm, opts, true).await
+        self.run_inner(dm, opts, true, None).await
     }
 
     /// Gather only the STUN-derived endpoint data needed for periodic endpoint
-    /// publication. Unlike [`Self::run`], this skips ICMP fallback and captive
-    /// portal HTTP probes so maintenance cannot turn into a full diagnostic
-    /// sweep on an active data-plane executor.
+    /// publication. This probes the current home region, or one deterministic
+    /// fallback region when the home is unavailable. Unlike [`Self::run`], it
+    /// skips ICMP fallback and captive portal HTTP probes so maintenance cannot
+    /// turn into a whole-map diagnostic sweep on an active data-plane executor.
     pub async fn run_endpoint_refresh(
         &self,
         dm: &DERPMap,
@@ -136,7 +137,10 @@ impl Prober {
     ) -> Result<Report, NetcheckError> {
         let mut endpoint_opts = opts.clone();
         endpoint_opts.skip_icmp = true;
-        self.run_inner(dm, &endpoint_opts, false).await
+        let refresh_region = endpoint_refresh_region(dm, opts.previous_preferred_derp)
+            .ok_or(NetcheckError::NoRegions)?;
+        self.run_inner(dm, &endpoint_opts, false, Some(refresh_region))
+            .await
     }
 
     async fn run_inner(
@@ -144,8 +148,9 @@ impl Prober {
         dm: &DERPMap,
         opts: &ProberOpts,
         detect_captive_portal: bool,
+        only_region: Option<i32>,
     ) -> Result<Report, NetcheckError> {
-        let probes = build_probe_plan(dm).await;
+        let probes = build_probe_plan(dm, only_region).await;
         if probes.is_empty() {
             return Err(NetcheckError::NoRegions);
         }
@@ -229,12 +234,31 @@ impl Prober {
     }
 }
 
+fn endpoint_refresh_region(dm: &DERPMap, preferred_region: i32) -> Option<i32> {
+    let is_probeable = |region: &rustscale_tailcfg::DERPRegion| {
+        !region.NoMeasureNoHome && region.Nodes.as_ref().is_some_and(|nodes| !nodes.is_empty())
+    };
+    dm.Regions
+        .get(&preferred_region)
+        .filter(|region| is_probeable(region))
+        .map(|region| region.RegionID)
+        .or_else(|| {
+            dm.Regions
+                .values()
+                .find(|region| is_probeable(region))
+                .map(|region| region.RegionID)
+        })
+}
+
 /// Build the probe plan: for each measurable region, one v4 probe and (if the
 /// node speaks IPv6) one v6 probe, targeting the resolved address. DNS
 /// resolution is performed here for nodes that carry only a hostname.
-async fn build_probe_plan(dm: &DERPMap) -> Vec<Probe> {
+async fn build_probe_plan(dm: &DERPMap, only_region: Option<i32>) -> Vec<Probe> {
     let mut probes = Vec::new();
     for region in dm.Regions.values() {
+        if only_region.is_some_and(|region_id| region.RegionID != region_id) {
+            continue;
+        }
         if region.NoMeasureNoHome {
             continue;
         }

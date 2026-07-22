@@ -179,64 +179,6 @@ async fn endpoint_refresh_skips_icmp_and_captive_portal_work() {
 }
 
 #[tokio::test]
-async fn endpoint_refresh_probes_only_the_current_home_region() {
-    let first = FakeStunServer::start(Some("127.0.0.1:1111".parse().unwrap()), Duration::ZERO)
-        .await
-        .unwrap();
-    let home = FakeStunServer::start(Some("127.0.0.1:2222".parse().unwrap()), Duration::ZERO)
-        .await
-        .unwrap();
-    let dm = map_from_servers(&[(1, first), (2, home)]);
-
-    let report = Prober
-        .run_endpoint_refresh(
-            &dm,
-            &ProberOpts {
-                previous_preferred_derp: 2,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("endpoint report");
-
-    assert_eq!(report.global_v4, Some("127.0.0.1:2222".parse().unwrap()));
-    assert_eq!(
-        report.region_latency.keys().copied().collect::<Vec<_>>(),
-        vec![2]
-    );
-    assert_eq!(report.preferred_derp, 2);
-}
-
-#[tokio::test]
-async fn endpoint_refresh_uses_one_deterministic_fallback_region() {
-    let first = FakeStunServer::start(Some("127.0.0.1:1111".parse().unwrap()), Duration::ZERO)
-        .await
-        .unwrap();
-    let second = FakeStunServer::start(Some("127.0.0.1:2222".parse().unwrap()), Duration::ZERO)
-        .await
-        .unwrap();
-    let dm = map_from_servers(&[(1, first), (2, second)]);
-
-    let report = Prober
-        .run_endpoint_refresh(
-            &dm,
-            &ProberOpts {
-                previous_preferred_derp: 999,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("endpoint report");
-
-    assert_eq!(report.global_v4, Some("127.0.0.1:1111".parse().unwrap()));
-    assert_eq!(
-        report.region_latency.keys().copied().collect::<Vec<_>>(),
-        vec![1]
-    );
-    assert_eq!(report.preferred_derp, 1);
-}
-
-#[tokio::test]
 async fn prober_runs_captive_portal_on_udp_fail() {
     let mut dm = map_from_servers(&[(
         1,

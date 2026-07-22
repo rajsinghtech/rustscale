@@ -439,16 +439,12 @@ pub(crate) async fn spawn_link_monitor(
 
 /// Periodic endpoint update task (Bug 4).
 ///
-/// Sends a non-streaming MapRequest with `OmitPeers=true` every 4.5–5.5 minutes
-/// so the control server always has fresh endpoint data (local IPs, STUN
-/// results, port-mapped endpoints). The maintenance probe is limited to the
-/// current home DERP because endpoint publication consumes one reflexive
-/// address; explicit diagnostic netchecks still measure every region.
-/// Randomizing every interval mirrors Go's periodic re-STUN
-/// anti-synchronization and prevents peers started together from phase-locking
-/// their maintenance work. Go's controlclient publishes via `setEndpoints`;
-/// rustscale previously sent endpoints only at startup and on link-change
-/// (netmon), which could leave them stale in long-lived sessions.
+/// Checks Magicsock-owned local and port-mapped endpoints every 4.5–5.5 minutes
+/// and sends a non-streaming MapRequest with `OmitPeers=true` only when that
+/// canonical endpoint set changes. Generic netcheck STUN results are not
+/// publishable here: those probes use short-lived sockets that Magicsock does
+/// not own. Randomizing every interval prevents peers started together from
+/// phase-locking the remaining endpoint checks.
 ///
 /// The task is self-contained: it creates its own `ControlClient` per
 /// update (to avoid sharing the streaming map-poll client) and respects
@@ -463,30 +459,20 @@ struct PeriodicEndpointUpdate {
     disco_key: DiscoPrivate,
     hostname: String,
     advertise_routes: Vec<String>,
-    derp_map: DERPMap,
     home_derp: i32,
     peer_relay_server: bool,
+    published_endpoints: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl PeriodicEndpointUpdate {
     async fn run(&self) {
-        let mut eps = self.magicsock.all_endpoints();
-        if !self.derp_map.Regions.is_empty() {
-            if let Ok(report) = rustscale_netcheck::Prober
-                .run_endpoint_refresh(
-                    &self.derp_map,
-                    &rustscale_netcheck::ProberOpts {
-                        previous_preferred_derp: self.home_derp,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                if let Some(g) = report.global_v4 {
-                    eps.push(g.to_string());
-                }
-            }
-        }
+        let Some(eps) = pending_endpoint_update(
+            self.published_endpoints.as_ref(),
+            self.magicsock.all_endpoints(),
+        ) else {
+            log::debug!("tsnet: periodic endpoint set unchanged; skipping publication");
+            return;
+        };
 
         let req = MapRequest {
             Version: CAPABILITY_VERSION,
@@ -495,7 +481,7 @@ impl PeriodicEndpointUpdate {
             DiscoKey: self.disco_key.public(),
             Stream: false,
             OmitPeers: true,
-            Endpoints: eps,
+            Endpoints: eps.clone(),
             Hostinfo: Some(Hostinfo {
                 OS: std::env::consts::OS.into(),
                 Hostname: self.hostname.clone(),
@@ -517,10 +503,27 @@ impl PeriodicEndpointUpdate {
             PROTOCOL_VERSION,
         );
         match cc.send_map_request(&req).await {
-            Ok(()) => log::debug!("tsnet: periodic endpoint update sent"),
+            Ok(()) => {
+                *self.published_endpoints.lock().unwrap() = eps;
+                log::debug!("tsnet: changed periodic endpoint update sent");
+            }
             Err(e) => log::warn!("tsnet: periodic endpoint update failed (non-fatal): {e}"),
         }
     }
+}
+
+fn canonical_endpoints(mut endpoints: Vec<String>) -> Vec<String> {
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    endpoints
+}
+
+fn pending_endpoint_update(
+    published_endpoints: &std::sync::Mutex<Vec<String>>,
+    endpoints: Vec<String>,
+) -> Option<Vec<String>> {
+    let endpoints = canonical_endpoints(endpoints);
+    (*published_endpoints.lock().unwrap() != endpoints).then_some(endpoints)
 }
 
 async fn run_periodic_maintenance_isolated<F, Fut>(make_future: F) -> Result<(), String>
@@ -550,10 +553,12 @@ pub(crate) fn spawn_periodic_endpoint_updates(
     disco_key: DiscoPrivate,
     hostname: String,
     advertise_routes: Vec<String>,
-    derp_map: DERPMap,
     home_derp: i32,
     peer_relay_server: bool,
 ) -> JoinHandle<()> {
+    let published_endpoints = Arc::new(std::sync::Mutex::new(canonical_endpoints(
+        magicsock.local_endpoints(),
+    )));
     let update = PeriodicEndpointUpdate {
         magicsock,
         control_url,
@@ -563,9 +568,9 @@ pub(crate) fn spawn_periodic_endpoint_updates(
         disco_key,
         hostname,
         advertise_routes,
-        derp_map,
         home_derp,
         peer_relay_server,
+        published_endpoints,
     };
     tokio::spawn(async move {
         loop {
@@ -885,6 +890,26 @@ mod tests {
             .expect("isolated endpoint worker did not stop after cancellation")
             .expect("isolated endpoint worker task panicked")
             .expect("isolated endpoint worker failed");
+    }
+
+    #[test]
+    fn periodic_endpoint_publication_requires_a_real_set_change() {
+        let published = std::sync::Mutex::new(canonical_endpoints(vec!["b".into(), "a".into()]));
+
+        assert_eq!(
+            pending_endpoint_update(&published, vec!["a".into(), "b".into(), "a".into()]),
+            None
+        );
+
+        let changed =
+            pending_endpoint_update(&published, vec!["b".into(), "mapped".into(), "a".into()])
+                .expect("new Magicsock endpoint should be published");
+        assert_eq!(changed, vec!["a", "b", "mapped"]);
+        *published.lock().unwrap() = changed;
+        assert_eq!(
+            pending_endpoint_update(&published, vec!["mapped".into(), "b".into(), "a".into()]),
+            None
+        );
     }
 
     struct BlockCountingRouter(Arc<AtomicUsize>);

@@ -1449,7 +1449,6 @@ impl Server {
             b.disco_key.clone(),
             b.hostname.clone(),
             b.advertise_routes.clone(),
-            b.derp_map.clone(),
             b.home_derp,
             self.config.peer_relay_server,
         );
@@ -2229,7 +2228,6 @@ impl Server {
             b.disco_key.clone(),
             b.hostname.clone(),
             b.advertise_routes.clone(),
-            b.derp_map.clone(),
             b.home_derp,
             self.config.peer_relay_server,
         );

@@ -174,6 +174,11 @@ tools/bench/gcp/run-matrix.sh --scale-streams
 tools/bench/gcp/run-matrix.sh \
   --config rs-tun --topology same-zone --path direct \
   --profile --profile-parallelism 1000
+
+# The identical diagnostic against pinned native tailscaled kernel TUN.
+tools/bench/gcp/run-matrix.sh \
+  --config ts-tun --topology same-zone --path direct \
+  --profile --profile-config ts-tun --profile-parallelism 1000
 ```
 
 The profile diagnostic runs only after the normal selected cell and never
@@ -183,6 +188,8 @@ when all requested streams are established, handshaken, completed, and present
 in every ordered one-second sample. `profile/metadata.json` records the stream
 count, RSB1 protocol, kernel-TCP transport, source identity, and endpoint roles;
 both daemon `perf` self/children reports and pre/post path gates must also pass.
+`--profile-config` accepts `rs-tun` (the default) or `ts-tun`, and the selected
+profile target must also be present in `--config`.
 
 A paid run accepts only an existing noninteractive `gcloud` account or an
 already configured ADC, workload-identity, or service-account credential file.

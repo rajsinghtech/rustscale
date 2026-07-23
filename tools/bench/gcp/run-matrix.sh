@@ -48,6 +48,7 @@ MATRIX_MANIFEST_PATH="/dev/null"
 MATRIX_OBSERVED_PATH="/dev/null"
 DURATION=10
 PEER_COUNT=1
+DIRECTION=down
 PARALLELISM_CSV="1,10,100,500,1000"
 MATRIX_PRESET="custom"
 LOAD_PRESET="routine-v1"
@@ -361,6 +362,7 @@ matrix_profile_self_test() {
   PROFILE_PARALLELISM=1000
   DURATION=10
   PEER_COUNT=1
+  DIRECTION=down
   PROFILE=1
   PROFILE_CONFIG=ts-tun
   matrix_test_record_run_config() { calls+=("$1|${*:4}"); }
@@ -375,9 +377,9 @@ matrix_profile_self_test() {
   unset -f matrix_test_record_run_config matrix_test_record_profile
 
   [[ ${#calls[@]} -eq 3 ]] || return 1
-  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[2]}" == 'profile|ts-tun s c sz cz /tmp/profile-authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --profile-only --profile-parallelism 1000 --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --direction down --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --direction down --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[2]}" == 'profile|ts-tun s c sz cz /tmp/profile-authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --direction down --profile-only --profile-parallelism 1000 --manifest /dev/null --observed /dev/null' ]] || return 1
 }
 
 # Build the directly invocable run-config command shape used by each cell.
@@ -387,7 +389,7 @@ matrix_build_run_config_args() {
   local config="$1"
   RUN_CONFIG_ARGS=(
     "$config" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" --repeat "$REPEAT" \
-    --parallelism "$PARALLELISM_CSV" --duration "$DURATION" --peer-count "$PEER_COUNT" \
+    --parallelism "$PARALLELISM_CSV" --duration "$DURATION" --peer-count "$PEER_COUNT" --direction "$DIRECTION" \
     --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
   )
 }
@@ -414,7 +416,7 @@ matrix_run_profile_diagnostic() {
   local runner="${9:-tools/bench/gcp/run-config.sh}"
   "$runner" "$PROFILE_CONFIG" "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
     "$authkey_file" "$results_dir" "$server_hostname" "$client_hostname" \
-    --repeat "$REPEAT" --parallelism "$PARALLELISM_CSV" --duration "$DURATION" --peer-count "$PEER_COUNT" \
+    --repeat "$REPEAT" --parallelism "$PARALLELISM_CSV" --duration "$DURATION" --peer-count "$PEER_COUNT" --direction "$DIRECTION" \
     --profile-only --profile-parallelism "$PROFILE_PARALLELISM" \
     --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
 }
@@ -430,6 +432,7 @@ matrix_parse_args() {
   PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
+  DIRECTION=down
   SCALE_STREAMS=0
   LOAD_PRESET="routine-v1"
   SHOW_HELP=0
@@ -437,7 +440,7 @@ matrix_parse_args() {
   PATH_FILTER=""
   CONFIG_FILTER=""
   FULL=0
-  local seen_dry_run=0 seen_profile=0 seen_profile_config=0 seen_profile_parallelism=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_scale=0 seen_full=0
+  local seen_dry_run=0 seen_profile=0 seen_profile_config=0 seen_profile_parallelism=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_direction=0 seen_scale=0 seen_full=0
   local seen_topology=0 seen_path=0 seen_config=0
 
   while [[ $# -gt 0 ]]; do
@@ -493,6 +496,10 @@ matrix_parse_args() {
         (( seen_peer_count == 0 )) || { echo "duplicate option: --peer-count" >&2; return 2; }
         [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 1000 ]] || { echo "--peer-count must be an integer in 1..=1000" >&2; return 2; }
         PEER_COUNT="$2"; seen_peer_count=1; shift 2 ;;
+      --direction)
+        (( seen_direction == 0 )) || { echo "duplicate option: --direction" >&2; return 2; }
+        [[ $# -ge 2 && ( "$2" == down || "$2" == up || "$2" == bidir ) ]] || { echo "--direction must be down, up, or bidir" >&2; return 2; }
+        DIRECTION="$2"; seen_direction=1; shift 2 ;;
       --profile)
         (( seen_profile == 0 )) || { echo "duplicate option: --profile" >&2; return 2; }
         PROFILE=1; seen_profile=1; shift ;;
@@ -539,12 +546,12 @@ matrix_option_parsing_self_test() {
   [[ "$actual" == '3/1/ts-tun/1000/0/1/same-zone/direct/rs-tun,ts-tun' ]] || return 1
   actual=$(matrix_parse_args --dry-run --help --not-an-error; printf '%s/%s/%s\n' "$DRY_RUN" "$SHOW_HELP" "$REPEAT") || return 1
   [[ "$actual" == '1/1/3' ]] || return 1
-  actual=$(matrix_parse_args --parallelism 1,10,100,500,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
-  [[ "$actual" == '1,10,100,500,1000/20/250' ]] || return 1
+  actual=$(matrix_parse_args --parallelism 1,10,100,500,1000 --duration 20 --peer-count 250 --direction bidir; printf '%s/%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT" "$DIRECTION") || return 1
+  [[ "$actual" == '1,10,100,500,1000/20/250/bidir' ]] || return 1
   actual=$(matrix_parse_args --scale-streams; printf '%s' "$PARALLELISM_CSV") || return 1
   [[ "$actual" == '1,10,100,500,1000' ]] || return 1
   local -a case_args=()
-  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--profile-config' '--profile-config nope --profile' '--profile-config ts-tun' '--profile-config rs-tun --profile-config ts-tun --profile' '--profile-parallelism' '--profile-parallelism 0 --profile' '--profile-parallelism 1001 --profile' '--profile-parallelism 100 --profile-parallelism 10 --profile' '--profile-parallelism 100' '--full --full' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1 --parallelism 2' '--scale-streams --scale-streams' '--scale-streams --parallelism 1' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001'; do
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--profile-config' '--profile-config nope --profile' '--profile-config ts-tun' '--profile-config rs-tun --profile-config ts-tun --profile' '--profile-parallelism' '--profile-parallelism 0 --profile' '--profile-parallelism 1001 --profile' '--profile-parallelism 100 --profile-parallelism 10 --profile' '--profile-parallelism 100' '--full --full' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1 --parallelism 2' '--scale-streams --scale-streams' '--scale-streams --parallelism 1' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001' '--direction' '--direction sideways' '--direction up --direction down'; do
     read -r -a case_args <<< "$args"
     if ( matrix_parse_args "${case_args[@]}" ) >/dev/null 2>&1; then
       return 1
@@ -781,7 +788,7 @@ matrix_write_manifest() {
     --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
     "${dry_flag[@]}" --topologies "${topologies[@]}" --paths "${paths[@]}" \
     --configs "${configs[@]}" --parallelism "${parallelism[@]}" --repeat "$repeat" \
-    --duration "$DURATION" --peer-count "$PEER_COUNT" --matrix-preset "$MATRIX_PRESET" \
+    --duration "$DURATION" --peer-count "$PEER_COUNT" --direction "$DIRECTION" --matrix-preset "$MATRIX_PRESET" \
     --load-preset "$selected_load_preset" --topology-source "$TOPOLOGY_SOURCE" \
     --path-source "$PATH_SOURCE" --config-source "$CONFIG_SOURCE"
 }
@@ -931,16 +938,23 @@ PYEOF
 }
 
 matrix_manifest_self_test() {
-  local temp_dir manifest invalid_manifest saved_project="$MATRIX_PROJECT"
+  local temp_dir manifest direction_manifest invalid_manifest saved_project="$MATRIX_PROJECT"
   MATRIX_PROJECT=fixture-project
   temp_dir=$(mktemp -d)
   manifest="$temp_dir/matrix.json"
+  direction_manifest="$temp_dir/bidir-matrix.json"
   invalid_manifest="$temp_dir/invalid.json"
   matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 500 1000 || { rm -rf "$temp_dir"; return 1; }
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
   python3 - "$manifest" "$GCP_MACHINE" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_TUN_INBOUND_WRITE_WORKER" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100,500,1000] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_toolchain_archive"] == "go1.26.4.linux-amd64.tar.gz" and build["go_toolchain_archive_sha256"] == "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "rs_tun_inbound_write_worker": sys.argv[5] == "1", "linux_udp_batch": sys.argv[6] == "1", "linux_udp_gro": sys.argv[7] == "1", "linux_udp_gso": sys.argv[8] == "1"}
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100,500,1000] and data["direction"] == "down" and data["warmup"]["direction"] == "down" and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_toolchain_archive"] == "go1.26.4.linux-amd64.tar.gz" and build["go_toolchain_archive_sha256"] == "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "rs_tun_inbound_write_worker": sys.argv[5] == "1", "linux_udp_batch": sys.argv[6] == "1", "linux_udp_gro": sys.argv[7] == "1", "linux_udp_gso": sys.argv[8] == "1"}
+PYEOF
+  DIRECTION=bidir matrix_write_manifest "$direction_manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 500 1000 || { rm -rf "$temp_dir"; return 1; }
+  python3 - "$direction_manifest" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
+import json, sys
+data=json.load(open(sys.argv[1]))
+assert data["direction"] == "bidir" and data["warmup"]["direction"] == "bidir"
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1
@@ -1065,7 +1079,7 @@ fi
 # ---------------------------------------------------------------------------
 matrix_usage() {
   cat <<EOF
-usage: $0 [--dry-run] [--full] [--profile] [--profile-config CONFIG] [--profile-parallelism N] [--repeat N] [--parallelism LIST] [--scale-streams] [--duration N] [--peer-count N] [--topology LIST] [--path LIST] [--config LIST]
+usage: $0 [--dry-run] [--full] [--profile] [--profile-config CONFIG] [--profile-parallelism N] [--repeat N] [--parallelism LIST] [--scale-streams] [--duration N] [--peer-count N] [--direction MODE] [--topology LIST] [--path LIST] [--config LIST]
 Runs same-zone/direct rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun with one matched RSB1 workload.
   --dry-run  validate args + script structure without gcloud or API calls.
   --full     expand to both topologies and both paths; all five configs remain selected.
@@ -1077,6 +1091,7 @@ Runs same-zone/direct rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun with o
   --scale-streams compatibility alias for the required 1,10,100,500,1000 RSB1 sweep
   --duration N measured throughput seconds (3..=120; default 10)
   --peer-count N record configured remote-peer load (1..=1000; default 1)
+  --direction MODE RSB1 throughput direction: down (default), up, or bidir
   --profile  profile one selected TUN cell after normal metrics
   --profile-config CONFIG  rs-tun (default) or ts-tun
   --profile-parallelism N stream count for the profile workload (1..=1000; default 10)

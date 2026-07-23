@@ -41,6 +41,7 @@ CONFIG: rs-userspace | rs-tun | ts-embedded | ts-userspace | ts-tun
 --parallelism LIST: ordered unique stream counts, each in 1..=1000
 --duration N: measured throughput duration in seconds (3..=120)
 --peer-count N: configured remote-peer load, including the benchmark peer (1..=1000)
+--direction MODE: RSB1 throughput direction: down (default), up, or bidir
 --manifest FILE and --observed FILE: current-run immutable provenance inputs
 EOF
   exit 2
@@ -56,9 +57,10 @@ parse_run_config_options() {
   PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
+  DIRECTION=down
   RESULT_MANIFEST=""
   OBSERVED_METADATA=""
-  local seen_profile=0 seen_profile_only=0 seen_profile_parallelism=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_manifest=0 seen_observed=0
+  local seen_profile=0 seen_profile_only=0 seen_profile_parallelism=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_direction=0 seen_manifest=0 seen_observed=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --profile)
@@ -89,6 +91,10 @@ parse_run_config_options() {
         (( seen_peer_count == 0 )) || { echo "duplicate option: --peer-count" >&2; return 2; }
         [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 1000 ]] || { echo "--peer-count must be an integer in 1..=1000" >&2; return 2; }
         PEER_COUNT="$2"; seen_peer_count=1; shift 2 ;;
+      --direction)
+        (( seen_direction == 0 )) || { echo "duplicate option: --direction" >&2; return 2; }
+        [[ $# -ge 2 && ( "$2" == down || "$2" == up || "$2" == bidir ) ]] || { echo "--direction must be down, up, or bidir" >&2; return 2; }
+        DIRECTION="$2"; seen_direction=1; shift 2 ;;
       --manifest)
         (( seen_manifest == 0 )) || { echo "duplicate option: --manifest" >&2; return 2; }
         [[ $# -ge 2 && -n "$2" ]] || { echo "--manifest requires a file" >&2; return 2; }
@@ -127,10 +133,10 @@ run_config_option_parsing_self_test() {
   [[ "$actual" == '1/0/9' ]] || return 1
   actual=$(parse_run_config_options; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
   [[ "$actual" == '0/0/3' ]] || return 1
-  actual=$(parse_run_config_options --parallelism 1,10,100,500,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
-  [[ "$actual" == '1,10,100,500,1000/20/250' ]] || return 1
+  actual=$(parse_run_config_options --parallelism 1,10,100,500,1000 --duration 20 --peer-count 250 --direction bidir; printf '%s/%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT" "$DIRECTION") || return 1
+  [[ "$actual" == '1,10,100,500,1000/20/250/bidir' ]] || return 1
   local -a case_args=()
-  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--parallelism' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1,a' '--parallelism 1 --parallelism 2' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001' '--profile --profile' '--profile-only --profile-only' '--profile --profile-only' '--profile-parallelism' '--profile-parallelism 0 --profile' '--profile-parallelism 1001 --profile' '--profile-parallelism 100 --profile-parallelism 10 --profile' '--profile-parallelism 100' '--unknown'; do
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--parallelism' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1,a' '--parallelism 1 --parallelism 2' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001' '--direction' '--direction sideways' '--direction up --direction down' '--profile --profile' '--profile-only --profile-only' '--profile --profile-only' '--profile-parallelism' '--profile-parallelism 0 --profile' '--profile-parallelism 1001 --profile' '--profile-parallelism 100 --profile-parallelism 10 --profile' '--profile-parallelism 100' '--unknown'; do
     read -r -a case_args <<< "$args"
     if ( parse_run_config_options "${case_args[@]}" ) >/dev/null 2>&1; then
       return 1
@@ -302,6 +308,7 @@ if (( SELF_TEST )); then
   PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
+  DIRECTION=down
 else
   [[ $# -ge 9 ]] || usage
   CONFIG="$1"
@@ -384,7 +391,7 @@ preflight_current_metadata() {
   python3 "$PROVENANCE_HELPER" preflight --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" \
     --config "$CONFIG" --topology "$TOPOLOGY" --path "$PATH_TAG" --server-zone "$SZONE" --client-zone "$CZONE" \
     --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --rs-tun-inbound-write-worker "$RS_TUN_INBOUND_WRITE_WORKER" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
-    --parallelism "${PARALLELS[@]}" --duration "$DURATION" --peer-count "$PEER_COUNT"
+    --parallelism "${PARALLELS[@]}" --duration "$DURATION" --peer-count "$PEER_COUNT" --direction "$DIRECTION"
 }
 
 if ! preflight_current_metadata; then
@@ -680,8 +687,8 @@ go_tsnet_client_command() {
   local operation="$1" authfile="$2" target="$3" value="$4" parallel="$5" hostname="$6" statedir="$7" logfile="$8"
   case "$operation" in
     throughput)
-      printf '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey-file %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
-        "$authfile" "$target" "$value" "$parallel" "$hostname" "$statedir" "$logfile" ;;
+      printf '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey-file %s --target %s --duration %s --parallel %s --direction %s --hostname %s --state-dir %s --json 2>%s' \
+        "$authfile" "$target" "$value" "$parallel" "$DIRECTION" "$hostname" "$statedir" "$logfile" ;;
     latency)
       printf '/opt/rustscale/bin/go-tsnet-rsb1 latency --authkey-file %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
         "$authfile" "$target" "$value" "$hostname" "$statedir" "$logfile" ;;
@@ -746,9 +753,10 @@ start_ts_userspace_bridge() {
 }
 
 command_shape_self_test() {
+  local DIRECTION=down
   local ts_direct rs_direct ts_derp rs_derp nofile_gate bridge_calls bridge_definition
   local rs_server_off rs_client_off rs_server_on rs_client_on rs_server_outbound rs_server_write_worker rs_server_scalar rs_server_plain rs_server_gso_off rs_userspace_server rs_userspace_client
-  local go_server go_client go_latency credential_commands
+  local go_server go_client go_bidir go_latency credential_commands
   ts_direct=$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)
   rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
   ts_derp=$(tun_ping_invocation tailscale /tmp/ts.sock derp 100.64.0.1)
@@ -816,6 +824,8 @@ command_shape_self_test() {
   [[ "$go_server" == 'nohup prlimit --nofile=65535:65535 -- /opt/rustscale/bin/go-tsnet-rsb1 server --authkey-file /tmp/rustscale-bench-authkey --port 7777 --port-count 17 --hostname srv --state-dir /tmp/go-srv > /tmp/go-srv.log 2>&1 & echo $! > /tmp/go-srv.pid' ]] || return 1
   go_client=$(go_tsnet_client_command throughput /tmp/rustscale-bench-authkey 100.64.0.1:7777 10 100 cli /tmp/go-cli /tmp/go-client.log)
   [[ "$go_client" == '/opt/rustscale/bin/go-tsnet-rsb1 client --authkey-file /tmp/rustscale-bench-authkey --target 100.64.0.1:7777 --duration 10 --parallel 100 --direction down --hostname cli --state-dir /tmp/go-cli --json 2>/tmp/go-client.log' ]] || return 1
+  go_bidir=$(DIRECTION=bidir go_tsnet_client_command throughput /tmp/rustscale-bench-authkey 100.64.0.1:7777 10 100 cli /tmp/go-cli /tmp/go-client.log)
+  [[ "$go_bidir" == *'--parallel 100 --direction bidir --hostname cli'* ]] || return 1
   go_latency=$(go_tsnet_client_command latency /tmp/rustscale-bench-authkey 100.64.0.1:7777 50 1 cli /tmp/go-cli /tmp/go-latency.log)
   [[ "$go_latency" == '/opt/rustscale/bin/go-tsnet-rsb1 latency --authkey-file /tmp/rustscale-bench-authkey --target 100.64.0.1:7777 --count 50 --hostname cli --state-dir /tmp/go-cli --json 2>/tmp/go-latency.log' ]] || return 1
   if go_tsnet_client_command invalid x x 1 1 x x x >/dev/null 2>&1; then return 1; fi
@@ -2272,16 +2282,16 @@ profile_report_command() {
 
 profile_rsb1_workload_valid() {
   local path="$1" parallel="$2" duration="$3"
-  python3 - "$path" "$parallel" "$duration" <<'PYEOF'
+  python3 - "$path" "$parallel" "$duration" "$DIRECTION" <<'PYEOF'
 import json, math, sys
-path, parallel, duration = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+path, parallel, duration, direction = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 with open(path) as src:
     result = json.load(src)
 assert result["tool"] == "rustscale-bench"
 assert result["mode"] == "throughput"
 assert result["transport"] == "kernel-tcp"
 assert result["protocol"] == "RSB1"
-assert result["direction"] == "down"
+assert result["direction"] == direction
 assert result["parallel"] == parallel
 assert result["established"] == parallel
 assert result["handshaken"] == parallel
@@ -2364,16 +2374,18 @@ profile_tun() {
       status=1
     elif ! profile_rsb1_workload_valid "$profile_dir/workload.json" "$profile_parallelism" "$DURATION"; then
       status=1
-    elif ! python3 - "$profile_dir/metadata.json" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$profile_parallelism" "$DURATION" "$REPEAT" "$srv_pid" "$cli_pid" "$OUT" "$daemon_command" <<'PYEOF'
+    elif ! python3 - "$profile_dir/metadata.json" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$profile_parallelism" "$DURATION" "$REPEAT" "$srv_pid" "$cli_pid" "$OUT" "$daemon_command" "$DIRECTION" <<'PYEOF'
 import json, sys
-out, topo, path, config, parallel, duration, repeat, srv_pid, cli_pid, result, command = sys.argv[1:]
+out, topo, path, config, parallel, duration, repeat, srv_pid, cli_pid, result, command, direction = sys.argv[1:]
+roles = {"down": ("sender", "receiver"), "up": ("receiver", "sender"), "bidir": ("sender-receiver", "sender-receiver")}
+server_role, client_role = roles[direction]
 json.dump({"topology":topo,"path":path,"config":config,
            "parallel":int(parallel),"duration_s":int(duration),"repeat":int(repeat),"frequency_hz":199,
            "result_json":result,"workload_result":"workload.json","workload_protocol":"RSB1",
-           "workload_transport":"kernel-tcp","workload_direction":"server_to_client",
-           "reverse":True,"endpoints":{
-             "server":{"pid":int(srv_pid),"command":command,"role":"sender"},
-             "client":{"pid":int(cli_pid),"command":command,"role":"receiver"}}},
+           "workload_transport":"kernel-tcp","workload_direction":direction,
+           "endpoints":{
+             "server":{"pid":int(srv_pid),"command":command,"role":server_role},
+             "client":{"pid":int(cli_pid),"command":command,"role":client_role}}},
           open(out,"w"), indent=2)
 PYEOF
     then
@@ -2398,11 +2410,11 @@ profile_command_self_test() {
   profile_test_copy() {
     printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"
     if [[ "$3" == "$(profile_workload_path)" ]]; then
-      python3 - "$4" "$DURATION" "${PROFILE_PARALLELISM:-10}" <<'PYEOF'
+      python3 - "$4" "$DURATION" "${PROFILE_PARALLELISM:-10}" "$DIRECTION" <<'PYEOF'
 import json, sys
-path, duration, parallel = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+path, duration, parallel, direction = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 result = {"tool":"rustscale-bench","mode":"throughput","transport":"kernel-tcp",
-          "protocol":"RSB1","direction":"down","duration_secs":duration,
+          "protocol":"RSB1","direction":direction,"duration_secs":duration,
           "parallel":parallel,"established":parallel,"handshaken":parallel,
           "completed":parallel,"total_mbps":1.0,
           "samples":[{"elapsed_secs":second,"mbps":1.0}
@@ -2446,11 +2458,10 @@ PYEOF
 import json, sys
 with open(sys.argv[1]) as f:
     metadata = json.load(f)
-assert metadata["workload_direction"] == "server_to_client"
+assert metadata["workload_direction"] == "down"
 assert metadata["workload_protocol"] == "RSB1"
 assert metadata["workload_transport"] == "kernel-tcp"
 assert metadata["workload_result"] == "workload.json"
-assert metadata["reverse"] is True
 assert metadata["parallel"] == 10
 assert metadata["repeat"] == 3
 assert metadata["run"]["id"] == "gcp-20260714-000000-selftest"
@@ -2594,7 +2605,7 @@ assemble_rsb1_result() {
   shift 2
   python3 - "$payload_dir" "$@" >"$output" <<'PYEOF'
 import json, math, pathlib, sys
-payload_dir, config, topo, requested_path, observed_path, transport, size, repeat, server_subjects, client_subjects, primary_subject, primary_path, workload_implementation, *parallels = sys.argv[1:]
+payload_dir, config, topo, requested_path, observed_path, transport, size, repeat, server_subjects, client_subjects, primary_subject, primary_path, workload_implementation, direction, *parallels = sys.argv[1:]
 payload_dir = pathlib.Path(payload_dir)
 def load_json(name):
     with (payload_dir / name).open() as source:
@@ -2642,7 +2653,7 @@ obj={"schema_version":6,"status":"ok","tool":tool,
  "implementation":implementation,"mode":mode,"topology":topo,"path":requested_path,"config":config,
  "repeat":int(repeat),"parallelism_requested":[int(x) for x in parallels],"error":"","log_tail":"",
  "path_class_reported":observed_path,"transport":transport,
- "workload":{"implementation":workload_implementation,"protocol":"RSB1","direction":"down","payload_bytes":1280,
+ "workload":{"implementation":workload_implementation,"protocol":"RSB1","direction":direction,"payload_bytes":1280,
              "warmup":{"parallel":1,"duration_s":3,"max_attempts":1},
              "client_lifecycle":"new_benchmark_process_per_trial",
              "transport_identity_lifecycle":"one_persisted_identity_per_endpoint_cell","measured_trial_attempts":1,
@@ -2672,14 +2683,14 @@ rsb1_client_command() {
   local kind="$1" operation="$2" target="$3" value="$4" parallel="$5" state_dir="$6" logfile="$7"
   case "$kind/$operation" in
     rust-userspace/throughput)
-      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport userspace --authkey-file %s --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
-        "$RSB1_TRIAL_TIMEOUT_SECONDS" "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
+      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport userspace --authkey-file %s --target %s --duration %s --parallel %s --direction %s --hostname %s --state-dir %s --json 2>%s' \
+        "$RSB1_TRIAL_TIMEOUT_SECONDS" "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$parallel" "$DIRECTION" "$CHOST" "$state_dir" "$logfile" ;;
     rust-userspace/latency)
       printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport userspace --authkey-file %s --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
         "$RSB1_TRIAL_TIMEOUT_SECONDS" "$REMOTE_AUTHKEY_FILE" "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
     rust-kernel/throughput)
-      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport kernel-tcp --target %s --duration %s --parallel %s --direction down --hostname %s --state-dir %s --json 2>%s' \
-        "$RSB1_TRIAL_TIMEOUT_SECONDS" "$target" "$value" "$parallel" "$CHOST" "$state_dir" "$logfile" ;;
+      printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench client --transport kernel-tcp --target %s --duration %s --parallel %s --direction %s --hostname %s --state-dir %s --json 2>%s' \
+        "$RSB1_TRIAL_TIMEOUT_SECONDS" "$target" "$value" "$parallel" "$DIRECTION" "$CHOST" "$state_dir" "$logfile" ;;
     rust-kernel/latency)
       printf 'timeout --signal=TERM --kill-after=5s %ss prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscale-bench latency --transport kernel-tcp --target %s --count %s --hostname %s --state-dir %s --json 2>%s' \
         "$RSB1_TRIAL_TIMEOUT_SECONDS" "$target" "$value" "$CHOST" "$state_dir" "$logfile" ;;
@@ -2749,7 +2760,7 @@ rsb1_measure() {
   trial_target=$(rsb1_trial_target "$client_kind" "$target" 0) || return 2
   command=$(rsb1_client_command "$client_kind" throughput "$trial_target" 3 1 "$client_state_dir" /tmp/rsb1-warmup.log) || return 2
   warmup_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
-  path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,tool=sys.argv[1:]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==1 and d["established"]==1 and d["handshaken"]==1 and d["completed"]==1; shutdown=d.get("shutdown"); assert shutdown in ("graceful","process-exit-after-close-timeout") if tool=="go-tsnet-rsb1" else shutdown is None; value=float(d["total_mbps"]); assert math.isfinite(value) and value>0; print(d["path_class"])' "$reported_transport" "$expected_client_tool") || return 1
+  path_class=$(printf '%s' "$warmup_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,tool,direction=sys.argv[1:]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]==direction and d["parallel"]==1 and d["established"]==1 and d["handshaken"]==1 and d["completed"]==1; shutdown=d.get("shutdown"); assert shutdown in ("graceful","process-exit-after-close-timeout") if tool=="go-tsnet-rsb1" else shutdown is None; value=float(d["total_mbps"]); assert math.isfinite(value) and value>0; print(d["path_class"])' "$reported_transport" "$expected_client_tool" "$DIRECTION") || return 1
   warmup_evidence=$(printf '%s' "$warmup_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); row={k:d[k] for k in ("transport","protocol","direction","duration_secs","parallel","established","handshaken","completed","total_mbps","path_class","target")}; row["shutdown"]=d.get("shutdown","process-return-after-complete"); print(json.dumps(row))') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && path_class="$gated_path"
   [[ "$PATH_TAG" == direct && "$path_class" == direct || "$PATH_TAG" == derp && "$path_class" == derp ]] || {
@@ -2772,7 +2783,7 @@ rsb1_measure() {
       trial_target=$(rsb1_trial_target "$client_kind" "$target" "$((sample_number + 1))") || return 2
       command=$(rsb1_client_command "$client_kind" throughput "$trial_target" "$DURATION" "$N" "$client_state_dir" "/tmp/rsb1-$N-$sample_index.log") || return 2
       sample_json=$(ssh_cmd "$CVM" "$CZONE" "${client_state_prep}${command}") || return 1
-      mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected,tool=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]=="down" and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; shutdown=d.get("shutdown"); assert shutdown in ("graceful","process-exit-after-close-timeout") if tool=="go-tsnet-rsb1" else shutdown is None; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$reported_transport" "$N" "$PATH_TAG" "$expected_client_tool") || return 1
+      mbps=$(printf '%s' "$sample_json" | python3 -c 'import json,math,sys; d=json.load(sys.stdin); transport,parallel,expected,tool,direction=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4],sys.argv[5]; assert d["tool"]==tool and d["transport"]==transport and d["protocol"]=="RSB1" and d["direction"]==direction and d["parallel"]==parallel and d["established"]==parallel and d["handshaken"]==parallel and d["completed"]==parallel; shutdown=d.get("shutdown"); assert shutdown in ("graceful","process-exit-after-close-timeout") if tool=="go-tsnet-rsb1" else shutdown is None; assert transport=="kernel-tcp" or d["path_class"]==expected; v=float(d["total_mbps"]); assert math.isfinite(v) and v>0; print(repr(v))' "$reported_transport" "$N" "$PATH_TAG" "$expected_client_tool" "$DIRECTION") || return 1
       samples+=("$mbps")
       trial_json=$(printf '%s' "$sample_json" | python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); d=json.load(sys.stdin); rows.append({"parallel":d["parallel"],"repeat_index":int(sys.argv[2]),"transport":d["transport"],"protocol":d["protocol"],"direction":d["direction"],"duration_s":d["duration_secs"],"established":d["established"],"handshaken":d["handshaken"],"completed":d["completed"],"total_mbps":d["total_mbps"],"path_class":d["path_class"],"target":d["target"],"shutdown":d.get("shutdown","process-return-after-complete")}); print(json.dumps(rows))' "$trial_json" "$sample_index") || return 1
       sample_number=$((sample_number+1))
@@ -2827,7 +2838,7 @@ rsb1_measure() {
     assemble_rsb1_result "$assembly_dir" "$PENDING_OUT" \
       "$CONFIG" "$TOPOLOGY" "$PATH_TAG" "$path_class" "$reported_transport" \
       "$bin_size" "$REPEAT" "$server_subjects" "$client_subjects" \
-      "$primary_subject" "$primary_path" "$workload_implementation" \
+      "$primary_subject" "$primary_path" "$workload_implementation" "$DIRECTION" \
       "${PARALLELS[@]}" || assembly_status=$?
   fi
   rsb1_result_payload_cleanup "$assembly_dir" || return 1
@@ -2885,7 +2896,7 @@ cell_exit_cleanup() {
 }
 
 rsb1_lifecycle_self_test() {
-  local command event kill_requested cleared status definition rust_trial go_trial
+  local command event kill_requested cleared status definition rust_trial rust_bidir_trial go_trial
   command=$(ts_tun_cleanup_command srv) || return 1
   bash -n <<<"$command" || return 1
   [[ "$command" == *'tailscale --socket="$socket" down'* \
@@ -2939,9 +2950,11 @@ rsb1_lifecycle_self_test() {
     && "$definition" == *'capture_rs_tun_runtime_stats "$SVM" "$SZONE" /tmp/rs-tun-srv.log'* \
     && "$definition" == *'capture_rs_tun_runtime_stats "$CVM" "$CZONE" /tmp/rs-tun-cli.log'* ]] || return 1
   rust_trial=$(rsb1_client_command rust-userspace throughput 100.64.0.1:5201 10 100 /tmp/rs-state /tmp/rs.log) || return 1
+  rust_bidir_trial=$(DIRECTION=bidir rsb1_client_command rust-kernel throughput 100.64.0.1:5201 10 100 /tmp/rs-state /tmp/rs.log) || return 1
   go_trial=$(rsb1_client_command go-userspace latency 100.64.0.1:5201 200 1 /tmp/go-state /tmp/go.log) || return 1
   [[ "$rust_trial" == "timeout --signal=TERM --kill-after=5s ${RSB1_TRIAL_TIMEOUT_SECONDS}s prlimit "* \
     && "$rust_trial" == *'/rustscale-bench client '* \
+    && "$rust_bidir_trial" == *'/rustscale-bench client '*'--direction bidir'* \
     && "$go_trial" == "timeout --signal=TERM --kill-after=5s ${RSB1_TRIAL_TIMEOUT_SECONDS}s prlimit "* \
     && "$go_trial" == *'/go-tsnet-rsb1 latency '* ]] || return 1
   [[ "$(rsb1_trial_target go-userspace 100.64.0.1:5201 0)" == 100.64.0.1:5201 \
@@ -2981,7 +2994,7 @@ for name, value in payloads.items():
 PYEOF
   assemble_rsb1_result "$assembly_payload" "$assembly_output" \
     ts-userspace same-zone direct direct kernel-tcp 123 1 \
-    tailscaled tailscaled tailscaled /usr/sbin/tailscaled rustscale-bench 1 || return 1
+    tailscaled tailscaled tailscaled /usr/sbin/tailscaled rustscale-bench down 1 || return 1
   python3 - "$assembly_output" <<'PYEOF'
 import json, sys
 result = json.load(open(sys.argv[1]))

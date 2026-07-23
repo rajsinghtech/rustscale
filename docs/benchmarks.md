@@ -170,6 +170,10 @@ tools/bench/gcp/run-matrix.sh
 # Compatibility alias for the same exact certification stream contract.
 tools/bench/gcp/run-matrix.sh --scale-streams
 
+# Run the same matrix for client-to-server or simultaneous two-way traffic.
+tools/bench/gcp/run-matrix.sh --direction up
+tools/bench/gcp/run-matrix.sh --direction bidir
+
 # One exact rs-tun matrix plus a separate P1000 daemon profile diagnostic.
 tools/bench/gcp/run-matrix.sh \
   --config rs-tun --topology same-zone --path direct \
@@ -197,12 +201,15 @@ If the active account is expired but an existing credential file is valid, the
 harness temporarily selects it with `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`;
 it never starts browser/device login, prints a token, or writes credentials.
 
-Every selected cell executes byte-identical RSB1 download semantics (direction
-`down`, 1280-byte writes), one P1/3-second warmup before sampling, the ordered
-throughput points and repeats, and 200 complete 8-byte TCP ping-pongs with raw
-nanosecond samples. Rust, daemon-proxy, and TUN cells use `rustscale-bench`;
-`ts-embedded` uses `go-tsnet-rsb1`. The daemon-proxy bridge admits 1100
-simultaneous connections, above the public P1000 contract.
+Every selected cell executes byte-identical RSB1 semantics with 1280-byte
+writes. `--direction` selects server-to-client (`down`, the default),
+client-to-server (`up`), or simultaneous two-way (`bidir`) traffic and is
+bound into the immutable manifest, warmup, every trial, result validation, and
+profile metadata. Each run performs one P1/3-second warmup before sampling,
+the ordered throughput points and repeats, and 200 complete 8-byte TCP
+ping-pongs with raw nanosecond samples. Rust, daemon-proxy, and TUN cells use
+`rustscale-bench`; `ts-embedded` uses `go-tsnet-rsb1`. The daemon-proxy bridge
+admits 1100 simultaneous connections, above the public P1000 contract.
 
 Certification accepts exactly the ordered stream set
 `1,10,100,500,1000`; `--parallelism` rejects every other list and

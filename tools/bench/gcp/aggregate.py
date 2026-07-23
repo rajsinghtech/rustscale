@@ -54,7 +54,7 @@ def selected_matrix(root: Path, allow_partial: bool) -> dict:
         matrix["manifest_schema"] = data["schema_version"]
         matrix["manifest_document"] = data
         matrix["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
-        for key in ("duration_s", "sample_cadence_s", "peer_count_requested", "selection", "load"):
+        for key in ("duration_s", "sample_cadence_s", "peer_count_requested", "direction", "selection", "load"):
             if key in data: matrix[key] = data[key]
         return matrix
     if data.get("schema_version") != 1 or not allow_partial:
@@ -311,6 +311,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
             "ts-tun": "kernel-tcp-via-tailscaled-tun",
         }[config]
         expected_workload = "go-tsnet-rsb1" if config == "ts-embedded" else "rustscale-bench"
+        expected_direction = matrix.get("direction", "down")
         expected_portmapping = {"rs-userspace": "disabled", "ts-embedded": "upstream-default"}.get(config, "not-applicable")
         primary_subject = {"rs-userspace": "rustscale-bench", "rs-tun": "rustscaled", "ts-embedded": "go-tsnet-rsb1",
                            "ts-userspace": "tailscaled", "ts-tun": "tailscaled"}[config]
@@ -320,7 +321,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
             errors.append("implementation/tool identity does not match config")
         workload = obj.get("workload")
         if (not isinstance(workload, dict) or workload.get("implementation") != expected_workload
-                or workload.get("protocol") != "RSB1" or workload.get("direction") != "down"
+                or workload.get("protocol") != "RSB1" or workload.get("direction") != expected_direction
                 or workload.get("payload_bytes") != 1280
                 or workload.get("warmup") != {"parallel": 1, "duration_s": 3, "max_attempts": 1}
                 or workload.get("client_lifecycle") != "new_benchmark_process_per_trial"
@@ -334,7 +335,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
         warmup_evidence = obj.get("warmup_evidence")
         expected_warmup_path = path if embedded else "externally-gated"
         if (not isinstance(warmup_evidence, dict) or warmup_evidence.get("transport") != expected_transport
-                or warmup_evidence.get("protocol") != "RSB1" or warmup_evidence.get("direction") != "down"
+                or warmup_evidence.get("protocol") != "RSB1" or warmup_evidence.get("direction") != expected_direction
                 or warmup_evidence.get("duration_secs") != 3 or warmup_evidence.get("parallel") != 1
                 or any(warmup_evidence.get(name) != 1 for name in ("established", "handshaken", "completed"))
                 or not finite_positive(warmup_evidence.get("total_mbps"))
@@ -351,7 +352,7 @@ def validate_ok(obj: dict, key: tuple[str, str, str], matrix: dict) -> list[str]
                 expected_trial_path = path if embedded else "externally-gated"
                 if (not isinstance(trial, dict) or (trial.get("parallel"), trial.get("repeat_index")) != expected_trial
                         or trial.get("transport") != expected_transport or trial.get("protocol") != "RSB1"
-                        or trial.get("direction") != "down" or trial.get("duration_s") != matrix.get("duration_s", 10)
+                        or trial.get("direction") != expected_direction or trial.get("duration_s") != matrix.get("duration_s", 10)
                         or any(trial.get(name) != parallel for name in ("established", "handshaken", "completed"))
                         or not finite_positive(trial.get("total_mbps")) or trial.get("path_class") != expected_trial_path):
                     errors.append(f"P{parallel} repeat {repeat_index} has incomplete RSB1 lifecycle evidence")

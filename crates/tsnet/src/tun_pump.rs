@@ -19,21 +19,26 @@ fn tun_inbound_write_worker_enabled_for(
     cfg!(target_os = "linux") && env_present && !inbound_pipeline && !outbound_pipeline
 }
 
-fn tun_inbound_write_inline(ingress_backlogged: bool, worker_outstanding: usize) -> bool {
-    !ingress_backlogged && worker_outstanding == 0
+fn tun_inbound_write_inline(
+    received_datagrams: usize,
+    bulk_recent: bool,
+    worker_outstanding: usize,
+) -> bool {
+    received_datagrams <= 1 && !bulk_recent && worker_outstanding == 0
 }
 
 const TUN_WRITE_SCHEDULER_REPORT_INTERVAL: u64 = 4_096;
+const TUN_WRITE_BULK_HOLD: std::time::Duration = std::time::Duration::from_millis(5);
 
 fn log_tun_write_scheduler_stats(
     inline_batches: u64,
     offloaded_batches: u64,
-    backlog_events: u64,
+    bulk_bursts: u64,
     worker_outstanding: usize,
 ) {
     log::info!(
         "rustscale: tun_write_scheduler_stats event=periodic inline_batches={inline_batches} \
-         offloaded_batches={offloaded_batches} backlog_events={backlog_events} \
+         offloaded_batches={offloaded_batches} bulk_bursts={bulk_bursts} \
          worker_outstanding={worker_outstanding}"
     );
 }
@@ -208,12 +213,12 @@ pub(crate) async fn run_tun_pump(
 }
 
 /// Experimental two-owner TUN scheduler. WireGuard state, transport sends,
-/// timers, and outbound TUN reads remain on this task. An ingress burst stays
-/// inline while the receive channel is drained, avoiding a latency-path task
-/// hop at low load. Once ciphertext is already waiting, one FIFO worker owns
-/// final authorization and TUN writes so those writes cannot starve outbound
-/// TCP ACK reads. Two scratch values are the hard queue bound, so a blocked
-/// bulk write can never grow plaintext memory without bound.
+/// timers, and outbound TUN reads remain on this task. Isolated one-datagram
+/// deliveries stay on the scalar inline path. A multi-datagram burst arms a
+/// short monotonic bulk window so sustained traffic keeps one FIFO worker as
+/// the write owner instead of oscillating between tasks. Two scratch values
+/// are the hard queue bound, so a blocked bulk write can never grow plaintext
+/// memory without bound while the owner services outbound TCP ACK reads.
 async fn run_tun_pump_with_write_worker(
     magicsock: Arc<Magicsock>,
     mut wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
@@ -255,7 +260,8 @@ async fn run_tun_pump_with_write_worker(
     let mut worker_outstanding = 0_usize;
     let mut inline_batches = 0_u64;
     let mut offloaded_batches = 0_u64;
-    let mut backlog_events = 0_u64;
+    let mut bulk_bursts = 0_u64;
+    let mut bulk_until = None;
     let mut next_stats_report = TUN_WRITE_SCHEDULER_REPORT_INTERVAL;
 
     loop {
@@ -270,16 +276,18 @@ async fn run_tun_pump_with_write_worker(
             inbound.peer_map_epoch = peer_map.authorization_epoch();
             pending_wg_batch =
                 take_immediate_receive_batches(first, &mut wg_recv, &mut inbound.datagrams);
-            // `take_immediate_receive_batches` already drained every complete
-            // batch that fit. A retained whole batch or a newly queued batch
-            // therefore means ingress remained backlogged across protocol
-            // work, rather than merely arriving as one coalesced burst.
-            let ingress_backlogged = pending_wg_batch.is_some() || !wg_recv.is_empty();
-            backlog_events += u64::from(ingress_backlogged);
-            if tun_inbound_write_inline(ingress_backlogged, worker_outstanding) {
+            let received_datagrams = inbound.datagrams.len();
+            let now = tokio::time::Instant::now();
+            let mut bulk_recent = bulk_until.is_some_and(|deadline| now < deadline);
+            if received_datagrams > 1 {
+                bulk_bursts += 1;
+                bulk_until = Some(now + TUN_WRITE_BULK_HOLD);
+                bulk_recent = true;
+            }
+            if tun_inbound_write_inline(received_datagrams, bulk_recent, worker_outstanding) {
                 // Preserve the exact scalar authorization and delivery path
-                // while ingress is drained. The adaptive scheduler should add
-                // no second barrier or task hop to the latency path.
+                // for isolated one-datagram traffic. The bulk scheduler adds
+                // no second barrier or task hop to that latency path.
                 if !process_tun_inbound_batch(
                     &magicsock,
                     tun.as_ref(),
@@ -320,7 +328,7 @@ async fn run_tun_pump_with_write_worker(
                 log_tun_write_scheduler_stats(
                     inline_batches,
                     offloaded_batches,
-                    backlog_events,
+                    bulk_bursts,
                     worker_outstanding,
                 );
                 next_stats_report =
@@ -3523,14 +3531,18 @@ mod tests {
             cfg!(target_os = "linux"),
             "the write worker must remain an isolated Linux experiment"
         );
-        assert!(tun_inbound_write_inline(false, 0));
+        assert!(tun_inbound_write_inline(1, false, 0));
         assert!(
-            !tun_inbound_write_inline(true, 0),
-            "sustained ingress must retain bidirectional scheduling"
+            !tun_inbound_write_inline(2, false, 0),
+            "a multi-datagram burst must arm bidirectional scheduling"
         );
         assert!(
-            !tun_inbound_write_inline(false, 1),
-            "a later drained burst must not overtake an offloaded write"
+            !tun_inbound_write_inline(1, true, 0),
+            "an isolated datagram inside the bulk window must retain one owner"
+        );
+        assert!(
+            !tun_inbound_write_inline(1, false, 1),
+            "a later isolated datagram must not overtake an offloaded write"
         );
     }
 
@@ -4264,10 +4276,10 @@ mod tests {
             }])
             .await
             .unwrap();
-        // Fill the first whole TUN batch and retain a second item in the
-        // receive channel. Replayed ciphertext after the first item is
-        // harmless here: the test needs one deliverable packet plus a
-        // deterministic ingress-backlog signal.
+        // Fill the first whole TUN batch to arm bulk scheduling and retain a
+        // second item in the receive channel. Replayed ciphertext after the
+        // first item is harmless here: the test needs one deliverable packet
+        // plus deterministic queued work while the write is blocked.
         let datagrams = (0..rustscale_tun::TunPacketBatch::MAX_PACKETS)
             .map(|_| {
                 magicsock

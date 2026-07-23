@@ -174,6 +174,55 @@ event-driven) · packet filter (incl. stateful UDP, capability ACLs, shields-up 
 with distinct embedded Rust, pinned embedded Go tsnet, daemon-proxy, and TUN
 cells; historical SOCKS5/Serve numbers are not embedded-tsnet claims.
 
+## Current embedded performance evidence (2026-07-22)
+
+The latest matched high-fanout receive comparison used the tracked RSB1
+userspace-tsnet upload workload on one 8-core ARM Neoverse-V2 AWS host running
+Ubuntu 24.04 and Linux 6.17. This is a same-host software-path comparison, not
+cross-machine or external-NIC evidence. A fixed Rust client sent 1,280-byte
+application payload chunks to either accepted RustScale, the current RustScale
+tree, or the pinned `tailscale.com/tsnet` v1.100.0 comparator. The current tree
+used neither detached-pipeline force nor disable controls, so it exercised the
+corrected default path.
+
+Each P500/P1000 cell contains three valid 20-second trials in serial balanced
+randomized blocks, following a separate three-second P1 direct-path warmup.
+Every trial established, handshook, completed, and retained exactly the
+requested 500 or 1,000 streams; reported 20/20 one-second samples; had no low,
+zero, or stalled interval; and passed descriptor, memory, process, and state
+cleanup checks. No trial was replaced and no valid outlier was removed.
+
+| Streams | Accepted RustScale | Current RustScale | Go tsnet v1.100.0 | Current vs accepted | Current vs Go | Current CV |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 500 | 3134.669 Mbps | 5270.876 Mbps | 4788.978 Mbps | +68.15% | +10.06% | 0.552% |
+| 1000 | 2853.839 Mbps | 5222.082 Mbps | 4875.703 Mbps | +82.98% | +7.10% | 0.301% |
+
+Raw P500 samples in accepted/current/Go order were
+`[3054.216704, 3170.086912, 3179.703296]`,
+`[5271.126528, 5241.629696, 5299.870720]`, and
+`[4794.399232, 4775.576064, 4796.958720]` Mbps. P1000 samples were
+`[2873.769984, 2849.022464, 2838.724608]`,
+`[5204.455424, 5227.130880, 5234.658816]`, and
+`[4859.879936, 4880.611328, 4886.617088]` Mbps.
+
+| Streams | Accepted cores / mean RSS | Current cores / mean RSS | Go cores / mean RSS |
+| ---: | ---: | ---: | ---: |
+| 500 | 1.277 / 576.7 MiB | 1.825 / 591.1 MiB | 2.540 / 1214.6 MiB |
+| 1000 | 1.753 / 1134.2 MiB | 1.923 / 1137.5 MiB | 2.520 / 1441.7 MiB |
+
+The current artifact came from committed clean tree
+`6258ee659c58c78a92e644163dd103f384364188` and was built with Rust 1.97.1;
+the native comparator used Go 1.26.4 and exactly matched the tracked
+`tools/bench/go-tsnet/` sources. The workload maps to `crates/bench`, the
+current receive implementation to `crates/tsnet/src/netstack_pump.rs`, and the
+standard maintained matrix analogue to `tools/bench/gcp/`.
+
+This evidence closes and exceeds the measured high-fanout embedded inbound
+throughput gap on this host. It does not establish latency, low-concurrency,
+download/bidirectional, DERP, TUN, daemon/userspace, startup, idle-resource,
+cross-host, or universal compatibility parity; those remain required before
+the overall parity goal or merge gate is complete.
+
 ## Test infrastructure
 
 `crates/testcontrol` ✅ in-process fake control server (Noise handshake, h2c,

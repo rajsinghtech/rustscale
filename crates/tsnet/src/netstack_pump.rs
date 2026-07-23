@@ -17,12 +17,57 @@ const NETSTACK_OUTBOUND_BATCH: usize = 128;
 const NETSTACK_OUTBOUND_BULK_YIELD_BYTES: usize = 64 << 10;
 const WG_TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_FORCED_NETSTACK_RX_GRO_SEGMENTS: usize = 128;
+const NETSTACK_DETACHED_PIPELINE_DEPTH: usize = 3;
+const NETSTACK_DETACHED_PIPELINE_MIN_PACKETS: usize = 8;
 
 struct NetstackOutboundRun {
     peer: NodePublic,
     tunnel: Arc<Mutex<WgTunn>>,
     start: usize,
     end: usize,
+}
+
+#[derive(Default)]
+struct NetstackDetachedBatch {
+    peer_map_epoch: u64,
+    received_batches: usize,
+    datagrams: Vec<rustscale_magicsock::WgDatagram>,
+    peer: Option<NodePublic>,
+    generation: u64,
+    tunnel: Option<Arc<Mutex<WgTunn>>>,
+    prepared: Vec<Option<rustscale_wg::WgPreparedPacket>>,
+    opened: Vec<Option<rustscale_wg::WgOpenedPacket>>,
+    plaintext: rustscale_wg::WgPlaintextBatch,
+    authenticated: Vec<usize>,
+    fallback: bool,
+}
+
+impl NetstackDetachedBatch {
+    fn abort_opened(&mut self) {
+        for opened in self.opened.iter_mut().flatten() {
+            WgTunn::abort_opened(opened, &mut self.plaintext);
+        }
+        self.opened.clear();
+    }
+
+    fn clear(&mut self) {
+        self.abort_opened();
+        self.peer_map_epoch = 0;
+        self.received_batches = 0;
+        self.datagrams.clear();
+        self.peer = None;
+        self.generation = 0;
+        self.tunnel = None;
+        self.prepared.clear();
+        self.plaintext.clear();
+        self.plaintext.release_oversized_slots();
+        self.authenticated.clear();
+        self.fallback = false;
+    }
+}
+
+struct PendingNetstackDetachedBatch {
+    task: tokio::task::JoinHandle<NetstackDetachedBatch>,
 }
 
 #[derive(Default)]
@@ -338,6 +383,25 @@ async fn run_netstack_inbound_pump(
     capture: crate::capture::CaptureSlot,
     peer_map: Arc<crate::peer_map::Runtime>,
 ) {
+    if std::env::var_os("RUSTSCALE_FORCE_NETSTACK_DETACHED_PIPELINE").is_some() {
+        eprintln!(
+            "rustscale: detached netstack receive pipeline forced by \
+             RUSTSCALE_FORCE_NETSTACK_DETACHED_PIPELINE"
+        );
+        run_netstack_detached_pipeline(
+            magicsock,
+            wg_recv,
+            netstack,
+            wg_tunnels,
+            filter,
+            packet_drops,
+            cancel,
+            capture,
+            peer_map,
+        )
+        .await;
+        return;
+    }
     let mut pump_stats = NetstackPumpStats::new("inbound");
     let mut inbound = NetstackInboundScratch::default();
     if let Ok(raw_segments) = std::env::var("RUSTSCALE_FORCE_NETSTACK_RX_GRO_SEGMENTS") {
@@ -398,6 +462,420 @@ async fn run_netstack_inbound_pump(
         )
         .await;
         datagrams.clear();
+    }
+}
+
+async fn prepare_netstack_detached_batch(
+    magicsock: &Magicsock,
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    peer_map: &crate::peer_map::Runtime,
+    scratch: &mut NetstackDetachedBatch,
+) {
+    scratch.fallback = true;
+    scratch.peer_map_epoch = peer_map.authorization_epoch();
+    let Some(first) = scratch.datagrams.first() else {
+        return;
+    };
+    if scratch.datagrams.len() < NETSTACK_DETACHED_PIPELINE_MIN_PACKETS {
+        return;
+    }
+    let peer = first.peer.clone();
+    let generation = first.authorization_generation();
+    if scratch
+        .datagrams
+        .iter()
+        .any(|datagram| datagram.peer != peer || datagram.authorization_generation() != generation)
+        || !magicsock.is_authorization_current(&peer, generation)
+    {
+        return;
+    }
+    let tunnel = {
+        let tunnels = wg_tunnels.read().await;
+        tunnels.get(&peer).cloned()
+    };
+    let Some(tunnel) = tunnel else {
+        return;
+    };
+
+    scratch.prepared.reserve(scratch.datagrams.len());
+    {
+        let tunnel_guard = tunnel.lock().await;
+        for datagram in &scratch.datagrams {
+            let Ok(prepared) = tunnel_guard.preflight_data(&datagram.data) else {
+                scratch.prepared.clear();
+                return;
+            };
+            scratch.prepared.push(Some(prepared));
+        }
+    }
+    scratch.peer = Some(peer);
+    scratch.generation = generation;
+    scratch.tunnel = Some(tunnel);
+    scratch.fallback = false;
+}
+
+fn open_netstack_detached_batch(mut scratch: NetstackDetachedBatch) -> NetstackDetachedBatch {
+    if scratch.fallback {
+        return scratch;
+    }
+    scratch.opened.resize_with(scratch.datagrams.len(), || None);
+    for index in 0..scratch.datagrams.len() {
+        let Some(prepared) = scratch.prepared[index].as_ref() else {
+            scratch.fallback = true;
+            break;
+        };
+        if let Ok(opened) = WgTunn::open_prepared_detached_into(
+            &scratch.datagrams[index].data,
+            prepared,
+            &mut scratch.plaintext,
+        ) {
+            scratch.opened[index] = Some(opened);
+        } else {
+            scratch.fallback = true;
+            break;
+        }
+    }
+    scratch.prepared.clear();
+    if scratch.fallback {
+        scratch.abort_opened();
+        scratch.plaintext.clear();
+    }
+    scratch
+}
+
+fn deliver_netstack_detached_batch(
+    netstack: &Netstack,
+    filter: &std::sync::Mutex<Filter>,
+    packet_drops: &AtomicU64,
+    capture: &crate::capture::CaptureSlot,
+    peer_map: &crate::peer_map::Runtime,
+    pump_stats: &mut NetstackPumpStats,
+    scratch: &mut NetstackDetachedBatch,
+    output: &mut NetstackInboundScratch,
+) {
+    let Some(peer) = scratch.peer.clone() else {
+        return;
+    };
+    let ownership = peer_map.packet_source_snapshot();
+    let mut filt = filter.lock().unwrap();
+    output.keep.clear();
+    output.accepted.clear();
+    for packet in scratch.plaintext.packets() {
+        let Some(info) = rustscale_packet::parse_packet(packet) else {
+            packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            output.keep.push(false);
+            continue;
+        };
+        if !ownership.matches(&peer, info.src) || filt.check_in_info(&info).is_drop() {
+            packet_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            output.keep.push(false);
+            continue;
+        }
+        output.keep.push(true);
+        output.accepted.push((peer.clone(), info));
+    }
+    drop(filt);
+    let mut index = 0;
+    scratch.plaintext.retain_mut(|_| {
+        let keep = output.keep[index];
+        index += 1;
+        keep
+    });
+    scratch.plaintext.drain_into(&mut output.decrypted);
+
+    let mut accepted = std::mem::take(&mut output.accepted);
+    let mut decrypted = std::mem::take(&mut output.decrypted);
+    for ((packet_peer, info), packet) in accepted.drain(..).zip(decrypted.drain(..)) {
+        crate::capture::log_packet(
+            capture,
+            crate::capture::CapturePath::SynthesizedToLocal,
+            &packet,
+        );
+        pump_stats.note_packet_info(true, &packet, &info);
+        debug_assert_eq!(packet_peer, peer);
+        output.packets.push(packet);
+    }
+    if !output.packets.is_empty() {
+        output
+            .gro
+            .coalesce_recycling(&mut output.packets, &mut output.recycled);
+        netstack.push_rx_batch_from(&mut output.packets, peer);
+    }
+    output.accepted = accepted;
+    output.decrypted = decrypted;
+}
+
+async fn commit_netstack_detached_batch(
+    magicsock: &Magicsock,
+    wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
+    netstack: &Netstack,
+    filter: &std::sync::Mutex<Filter>,
+    packet_drops: &AtomicU64,
+    cancel: &CancelToken,
+    capture: &crate::capture::CaptureSlot,
+    peer_map: &crate::peer_map::Runtime,
+    pump_stats: &mut NetstackPumpStats,
+    output: &mut NetstackInboundScratch,
+    scratch: &mut NetstackDetachedBatch,
+) -> bool {
+    pump_stats.note_connections(netstack.connection_stats());
+    if scratch.fallback {
+        handle_inbound_wg_batch(
+            magicsock,
+            wg_tunnels,
+            &scratch.datagrams,
+            scratch.received_batches,
+            netstack,
+            filter,
+            packet_drops,
+            capture,
+            peer_map,
+            pump_stats,
+            output,
+        )
+        .await;
+        return true;
+    }
+
+    let Some(peer) = scratch.peer.clone() else {
+        scratch.fallback = true;
+        return true;
+    };
+    let Some(tunnel) = scratch.tunnel.clone() else {
+        scratch.fallback = true;
+        return true;
+    };
+    let map_guard = tokio::select! {
+        guard = peer_map.gate.read() => guard,
+        () = cancel.cancelled() => return false,
+    };
+    let delivery_guard = tokio::select! {
+        guard = magicsock.authorization_delivery_guard() => guard,
+        () = cancel.cancelled() => return false,
+    };
+    if scratch.peer_map_epoch != peer_map.authorization_epoch()
+        || !magicsock.is_authorization_current(&peer, scratch.generation)
+    {
+        drop(delivery_guard);
+        drop(map_guard);
+        scratch.abort_opened();
+        scratch.plaintext.clear();
+        scratch.fallback = true;
+        return Box::pin(commit_netstack_detached_batch(
+            magicsock,
+            wg_tunnels,
+            netstack,
+            filter,
+            packet_drops,
+            cancel,
+            capture,
+            peer_map,
+            pump_stats,
+            output,
+            scratch,
+        ))
+        .await;
+    }
+
+    let mut tunnel_guard = tokio::select! {
+        guard = tunnel.lock() => guard,
+        () = cancel.cancelled() => return false,
+    };
+    let valid = scratch.opened.iter().all(|opened| {
+        opened
+            .as_ref()
+            .is_some_and(|opened| tunnel_guard.preflight_opened(opened, &scratch.plaintext))
+    });
+    if !valid {
+        drop(tunnel_guard);
+        drop(delivery_guard);
+        drop(map_guard);
+        scratch.abort_opened();
+        scratch.plaintext.clear();
+        scratch.fallback = true;
+        return Box::pin(commit_netstack_detached_batch(
+            magicsock,
+            wg_tunnels,
+            netstack,
+            filter,
+            packet_drops,
+            cancel,
+            capture,
+            peer_map,
+            pump_stats,
+            output,
+            scratch,
+        ))
+        .await;
+    }
+
+    scratch.authenticated.clear();
+    for (index, opened) in scratch.opened.iter_mut().enumerate() {
+        let Some(opened) = opened.as_mut() else {
+            continue;
+        };
+        match tunnel_guard.commit_opened(opened, &mut scratch.plaintext) {
+            Ok(rustscale_wg::WgCommitResult::Accepted | rustscale_wg::WgCommitResult::Dropped) => {
+                scratch.authenticated.push(index);
+            }
+            Ok(rustscale_wg::WgCommitResult::Stale) | Err(_) => {
+                debug_assert!(false, "validated detached receive commit became stale");
+            }
+        }
+    }
+    scratch.plaintext.finish_opened_batch();
+    drop(tunnel_guard);
+    drop(delivery_guard);
+    magicsock.note_authenticated_wg_transports(&scratch.datagrams, &scratch.authenticated);
+    pump_stats.note_batches(scratch.received_batches);
+    deliver_netstack_detached_batch(
+        netstack,
+        filter,
+        packet_drops,
+        capture,
+        peer_map,
+        pump_stats,
+        scratch,
+        output,
+    );
+    drop(map_guard);
+    if pump_stats.enabled {
+        pump_stats.note_queues(netstack.data_plane_queue_depths());
+    }
+    true
+}
+
+async fn run_netstack_detached_pipeline(
+    magicsock: Arc<Magicsock>,
+    mut wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
+    netstack: Arc<Netstack>,
+    wg_tunnels: Arc<RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>>,
+    filter: Arc<std::sync::Mutex<Filter>>,
+    packet_drops: Arc<AtomicU64>,
+    cancel: Arc<CancelToken>,
+    capture: crate::capture::CaptureSlot,
+    peer_map: Arc<crate::peer_map::Runtime>,
+) {
+    let mut pump_stats = NetstackPumpStats::new("inbound-detached");
+    let mut output = NetstackInboundScratch::default();
+    if let Ok(raw_segments) = std::env::var("RUSTSCALE_FORCE_NETSTACK_RX_GRO_SEGMENTS") {
+        if let Ok(segments @ 1..=MAX_FORCED_NETSTACK_RX_GRO_SEGMENTS) =
+            raw_segments.parse::<usize>()
+        {
+            output.gro.set_max_segments(segments);
+        }
+    }
+    let mut free: Vec<NetstackDetachedBatch> = (0..NETSTACK_DETACHED_PIPELINE_DEPTH)
+        .map(|_| NetstackDetachedBatch::default())
+        .collect();
+    let mut pending = std::collections::VecDeque::<PendingNetstackDetachedBatch>::new();
+    let mut deferred = None;
+    let mut receiver_closed = false;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        if pending.is_empty() && receiver_closed {
+            break;
+        }
+
+        if pending.len() < NETSTACK_DETACHED_PIPELINE_DEPTH && !receiver_closed {
+            let ready = deferred.take().or_else(|| wg_recv.try_recv().ok());
+            if let Some(first) = ready {
+                let mut scratch = free.pop().expect("pipeline scratch available");
+                scratch.clear();
+                netstack.take_recycled_rx_buffers(
+                    &mut output.recycled,
+                    rustscale_wg::WgPlaintextBatch::MAX_PACKETS,
+                );
+                scratch.plaintext.refill_from(&mut output.recycled);
+                let (next, received_batches) = take_immediate_netstack_receive_batches(
+                    first,
+                    &mut wg_recv,
+                    &mut scratch.datagrams,
+                );
+                deferred = next;
+                scratch.received_batches = received_batches;
+                prepare_netstack_detached_batch(&magicsock, &wg_tunnels, &peer_map, &mut scratch)
+                    .await;
+                pending.push_back(PendingNetstackDetachedBatch {
+                    task: tokio::spawn(async move { open_netstack_detached_batch(scratch) }),
+                });
+                continue;
+            }
+        }
+
+        if pending.is_empty() {
+            let first = tokio::select! {
+                batch = wg_recv.recv() => batch,
+                () = cancel.cancelled() => break,
+            };
+            match first {
+                Some(first) => deferred = Some(first),
+                None => receiver_closed = true,
+            }
+            continue;
+        }
+
+        enum PipelineEvent {
+            Opened(Result<NetstackDetachedBatch, tokio::task::JoinError>),
+            Received(Option<rustscale_magicsock::WgReceiveBatch>),
+            Cancelled,
+        }
+        let event = {
+            let drain_only = pending.len() == NETSTACK_DETACHED_PIPELINE_DEPTH || receiver_closed;
+            let front = &mut pending.front_mut().expect("pending front").task;
+            if drain_only {
+                tokio::select! {
+                    result = front => PipelineEvent::Opened(result),
+                    () = cancel.cancelled() => PipelineEvent::Cancelled,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    batch = wg_recv.recv() => PipelineEvent::Received(batch),
+                    result = front => PipelineEvent::Opened(result),
+                    () = cancel.cancelled() => PipelineEvent::Cancelled,
+                }
+            }
+        };
+        match event {
+            PipelineEvent::Opened(result) => {
+                pending.pop_front();
+                let Ok(mut scratch) = result else {
+                    log::error!("tsnet: detached receive worker failed");
+                    cancel.cancel();
+                    break;
+                };
+                if !commit_netstack_detached_batch(
+                    &magicsock,
+                    &wg_tunnels,
+                    &netstack,
+                    &filter,
+                    &packet_drops,
+                    &cancel,
+                    &capture,
+                    &peer_map,
+                    &mut pump_stats,
+                    &mut output,
+                    &mut scratch,
+                )
+                .await
+                {
+                    break;
+                }
+                scratch.clear();
+                free.push(scratch);
+            }
+            PipelineEvent::Received(Some(batch)) => deferred = Some(batch),
+            PipelineEvent::Received(None) => receiver_closed = true,
+            PipelineEvent::Cancelled => break,
+        }
+    }
+
+    for pending_batch in pending {
+        pending_batch.task.abort();
     }
 }
 

@@ -13,6 +13,56 @@ use rustscale_wg::WgTunn;
 
 use crate::{DialStats, Netstack, DEFAULT_MTU, TCP_BUF, TCP_DIAL_TIMEOUT};
 
+#[tokio::test(flavor = "current_thread")]
+async fn batched_plaintext_ingress_preserves_order_and_records_only_syn_provenance() {
+    fn tcp_packet(flags: u8, source_port: u16) -> Vec<u8> {
+        let mut packet = vec![0; 40];
+        let packet_len = packet.len() as u16;
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[100, 64, 0, 2]);
+        packet[16..20].copy_from_slice(&[100, 64, 0, 1]);
+        packet[20..22].copy_from_slice(&source_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        packet[32] = 5 << 4;
+        packet[33] = flags;
+        packet
+    }
+
+    let netstack = Netstack::new(Ipv4Addr::new(100, 64, 0, 1), DEFAULT_MTU).unwrap();
+    let peer = NodePrivate::generate().public();
+    let ack = tcp_packet(0x10, 40000);
+    let syn = tcp_packet(0x02, 40001);
+    let expected = vec![ack.clone(), syn.clone()];
+    let mut packets = vec![ack, syn];
+
+    netstack.push_rx_batch_from(&mut packets, peer.clone());
+
+    assert!(packets.is_empty(), "batch ownership must transfer wholly");
+    assert_eq!(
+        netstack
+            .rx_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        &*netstack.inbound_flows.lock().unwrap(),
+        &std::collections::HashMap::from([(
+            crate::TcpFlow {
+                remote: SocketAddr::from((Ipv4Addr::new(100, 64, 0, 2), 40001)),
+                local: SocketAddr::from((Ipv4Addr::new(100, 64, 0, 1), 443)),
+            },
+            peer,
+        )])
+    );
+}
+
 #[tokio::test]
 async fn full_app_channel_cannot_lose_close_ownership() {
     use tokio::io::AsyncWriteExt;
@@ -160,6 +210,53 @@ async fn full_app_channel_shutdown_aborts_and_drop_is_idempotent() {
             .load(std::sync::atomic::Ordering::Acquire),
         1
     );
+}
+
+#[tokio::test]
+async fn app_write_readiness_coalesces_without_losing_boundary_wakeups() {
+    use tokio::io::AsyncWriteExt;
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let stats = Arc::new(crate::ConnectionStatsInner::default());
+    let (mut stream, mut conn) =
+        crate::make_stream_and_conn(Arc::clone(&notify), Arc::clone(&stats), None, None, None);
+
+    stream.write_all(&[1]).await.expect("first app write");
+    assert!(conn
+        .lifecycle
+        .write_pending
+        .load(std::sync::atomic::Ordering::Acquire));
+    notify.notified().await;
+
+    stream.write_all(&[2]).await.expect("coalesced app write");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), notify.notified())
+            .await
+            .is_err(),
+        "an already-ready channel must not publish another wakeup"
+    );
+
+    // Model the poll loop's clear-before-drain boundary. A write after the
+    // clear must restore readiness and a retained Notify permit even if the
+    // current drain consumes it immediately.
+    assert!(conn
+        .lifecycle
+        .write_pending
+        .swap(false, std::sync::atomic::Ordering::Acquire));
+    stream.write_all(&[3]).await.expect("boundary app write");
+    assert!(conn
+        .lifecycle
+        .write_pending
+        .load(std::sync::atomic::Ordering::Acquire));
+    tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
+        .await
+        .expect("boundary write must wake the poll loop");
+
+    let mut received = Vec::new();
+    while let Ok(bytes) = conn.app_rx.try_recv() {
+        received.extend_from_slice(&bytes);
+    }
+    assert_eq!(received, [1, 2, 3]);
 }
 
 #[test]

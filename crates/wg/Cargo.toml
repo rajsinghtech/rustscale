@@ -12,4 +12,5 @@ workspace = true
 [dependencies]
 rustscale-key = { path = "../key", version = "0.1.5" }
 boringtun.workspace = true
+rayon.workspace = true
 thiserror.workspace = true

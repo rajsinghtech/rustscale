@@ -44,6 +44,67 @@ pub use darwin::TunDevice;
 pub use linux::TunDevice;
 pub use mock::MockTun;
 
+/// Reusable TCP receive coalescer for userspace IP stacks.
+///
+/// Valid, contiguous TCPv4/TCPv6 segments are combined into ordinary IP
+/// packets with complete checksums. Malformed, checksum-invalid, non-TCP, and
+/// incompatible packets remain scalar and retain their input order. Unlike
+/// Linux TUN write-side GRO, the output carries no virtio header or partial
+/// checksum metadata and can be injected directly into a userspace stack.
+pub struct TcpGroCoalescer {
+    state: offload::TcpGroState,
+    output: Vec<Vec<u8>>,
+    max_segments: usize,
+}
+
+impl Default for TcpGroCoalescer {
+    fn default() -> Self {
+        Self {
+            state: offload::TcpGroState::default(),
+            output: Vec::new(),
+            max_segments: usize::MAX,
+        }
+    }
+}
+
+impl TcpGroCoalescer {
+    /// Construct an empty coalescer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Limit the number of original TCP segments represented by one output
+    /// packet. A bound of one leaves valid input segments scalar.
+    pub fn set_max_segments(&mut self, max_segments: usize) {
+        assert!(max_segments > 0, "TCP GRO segment bound must be non-zero");
+        self.max_segments = max_segments;
+    }
+
+    /// Coalesce compatible TCP segments in place while retaining planner
+    /// allocations for the next batch.
+    pub fn coalesce(&mut self, packets: &mut Vec<Vec<u8>>) {
+        offload::coalesce_tcp_packets_bounded(
+            &mut self.state,
+            packets,
+            &mut self.output,
+            self.max_segments,
+        );
+    }
+
+    /// Coalesce while returning fragment allocations that no longer own an
+    /// output packet. Embedded stacks can feed these buffers back into their
+    /// WireGuard plaintext scratch instead of freeing them per segment.
+    pub fn coalesce_recycling(&mut self, packets: &mut Vec<Vec<u8>>, recycled: &mut Vec<Vec<u8>>) {
+        offload::coalesce_tcp_packets_bounded_recycling(
+            &mut self.state,
+            packets,
+            &mut self.output,
+            self.max_segments,
+            recycled,
+        );
+    }
+}
+
 /// Reusable storage for packets returned by [`Tun::read_batch`].
 ///
 /// A successful read may contain up to [`Self::MAX_PACKETS`] packets. Calling

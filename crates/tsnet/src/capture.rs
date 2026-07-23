@@ -78,21 +78,32 @@ impl CaptureOutput for ChannelOutput {
     }
 }
 
-/// Shared optional capture sink. Pumps retain this slot and only acquire its
-/// read lock when deciding whether a packet needs capture work.
-pub(crate) type CaptureSlot = Arc<RwLock<Option<Arc<Sink>>>>;
+/// Shared optional capture sink. The atomic flag keeps disabled capture out of
+/// packet-path locking; the sink lock still serializes capture lifecycle
+/// changes and gives active sessions their existing ownership semantics.
+pub(crate) struct CaptureState {
+    active: AtomicBool,
+    sink: RwLock<Option<Arc<Sink>>>,
+}
+
+pub(crate) type CaptureSlot = Arc<CaptureState>;
 
 pub(crate) fn new_slot() -> CaptureSlot {
-    Arc::new(RwLock::new(None))
+    Arc::new(CaptureState {
+        active: AtomicBool::new(false),
+        sink: RwLock::new(None),
+    })
 }
 
 pub(crate) fn get_or_set(slot: &CaptureSlot) -> Arc<Sink> {
-    let mut guard = slot.write().expect("capture slot lock poisoned");
+    let mut guard = slot.sink.write().expect("capture slot lock poisoned");
     if let Some(sink) = guard.as_ref() {
+        debug_assert!(slot.active.load(Ordering::Acquire));
         return sink.clone();
     }
     let sink = Arc::new(Sink::new());
     *guard = Some(sink.clone());
+    slot.active.store(true, Ordering::Release);
     sink
 }
 
@@ -101,10 +112,12 @@ pub(crate) fn get_or_set(slot: &CaptureSlot) -> Arc<Sink> {
 /// registered by its successor.
 pub(crate) fn replace(slot: &CaptureSlot) -> Arc<Sink> {
     let sink = Arc::new(Sink::new());
-    let previous = slot
-        .write()
-        .expect("capture slot lock poisoned")
-        .replace(Arc::clone(&sink));
+    let previous = {
+        let mut guard = slot.sink.write().expect("capture slot lock poisoned");
+        let previous = guard.replace(Arc::clone(&sink));
+        slot.active.store(true, Ordering::Release);
+        previous
+    };
     if let Some(previous) = previous {
         previous.close();
     }
@@ -113,25 +126,33 @@ pub(crate) fn replace(slot: &CaptureSlot) -> Arc<Sink> {
 
 /// Clear only the session installed by the caller.
 pub(crate) fn clear_if_same(slot: &CaptureSlot, expected: &Arc<Sink>) {
-    let mut guard = slot.write().expect("capture slot lock poisoned");
+    let mut guard = slot.sink.write().expect("capture slot lock poisoned");
     if guard
         .as_ref()
         .is_some_and(|current| Arc::ptr_eq(current, expected))
     {
         let sink = guard.take().expect("capture sink disappeared");
+        slot.active.store(false, Ordering::Release);
         sink.close();
     }
 }
 
 pub(crate) fn clear(slot: &CaptureSlot) {
-    if let Some(sink) = slot.write().expect("capture slot lock poisoned").take() {
+    let mut guard = slot.sink.write().expect("capture slot lock poisoned");
+    if let Some(sink) = guard.take() {
+        slot.active.store(false, Ordering::Release);
         sink.close();
     }
 }
 
 pub(crate) fn log_packet(slot: &CaptureSlot, path: CapturePath, data: &[u8]) {
-    // This is the disabled-capture hot path: one read-lock/Option check.
+    // This is the normal disabled-capture hot path. The acquire pairs with
+    // session publication before an active reader consults the sink lock.
+    if !slot.active.load(Ordering::Acquire) {
+        return;
+    }
     let sink = slot
+        .sink
         .read()
         .expect("capture slot lock poisoned")
         .as_ref()
@@ -139,6 +160,11 @@ pub(crate) fn log_packet(slot: &CaptureSlot, path: CapturePath, data: &[u8]) {
     if let Some(sink) = sink {
         sink.log_packet(path, SystemTime::now(), data, CaptureMeta::default());
     }
+}
+
+#[cfg(test)]
+pub(crate) fn current(slot: &CaptureSlot) -> Option<Arc<Sink>> {
+    slot.sink.read().unwrap().clone()
 }
 
 /// Fanout sink for pcap records.
@@ -407,6 +433,34 @@ mod tests {
             CaptureMeta::default(),
         );
         assert_eq!(sink.output_count(), 0);
+    }
+
+    #[test]
+    fn disabled_capture_skips_the_sink_lock() {
+        let slot = new_slot();
+        let poisoned = Arc::clone(&slot);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.sink.write().unwrap();
+            panic!("poison capture sink lock");
+        });
+
+        assert!(!slot.active.load(Ordering::Acquire));
+        log_packet(&slot, CapturePath::FromLocal, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn stale_capture_cleanup_preserves_the_active_successor() {
+        let slot = new_slot();
+        let stale = replace(&slot);
+        let successor = replace(&slot);
+
+        clear_if_same(&slot, &stale);
+        assert!(slot.active.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(&current(&slot).unwrap(), &successor));
+
+        clear_if_same(&slot, &successor);
+        assert!(!slot.active.load(Ordering::Acquire));
+        assert!(current(&slot).is_none());
     }
 
     #[tokio::test]

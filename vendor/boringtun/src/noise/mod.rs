@@ -80,6 +80,45 @@ pub struct Tunn {
     pipeline_tunnel_id: u64,
 }
 
+/// Immutable established-session capability for formatting an ordered batch
+/// with a counter range reserved up front. While this value exists, Rust's
+/// borrow rules prevent the parent tunnel from changing session state.
+pub struct PreparedSendBatch<'a> {
+    session: &'a session::Session,
+    first_counter: u64,
+    count: usize,
+}
+
+impl PreparedSendBatch<'_> {
+    /// Number of counters reserved by this capability.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether this capability reserved no counters.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Encrypt one packet at its stable position in the reserved range.
+    pub fn format_packet_data<'a>(
+        &self,
+        index: usize,
+        src: &[u8],
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        if index >= self.count {
+            return Err(WireGuardError::InvalidCounter);
+        }
+        let counter = self
+            .first_counter
+            .checked_add(index as u64)
+            .ok_or(WireGuardError::InvalidCounter)?;
+        self.session
+            .format_packet_data_with_counter(src, dst, counter)
+    }
+}
+
 type MessageType = u32;
 const HANDSHAKE_INIT: MessageType = 1;
 const HANDSHAKE_RESP: MessageType = 2;
@@ -305,7 +344,10 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = match session.format_packet_data(src, dst) {
+                Ok(packet) => packet,
+                Err(error) => return TunnResult::Err(error),
+            };
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -319,6 +361,38 @@ impl Tunn {
         self.queue_packet(src);
         // Initiate a new handshake if none is in progress
         self.format_handshake_initiation(dst, false)
+    }
+
+    /// Reserve an established session's sending counters for a complete data
+    /// batch. This returns `NoCurrentSession` without queueing plaintext or
+    /// initiating a handshake, so callers may safely choose the scalar path.
+    pub fn prepare_send_batch(
+        &self,
+        count: usize,
+    ) -> Result<PreparedSendBatch<'_>, WireGuardError> {
+        let session = self.sessions[self.current % N_SESSIONS]
+            .as_ref()
+            .ok_or(WireGuardError::NoCurrentSession)?;
+        let first_counter = session.reserve_sending_counters(count)?;
+        Ok(PreparedSendBatch {
+            session,
+            first_counter,
+            count,
+        })
+    }
+
+    /// Publish timer and byte accounting after a prepared batch was wholly
+    /// formatted. Counter reservations are intentionally not rolled back when
+    /// formatting fails; unused gaps are safe, nonce reuse is not.
+    pub fn complete_send_batch(&mut self, packet_count: usize, data_bytes: usize) {
+        if packet_count == 0 {
+            return;
+        }
+        self.timer_tick(TimerName::TimeLastPacketSent);
+        if data_bytes != 0 {
+            self.timer_tick(TimerName::TimeLastDataPacketSent);
+        }
+        self.tx_bytes = self.tx_bytes.saturating_add(data_bytes);
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -557,7 +631,7 @@ impl Tunn {
         let session = self.handshake.receive_handshake_response(p)?;
         self.invalidate_pipeline_generation();
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let keepalive_packet = session.format_packet_data(&[], dst)?;
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;

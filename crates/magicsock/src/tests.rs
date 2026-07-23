@@ -2256,6 +2256,30 @@ async fn authenticated_wg_transport_publishes_direct_activity() {
     assert_eq!(telemetry.class, PathClass::Direct);
     assert_eq!(telemetry.addr, Some(direct_addr));
     assert!(telemetry.fresh);
+
+    let batch = [
+        WgTransportEvidence::Direct(direct_addr),
+        WgTransportEvidence::Direct(direct_addr),
+        WgTransportEvidence::Derp(7),
+    ]
+    .into_iter()
+    .map(|transport| WgDatagram {
+        peer: peer_key.clone(),
+        data: WgCiphertext::from(vec![4, 5, 6])
+            .authorized(generation)
+            .received_via(transport),
+    })
+    .collect::<Vec<_>>();
+    magicsock.note_authenticated_wg_transports(&batch, &[0, 1, 2]);
+
+    // Repeated direct evidence is coalesced, but the following transition is
+    // still applied in order. Direct trust therefore survives while DERP is
+    // correctly exposed as the latest authenticated transport.
+    assert!(magicsock.peer_direct_trusted(&peer_key));
+    let telemetry = magicsock.peer_path_telemetry(&peer_key);
+    assert_eq!(telemetry.class, PathClass::Derp);
+    assert_eq!(telemetry.derp_region, Some(7));
+    assert!(telemetry.fresh);
 }
 
 #[tokio::test]
@@ -2613,10 +2637,10 @@ async fn direct_path_upgrade_over_udp() {
     assert!(b_counts.iter().all(|call| call.recv));
 }
 
-// ---- Test: trust expiry downgrades to DERP ----
+// ---- Test: trust expiry hedges direct UDP with DERP ----
 
 #[tokio::test]
-async fn trust_expiry_downgrades_to_derp() {
+async fn trust_expiry_hedges_direct_with_derp() {
     let relay = Arc::new(FakeRelay::new());
 
     let a_priv = NodePrivate::generate();
@@ -2643,7 +2667,7 @@ async fn trust_expiry_downgrades_to_derp() {
     .expect("A magicsock");
 
     let b_derp = connect_to_relay(&relay, b_priv.clone()).await;
-    let (b, _b_rx) = Magicsock::new(MagicsockConfig {
+    let (b, mut b_rx) = Magicsock::new(MagicsockConfig {
         private_key: b_priv,
         disco_key: DiscoPrivate::generate(),
         derp_client: Some(b_derp),
@@ -2664,8 +2688,10 @@ async fn trust_expiry_downgrades_to_derp() {
 
     let a_udp = a.bound_udp_addr().unwrap().to_string();
     let b_udp = b.bound_udp_addr().unwrap().to_string();
-    let b_peer = make_peer(b.node_public(), b.disco_public(), vec![b_udp], 1);
-    let a_peer = make_peer(a.node_public(), a.disco_public(), vec![a_udp], 1);
+    let mut b_peer = make_peer(b.node_public(), b.disco_public(), vec![b_udp], 1);
+    b_peer.Addresses = vec!["100.64.0.2/32".into()];
+    let mut a_peer = make_peer(a.node_public(), a.disco_public(), vec![a_udp], 1);
+    a_peer.Addresses = vec!["100.64.0.1/32".into()];
     a.set_netmap(vec![b_peer]).await.unwrap();
     b.set_netmap(vec![a_peer]).await.unwrap();
 
@@ -2678,6 +2704,11 @@ async fn trust_expiry_downgrades_to_derp() {
     assert!(a.peer_direct_trusted(&b.node_public()));
     assert_eq!(a.peer_path_class(&b.node_public()), PathClass::Direct);
 
+    let (a_counts, a_counter) = recording_counter();
+    let (b_counts, b_counter) = recording_counter();
+    a.set_connection_counter(Some(a_counter));
+    b.set_connection_counter(Some(b_counter));
+
     // Manually expire the trust.
     {
         let mut endpoints = a.inner.endpoints.write().expect("endpoints lock poisoned");
@@ -2685,10 +2716,7 @@ async fn trust_expiry_downgrades_to_derp() {
             let past = std::time::Instant::now()
                 .checked_sub(Duration::from_secs(100))
                 .unwrap();
-            ep.confirm_direct(
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-                past,
-            );
+            ep.confirm_direct(b.bound_udp_addr().unwrap(), past);
         }
     }
 
@@ -2697,6 +2725,49 @@ async fn trust_expiry_downgrades_to_derp() {
         PathClass::Derp,
         "expired direct should fall back to DERP"
     );
+
+    a.send(b.node_public(), b"expired-direct-hedge")
+        .await
+        .expect("either hedged path delivers");
+    let mut received = Vec::new();
+    while received.len() < 2 {
+        received.extend(
+            tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
+                .await
+                .expect("timed out waiting for hedged copies")
+                .expect("B receive batch")
+                .into_datagrams(),
+        );
+    }
+    assert_eq!(received.len(), 2);
+    assert!(received
+        .iter()
+        .all(|datagram| datagram.data == b"expired-direct-hedge".as_slice()));
+
+    let a_counts = a_counts.lock().unwrap();
+    assert!(a_counts.iter().any(|call| {
+        call.destination
+            == (
+                b.bound_udp_addr().unwrap().ip(),
+                b.bound_udp_addr().unwrap().port(),
+            )
+            && !call.recv
+    }));
+    assert!(a_counts
+        .iter()
+        .any(|call| { call.destination == (DERP_MAGIC_IP, 1) && !call.recv }));
+    let b_counts = b_counts.lock().unwrap();
+    assert!(b_counts.iter().any(|call| {
+        call.destination
+            == (
+                a.bound_udp_addr().unwrap().ip(),
+                a.bound_udp_addr().unwrap().port(),
+            )
+            && call.recv
+    }));
+    assert!(b_counts
+        .iter()
+        .any(|call| call.destination == (DERP_MAGIC_IP, 1) && call.recv));
 }
 
 // ---- Test: send to unknown peer errors ----

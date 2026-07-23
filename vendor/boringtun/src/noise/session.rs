@@ -6,6 +6,7 @@ use crate::noise::errors::WireGuardError;
 use parking_lot::Mutex;
 use portable_atomic::{AtomicU64, Ordering};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use std::convert::TryFrom;
 
 pub struct Session {
     pub(crate) receiving_index: u32,
@@ -230,15 +231,43 @@ impl Session {
         self.receiving_counter_mark(counter)
     }
 
+    /// Reserve a contiguous range of sending counters without ever wrapping.
+    /// A failed reservation leaves the counter unchanged.
+    pub(super) fn reserve_sending_counters(
+        &self,
+        count: usize,
+    ) -> Result<u64, WireGuardError> {
+        let count = u64::try_from(count).map_err(|_| WireGuardError::InvalidCounter)?;
+        self.sending_key_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(count)
+            })
+            .map_err(|_| WireGuardError::InvalidCounter)
+    }
+
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
-    /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+    /// returns the formatted packet
+    pub(super) fn format_packet_data<'a>(
+        &self,
+        src: &[u8],
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        let sending_key_counter = self.reserve_sending_counters(1)?;
+        self.format_packet_data_with_counter(src, dst, sending_key_counter)
+    }
+
+    /// Format one data packet using a counter previously reserved by
+    /// [`Self::reserve_sending_counters`].
+    pub(super) fn format_packet_data_with_counter<'a>(
+        &self,
+        src: &[u8],
+        dst: &'a mut [u8],
+        sending_key_counter: u64,
+    ) -> Result<&'a mut [u8], WireGuardError> {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
-
-        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
@@ -263,10 +292,10 @@ impl Session {
                     data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
                     src.len() + AEAD_SIZE
                 })
-                .unwrap()
+                .map_err(|_| WireGuardError::InvalidPacket)?
         };
 
-        &mut dst[..DATA_OFFSET + n]
+        Ok(&mut dst[..DATA_OFFSET + n])
     }
 
     /// packet - a data packet we received from the network
@@ -307,6 +336,29 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session() -> Session {
+        Session::new(1, 2, [3; 32], [4; 32])
+    }
+
+    #[test]
+    fn sending_counter_reservations_are_contiguous_and_non_overlapping() {
+        let session = session();
+        assert_eq!(session.reserve_sending_counters(4).unwrap(), 0);
+        assert_eq!(session.reserve_sending_counters(3).unwrap(), 4);
+        assert_eq!(session.reserve_sending_counters(0).unwrap(), 7);
+    }
+
+    #[test]
+    fn sending_counter_reservation_never_wraps_or_mutates_on_failure() {
+        let session = session();
+        session
+            .sending_key_counter
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        assert!(session.reserve_sending_counters(2).is_err());
+        assert_eq!(session.reserve_sending_counters(1).unwrap(), u64::MAX - 1);
+        assert!(session.reserve_sending_counters(1).is_err());
+    }
     #[test]
     fn test_replay_counter() {
         let mut c: ReceivingKeyCounterValidator = Default::default();

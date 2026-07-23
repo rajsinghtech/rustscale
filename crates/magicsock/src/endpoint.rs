@@ -306,6 +306,37 @@ impl BestPath {
     }
 }
 
+/// Physical destinations for one outbound WireGuard batch.
+///
+/// An expired direct address remains a hedge until fresh discovery selects a
+/// path. This mirrors upstream `addrForSendLocked`, which returns both the
+/// previous UDP address and its fallback instead of abandoning UDP at the
+/// trust deadline.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SendPlan {
+    None,
+    Derp {
+        region: i32,
+    },
+    Direct {
+        addr: SocketAddr,
+    },
+    Relay {
+        addr: SocketAddr,
+        vni: u32,
+    },
+    ExpiredDirect {
+        addr: SocketAddr,
+        fallback: SendFallback,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SendFallback {
+    Derp { region: i32 },
+    Relay { addr: SocketAddr, vni: u32 },
+}
+
 /// Per-peer endpoint state.
 #[derive(Clone)]
 struct RelayPath {
@@ -569,6 +600,48 @@ impl Endpoint {
             };
         }
         BestPath::None
+    }
+
+    /// Build the outbound destination plan without discarding an expired UDP
+    /// address. The expired address is sent alongside the best available
+    /// fallback until a fresh authenticated pong or WireGuard packet renews
+    /// direct trust.
+    pub(crate) fn send_plan(&self, now: Instant) -> SendPlan {
+        if let Some((addr, trusted_until)) = self.best_addr {
+            if now < trusted_until {
+                return SendPlan::Direct { addr };
+            }
+            let fallback = if let Some(relay) = self.relay.as_ref() {
+                SendFallback::Relay {
+                    addr: relay.addr,
+                    vni: relay.vni,
+                }
+            } else {
+                let region = if self.derp_route_valid() {
+                    self.last_recv_derp_region
+                } else {
+                    self.home_derp
+                };
+                SendFallback::Derp { region }
+            };
+            return SendPlan::ExpiredDirect { addr, fallback };
+        }
+        if let Some(relay) = self.relay.as_ref() {
+            return SendPlan::Relay {
+                addr: relay.addr,
+                vni: relay.vni,
+            };
+        }
+        let region = if self.derp_route_valid() {
+            self.last_recv_derp_region
+        } else {
+            self.home_derp
+        };
+        if region > 0 {
+            SendPlan::Derp { region }
+        } else {
+            SendPlan::None
+        }
     }
 
     /// Confirm a direct path after receiving a pong from `addr`.
@@ -1264,13 +1337,25 @@ mod tests {
     fn trust_expires_to_relay() {
         let mut e = ep();
         let now = Instant::now();
-        e.set_relay(sa(4000), 42, NodePrivate::generate().public(), 1);
-        e.confirm_direct(sa(5000), now);
+        let relay = sa(4000);
+        let direct = sa(5000);
+        e.set_relay(relay, 42, NodePrivate::generate().public(), 1);
+        e.confirm_direct(direct, now);
 
         assert_eq!(e.best_path(now).class(), PathClass::Direct);
 
         let later = now + TRUST_BEST_ADDR_DURATION + Duration::from_millis(1);
         assert_eq!(e.best_path(later).class(), PathClass::Relay);
+        assert_eq!(
+            e.send_plan(later),
+            SendPlan::ExpiredDirect {
+                addr: direct,
+                fallback: SendFallback::Relay {
+                    addr: relay,
+                    vni: 42,
+                },
+            }
+        );
         assert!(e.direct_expired(later));
     }
 
@@ -1278,10 +1363,18 @@ mod tests {
     fn trust_expires_to_derp_when_no_relay() {
         let mut e = ep();
         let now = Instant::now();
-        e.confirm_direct(sa(5000), now);
+        let direct = sa(5000);
+        e.confirm_direct(direct, now);
 
         let later = now + TRUST_BEST_ADDR_DURATION + Duration::from_millis(1);
         assert_eq!(e.best_path(later).class(), PathClass::Derp);
+        assert_eq!(
+            e.send_plan(later),
+            SendPlan::ExpiredDirect {
+                addr: direct,
+                fallback: SendFallback::Derp { region: 1 },
+            }
+        );
     }
 
     #[test]

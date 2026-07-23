@@ -23,6 +23,23 @@ struct IdentitySnapshot {
     by_ip: HashMap<IpAddr, NodePublic>,
 }
 
+/// Immutable address ownership retained for one data-plane batch.
+///
+/// Callers obtain this while holding [`Runtime::gate`] for the complete batch,
+/// so a map update cannot make the snapshot stale before final delivery.
+pub(crate) struct PacketSourceSnapshot {
+    identity: Arc<IdentitySnapshot>,
+}
+
+impl PacketSourceSnapshot {
+    pub(crate) fn matches(&self, peer: &NodePublic, source: IpAddr) -> bool {
+        self.identity
+            .by_ip
+            .get(&source)
+            .is_some_and(|owner| owner == peer)
+    }
+}
+
 /// Shared map-application gate, current address ownership, and TUN flow
 /// provenance. Data-plane readers hold `gate` while consulting tunnels/routes;
 /// map updates hold its writer while replacing every peer-derived subsystem.
@@ -95,6 +112,14 @@ impl Runtime {
             .by_ip
             .get(&parsed.src)
             .is_some_and(|owner| owner == peer)
+    }
+
+    /// Snapshot source-address ownership once for a batch protected by
+    /// [`Self::gate`]. The returned map is immutable and lookup-only.
+    pub(crate) fn packet_source_snapshot(&self) -> PacketSourceSnapshot {
+        PacketSourceSnapshot {
+            identity: Arc::clone(&self.identity.read().expect("peer identity lock poisoned")),
+        }
     }
 
     pub(crate) fn current_owner(&self, ip: IpAddr) -> Option<NodePublic> {
@@ -390,5 +415,17 @@ mod tests {
             reconcile(&[], &response),
             Err(ReconcileError::DuplicateAddress(_))
         ));
+    }
+
+    #[test]
+    fn packet_source_snapshot_matches_only_the_current_exact_owner() {
+        let owner = NodePrivate::generate().public();
+        let other = NodePrivate::generate().public();
+        let runtime = Runtime::new(&[node(1, &owner, "100.64.0.1")]).unwrap();
+        let snapshot = runtime.packet_source_snapshot();
+
+        assert!(snapshot.matches(&owner, "100.64.0.1".parse().unwrap()));
+        assert!(!snapshot.matches(&other, "100.64.0.1".parse().unwrap()));
+        assert!(!snapshot.matches(&owner, "100.64.0.2".parse().unwrap()));
     }
 }

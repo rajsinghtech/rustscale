@@ -1610,9 +1610,7 @@ async fn send_tun_batch(
         datagrams.clear();
         {
             let mut tunnel = run.tunnel.lock().await;
-            for packet in &packets[run.start..run.end] {
-                let _ = tunnel.encapsulate_into(packet, &mut datagrams);
-            }
+            let _ = tunnel.encapsulate_batch_into(&packets[run.start..run.end], &mut datagrams);
         }
         let _ = magicsock
             .send_batch(run.peer.clone(), datagrams.packets())
@@ -1681,9 +1679,8 @@ async fn send_tun_batch_pipeline(
         datagram_run.datagrams.clear();
         {
             let mut tunnel = run.tunnel.lock().await;
-            for packet in &packets[run.start..run.end] {
-                let _ = tunnel.encapsulate_into(packet, &mut datagram_run.datagrams);
-            }
+            let _ = tunnel
+                .encapsulate_batch_into(&packets[run.start..run.end], &mut datagram_run.datagrams);
         }
         if !sender.queue(datagram_run).await {
             return;

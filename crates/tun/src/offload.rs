@@ -262,6 +262,93 @@ impl<S: BuildHasher> TcpGroState<S> {
     }
 }
 
+/// Materialize the platform-neutral GRO plan as ordinary, fully checksummed
+/// IP packets for a userspace stack. Scalar packets move without copying;
+/// coalesced packets reuse the head allocation and copy only tail payloads.
+pub(crate) fn coalesce_tcp_packets(
+    state: &mut TcpGroState,
+    packets: &mut Vec<Vec<u8>>,
+    output: &mut Vec<Vec<u8>>,
+) {
+    coalesce_tcp_packets_bounded(state, packets, output, usize::MAX);
+}
+
+pub(crate) fn coalesce_tcp_packets_bounded(
+    state: &mut TcpGroState,
+    packets: &mut Vec<Vec<u8>>,
+    output: &mut Vec<Vec<u8>>,
+    max_segments: usize,
+) {
+    coalesce_tcp_packets_bounded_inner(state, packets, output, max_segments, None);
+}
+
+pub(crate) fn coalesce_tcp_packets_bounded_recycling(
+    state: &mut TcpGroState,
+    packets: &mut Vec<Vec<u8>>,
+    output: &mut Vec<Vec<u8>>,
+    max_segments: usize,
+    recycled: &mut Vec<Vec<u8>>,
+) {
+    coalesce_tcp_packets_bounded_inner(state, packets, output, max_segments, Some(recycled));
+}
+
+fn coalesce_tcp_packets_bounded_inner(
+    state: &mut TcpGroState,
+    packets: &mut Vec<Vec<u8>>,
+    output: &mut Vec<Vec<u8>>,
+    max_segments: usize,
+    recycled: Option<&mut Vec<Vec<u8>>>,
+) {
+    state.plan_bounded(packets, max_segments);
+    output.clear();
+    output.reserve(state.outputs().len());
+    for planned in state.outputs() {
+        let mut packet = std::mem::take(&mut packets[planned.head]);
+        if !planned.fragments.is_empty() {
+            let additional = planned
+                .fragments
+                .iter()
+                .map(|fragment| fragment.end - fragment.start)
+                .sum();
+            packet.reserve(additional);
+            for fragment in &planned.fragments {
+                packet.extend_from_slice(&packets[fragment.packet][fragment.start..fragment.end]);
+            }
+            finalize_tcp_checksum(&mut packet);
+        }
+        output.push(packet);
+    }
+    if let Some(recycled) = recycled {
+        for packet in packets.iter_mut() {
+            if packet.capacity() != 0 {
+                packet.clear();
+                recycled.push(std::mem::take(packet));
+            }
+        }
+    }
+    packets.clear();
+    std::mem::swap(packets, output);
+}
+
+fn finalize_tcp_checksum(packet: &mut [u8]) {
+    let (ip_len, address, size) = if packet[0] >> 4 == 6 {
+        (40, 8, 16)
+    } else {
+        (20, 12, 4)
+    };
+    let tcp_len = u16::try_from(packet.len() - ip_len).expect("GRO plan bounds TCP length");
+    let checksum_at = ip_len + 16;
+    packet[checksum_at..checksum_at + 2].fill(0);
+    let initial = pseudo(
+        TCP,
+        &packet[address..address + size],
+        &packet[address + size..address + 2 * size],
+        tcp_len,
+    );
+    let sum = !checksum(&packet[ip_len..], initial);
+    packet[checksum_at..checksum_at + 2].copy_from_slice(&sum.to_be_bytes());
+}
+
 impl<S: BuildHasher> TcpGroState<S> {
     pub(crate) fn outputs(&self) -> &[GroOutput] {
         &self.outputs
@@ -281,13 +368,18 @@ impl<S: BuildHasher> TcpGroState<S> {
     /// Build an ordered TCP4/TCP6 GRO plan and apply VNET accounting to the
     /// selected head packets. Malformed and non-TCP packets are scalar output.
     pub(crate) fn plan(&mut self, packets: &mut [Vec<u8>]) {
+        self.plan_bounded(packets, usize::MAX);
+    }
+
+    fn plan_bounded(&mut self, packets: &mut [Vec<u8>], max_segments: usize) {
+        assert!(max_segments > 0, "TCP GRO segment bound must be non-zero");
         self.reset();
         for index in 0..packets.len() {
             let Some(meta) = tcp_meta(&packets[index]) else {
                 Self::push_scalar(&mut self.outputs, &mut self.output_pool, index);
                 continue;
             };
-            self.tcp_gro(index, meta, packets);
+            self.tcp_gro(index, meta, packets, max_segments);
         }
         self.apply_accounting(packets);
     }
@@ -317,7 +409,13 @@ impl<S: BuildHasher> TcpGroState<S> {
         }
     }
 
-    fn tcp_gro(&mut self, packet: usize, meta: TcpMeta, packets: &mut [Vec<u8>]) {
+    fn tcp_gro(
+        &mut self,
+        packet: usize,
+        meta: TcpMeta,
+        packets: &mut [Vec<u8>],
+        max_segments: usize,
+    ) {
         let Self {
             flows,
             item_pool,
@@ -340,7 +438,8 @@ impl<S: BuildHasher> TcpGroState<S> {
             // Copy one candidate out of the table, rather than cloning the
             // entire per-flow Vec on every packet.
             let item = items[item_index];
-            let mode = Self::can_coalesce(outputs, &packets[packet], meta, item, packets);
+            let mode =
+                Self::can_coalesce(outputs, &packets[packet], meta, item, packets, max_segments);
             if mode == Coalesce::No {
                 continue;
             }
@@ -378,9 +477,10 @@ impl<S: BuildHasher> TcpGroState<S> {
         meta: TcpMeta,
         item: TcpItem,
         packets: &[Vec<u8>],
+        max_segments: usize,
     ) -> Coalesce {
         let output = &outputs[item.output];
-        if output.iovec_count() >= MAX_GRO_IOVECS {
+        if output.iovec_count() >= MAX_GRO_IOVECS || output.fragments.len() + 1 >= max_segments {
             return Coalesce::No;
         }
         let head = &packets[output.head];
@@ -1422,11 +1522,11 @@ mod tests {
         ];
 
         let first = tcp_meta(&packets[0]).expect("valid TCP packet");
-        state.tcp_gro(0, first, &mut packets);
+        state.tcp_gro(0, first, &mut packets, usize::MAX);
         hashes.store(0, std::sync::atomic::Ordering::Relaxed);
 
         let second = tcp_meta(&packets[1]).expect("valid TCP packet");
-        state.tcp_gro(1, second, &mut packets);
+        state.tcp_gro(1, second, &mut packets, usize::MAX);
 
         assert_eq!(hashes.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(state.outputs()[0].fragments[0].packet, 1);
@@ -1699,6 +1799,109 @@ mod tests {
             }
             assert_eq!(split.packets(), expected.as_slice());
         }
+    }
+
+    #[test]
+    fn userspace_tcp_gro_materializes_full_packets_and_checksums() {
+        for v6 in [false, true] {
+            let mut packets = vec![
+                tcp_packet(v6, 100, 9, b"first-", TCP_ACK),
+                tcp_packet(v6, 106, 9, b"second", TCP_ACK | TCP_PSH),
+            ];
+            let mut state = TcpGroState::default();
+
+            let mut output = Vec::new();
+            coalesce_tcp_packets(&mut state, &mut packets, &mut output);
+
+            assert_eq!(packets.len(), 1);
+            let ip_len = if v6 { 40 } else { 20 };
+            let tcp_len = usize::from(packets[0][ip_len + 12] >> 4) * 4;
+            assert_eq!(&packets[0][ip_len + tcp_len..], b"first-second");
+            assert_eq!(packets[0][ip_len + 13] & TCP_PSH, TCP_PSH);
+            assert!(tcp_checksum_valid(&packets[0], ip_len, v6));
+            if v6 {
+                assert_eq!(
+                    usize::from(u16::from_be_bytes(packets[0][4..6].try_into().unwrap())),
+                    packets[0].len() - ip_len
+                );
+            } else {
+                assert_eq!(
+                    usize::from(u16::from_be_bytes(packets[0][2..4].try_into().unwrap())),
+                    packets[0].len()
+                );
+                assert_eq!(!checksum(&packets[0][..ip_len], 0), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn userspace_tcp_gro_recycles_fragment_allocation() {
+        let mut packets = vec![
+            tcp_packet(false, 100, 9, b"first-", TCP_ACK),
+            tcp_packet(false, 106, 9, b"second", TCP_ACK | TCP_PSH),
+        ];
+        let fragment_allocation = packets[1].as_ptr();
+        let mut state = TcpGroState::default();
+        let mut output = Vec::new();
+        let mut recycled = Vec::new();
+
+        coalesce_tcp_packets_bounded_recycling(
+            &mut state,
+            &mut packets,
+            &mut output,
+            usize::MAX,
+            &mut recycled,
+        );
+
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0][40..], b"first-second");
+        assert_eq!(recycled.len(), 1);
+        assert!(recycled[0].is_empty());
+        assert_eq!(recycled[0].as_ptr(), fragment_allocation);
+    }
+
+    #[test]
+    fn userspace_tcp_gro_respects_segment_bound() {
+        let mut packets = vec![
+            tcp_packet(false, 100, 9, b"aa", TCP_ACK),
+            tcp_packet(false, 102, 9, b"bb", TCP_ACK),
+            tcp_packet(false, 104, 9, b"cc", TCP_ACK),
+            tcp_packet(false, 106, 9, b"dd", TCP_ACK),
+            tcp_packet(false, 108, 9, b"ee", TCP_ACK),
+        ];
+        let mut state = TcpGroState::default();
+        let mut output = Vec::new();
+
+        coalesce_tcp_packets_bounded(&mut state, &mut packets, &mut output, 2);
+
+        let payloads = packets
+            .iter()
+            .map(|packet| &packet[40..])
+            .collect::<Vec<_>>();
+        assert_eq!(payloads, [b"aabb".as_slice(), b"ccdd", b"ee"]);
+        assert!(packets
+            .iter()
+            .all(|packet| tcp_checksum_valid(packet, 20, false)));
+    }
+
+    #[test]
+    fn userspace_tcp_gro_keeps_scalar_and_corrupt_packets_separate() {
+        let scalar = vec![
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+        ];
+        let mut packets = vec![scalar.clone()];
+        let mut state = TcpGroState::default();
+        let mut output = Vec::new();
+        coalesce_tcp_packets(&mut state, &mut packets, &mut output);
+        assert_eq!(packets, [scalar]);
+
+        let mut packets = vec![
+            tcp_packet(false, 1, 1, b"good", TCP_ACK),
+            tcp_packet(false, 5, 1, b"next", TCP_ACK),
+        ];
+        packets[1][36] ^= 1;
+        coalesce_tcp_packets(&mut state, &mut packets, &mut output);
+        assert_eq!(packets.len(), 2);
     }
 
     #[test]

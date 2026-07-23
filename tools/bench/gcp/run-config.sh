@@ -464,7 +464,7 @@ capture_rs_tun_runtime_stats() {
   local vm="$1" zone="$2" logfile="$3" quoted_log
   printf -v quoted_log '%q' "$logfile"
   ssh_cmd "$vm" "$zone" \
-    "grep -E 'rustscale: (Linux UDP GRO receive (enabled|unavailable|disabled|permanently disabled)|udp_gro_stats|.*RXQ overflow|SO_RXQ_OVFL|.*wg_handoff_stats|.*netstack_pump_stats|magicsock_udp_socket_buffers)' $quoted_log 2>/dev/null | tail -n $RUNTIME_STATS_MAX_LINES | cut -c1-$RUNTIME_STATS_MAX_COLUMNS | head -c $RUNTIME_STATS_MAX_BYTES" \
+    "grep -E 'rustscale: (Linux UDP GRO receive (enabled|unavailable|disabled|permanently disabled)|udp_gro_stats|.*RXQ overflow|SO_RXQ_OVFL|.*wg_handoff_stats|.*netstack_pump_stats|tun_write_scheduler_stats|magicsock_udp_socket_buffers)' $quoted_log 2>/dev/null | tail -n $RUNTIME_STATS_MAX_LINES | cut -c1-$RUNTIME_STATS_MAX_COLUMNS | head -c $RUNTIME_STATS_MAX_BYTES" \
     2>/dev/null | bound_rs_tun_runtime_stats || true
 }
 
@@ -1636,14 +1636,18 @@ runtime_stats_self_test() {
   # oversized fixture that exercises the line, column, and byte bounds above.
   ssh_cmd() {
     printf '%s\n' "$3" >"$log_file"
-    printf '%s\n' 'rustscale: magicsock_udp_socket_buffers requested=7340032 recv_outcome=force_failed_portable_ok send_outcome=force_failed_portable_ok actual_recv=425984 actual_send=425984'
+    printf '%s\n' \
+      'rustscale: tun_write_scheduler_stats event=periodic inline_batches=10 offloaded_batches=2 backlog_events=2 worker_outstanding=1' \
+      'rustscale: magicsock_udp_socket_buffers requested=7340032 recv_outcome=force_failed_portable_ok send_outcome=force_failed_portable_ok actual_recv=425984 actual_send=425984'
   }
   stats=$(capture_rs_tun_runtime_stats "$SVM" "$SZONE" '/tmp/rs tun.log')
-  [[ "$stats" == *'magicsock_udp_socket_buffers'* ]] || return 1
+  [[ "$stats" == *'tun_write_scheduler_stats'* \
+    && "$stats" == *'magicsock_udp_socket_buffers'* ]] || return 1
   command=$(<"$log_file")
   [[ "$command" == *"grep -E"* && "$command" == *"tail -n $RUNTIME_STATS_MAX_LINES"* \
     && "$command" == *"cut -c1-$RUNTIME_STATS_MAX_COLUMNS"* \
     && "$command" == *"head -c $RUNTIME_STATS_MAX_BYTES"* \
+    && "$command" == *'tun_write_scheduler_stats'* \
     && "$command" == *'magicsock_udp_socket_buffers'* \
     && "$command" == *'/tmp/rs\'*' tun.log'* ]] || return 1
 

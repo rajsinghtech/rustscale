@@ -302,6 +302,20 @@ so kernel-TUN throughput parity remains open. Exact evidence is retained under
 and
 [`docs/performance/gcp-20260723-131614-95f50d8842`](performance/gcp-20260723-131614-95f50d8842/).
 
+A follow-up immediate-read candidate at exact clean source
+`dabefa6b917848291f7708e2844543848616707a` attempted the same nonblocking
+fast path before Linux TUN read-readiness registration. Against the accepted
+immediate-write control above, its P1/P10/P100/P500/P1000 median changes were
+only +0.53%/+0.64%/+0.31%/+1.52%/+3.26%, and every three-sample raw range
+overlapped. Mean and p50/p95/p99 latency instead regressed
+38.83%/34.80%/33.98%/36.78%; client handoff credit waits rose from 1,024 to
+4,096 and total receive-to-publish time rose 75.4%. All 15 throughput trials,
+200/200 latency exchanges, direct-path gates, GRO/RXQ/drop counters, resource
+capture, source seals, and cleanup gates remained valid. The candidate is
+therefore rejected and its product change is not part of this branch. Exact
+evidence is retained under
+[`docs/performance/gcp-20260723-183200-da8373691c`](performance/gcp-20260723-183200-da8373691c/).
+
 Together, the same-host upload and cross-host download evidence closes and
 exceeds the measured direct embedded throughput gap from P1 through P1000 and
 the measured p50/p95/p99 latency gap. It does not close kernel-TUN throughput,

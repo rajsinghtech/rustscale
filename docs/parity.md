@@ -245,6 +245,24 @@ The control/sender artifact SHA-256 was
 This A/B validates the headroom change relative to the accepted RustScale
 path; it is not a contemporaneous native-Tailscale P10 comparison.
 
+Three subsequent first-execution diagnostics exercised the production
+direct-UDP/WireGuard/netstack P1000 retention test on Linux with the kernel
+clamping each requested 7 MiB UDP buffer to 425,984 bytes. Raising packet
+handoff/pool capacity from the accepted 256/512 detachable packets to
+1,024/1,152 at exact source
+`625aaf0029ea9e93898c2c7d24ef507a267103dc` still starved a connection and
+ended with 314 kernel receive-queue overflows. Raising only detached-decrypt
+pipeline depth from three to eight at
+`15b1a1949630a463e77eeed41b3f54fd8c742e80` similarly ended with 317
+overflows. Finally, a 2,048/2,176 capacity candidate at
+`55421822566691695da78bbd4b795acd82db4746` ended with 316 overflows even
+though its channel and pool high-water marks were only 1,939 and 2,116. Each
+candidate completed its applicable Clippy and focused package gates before the
+same 30-second P1000 assertion; none was retried. The results reject both
+capacity increases and deeper detached-decrypt concurrency: the remaining
+constrained-socket issue is kernel-drain scheduling, not bounded queue
+capacity. None of these diagnostic product changes is part of this branch.
+
 The subsequent canonical GCP run
 `gcp-20260723-064751-19775b4c5b` used two matched `n1-standard-4` VMs in
 `us-central1-a` and `us-central1-b`, clean source commit

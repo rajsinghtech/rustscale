@@ -17,7 +17,10 @@ const NETSTACK_OUTBOUND_BATCH: usize = 128;
 const NETSTACK_OUTBOUND_BULK_YIELD_BYTES: usize = 64 << 10;
 const WG_TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_FORCED_NETSTACK_RX_GRO_SEGMENTS: usize = 128;
-const NETSTACK_DETACHED_PIPELINE_DEPTH: usize = 3;
+// Keep enough independently scheduled opens in flight for eight full
+// 128-packet receive items (1,024 packets). Ordered commit still happens from
+// the front of the queue.
+const NETSTACK_DETACHED_PIPELINE_DEPTH: usize = 8;
 const NETSTACK_DETACHED_PIPELINE_MIN_PACKETS: usize = 8;
 
 struct NetstackOutboundRun {

@@ -1,0 +1,843 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'task-clock:ppp'
+# Event count (approx.): 12713566250
+#
+# Overhead  Command          Shared Object      Symbol                                                                                                                                                                                                                                                                                                                                                                                                                    
+# ........  ...............  .................  ..........................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+     9.37%  tokio-rt-worker  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+            |
+            ---_raw_spin_unlock_irqrestore
+               |          
+                --8.26%--__wake_up_sync_key
+                          |          
+                          |--5.97%--sock_def_readable
+                          |          |          
+                          |          |--2.73%--tcp_data_ready
+                          |          |          tcp_data_queue
+                          |          |          tcp_rcv_established
+                          |          |          tcp_v4_do_rcv
+                          |          |          tcp_v4_rcv
+                          |          |          ip_protocol_deliver_rcu
+                          |          |          ip_local_deliver_finish
+                          |          |          ip_local_deliver
+                          |          |          ip_rcv
+                          |          |          __netif_receive_skb_one_core
+                          |          |          __netif_receive_skb
+                          |          |          netif_receive_skb
+                          |          |          tun_rx_batched
+                          |          |          tun_get_user
+                          |          |          tun_chr_write_iter
+                          |          |          do_iter_readv_writev
+                          |          |          vfs_writev
+                          |          |          do_writev
+                          |          |          __x64_sys_writev
+                          |          |          x64_sys_call
+                          |          |          do_syscall_64
+                          |          |          entry_SYSCALL_64_after_hwframe
+                          |          |          writev
+                          |          |          
+                          |          |--2.09%--tun_net_xmit
+                          |          |          dev_hard_start_xmit
+                          |          |          sch_direct_xmit
+                          |          |          __dev_xmit_skb
+                          |          |          __dev_queue_xmit
+                          |          |          neigh_connected_output
+                          |          |          ip_finish_output2
+                          |          |          __ip_finish_output
+                          |          |          ip_finish_output
+                          |          |          ip_output
+                          |          |          ip_local_out
+                          |          |          __ip_queue_xmit
+                          |          |          ip_queue_xmit
+                          |          |          __tcp_transmit_skb
+                          |          |          __tcp_send_ack.part.0
+                          |          |          tcp_send_ack
+                          |          |          __tcp_ack_snd_check
+                          |          |          tcp_rcv_established
+                          |          |          tcp_v4_do_rcv
+                          |          |          tcp_v4_rcv
+                          |          |          ip_protocol_deliver_rcu
+                          |          |          ip_local_deliver_finish
+                          |          |          ip_local_deliver
+                          |          |          ip_rcv
+                          |          |          __netif_receive_skb_one_core
+                          |          |          __netif_receive_skb
+                          |          |          netif_receive_skb
+                          |          |          tun_rx_batched
+                          |          |          tun_get_user
+                          |          |          tun_chr_write_iter
+                          |          |          do_iter_readv_writev
+                          |          |          vfs_writev
+                          |          |          do_writev
+                          |          |          __x64_sys_writev
+                          |          |          x64_sys_call
+                          |          |          do_syscall_64
+                          |          |          entry_SYSCALL_64_after_hwframe
+                          |          |          writev
+                          |          |          
+                          |           --1.15%--__udp_enqueue_schedule_skb
+                          |                     udp_queue_rcv_one_skb
+                          |                     udp_queue_rcv_skb
+                          |                     udp_unicast_rcv_skb
+                          |                     __udp4_lib_rcv
+                          |                     udp_rcv
+                          |                     ip_protocol_deliver_rcu
+                          |                     ip_local_deliver_finish
+                          |                     ip_local_deliver
+                          |                     ip_sublist_rcv_finish
+                          |                     ip_sublist_rcv
+                          |                     ip_list_rcv
+                          |                     __netif_receive_skb_list_core
+                          |                     netif_receive_skb_list_internal
+                          |                     |          
+                          |                      --1.07%--napi_complete_done
+                          |                                virtnet_poll
+                          |                                __napi_poll
+                          |                                net_rx_action
+                          |                                handle_softirqs
+                          |                                |          
+                          |                                 --0.87%--__irq_exit_rcu
+                          |                                           irq_exit_rcu
+                          |                                           common_interrupt
+                          |                                           asm_common_interrupt
+                          |          
+                           --2.29%--sock_wfree
+                                     skb_release_head_state
+                                     |          
+                                      --2.13%--kfree_skb_reason
+                                                dev_kfree_skb_any_reason
+                                                napi_consume_skb
+                                                free_old_xmit_skbs
+                                                start_xmit
+                                                dev_hard_start_xmit
+                                                sch_direct_xmit
+                                                __dev_xmit_skb
+                                                __dev_queue_xmit
+                                                neigh_hh_output
+                                                ip_finish_output2
+                                                __ip_finish_output
+                                                ip_finish_output
+                                                ip_output
+                                                ip_send_skb
+                                                udp_send_skb
+                                                udp_sendmsg
+                                                inet_sendmsg
+                                                ____sys_sendmsg
+                                                ___sys_sendmsg
+                                                __sys_sendmmsg
+                                                __x64_sys_sendmmsg
+                                                x64_sys_call
+                                                do_syscall_64
+                                                entry_SYSCALL_64_after_hwframe
+                                                __sendmmsg
+                                                0
+
+     5.69%  tokio-rt-worker  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               |          
+                --5.18%--schedule_hrtimeout_range_clock
+                          schedule_hrtimeout_range
+                          ep_poll
+                          do_epoll_wait
+                          __x64_sys_epoll_wait
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          epoll_wait
+
+     4.35%  tokio-rt-worker  [kernel.kallsyms]  [k] do_syscall_64
+            |
+            ---do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               |          
+               |--1.11%--epoll_wait
+               |          
+               |--0.91%--writev
+               |          
+               |--0.71%--read
+               |          
+               |--0.67%--__sendmmsg
+               |          0
+               |          
+                --0.55%--recvmmsg
+                          _RINvNtNtNtCs4aYaQ4W9pNd_5tokio7runtime4task3raw4pollNCNvCskB52vjtndxm_19rustscale_magicsock16spawn_recv_tasks0INtNtCscdodAO9FK5_5alloc4sync3ArcNtNtNtNtB6_9scheduler12multi_thread6handle6HandleEEBS_
+
+     4.23%  tokio-rt-worker  rustscaled         [.] ring_core_0_17_14__chacha20_poly1305_open_avx2
+            |
+            ---ring_core_0_17_14__chacha20_poly1305_open_avx2
+
+     2.45%  tokio-rt-worker  rustscaled         [.] _RNCNvCskB52vjtndxm_19rustscale_magicsock16spawn_recv_tasks0B3_
+            |
+            ---_RNCNvCskB52vjtndxm_19rustscale_magicsock16spawn_recv_tasks0B3_
+               _RINvNtNtNtCs4aYaQ4W9pNd_5tokio7runtime4task3raw4pollNCNvCskB52vjtndxm_19rustscale_magicsock16spawn_recv_tasks0INtNtCscdodAO9FK5_5alloc4sync3ArcNtNtNtNtB6_9scheduler12multi_thread6handle6HandleEEBS_
+
+     1.86%  tokio-rt-worker  rustscaled         [.] _RNCINvMsn_CskB52vjtndxm_19rustscale_magicsockNtB8_9Magicsock21try_send_direct_batchINtNtCscdodAO9FK5_5alloc3vec3VechEE0Cs2it1l7Xp9LR_10rustscaled
+            |
+            ---_RNCINvMsn_CskB52vjtndxm_19rustscale_magicsockNtB8_9Magicsock21try_send_direct_batchINtNtCscdodAO9FK5_5alloc3vec3VechEE0Cs2it1l7Xp9LR_10rustscaled
+               |          
+                --1.07%--0x1
+
+     1.82%  tokio-rt-worker  libc.so.6          [.] epoll_wait
+            |
+            ---epoll_wait
+
+     1.38%  tokio-rt-worker  libc.so.6          [.] read
+            |
+            ---read
+
+     1.38%  tokio-rt-worker  libc.so.6          [.] writev
+            |
+            ---writev
+
+     1.34%  tokio-rt-worker  [kernel.kallsyms]  [k] rep_movs_alternative
+            |
+            ---rep_movs_alternative
+               |          
+                --0.71%--simple_copy_to_iter
+                          __skb_datagram_iter
+                          skb_copy_datagram_iter
+                          |          
+                           --0.63%--udp_recvmsg
+                                     inet_recvmsg
+
+     1.30%  tokio-rt-worker  libc.so.6          [.] recvmmsg
+            |
+            ---recvmmsg
+               _RINvNtNtNtCs4aYaQ4W9pNd_5tokio7runtime4task3raw4pollNCNvCskB52vjtndxm_19rustscale_magicsock16spawn_recv_tasks0INtNtCscdodAO9FK5_5alloc4sync3ArcNtNtNtNtB6_9scheduler12multi_thread6handle6HandleEEBS_
+
+     1.23%  tokio-rt-worker  [kernel.kallsyms]  [k] memset_orig
+            |
+            ---memset_orig
+               |          
+                --1.07%--kmalloc_reserve
+                          __alloc_skb
+                          |          
+                           --0.95%--alloc_skb_with_frags
+                                     sock_alloc_send_pskb
+                                     |          
+                                      --0.75%--tun_get_user
+                                                tun_chr_write_iter
+                                                do_iter_readv_writev
+                                                vfs_writev
+                                                do_writev
+                                                __x64_sys_writev
+                                                x64_sys_call
+                                                do_syscall_64
+                                                entry_SYSCALL_64_after_hwframe
+                                                writev
+
+     1.15%  tokio-rt-worker  rustscaled         [.] _RNvXs3_NtNtCs4NRVxsYgnAr_4core4hash3sipINtB5_6HasherNtB5_11Sip13RoundsENtB7_6Hasher5writeCskB52vjtndxm_19rustscale_magicsock
+            |
+            ---_RNvXs3_NtNtCs4NRVxsYgnAr_4core4hash3sipINtB5_6HasherNtB5_11Sip13RoundsENtB7_6Hasher5writeCskB52vjtndxm_19rustscale_magicsock
+
+     0.87%  tokio-rt-worker  [kernel.kallsyms]  [k] clear_page_erms
+            |
+            ---clear_page_erms
+               get_page_from_freelist
+               __alloc_pages
+               |          
+                --0.75%--alloc_pages_mpol
+                          alloc_pages
+                          |          
+                           --0.59%--skb_page_frag_refill
+                                     add_recvbuf_mergeable
+                                     try_fill_recv
+                                     virtnet_receive.constprop.0
+                                     virtnet_poll
+                                     __napi_poll
+                                     net_rx_action
+                                     handle_softirqs
+
+     0.79%  tokio-rt-worker  [kernel.kallsyms]  [k] established_get_first
+            |
+            ---established_get_first
+
+     0.75%  tokio-rt-worker  libc.so.6          [.] __sendmmsg
+            |
+            ---__sendmmsg
+               0
+
+     0.67%  tokio-rt-worker  [kernel.kallsyms]  [k] __raw_callee_save___pv_queued_spin_unlock
+            |
+            ---__raw_callee_save___pv_queued_spin_unlock
+
+     0.67%  tokio-rt-worker  rustscaled         [.] _RINvYNtNtNtCs2AWtUsOyxgP_3std4hash6random11RandomStateNtNtCs4NRVxsYgnAr_4core4hash11BuildHasher8hash_oneRNtNtCs5QxOmsM9ZNc_13rustscale_key4node10NodePublicECskB52vjtndxm_19rustscale_magicsock.llvm.9208442077820827434
+            |
+            ---_RINvYNtNtNtCs2AWtUsOyxgP_3std4hash6random11RandomStateNtNtCs4NRVxsYgnAr_4core4hash11BuildHasher8hash_oneRNtNtCs5QxOmsM9ZNc_13rustscale_key4node10NodePublicECskB52vjtndxm_19rustscale_magicsock.llvm.9208442077820827434
+
+     0.63%  tokio-rt-worker  [kernel.kallsyms]  [k] handle_softirqs
+            |
+            ---handle_softirqs
+               __irq_exit_rcu
+               irq_exit_rcu
+               |          
+                --0.55%--common_interrupt
+                          asm_common_interrupt
+
+     0.63%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtCs3RpZqnzq8as_9boringtun5noise12rate_limiterNtB2_11RateLimiter13verify_packet
+            |
+            ---_RNvMNtNtCs3RpZqnzq8as_9boringtun5noise12rate_limiterNtB2_11RateLimiter13verify_packet
+               _RNvMs2_NtCs3RpZqnzq8as_9boringtun5noiseNtB5_4Tunn11decapsulate
+
+     0.63%  tokio-rt-worker  rustscaled         [.] _RNvNtNtNtNtCs4aYaQ4W9pNd_5tokio7runtime9scheduler12multi_thread6worker3run
+            |
+            ---_RNvNtNtNtNtCs4aYaQ4W9pNd_5tokio7runtime9scheduler12multi_thread6worker3run
+
+     0.59%  tokio-rt-worker  [kernel.kallsyms]  [k] x64_sys_call
+            |
+            ---x64_sys_call
+
+     0.55%  tokio-rt-worker  rustscaled         [.] _RNvMs0_NtCs33CDimMVQ9n_13rustscale_tun7offloadNtB5_11TcpGroState12plan_boundedB7_
+            |
+            ---_RNvMs0_NtCs33CDimMVQ9n_13rustscale_tun7offloadNtB5_11TcpGroState12plan_boundedB7_
+
+     0.51%  tokio-rt-worker  [kernel.kallsyms]  [k] __fdget
+            |
+            ---__fdget
+
+     0.51%  tokio-rt-worker  [vdso]             [.] 0x0000000000000b03
+            |
+            ---0x7fffef38fb03
+               clock_gettime
+
+     0.51%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0a3b
+            |
+            ---0x7a33a19a0a3b
+
+     0.51%  tokio-rt-worker  rustscaled         [.] _RNvMs6_NtCskB52vjtndxm_19rustscale_magicsock9udp_batchNtB5_12ReceiveBatch15detach_datagram
+            |
+            ---_RNvMs6_NtCskB52vjtndxm_19rustscale_magicsock9udp_batchNtB5_12ReceiveBatch15detach_datagram
+
+     0.51%  tokio-rt-worker  rustscaled         [.] _RNvMse_CskB52vjtndxm_19rustscale_magicsockNtB5_17PeerAuthorization10generation
+            |
+            ---_RNvMse_CskB52vjtndxm_19rustscale_magicsockNtB5_17PeerAuthorization10generation
+
+     0.47%  tokio-rt-worker  [kernel.kallsyms]  [k] check_heap_object
+     0.43%  tokio-rt-worker  [kernel.kallsyms]  [k] __virt_addr_valid
+     0.43%  tokio-rt-worker  [kernel.kallsyms]  [k] kmem_cache_alloc_node
+     0.43%  tokio-rt-worker  rustscaled         [.] ring_core_0_17_14__chacha20_poly1305_seal_avx2
+     0.40%  tokio-rt-worker  [kernel.kallsyms]  [k] ___slab_alloc
+     0.40%  tokio-rt-worker  [kernel.kallsyms]  [k] __tcp_transmit_skb
+     0.40%  tokio-rt-worker  [kernel.kallsyms]  [k] fib_table_lookup
+     0.40%  tokio-rt-worker  [kernel.kallsyms]  [k] virtqueue_get_buf_ctx_split
+     0.40%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a110a
+     0.40%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtCs4aYaQ4W9pNd_5tokio4sync15batch_semaphoreNtB2_9Semaphore18add_permits_locked.llvm.15767208057458742568
+     0.40%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtNtCs4aYaQ4W9pNd_5tokio7runtime2io6driverNtB2_6Driver4turn
+     0.36%  tokio-rt-worker  [kernel.kallsyms]  [k] _raw_spin_lock
+     0.36%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_check_space
+     0.36%  tokio-rt-worker  [kernel.kallsyms]  [k] tun_put_user.constprop.0
+     0.36%  tokio-rt-worker  [kernel.kallsyms]  [k] udp_recvmsg
+     0.36%  tokio-rt-worker  rustscaled         [.] _RNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump37retain_current_delivery_authorization
+     0.36%  tokio-rt-worker  rustscaled         [.] _RNvXs1_NtNtCs4aYaQ4W9pNd_5tokio4sync15batch_semaphoreNtB5_7AcquireNtNtNtCs4NRVxsYgnAr_4core6future6future6Future4poll
+     0.36%  tokio-rt-worker  rustscaled         [.] _RNvXs2_NtNtCs2AWtUsOyxgP_3std4hash6randomNtB5_13DefaultHasherNtNtCs4NRVxsYgnAr_4core4hash6Hasher5write
+     0.32%  tokio-rt-worker  [kernel.kallsyms]  [k] __build_skb_around
+     0.32%  tokio-rt-worker  [kernel.kallsyms]  [k] __fdget_pos
+     0.32%  tokio-rt-worker  [kernel.kallsyms]  [k] aa_inet_msg_perm
+     0.32%  tokio-rt-worker  [kernel.kallsyms]  [k] ep_poll
+     0.32%  tokio-rt-worker  [kernel.kallsyms]  [k] udp_sendmsg
+     0.32%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a3a28
+     0.32%  tokio-rt-worker  rustscaled         [.] _RNCNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump25process_tun_inbound_batch0Cs2it1l7Xp9LR_10rustscaled
+     0.32%  tokio-rt-worker  rustscaled         [.] _RNvXs5_NtNtNtCs4aYaQ4W9pNd_5tokio7runtime2io12scheduled_ioNtB5_9ReadinessNtNtNtCs4NRVxsYgnAr_4core6future6future6Future4poll
+     0.28%  tokio-rt-worker  [kernel.kallsyms]  [k] __inet_lookup_established
+     0.28%  tokio-rt-worker  [kernel.kallsyms]  [k] kfree
+     0.28%  tokio-rt-worker  [kernel.kallsyms]  [k] sock_def_readable
+     0.28%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_v4_rcv
+     0.28%  tokio-rt-worker  [kernel.kallsyms]  [k] vfs_writev
+     0.28%  tokio-rt-worker  libc.so.6          [.] malloc
+     0.28%  tokio-rt-worker  rustscaled         [.] _RNCNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump12run_tun_pump0Cs2it1l7Xp9LR_10rustscaled
+     0.28%  tokio-rt-worker  rustscaled         [.] _RNCNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump25collect_tun_inbound_batch0Cs2it1l7Xp9LR_10rustscaled
+     0.28%  tokio-rt-worker  rustscaled         [.] _RNvMs1_CsdC8kz1ZFVqn_12rustscale_wgNtB5_6WgTunn16decapsulate_into
+     0.28%  tokio-rt-worker  rustscaled         [.] _RNvXs_NtCskB52vjtndxm_19rustscale_magicsock9udp_batchNtB4_12PooledPacketNtNtNtCs4NRVxsYgnAr_4core3ops4drop4Drop4drop
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] ____sys_recvmsg
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] __ip_append_data
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] __slab_free
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] apparmor_file_permission
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] kmem_cache_free
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] rcu_all_qs
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] select_estimate_accuracy
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] sock_wfree
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] start_xmit
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] syscall_exit_to_user_mode
+     0.24%  tokio-rt-worker  [kernel.kallsyms]  [k] udp4_lib_lookup2
+     0.24%  tokio-rt-worker  libc.so.6          [.] syscall
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNCINvMsn_CskB52vjtndxm_19rustscale_magicsockNtB8_9Magicsock10send_batchINtNtCscdodAO9FK5_5alloc3vec3VechEE0Cs2it1l7Xp9LR_10rustscaled
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNCNvMs1_NtNtNtCs4aYaQ4W9pNd_5tokio4sync4mpsc7boundedINtB7_6SenderNtCskB52vjtndxm_19rustscale_magicsock14WgReceiveBatchE4send0B14_
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNCNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump30send_tun_batch_maybe_pipelined0Cs2it1l7Xp9LR_10rustscaled
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNCNvXsc_NtCs33CDimMVQ9n_13rustscale_tun5linuxNtB7_9TunDeviceNtB9_3Tun10read_batch0B9_
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNvMs2_NtCs3RpZqnzq8as_9boringtun5noiseNtB5_4Tunn11decapsulate
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNvMs2_NtCs3RpZqnzq8as_9boringtun5noiseNtB5_4Tunn22handle_verified_packet
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNvMs5_Cs2aDC4wop9qv_16rustscale_packetNtB5_6Parsed6decode
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNvMsn_CskB52vjtndxm_19rustscale_magicsockNtB5_9Magicsock31note_authenticated_wg_transport
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNvNtCs33CDimMVQ9n_13rustscale_tun7offload19checksum_accumulate
+     0.24%  tokio-rt-worker  rustscaled         [.] _RNvXs3_NtNtCs4NRVxsYgnAr_4core4hash3sipINtB5_6HasherNtB5_11Sip13RoundsENtB7_6Hasher5writeCs8eykVRKUS3a_15rustscale_tsnet
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] __check_heap_object
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] __cond_resched
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] __fib_validate_source
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] __get_user_8
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] __put_user_4
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] __raw_spin_unlock_irq
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] do_writev
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] fib_get_table
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] fib_rules_lookup
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_output
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] mod_memcg_state
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] net_rx_action
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] read_tsc
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] security_file_permission
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] syscall_exit_to_user_mode_prepare
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_rcv_established
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] tun_get_user
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] udp4_gro_receive
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] vfs_read
+     0.20%  tokio-rt-worker  [kernel.kallsyms]  [k] virtqueue_kick_prepare
+     0.20%  tokio-rt-worker  libc.so.6          [.] clock_gettime
+     0.20%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0891
+     0.20%  tokio-rt-worker  rustscaled         [.] _RNCNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump22prepare_outbound_batch0Cs2it1l7Xp9LR_10rustscaled
+     0.20%  tokio-rt-worker  rustscaled         [.] _RNCNvXsc_NtCs33CDimMVQ9n_13rustscale_tun5linuxNtB7_9TunDeviceNtB9_3Tun11write_batch0B9_
+     0.20%  tokio-rt-worker  rustscaled         [.] _RNvMNtCs8eykVRKUS3a_15rustscale_tsnet7routingNtB2_10RouteTable15lookup_explicit.llvm.13880304349659014424
+     0.20%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtCs4aYaQ4W9pNd_5tokio7runtime4timeNtB2_6Driver13park_internal
+     0.20%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtNtCs4aYaQ4W9pNd_5tokio7runtime4time5wheelNtB2_5Wheel15next_expiration
+     0.20%  tokio-rt-worker  rustscaled         [.] _RNvMs_NtNtNtNtCs4aYaQ4W9pNd_5tokio7runtime9scheduler12multi_thread6workerNtB4_7Context13park_internal
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] ____sys_sendmsg
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] __fib_lookup
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] __fsnotify_parent
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] __kmalloc_node_track_caller
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] __netif_receive_skb_core.constprop.0
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] __skb_flow_dissect
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] copy_msghdr_from_user
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] fib4_rule_match
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] futex_wake
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] inet_gro_receive
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_skb_dst_mtu
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] receive_buf
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] sk_filter_trim_cap
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_release_data
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] slab_update_freelist.constprop.0.isra.0
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] sock_alloc_send_pskb
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_data_queue
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] udp4_hwcsum
+     0.16%  tokio-rt-worker  [kernel.kallsyms]  [k] virtnet_poll
+     0.16%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a181b
+     0.16%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a09f1
+     0.16%  tokio-rt-worker  rustscaled         [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtCskB52vjtndxm_19rustscale_magicsock10WgDatagramECs2it1l7Xp9LR_10rustscaled
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNCNvMs0_NtNtNtCs4aYaQ4W9pNd_5tokio7runtime2io12registrationNtB7_12Registration9readiness0Cs2it1l7Xp9LR_10rustscaled
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNCNvMsn_CskB52vjtndxm_19rustscale_magicsockNtB7_9Magicsock28authorization_delivery_guard0Cs2it1l7Xp9LR_10rustscaled
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvMCsamQonwgoHEc_22rustscale_controlknobsNtB2_12ControlKnobs8get_bool
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvMCskB52vjtndxm_19rustscale_magicsockNtB2_21ConnectionCounterHook6record
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvMs0_NtNtCs3RpZqnzq8as_9boringtun5noise7sessionNtB5_7Session22receiving_counter_mark
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvMs_CsdC8kz1ZFVqn_12rustscale_wgNtB4_16WgPlaintextBatch9push_copy
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvMs_NtNtCs4aYaQ4W9pNd_5tokio7runtime4timeNtNtB4_6handle6Handle15process_at_time
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvMs_NtNtNtCs4aYaQ4W9pNd_5tokio7runtime2io12scheduled_ioNtB4_11ScheduledIo4wake.llvm.15767208057458742568
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvMsf_NtNtCs4aYaQ4W9pNd_5tokio4sync6notifyNtB5_15NotifiedProject13poll_notified.llvm.15767208057458742568
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump16build_batch_runs
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvNtCskB52vjtndxm_19rustscale_magicsock9udp_batch13parse_control
+     0.16%  tokio-rt-worker  rustscaled         [.] _RNvXsz_NtNtCs4NRVxsYgnAr_4core3str4iterNtB5_15SplitWhitespaceNtNtNtNtB9_4iter6traits8iterator8Iterator4next
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __alloc_skb
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __check_object_size
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __copy_msghdr
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __ip_make_skb
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __ip_select_ident
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __local_bh_enable_ip
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __put_user_nocheck_4
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __pv_queued_spin_lock_slowpath
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __raw_spin_unlock_irq
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __skb_recv_udp
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __tcp_send_ack.part.0
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __udp4_lib_lookup
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] __xfrm_policy_check2.constprop.0
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] build_detached_freelist
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] copy_iovec_from_user
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] dev_get_by_index_rcu
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] dev_gro_receive
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] dev_hard_start_xmit
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] dev_kfree_skb_any_reason
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] do_epoll_wait
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] do_recvmmsg
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] iov_iter_advance
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_finish_output
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_rcv_core
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] kfree_skbmem
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] kmem_cache_alloc
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] netif_skb_features
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] page_to_skb
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] passthru_features_check
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] refill_stock
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] schedule
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] security_socket_recvmsg
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_clone_tx_timestamp
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_copy_datagram_iter
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_free_head
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_put
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_set_owner_w
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_ack
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_established_options
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_queue_rcv
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] tun_net_xmit
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] udp_send_skb
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] validate_xmit_skb
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] virtqueue_add_split
+     0.12%  tokio-rt-worker  [kernel.kallsyms]  [k] xmit_skb
+     0.12%  tokio-rt-worker  libc.so.6          [.] __lll_lock_wake_private
+     0.12%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a110c
+     0.12%  tokio-rt-worker  rustscaled         [.] _RINvNtNtNtCs4aYaQ4W9pNd_5tokio7runtime4task3raw4pollNCNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump12run_tun_pump0INtNtCscdodAO9FK5_5alloc4sync3ArcNtNtNtNtB6_9scheduler12multi_thread6handle6HandleEECs2it1l7Xp9LR_10rustscaled
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNCNvMNtNtNtCs4aYaQ4W9pNd_5tokio4sync4mpsc7boundedINtB4_8ReceiverNtCskB52vjtndxm_19rustscale_magicsock14WgReceiveBatchE4recv0Cs2it1l7Xp9LR_10rustscaled
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNCNvMsa_NtNtNtCs4aYaQ4W9pNd_5tokio4sync4mpsc4chanINtB7_2RxNtCskB52vjtndxm_19rustscale_magicsock14WgReceiveBatchNtNtB9_7bounded9SemaphoreE8try_recv0Cs8eykVRKUS3a_15rustscale_tsnet.llvm.13880304349659014424
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNCNvMsc_NtNtCs4aYaQ4W9pNd_5tokio4sync6rwlockINtB7_6RwLockINtNtCs4NRVxsYgnAr_4core6option6OptionNtNtCsiQSK6TAeHex_17rustscale_tailcfg3dns9DNSConfigEE4read0Cs2it1l7Xp9LR_10rustscaled
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNCNvMsc_NtNtCs4aYaQ4W9pNd_5tokio4sync6rwlockINtB7_6RwLockuE4read0Cs2it1l7Xp9LR_10rustscaled
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNvMCsjveOAXXf07V_15rustscale_ipsetNtB2_14ContainsIpFunc8contains
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtNtNtCs2AWtUsOyxgP_3std3sys4sync6rwlock5futexNtB2_6RwLock15write_contended
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNvMs0_NtNtNtCs4aYaQ4W9pNd_5tokio4sync4task12atomic_wakerNtB5_11AtomicWaker15register_by_ref
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNvMs_NtNtCsd5ZTa9qooue_4ring4aead9algorithmNtB4_9Algorithm11open_within
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNvNtCs33CDimMVQ9n_13rustscale_tun5linux16gro_write_iovecs
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNvNtCs33CDimMVQ9n_13rustscale_tun7offload11copy_single
+     0.12%  tokio-rt-worker  rustscaled         [.] _RNvXs3_NtNtCs4NRVxsYgnAr_4core4hash3sipINtB5_6HasherNtB5_11Sip13RoundsENtB7_6Hasher5writeCsamQonwgoHEc_22rustscale_controlknobs
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ___sys_sendmsg
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __alloc_pages
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __build_skb
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __check_object_size.part.0
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __d_lookup_rcu
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __dev_xmit_skb
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __get_xps_queue_idx
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __import_iovec
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __inet_lookup_skb
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __ip_queue_xmit
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __napi_alloc_skb
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __skb_datagram_iter
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __x64_sys_epoll_wait
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __x64_sys_recvmmsg
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] __x64_sys_sendmmsg
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] _copy_from_iter
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] _copy_from_user
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] _copy_to_iter
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] add_recvbuf_mergeable
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] apparmor_socket_recvmsg
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] apparmor_socket_sock_rcv_skb
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] check_stack_object
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] consume_stock
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] csum_partial
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] fib_lookup_good_nhc
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] format_decode
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] free_old_xmit_skbs
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] free_unref_page_prepare
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] get_pfnblock_flags_mask
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] get_pid_task
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] hrtimer_start_range_ns
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] import_ubuf
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] inet_recvmsg
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] inet_sendmsg
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_finish_output2
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_local_deliver_finish
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_protocol_deliver_rcu
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_queue_xmit
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_rcv
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_rcv_finish_core.constprop.0
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_send_check
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ipv4_mtu
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] is_vmalloc_addr
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] kmalloc_reserve
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] kmalloc_size_roundup
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] ktime_get_with_offset
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] link_path_walk.part.0.constprop.0
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] memcpy_orig
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] move_addr_to_user
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] netdev_pick_tx
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] netif_receive_skb
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] number
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] page_counter_try_charge
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] receive_mergeable
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] rseq_get_rseq_cs
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] rw_verify_area
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] sch_direct_xmit
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] should_failslab.constprop.0
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_push
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_release_head_state
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_try_coalesce
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_try_rmem_schedule
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_v4_do_rcv
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] tun_chr_write_iter
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] tun_rx_batched
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] tun_sock_write_space
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] udp4_lib_lookup_skb
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] udp_gro_receive_segment
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] udp_poll
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] udp_rmem_release
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] validate_xmit_xfrm
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] virtio_net_hdr_to_skb.constprop.0
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] virtnet_receive.constprop.0
+     0.08%  tokio-rt-worker  [kernel.kallsyms]  [k] virtqueue_enable_cb_delayed
+     0.08%  tokio-rt-worker  libc.so.6          [.] cfree
+     0.08%  tokio-rt-worker  libc.so.6          [.] readlink
+     0.08%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a1846
+     0.08%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a3de8
+     0.08%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a3fd3
+     0.08%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0a58
+     0.08%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a1040
+     0.08%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a1048
+     0.08%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a112a
+     0.08%  tokio-rt-worker  rustscaled         [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNCNvMsq_CskB52vjtndxm_19rustscale_magicsockNtBJ_5Inner23prepare_linux_udp_batch0EBJ_
+     0.08%  tokio-rt-worker  rustscaled         [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueSNtCskB52vjtndxm_19rustscale_magicsock10WgDatagramEBE_
+     0.08%  tokio-rt-worker  rustscaled         [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueTNCNvMs8_NtNtCs4aYaQ4W9pNd_5tokio4sync5mutexINtBK_5MutexNtCsdC8kz1ZFVqn_12rustscale_wg6WgTunnE4lock0NCNvMNtCs8eykVRKUS3a_15rustscale_tsnet4utilNtB2i_11CancelToken9cancelled0EECs2it1l7Xp9LR_10rustscaled
+     0.08%  tokio-rt-worker  rustscaled         [.] _RINvYNtNtNtCs2AWtUsOyxgP_3std4hash6random11RandomStateNtNtCs4NRVxsYgnAr_4core4hash11BuildHasher8hash_oneRNtNtCs33CDimMVQ9n_13rustscale_tun7offload10TcpFlowKeyEB1J_
+     0.08%  tokio-rt-worker  rustscaled         [.] _RINvYNtNtNtCs2AWtUsOyxgP_3std4hash6random11RandomStateNtNtCs4NRVxsYgnAr_4core4hash11BuildHasher8hash_oneRNtNtNtBU_3net11socket_addr10SocketAddrECskB52vjtndxm_19rustscale_magicsock
+     0.08%  tokio-rt-worker  rustscaled         [.] _RINvYNtNtNtCs2AWtUsOyxgP_3std4hash6random11RandomStateNtNtCs4NRVxsYgnAr_4core4hash11BuildHasher8hash_oneRNtNtNtBU_3net7ip_addr6IpAddrECs8eykVRKUS3a_15rustscale_tsnet
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNCNvMNtNtCs4aYaQ4W9pNd_5tokio2io8async_fdINtB4_7AsyncFdNtNtNtNtCs2AWtUsOyxgP_3std2os2fd5owned7OwnedFdE5ready0Cs33CDimMVQ9n_13rustscale_tun
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNCNvMs0_NtNtNtCs4aYaQ4W9pNd_5tokio7runtime2io12registrationNtB7_12Registration9readiness0CskB52vjtndxm_19rustscale_magicsock
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNCNvMs8_NtNtCs4aYaQ4W9pNd_5tokio4sync5mutexINtB7_5MutexNtCsdC8kz1ZFVqn_12rustscale_wg6WgTunnE4lock0Cs2it1l7Xp9LR_10rustscaled
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNCNvMs8_NtNtCs4aYaQ4W9pNd_5tokio4sync5mutexINtB7_5MutexNtCsdC8kz1ZFVqn_12rustscale_wg6WgTunnE7acquire0Cs2it1l7Xp9LR_10rustscaled
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvCsghYnP8CdqTC_13rustscale_art11common_bits.llvm.17982460967781238138
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtNtNtCs2AWtUsOyxgP_3std3sys3pal4unix4timeNtB2_8Timespec12sub_timespec.llvm.1650871782393469239
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtNtNtCs2AWtUsOyxgP_3std3sys3pal4unix4timeNtB2_8Timespec3now.llvm.1650871782393469239
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMs0_NtCs33CDimMVQ9n_13rustscale_tun7offloadNtB5_11TcpGroState5resetB7_
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMs0_NtNtNtCs2AWtUsOyxgP_3std4sync4mpmc5wakerNtB5_9SyncWaker6notify
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMs1_CsdC8kz1ZFVqn_12rustscale_wgNtB5_6WgTunn22encapsulate_batch_into
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMs1_NtNtCs4aYaQ4W9pNd_5tokio7process3impNtB5_17GlobalOrphanQueue12reap_orphans
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMs2_NtNtNtNtCs4aYaQ4W9pNd_5tokio7runtime9scheduler12multi_thread6workerNtNtB7_6handle6Handle19notify_parked_local
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMs3_NtCskB52vjtndxm_19rustscale_magicsock8endpointNtB5_8Endpoint19record_transport_at.llvm.9208442077820827434
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMs6_NtCskB52vjtndxm_19rustscale_magicsock9udp_batchNtB5_12ReceiveBatch8datagram
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMs_NtCsb6el3jIyfJN_11parking_lot7condvarNtB4_7Condvar19wait_until_internal
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMsg_CskB52vjtndxm_19rustscale_magicsockNtB5_14WgReceiveBatch14into_datagrams
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvMsq_CskB52vjtndxm_19rustscale_magicsockNtB5_5Inner10udp_socket
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvNtNtNtCs4aYaQ4W9pNd_5tokio7runtime4task5waker11wake_by_val
+     0.08%  tokio-rt-worker  rustscaled         [.] _RNvXs3_NtNtCs4NRVxsYgnAr_4core4hash3sipINtB5_6HasherNtB5_11Sip13RoundsENtB7_6Hasher5writeCs2it1l7Xp9LR_10rustscaled
+     0.08%  tokio-rt-worker  rustscaled         [.] ring_core_0_17_14__chacha20_poly1305_seal_sse41
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] ___sys_recvmsg
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __dev_queue_xmit
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __folio_put
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __ip_finish_output
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __ip_local_out
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __legitimize_mnt
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __mod_timer
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __napi_build_skb
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __netif_receive_skb_one_core
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __next_zones_zonelist
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __rseq_handle_notify_resume
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __sk_dst_check
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __sk_mem_raise_allocated
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __sk_mem_reduce_allocated
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __skb_try_recv_from_queue
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __sock_recv_cmsgs
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __tcp_ack_snd_check
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __udp4_lib_rcv
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __udp_enqueue_schedule_skb
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __x64_sys_read
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __x64_sys_writev
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __xfrm_policy_check2.constprop.0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] __zone_watermark_ok
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] _copy_to_user
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] _raw_spin_lock_bh
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] aa_file_perm
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] alloc_pages_mpol
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] alloc_skb_with_frags
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] apparmor_socket_sendmsg
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] begin_current_label_crit_section
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] bpf_skops_write_hdr_opt.isra.0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] check_sq_full_and_disable.isra.0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] datagram_poll
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] dequeue_skb
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] detach_buf_split
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] fib4_rule_action
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] follow_pmd_mask.isra.0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] fq_codel_dequeue
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] fq_codel_enqueue
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] free_tail_page_prepare
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] futex_hash
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] futex_q_lock
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] get_futex_key
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] gro_pull_from_frag0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] inet_lookup_reuseport
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] iovec_from_user.part.0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_generic_getfrag
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] ip_route_output_key_hash_rcu
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] ipv4_pktinfo_prepare
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] irqentry_exit_to_user_mode
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] its_return_thunk
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] kfree_skb_reason
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] ktime_get
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] ktime_get_ts64
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] lockref_get
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] lookup_fast
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] mntget
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] mutex_lock
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] napi_complete_done
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] napi_consume_skb
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] napi_gro_complete.constprop.0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] neigh_connected_output
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] neigh_hh_output
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] netdev_core_pick_tx
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] netif_receive_skb_list_internal
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] nf_hook_slow
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] page_frag_free
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] pid_delete_dentry
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] pid_revalidate
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] prepend_path
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] proc_fd_link
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] proc_fill_cache
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] proc_pid_permission
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] put_cmsg
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] putname
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] raw_local_deliver
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] raw_v4_input
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] rb_first
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] rseq_update_cpu_node_id
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] schedule_debug.constprop.0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] security_sk_classify_flow
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] security_socket_sendmsg
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] seq_pad
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] set_root
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_copy_datagram_from_iter
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_csum_hwoffload_help
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_gro_receive
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_network_protocol
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_partial_csum_set
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_to_sgvec
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] skb_try_coalesce
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] sock_i_ino
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] sock_recvmsg
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] sockfd_lookup_light
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] task_lookup_next_fdget_rcu
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_add_backlog
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_data_ready
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_do_parse_auth_options
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_grow_window
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_in_ack_event
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_measure_rcv_mss
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_ofo_queue
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_options_write
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_process_tlp_ack
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_seek_last_pos
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_v4_fill_cb
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tcp_v4_send_check
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] tun_do_read
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] udp4_csum_init
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] udp4_gro_complete
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] udp_queue_rcv_skb
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] update_blocked_averages
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] validate_xmit_skb_list
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] virtio_net_hdr_to_skb.constprop.0
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] virtnet_rq_get_buf
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] virtqueue_get_buf
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] virtqueue_get_buf_ctx
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] virtqueue_poll
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] vring_map_one_sg
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] vsnprintf
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] wake_up_q
+     0.04%  tokio-rt-worker  [kernel.kallsyms]  [k] walk_component
+     0.04%  tokio-rt-worker  [vdso]             [.] 0x0000000000000ab0
+     0.04%  tokio-rt-worker  [vdso]             [.] 0x0000000000000ab1
+     0.04%  tokio-rt-worker  [vdso]             [.] 0x0000000000000ab9
+     0.04%  tokio-rt-worker  [vdso]             [.] 0x0000000000000ada
+     0.04%  tokio-rt-worker  [vdso]             [.] 0x0000000000000ae9
+     0.04%  tokio-rt-worker  [vdso]             [.] 0x0000000000000b05
+     0.04%  tokio-rt-worker  [vdso]             [.] 0x0000000000000b2b
+     0.04%  tokio-rt-worker  [vdso]             [.] 0x0000000000000b3d
+     0.04%  tokio-rt-worker  [vdso]             [.] 0x0000000000000b75
+     0.04%  tokio-rt-worker  libc.so.6          [.] __close_nocancel
+     0.04%  tokio-rt-worker  libc.so.6          [.] __errno_location
+     0.04%  tokio-rt-worker  libc.so.6          [.] __open64_nocancel
+     0.04%  tokio-rt-worker  libc.so.6          [.] fstatat64
+     0.04%  tokio-rt-worker  libc.so.6          [.] realloc
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x0000000000090a1b
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x0000000000090a60
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x0000000000090a69
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x0000000000090a72
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a1729
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a172e
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a1749
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a1824
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a18e0
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a18f2
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a26a0
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a26ab
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a273b
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a273f
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a28ca
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a28f7
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a290d
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a2a0e
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a2a21
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a3a22
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a3ee7
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a3f3d
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a3f9b
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a3fd7
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a41af
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a45a0
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a48b4
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000000a4b08
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x0000000000199e39
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x000000000019d8ad
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a08b0
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0940
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0947
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0a29
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0a2e
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0a33
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0a4a
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0aaa
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0abc
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0ac6
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0aca
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a0adc
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a108d
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a1150
+     0.04%  tokio-rt-worker  libc.so.6          [.] 0x00000000001a1158
+     0.04%  tokio-rt-worker  libm.so.6          [.] pow
+     0.04%  tokio-rt-worker  libm.so.6          [.] 0x0000000000076905
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvMNtCs4NRVxsYgnAr_4core3stre12trim_matchesNvMNtNtB5_4char7methodsc13is_whitespaceECsaIkgWKk2k5g_18rustscale_portlist
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvMs1_NtCsgQfI1edjipl_9hashbrown3mapINtB6_7HashMapNtNtNtCs4NRVxsYgnAr_4core3net7ip_addr6IpAddrNtNtCs5QxOmsM9ZNc_13rustscale_key4node10NodePublicNtNtNtCs2AWtUsOyxgP_3std4hash6random11RandomStateE3getBO_ECs8eykVRKUS3a_15rustscale_tsnet.llvm.13880304349659014424
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvMs2_NtNtNtCs2AWtUsOyxgP_3std11collections4hash3mapINtB6_7HashMapNtNtCs5QxOmsM9ZNc_13rustscale_key4node10NodePublicNtNtCskB52vjtndxm_19rustscale_magicsock8endpoint8EndpointE7get_mutB14_ECs2it1l7Xp9LR_10rustscaled
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueINtNtNtNtCs2AWtUsOyxgP_3std4sync6poison6rwlock16RwLockWriteGuardINtNtB4_6option6OptionNtNtCskB52vjtndxm_19rustscale_magicsock13relay_manager18RelayManagerHandleEEECs2it1l7Xp9LR_10rustscaled
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNCNvMs2_NtCs33CDimMVQ9n_13rustscale_tun5linuxNtBJ_9TunDevice15read_vnet_batch0EBL_
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNCNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump14send_tun_batch0ECs2it1l7Xp9LR_10rustscaled
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNCNvNtCs8eykVRKUS3a_15rustscale_tsnet8tun_pump30send_tun_batch_maybe_pipelined0ECs2it1l7Xp9LR_10rustscaled
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueTNCNvMsc_NtNtCs4aYaQ4W9pNd_5tokio4sync6rwlockINtBK_6RwLockINtNtNtNtCs2AWtUsOyxgP_3std11collections4hash3map7HashMapNtNtCs5QxOmsM9ZNc_13rustscale_key4node10NodePublicINtNtCscdodAO9FK5_5alloc4sync3ArcINtNtBM_5mutex5MutexNtCsdC8kz1ZFVqn_12rustscale_wg6WgTunnEEEE4read0NCNvMNtCs8eykVRKUS3a_15rustscale_tsnet4utilNtB4X_11CancelToken9cancelled0EECs2it1l7Xp9LR_10rustscaled
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvNtNtNtCs4aYaQ4W9pNd_5tokio7runtime4task3raw4pollNCNvCskB52vjtndxm_19rustscale_magicsock16spawn_recv_tasks0INtNtCscdodAO9FK5_5alloc4sync3ArcNtNtNtNtB6_9scheduler12multi_thread6handle6HandleEEBS_
+     0.04%  tokio-rt-worker  rustscaled         [.] _RINvYNtNtNtCs2AWtUsOyxgP_3std4hash6random11RandomStateNtNtCs4NRVxsYgnAr_4core4hash11BuildHasher8hash_oneRAhj20_ECs8eykVRKUS3a_15rustscale_tsnet
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNCNCNvMs9_NtCs8eykVRKUS3a_15rustscale_tsnet9lifecycleNtBb_6Server6up_tun0s4_0Cs2it1l7Xp9LR_10rustscaled
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNCNvMNtNtCs4aYaQ4W9pNd_5tokio2io8async_fdINtB4_7AsyncFdNtNtNtNtCs2AWtUsOyxgP_3std2os2fd5owned7OwnedFdE8writable0Cs33CDimMVQ9n_13rustscale_tun
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNCNvMs2_NtNtNtNtCs4aYaQ4W9pNd_5tokio7runtime9scheduler12multi_thread6workerNtNtB9_6handle6Handle13schedule_task0Bf_.llvm.15767208057458742568
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNCNvMsc_NtNtCs4aYaQ4W9pNd_5tokio4sync6rwlockINtB7_6RwLockuE10read_owned0CskB52vjtndxm_19rustscale_magicsock
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvCskB52vjtndxm_19rustscale_magicsock20advance_direct_batch
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMNtCs2AWtUsOyxgP_3std4timeNtB2_7Instant22checked_duration_since
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtCs4aYaQ4W9pNd_5tokio4sync9semaphoreNtB2_9Semaphore22try_acquire_many_owned
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtCs4aYaQ4W9pNd_5tokio7runtime6driverNtB2_6Driver12park_timeout
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtCs4aYaQ4W9pNd_5tokio7runtime6driverNtB2_6Driver4park
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMNtNtCs4aYaQ4W9pNd_5tokio7runtime6signalNtB2_6Driver7process
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs0_CsdC8kz1ZFVqn_12rustscale_wgNtB5_15WgDatagramBatch9push_copy
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs0_NtNtNtCs4aYaQ4W9pNd_5tokio4sync4mpsc4listINtB5_2RxNtCskB52vjtndxm_19rustscale_magicsock14WgReceiveBatchE3popCs2it1l7Xp9LR_10rustscaled
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs0_NtNtNtCs4aYaQ4W9pNd_5tokio4sync4mpsc4listINtB5_2RxNtCskB52vjtndxm_19rustscale_magicsock14WgReceiveBatchE7try_popCs8eykVRKUS3a_15rustscale_tsnet
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs0_NtNtNtNtCs4aYaQ4W9pNd_5tokio7runtime9scheduler12multi_thread4parkNtB5_8Unparker6unpark
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs2_Cs3hOTTyWkhOV_16rustscale_filterNtB5_6Filter13check_in_info
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs3_NtCskB52vjtndxm_19rustscale_magicsock8endpointNtB5_8Endpoint16derp_send_region
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs4_NtCscdodAO9FK5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCskB52vjtndxm_19rustscale_magicsock
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs9_NtNtNtCs2AWtUsOyxgP_3std4sync6poison6rwlockINtB5_6RwLockINtNtNtNtBb_11collections4hash3map7HashMapNtNtCs5QxOmsM9ZNc_13rustscale_key4node10NodePublicNtNtCskB52vjtndxm_19rustscale_magicsock8endpoint8EndpointEE5writeCs2it1l7Xp9LR_10rustscaled
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs_NtCsb6el3jIyfJN_11parking_lot7condvarNtB4_7Condvar15notify_one_slow
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMs_NtNtNtNtCs4aYaQ4W9pNd_5tokio7runtime9scheduler12multi_thread6workerNtB4_7Context8run_task
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMsf_NtNtCs4aYaQ4W9pNd_5tokio4sync6notifyNtB5_15NotifiedProject13drop_notified.llvm.15767208057458742568
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvMsn_NtCscdodAO9FK5_5alloc4syncINtB5_3ArcNtCskB52vjtndxm_19rustscale_magicsock24PoolInventoryReservationE9drop_slowBH_
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvNtCs33CDimMVQ9n_13rustscale_tun7offload18tcp_checksum_valid
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvNtCs8eykVRKUS3a_15rustscale_tsnet7capture10log_packet
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvNtNtCs2AWtUsOyxgP_3std3sys2fs9read_link
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvNtNtCsd5ZTa9qooue_4ring4aead9algorithm22chacha20_poly1305_open
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvNtNtCsd5ZTa9qooue_4ring4aead9algorithm22chacha20_poly1305_seal
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvNtNtNtCs4aYaQ4W9pNd_5tokio7runtime4task5waker11clone_waker
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvXs3_NtNtCs4aYaQ4W9pNd_5tokio4sync15batch_semaphoreNtB5_7AcquireNtNtNtCs4NRVxsYgnAr_4core3ops4drop4Drop4drop
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvXsI_NtNtNtCs4NRVxsYgnAr_4core4iter8adapters7flattenINtB5_13FlattenCompatNtNtCs2AWtUsOyxgP_3std2fs7ReadDirINtNtBb_6result8IntoIterNtB1d_8DirEntryEENtNtNtB9_6traits8iterator8Iterator4nextCsaIkgWKk2k5g_18rustscale_portlist
+     0.04%  tokio-rt-worker  rustscaled         [.] _RNvXsc_NtCs33CDimMVQ9n_13rustscale_tun5linuxNtB5_9TunDeviceNtB7_3Tun10read_batch
+     0.04%  tokio-rt-worker  rustscaled         [.] __floattidf
+     0.04%  tokio-rt-worker  rustscaled         [.] poly_hash_ad_internal
+     0.04%  tokio-rt-worker  rustscaled         [.] process_extra_in_trailer
+     0.04%  tokio-rt-worker  rustscaled         [.] ring_core_0_17_14__chacha20_poly1305_open_sse41
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

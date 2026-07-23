@@ -163,6 +163,39 @@ the product change is not part of the parity PR. The complete credential-free
 result and checksums are tracked in
 [`docs/performance/gcp-20260723-081840-984481bfc6`](docs/performance/gcp-20260723-081840-984481bfc6/).
 
+### Exact P1000 TUN profile
+
+Run `gcp-20260723-092124-39a3549e46` profiled the accepted default at exact
+clean source `0ae06baa1d9820029471de2f8608dfd713d40998`. The diagnostic used
+the same reverse RSB1 kernel-TCP workload as the matrix rather than iperf3,
+whose implementation cannot create the requested 1000 streams. Both runtime
+pipelines were off and Linux UDP batching, GRO, and GSO were on. The profile
+established, handshook, and completed all 1000 connections, retained exactly
+ten ordered one-second samples, transferred 407,221,420 DOWN bytes, and
+measured 325.777 Mbps. Both endpoints produced self and inclusive perf reports
+with approximately 2,000 task-clock samples and zero lost samples.
+
+The normal three-trial medians collected immediately before the diagnostic
+were 1497.1, 1128.7, 886.3, 519.8, and 350.4 Mbps at
+P1/P10/P100/P500/P1000; every CV was at most 1.86%. The P1000 diagnostic's
+ordered samples fell from 399.777 Mbps in its first second to 238.504 Mbps in
+its final second. This separate run is diagnostic evidence and does not
+replace the canonical cross-product matrix above.
+
+The profile does not support a crypto-scaling explanation for the remaining
+gap. ChaCha20-Poly1305 accounted for 3.42% self time on the sender and 4.23%
+on the receiver. In contrast, `writev` accounted for 24.46% and 23.32% of
+inclusive samples, with `tun_chr_write_iter`/`tun_get_user` at approximately
+21%/21% on the sender and 19%/19% on the receiver. Scheduler spin and context
+switch paths were also the largest flat self-time entries. Each daemon used
+only about 1.3 CPU cores during the profiled interval. The next optimization
+target is therefore the serialized TUN-output and bidirectional scheduling
+boundary, not wider packet authentication.
+
+The complete credential-free result, raw perf data and reports, workload
+accounting, and checksums are tracked in
+[`docs/performance/gcp-20260723-092124-39a3549e46`](docs/performance/gcp-20260723-092124-39a3549e46/).
+
 ### Historical RustScale outbound pipeline A/B (superseded)
 
 This is a same-binary A/B at source `ca56c1d0583249e97a3c68ca3ad00a48a0b95553`

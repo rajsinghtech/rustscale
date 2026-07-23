@@ -788,8 +788,8 @@ pub(crate) struct ReceiveBatch {
     packets: Vec<Box<Packet>>,
     pool: ReceiveBufferPool,
     /// One bounded kernel tail per plain slot. This is intentionally scratch,
-    /// not detached ownership: it avoids 512 jumbo-sized pooled buffers while
-    /// allowing every valid scalar-sized UDP payload to be received intact.
+    /// not detached ownership: it avoids making every pooled fast-path buffer
+    /// jumbo-sized while allowing every valid scalar UDP payload intact.
     #[allow(clippy::vec_box)]
     kernel_packets: Vec<Box<KernelPacket>>,
     /// True when a published logical packet is backed by its kernel scratch

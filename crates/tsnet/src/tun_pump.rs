@@ -19,8 +19,8 @@ fn tun_inbound_write_worker_enabled_for(
     cfg!(target_os = "linux") && env_present && !inbound_pipeline && !outbound_pipeline
 }
 
-fn tun_inbound_write_inline(plaintext_packets: usize, worker_outstanding: usize) -> bool {
-    plaintext_packets <= 1 && worker_outstanding == 0
+fn tun_inbound_write_inline(ingress_backlogged: bool, worker_outstanding: usize) -> bool {
+    !ingress_backlogged && worker_outstanding == 0
 }
 
 /// TUN data-plane pump: TUN device <-> WG <-> magicsock.
@@ -193,11 +193,12 @@ pub(crate) async fn run_tun_pump(
 }
 
 /// Experimental two-owner TUN scheduler. WireGuard state, transport sends,
-/// timers, and outbound TUN reads remain on this task. One-packet deliveries
-/// stay inline to avoid a latency-path task hop; one FIFO worker owns final
-/// authorization and TUN writes for larger bursts. Two scratch values are the
-/// hard queue bound, so a blocked bulk write can never grow plaintext memory
-/// without bound while the owner continues to service TCP ACKs from the TUN.
+/// timers, and outbound TUN reads remain on this task. An ingress burst stays
+/// inline while the receive channel is drained, avoiding a latency-path task
+/// hop at low load. Once ciphertext is already waiting, one FIFO worker owns
+/// final authorization and TUN writes so those writes cannot starve outbound
+/// TCP ACK reads. Two scratch values are the hard queue bound, so a blocked
+/// bulk write can never grow plaintext memory without bound.
 async fn run_tun_pump_with_write_worker(
     magicsock: Arc<Magicsock>,
     mut wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
@@ -255,7 +256,12 @@ async fn run_tun_pump_with_write_worker(
             {
                 break;
             }
-            if tun_inbound_write_inline(inbound.plaintext.len(), worker_outstanding) {
+            // `take_immediate_receive_batches` already drained every complete
+            // batch that fit. A retained whole batch or a newly queued batch
+            // therefore means ingress remained backlogged across protocol
+            // work, rather than merely arriving as one coalesced burst.
+            let ingress_backlogged = pending_wg_batch.is_some() || !wg_recv.is_empty();
+            if tun_inbound_write_inline(ingress_backlogged, worker_outstanding) {
                 if !deliver_tun_inbound_write(
                     tun.as_ref(),
                     &magicsock,
@@ -3475,15 +3481,14 @@ mod tests {
             cfg!(target_os = "linux"),
             "the write worker must remain an isolated Linux experiment"
         );
-        assert!(tun_inbound_write_inline(0, 0));
-        assert!(tun_inbound_write_inline(1, 0));
+        assert!(tun_inbound_write_inline(false, 0));
         assert!(
-            !tun_inbound_write_inline(2, 0),
-            "multi-packet bursts must retain bidirectional scheduling"
+            !tun_inbound_write_inline(true, 0),
+            "sustained ingress must retain bidirectional scheduling"
         );
         assert!(
-            !tun_inbound_write_inline(1, 1),
-            "a later one-packet burst must not overtake an offloaded write"
+            !tun_inbound_write_inline(false, 1),
+            "a later drained burst must not overtake an offloaded write"
         );
     }
 
@@ -4217,15 +4222,29 @@ mod tests {
             }])
             .await
             .unwrap();
-        let datagrams = vec![
-            magicsock
-                .authorized_wg_datagram(source_public.clone(), ciphertext)
-                .expect("authorized datagram"),
-            magicsock
-                .authorized_wg_datagram(source_public.clone(), second_ciphertext)
-                .expect("second authorized datagram"),
-        ];
-        let (wg_tx, wg_rx) = mpsc::channel(1);
+        // Fill the first whole TUN batch and retain a second item in the
+        // receive channel. Replayed ciphertext after the first item is
+        // harmless here: the test needs one deliverable packet plus a
+        // deterministic ingress-backlog signal.
+        let datagrams = (0..rustscale_tun::TunPacketBatch::MAX_PACKETS)
+            .map(|_| {
+                magicsock
+                    .authorized_wg_datagram(source_public.clone(), ciphertext.clone())
+                    .expect("authorized datagram")
+            })
+            .collect();
+        let backlog = vec![magicsock
+            .authorized_wg_datagram(source_public.clone(), second_ciphertext)
+            .expect("backlogged authorized datagram")];
+        let (wg_tx, wg_rx) = mpsc::channel(2);
+        wg_tx
+            .send(rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(datagrams))
+            .await
+            .expect("queue first inbound batch");
+        wg_tx
+            .send(rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(backlog))
+            .await
+            .expect("queue backlogged inbound batch");
         let cancel = Arc::new(CancelToken::new());
         let peer_map = crate::peer_map::Runtime::new(&[Node {
             ID: 1,
@@ -4246,10 +4265,6 @@ mod tests {
             crate::capture::new_slot(),
             peer_map.clone(),
         ));
-        wg_tx
-            .send(rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(datagrams))
-            .await
-            .expect("queue inbound packet");
         tokio::time::timeout(std::time::Duration::from_millis(250), write_entered_rx)
             .await
             .expect("write worker did not enter TUN write")

@@ -19,6 +19,10 @@ fn tun_inbound_write_worker_enabled_for(
     cfg!(target_os = "linux") && env_present && !inbound_pipeline && !outbound_pipeline
 }
 
+fn tun_inbound_write_inline(plaintext_packets: usize, worker_outstanding: usize) -> bool {
+    plaintext_packets <= 1 && worker_outstanding == 0
+}
+
 /// TUN data-plane pump: TUN device <-> WG <-> magicsock.
 ///
 /// Inbound (from network): magicsock recv -> WG decapsulate -> TUN write.
@@ -189,10 +193,11 @@ pub(crate) async fn run_tun_pump(
 }
 
 /// Experimental two-owner TUN scheduler. WireGuard state, transport sends,
-/// timers, and outbound TUN reads remain on this task; one FIFO worker owns
-/// only final authorization and TUN writes. Two scratch values are the hard
-/// queue bound, so a blocked write can never grow plaintext memory without
-/// bound while the owner continues to service TCP ACKs from the TUN.
+/// timers, and outbound TUN reads remain on this task. One-packet deliveries
+/// stay inline to avoid a latency-path task hop; one FIFO worker owns final
+/// authorization and TUN writes for larger bursts. Two scratch values are the
+/// hard queue bound, so a blocked bulk write can never grow plaintext memory
+/// without bound while the owner continues to service TCP ACKs from the TUN.
 async fn run_tun_pump_with_write_worker(
     magicsock: Arc<Magicsock>,
     mut wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
@@ -231,6 +236,7 @@ async fn run_tun_pump_with_write_worker(
         InboundBatchScratch::default(),
     ];
     let mut pending_wg_batch = None;
+    let mut worker_outstanding = 0_usize;
 
     loop {
         if cancel.is_cancelled() {
@@ -249,8 +255,27 @@ async fn run_tun_pump_with_write_worker(
             {
                 break;
             }
-            if write_tx.send(inbound).is_err() {
-                break;
+            if tun_inbound_write_inline(inbound.plaintext.len(), worker_outstanding) {
+                if !deliver_tun_inbound_write(
+                    tun.as_ref(),
+                    &magicsock,
+                    &peer_map,
+                    &filter,
+                    &packet_drops,
+                    &capture,
+                    &cancel,
+                    &mut inbound,
+                )
+                .await
+                {
+                    break;
+                }
+                free.push(inbound);
+            } else {
+                if write_tx.send(inbound).is_err() {
+                    break;
+                }
+                worker_outstanding += 1;
             }
             continue;
         }
@@ -281,6 +306,8 @@ async fn run_tun_pump_with_write_worker(
             }
             recycled = recycle_rx.recv(), if free.len() < 2 => {
                 let Some(recycled) = recycled else { break };
+                debug_assert!(worker_outstanding > 0);
+                worker_outstanding = worker_outstanding.saturating_sub(1);
                 free.push(recycled);
             }
             _ = ticker.tick() => {
@@ -298,8 +325,9 @@ async fn run_tun_pump_with_write_worker(
 
 /// Commit one receive burst and send any WireGuard replies while the ordered
 /// pump still owns all transport sends. Final peer/ACL authorization is
-/// deliberately deferred to the write worker and repeated under fresh map and
-/// delivery guards immediately before plaintext reaches the kernel TUN.
+/// deliberately deferred to the selected delivery path and repeated under
+/// fresh map and delivery guards immediately before plaintext reaches the
+/// kernel TUN.
 async fn prepare_tun_inbound_write(
     magicsock: &Magicsock,
     wg_tunnels: &RwLock<HashMap<NodePublic, Arc<Mutex<WgTunn>>>>,
@@ -351,41 +379,71 @@ async fn tun_inbound_write_worker(
         }) else {
             return;
         };
-        let map_guard = tokio::select! {
-            guard = peer_map.gate.read() => guard,
-            () = cancel.cancelled() => return,
-        };
-        let delivery_guard = tokio::select! {
-            guard = magicsock.authorization_delivery_guard() => guard,
-            () = cancel.cancelled() => return,
-        };
-        retain_current_delivery_authorization(
+        if !deliver_tun_inbound_write(
+            tun.as_ref(),
             &magicsock,
             &peer_map,
             &filter,
             &packet_drops,
             &capture,
+            &cancel,
             &mut inbound,
-        );
-        if !inbound.plaintext.is_empty() {
-            let result = tokio::select! {
-                result = tun.write_batch(inbound.plaintext.packets_mut()) => result,
-                () = cancel.cancelled() => return,
-            };
-            if let Err(error) = result {
-                log::warn!("tun batch write error: {error}");
-            }
+        )
+        .await
+        {
+            return;
         }
-        inbound.plaintext.clear();
-        inbound.plaintext.release_oversized_slots();
-        inbound.plaintext_peers.clear();
-        inbound.plaintext_generations.clear();
-        drop(delivery_guard);
-        drop(map_guard);
         if recycle.send(inbound).is_err() {
             return;
         }
     }
+}
+
+/// Apply the final authorization barriers and deliver one prepared burst.
+/// The one-packet latency path calls this inline; larger bursts call it from
+/// the worker so their kernel write cannot delay outbound TUN reads.
+async fn deliver_tun_inbound_write(
+    tun: &dyn Tun,
+    magicsock: &Magicsock,
+    peer_map: &crate::peer_map::Runtime,
+    filter: &Arc<std::sync::Mutex<Filter>>,
+    packet_drops: &Arc<AtomicU64>,
+    capture: &crate::capture::CaptureSlot,
+    cancel: &CancelToken,
+    inbound: &mut InboundBatchScratch,
+) -> bool {
+    let map_guard = tokio::select! {
+        guard = peer_map.gate.read() => guard,
+        () = cancel.cancelled() => return false,
+    };
+    let delivery_guard = tokio::select! {
+        guard = magicsock.authorization_delivery_guard() => guard,
+        () = cancel.cancelled() => return false,
+    };
+    retain_current_delivery_authorization(
+        magicsock,
+        peer_map,
+        filter,
+        packet_drops,
+        capture,
+        inbound,
+    );
+    if !inbound.plaintext.is_empty() {
+        let result = tokio::select! {
+            result = tun.write_batch(inbound.plaintext.packets_mut()) => result,
+            () = cancel.cancelled() => return false,
+        };
+        if let Err(error) = result {
+            log::warn!("tun batch write error: {error}");
+        }
+    }
+    inbound.plaintext.clear();
+    inbound.plaintext.release_oversized_slots();
+    inbound.plaintext_peers.clear();
+    inbound.plaintext_generations.clear();
+    drop(delivery_guard);
+    drop(map_guard);
+    true
 }
 
 /// Move one received item and every immediately-ready whole item that fits
@@ -3417,6 +3475,16 @@ mod tests {
             cfg!(target_os = "linux"),
             "the write worker must remain an isolated Linux experiment"
         );
+        assert!(tun_inbound_write_inline(0, 0));
+        assert!(tun_inbound_write_inline(1, 0));
+        assert!(
+            !tun_inbound_write_inline(2, 0),
+            "multi-packet bursts must retain bidirectional scheduling"
+        );
+        assert!(
+            !tun_inbound_write_inline(1, 1),
+            "a later one-packet burst must not overtake an offloaded write"
+        );
     }
 
     #[async_trait::async_trait]
@@ -4096,6 +4164,15 @@ mod tests {
             .expect("encrypt inbound packet")
             .pop()
             .expect("one inbound packet");
+        let second_ciphertext = sender
+            .lock()
+            .await
+            .encapsulate(&[
+                0x45, 0, 0, 20, 0, 3, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
+            ])
+            .expect("encrypt second inbound packet")
+            .pop()
+            .expect("one second inbound packet");
 
         let (write_entered_tx, write_entered_rx) = tokio::sync::oneshot::channel();
         let (write_release_tx, write_release_rx) = tokio::sync::oneshot::channel();
@@ -4140,9 +4217,14 @@ mod tests {
             }])
             .await
             .unwrap();
-        let datagram = magicsock
-            .authorized_wg_datagram(source_public.clone(), ciphertext)
-            .expect("authorized datagram");
+        let datagrams = vec![
+            magicsock
+                .authorized_wg_datagram(source_public.clone(), ciphertext)
+                .expect("authorized datagram"),
+            magicsock
+                .authorized_wg_datagram(source_public.clone(), second_ciphertext)
+                .expect("second authorized datagram"),
+        ];
         let (wg_tx, wg_rx) = mpsc::channel(1);
         let cancel = Arc::new(CancelToken::new());
         let peer_map = crate::peer_map::Runtime::new(&[Node {
@@ -4165,7 +4247,7 @@ mod tests {
             peer_map.clone(),
         ));
         wg_tx
-            .send(rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(vec![datagram]))
+            .send(rustscale_magicsock::WgReceiveBatch::from_datagrams_for_test(datagrams))
             .await
             .expect("queue inbound packet");
         tokio::time::timeout(std::time::Duration::from_millis(250), write_entered_rx)

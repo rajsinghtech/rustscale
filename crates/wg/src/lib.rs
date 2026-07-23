@@ -136,7 +136,10 @@ pub struct WgOpenedPacket {
 
 /// Opaque mutation-free data preflight result.
 #[derive(Debug)]
-pub struct WgPreparedPacket(PreparedData);
+pub struct WgPreparedPacket {
+    prepared: PreparedData,
+    tunnel_instance_id: u64,
+}
 
 /// Ordered speculative commit result.
 pub enum WgCommitResult {
@@ -168,6 +171,14 @@ impl WgPlaintextBatch {
     /// This is normally zero at pipeline ownership boundaries.
     pub fn reserved_len(&self) -> usize {
         self.reserved
+    }
+
+    /// Close a speculative-open turn after every capability has been either
+    /// committed or aborted. Any accidentally retained capability becomes
+    /// stale and can no longer address a slot in this batch.
+    pub fn finish_opened_batch(&mut self) {
+        self.reserved = 0;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Forget the initialized packet prefix without releasing slot storage.
@@ -582,7 +593,10 @@ impl WgTunn {
         }
         self.tunn
             .preflight_data(datagram)
-            .map(WgPreparedPacket)
+            .map(|prepared| WgPreparedPacket {
+                prepared,
+                tunnel_instance_id: self.pipeline_instance_id,
+            })
             .map_err(|error| WgError::Tunnel(format!("{error:?}")))
     }
 
@@ -594,7 +608,10 @@ impl WgTunn {
         plaintext: &mut WgPlaintextBatch,
     ) -> Result<WgOpenedPacket, WgError> {
         let (slot, packet) = plaintext.take_open_slot(datagram.len().saturating_sub(16))?;
-        let opened = match self.tunn.open_prepared_data(datagram, &prepared.0, packet) {
+        let opened = match self
+            .tunn
+            .open_prepared_data(datagram, &prepared.prepared, packet)
+        {
             Ok(opened) => opened,
             Err(error) => {
                 // An AEAD or immutable-token failure must not turn this
@@ -610,6 +627,31 @@ impl WgTunn {
             batch_id: plaintext.id,
             batch_epoch: plaintext.epoch,
             tunnel_instance_id: self.pipeline_instance_id,
+        })
+    }
+
+    /// Authenticate prepared data without retaining or locking the tunnel.
+    /// Replay and all mutable state remain deferred to [`Self::commit_opened`].
+    pub fn open_prepared_detached_into(
+        datagram: &[u8],
+        prepared: &WgPreparedPacket,
+        plaintext: &mut WgPlaintextBatch,
+    ) -> Result<WgOpenedPacket, WgError> {
+        let (slot, packet) = plaintext.take_open_slot(datagram.len().saturating_sub(16))?;
+        let opened = match Tunn::open_prepared_data_detached(datagram, &prepared.prepared, packet) {
+            Ok(opened) => opened,
+            Err(error) => {
+                let restored = plaintext.return_open_slot(slot, error.plaintext, None);
+                debug_assert!(restored);
+                return Err(WgError::Tunnel(format!("{:?}", error.error)));
+            }
+        };
+        Ok(WgOpenedPacket {
+            opened: Some(opened),
+            slot,
+            batch_id: plaintext.id,
+            batch_epoch: plaintext.epoch,
+            tunnel_instance_id: prepared.tunnel_instance_id,
         })
     }
 
@@ -1341,6 +1383,45 @@ mod tests {
         assert_eq!(plaintext.packets[0].as_ptr(), pointer);
         assert_eq!(plaintext.packets[0].capacity(), capacity);
         assert!(receiver.preflight_data(&ciphertext).is_ok());
+    }
+
+    #[test]
+    fn detached_open_crosses_a_worker_boundary_before_ordered_commit() {
+        let sender_private = NodePrivate::generate();
+        let receiver_private = NodePrivate::generate();
+        let mut sender =
+            WgTunn::new(&sender_private, &receiver_private.public(), 65).expect("sender tunnel");
+        let mut receiver =
+            WgTunn::new(&receiver_private, &sender_private.public(), 66).expect("receiver tunnel");
+        handshake(&mut sender, &mut receiver);
+
+        let packet = make_ipv4_packet(b"detached worker open");
+        let ciphertext = sender
+            .encapsulate(&packet)
+            .expect("encrypt")
+            .pop()
+            .expect("data packet");
+        let prepared = receiver.preflight_data(&ciphertext).expect("preflight");
+        let (mut opened, mut plaintext) = std::thread::spawn(move || {
+            let mut plaintext = WgPlaintextBatch::new();
+            let opened =
+                WgTunn::open_prepared_detached_into(&ciphertext, &prepared, &mut plaintext)
+                    .expect("detached open");
+            (opened, plaintext)
+        })
+        .join()
+        .expect("worker join");
+
+        assert!(receiver
+            .preflight_data(&sender.encapsulate(&packet).unwrap()[0])
+            .is_ok());
+        assert!(matches!(
+            receiver.commit_opened(&mut opened, &mut plaintext).unwrap(),
+            WgCommitResult::Accepted
+        ));
+        plaintext.finish_opened_batch();
+        assert_eq!(plaintext.reserved_len(), 0);
+        assert_eq!(plaintext.packets(), [packet]);
     }
 
     #[test]

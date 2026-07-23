@@ -162,12 +162,24 @@ pub struct PacketData<'a> {
 }
 
 /// Opaque mutation-free eligibility proof for an established data packet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct PreparedData {
     receiver_idx: u32,
     counter: u64,
     generation: u64,
     tunnel_id: u64,
+    receiver: Arc<ring::aead::LessSafeKey>,
+}
+
+impl std::fmt::Debug for PreparedData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedData")
+            .field("receiver_idx", &self.receiver_idx)
+            .field("counter", &self.counter)
+            .field("generation", &self.generation)
+            .field("tunnel_id", &self.tunnel_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Authenticated plaintext metadata. It owns no key or borrowed input.
@@ -459,6 +471,7 @@ impl Tunn {
             counter: packet.counter,
             generation: self.pipeline_generation,
             tunnel_id: self.pipeline_tunnel_id,
+            receiver: session.receiving_key(),
         })
     }
 
@@ -468,13 +481,25 @@ impl Tunn {
         &self,
         datagram: &[u8],
         prepared: &PreparedData,
-        mut plaintext: Vec<u8>,
+        plaintext: Vec<u8>,
     ) -> Result<OpenedData, OpenError> {
         if self.pipeline_generation != prepared.generation
             || self.pipeline_tunnel_id != prepared.tunnel_id
         {
             return Err(OpenError { error: WireGuardError::NoCurrentSession, plaintext });
         }
+        Self::open_prepared_data_detached(datagram, prepared, plaintext)
+    }
+
+    /// Authenticate one previously prepared data packet without borrowing its
+    /// parent tunnel. The prepared capability retains the immutable receive
+    /// key; ordered replay and mutable tunnel state remain deferred to
+    /// [`Self::commit_opened_data`].
+    pub fn open_prepared_data_detached(
+        datagram: &[u8],
+        prepared: &PreparedData,
+        mut plaintext: Vec<u8>,
+    ) -> Result<OpenedData, OpenError> {
         let packet = match Self::parse_incoming_packet(datagram) {
             Err(error) => return Err(OpenError { error, plaintext }),
             Ok(packet) => match packet {
@@ -487,9 +512,6 @@ impl Tunn {
             _ => return Err(OpenError { error: WireGuardError::InvalidPacket, plaintext }),
             },
         };
-        let Some(session) = self.sessions[(prepared.receiver_idx as usize) % N_SESSIONS].as_ref() else {
-            return Err(OpenError { error: WireGuardError::NoCurrentSession, plaintext });
-        };
         if plaintext.len() < packet.encrypted_encapsulated_packet.len() {
             return Err(OpenError { error: WireGuardError::InvalidPacket, plaintext });
         }
@@ -499,7 +521,11 @@ impl Tunn {
             Ok(tag) => tag,
             Err(_) => return Err(OpenError { error: WireGuardError::InvalidPacket, plaintext }),
         };
-        let plaintext_len = match session.open_packet_data(packet, &mut plaintext) {
+        let plaintext_len = match session::Session::open_packet_data_with_key(
+            &prepared.receiver,
+            packet,
+            &mut plaintext,
+        ) {
             Ok(plain) => plain.len(),
             Err(error) => return Err(OpenError { error, plaintext }),
         };

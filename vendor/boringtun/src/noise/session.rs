@@ -7,11 +7,12 @@ use parking_lot::Mutex;
 use portable_atomic::{AtomicU64, Ordering};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::convert::TryFrom;
+use std::sync::Arc;
 
 pub struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
-    receiver: LessSafeKey,
+    receiver: Arc<LessSafeKey>,
     sender: LessSafeKey,
     sending_key_counter: AtomicU64,
     receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
@@ -162,9 +163,9 @@ impl Session {
         Session {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: LessSafeKey::new(
+            receiver: Arc::new(LessSafeKey::new(
                 UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
-            ),
+            )),
             sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
             sending_key_counter: AtomicU64::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
@@ -181,6 +182,10 @@ impl Session {
         counter_validator.will_accept(counter)
     }
 
+    pub(super) fn receiving_key(&self) -> Arc<LessSafeKey> {
+        Arc::clone(&self.receiver)
+    }
+
     /// Returns true if receiving counter is good to use, and marks it as used {
     fn receiving_counter_mark(&self, counter: u64) -> Result<(), WireGuardError> {
         let mut counter_validator = self.receiving_key_counter.lock();
@@ -191,26 +196,16 @@ impl Session {
         ret
     }
 
-    /// Authenticate established data without changing the replay window. The
-    /// ordered receiver marks the counter only after whole-burst validation.
-    pub(super) fn open_packet_data<'a>(
+    fn open_packet_data_unchecked<'a>(
         &self,
         packet: PacketData,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        let ct_len = packet.encrypted_encapsulated_packet.len();
-        if dst.len() < ct_len {
-            panic!("The destination buffer is too small");
-        }
-        if packet.receiver_idx != self.receiving_index {
-            return Err(WireGuardError::WrongIndex);
-        }
-        self.receiving_counter_quick_check(packet.counter)?;
-        self.open_packet_data_unchecked(packet, dst)
+        Self::open_packet_data_with_key(&self.receiver, packet, dst)
     }
 
-    fn open_packet_data_unchecked<'a>(
-        &self,
+    pub(super) fn open_packet_data_with_key<'a>(
+        receiver: &LessSafeKey,
         packet: PacketData,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
@@ -218,7 +213,7 @@ impl Session {
         let mut nonce = [0u8; 12];
         nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
         dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
-        self.receiver
+        receiver
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce),
                 Aad::from(&[]),

@@ -322,8 +322,9 @@ pub const WG_RECEIVE_BATCH_MAX_PACKETS: usize = 128;
 
 /// Total number of WireGuard packets that may wait between magicsock and its
 /// consumer. This is deliberately packet-counted, even though the channel
-/// transports batches.
-const WG_RECEIVE_PACKET_CAPACITY: usize = 256;
+/// transports batches. One 1024-packet direct-UDP microburst can leave a
+/// constrained kernel socket before consumer scheduling applies backpressure.
+const WG_RECEIVE_PACKET_CAPACITY: usize = 1024;
 
 /// Process-local Linux handoff diagnostics. They are deliberately bounded and
 /// credential-free so benchmark failure artifacts can retain the first
@@ -6063,7 +6064,10 @@ mod linux_batch_tests {
 
         assert!(staged.is_empty());
         assert_eq!(receiver.len(), 1, "burst occupies one channel item");
-        assert_eq!(credits.available_permits(), 128);
+        assert_eq!(
+            credits.available_permits(),
+            WG_RECEIVE_PACKET_CAPACITY - WG_RECEIVE_BATCH_MAX_PACKETS
+        );
         let batch = receiver.recv().await.expect("receive burst");
         assert_eq!(batch.len(), WG_RECEIVE_BATCH_MAX_PACKETS);
         let datagrams = batch.into_datagrams();
@@ -6087,13 +6091,14 @@ mod linux_batch_tests {
 
     #[tokio::test]
     async fn queued_direct_burst_bounds_derp_progress_under_sustained_direct_work() {
-        let (sender, mut receiver) = mpsc::channel(WG_RECEIVE_PACKET_CAPACITY);
-        let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
+        let credit_capacity = WG_RECEIVE_BATCH_MAX_PACKETS * 2;
+        let (sender, mut receiver) = mpsc::channel(credit_capacity);
+        let credits = Arc::new(Semaphore::new(credit_capacity));
         let mut first = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
         let mut second = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
         publish_linux_wg_batch(&sender, &credits, &mut first).await;
         publish_linux_wg_batch(&sender, &credits, &mut second).await;
-        assert_eq!(receiver.len(), 2, "256 packets are two, not 256, batches");
+        assert_eq!(receiver.len(), 2, "two full bursts are two receive items");
         assert_eq!(credits.available_permits(), 0);
 
         // A third direct burst is already waiting for its atomic 128 credits
@@ -6178,7 +6183,7 @@ mod linux_batch_tests {
             .expect("sustained direct publisher resumes after DERP")
             .expect("sustained direct publisher task");
         drop(receiver.recv().await.expect("post-DERP direct batch"));
-        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
+        assert_eq!(credits.available_permits(), credit_capacity);
     }
 
     #[tokio::test]
@@ -6187,7 +6192,7 @@ mod linux_batch_tests {
         let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
         let mut staged = pending(3);
         publish_linux_wg_batch(&sender, &credits, &mut staged).await;
-        assert_eq!(credits.available_permits(), 253);
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY - 3);
         let consumed = receiver.recv().await.expect("batch");
         let datagrams = consumed.into_datagrams();
         assert_eq!(
@@ -6200,14 +6205,15 @@ mod linux_batch_tests {
 
         let mut staged = pending(4);
         publish_linux_wg_batch(&sender, &credits, &mut staged).await;
-        assert_eq!(credits.available_permits(), 252);
+        assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY - 4);
         drop(receiver.recv().await.expect("batch to drop"));
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
 
-        let mut full = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
-        publish_linux_wg_batch(&sender, &credits, &mut full).await;
-        let mut full = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
-        publish_linux_wg_batch(&sender, &credits, &mut full).await;
+        assert_eq!(WG_RECEIVE_PACKET_CAPACITY % WG_RECEIVE_BATCH_MAX_PACKETS, 0);
+        for _ in 0..(WG_RECEIVE_PACKET_CAPACITY / WG_RECEIVE_BATCH_MAX_PACKETS) {
+            let mut full = pending(WG_RECEIVE_BATCH_MAX_PACKETS);
+            publish_linux_wg_batch(&sender, &credits, &mut full).await;
+        }
         let cancelled_sender = sender.clone();
         let cancelled_credits = credits.clone();
         let cancelled = tokio::spawn(async move {

@@ -49,10 +49,11 @@ const SENDMMSG_FLAGS: libc::c_uint = libc::MSG_DONTWAIT as libc::c_uint;
 type Packet = [u8; LOGICAL_PACKET_CAPACITY];
 type KernelPacket = [u8];
 /// Total fixed receive storage. 128 boxes are always installed in recvmmsg
-/// scratch, leaving exactly 512 independently reserved detachable buffers.
-/// This is exactly 1.25 MiB of pooled fast-path payload storage; separate
-/// per-slot kernel scratch is never detached into queued ciphertexts.
-pub(crate) const RECEIVE_BUFFER_POOL_CAPACITY: usize = 640;
+/// scratch, leaving exactly 1152 independently reserved detachable buffers.
+/// This is exactly 2.5 MiB of pooled fast-path payload storage; separate
+/// per-slot kernel scratch is never detached into queued ciphertexts. The
+/// detachable inventory stays one batch larger than packet handoff credits.
+pub(crate) const RECEIVE_BUFFER_POOL_CAPACITY: usize = 1280;
 const RECEIVE_BUFFER_POOL_FREE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY;
 pub(crate) const RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY: usize =
     RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH;

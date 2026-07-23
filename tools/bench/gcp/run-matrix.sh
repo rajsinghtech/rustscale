@@ -87,8 +87,13 @@ provision_topology_pair() {
       Z_A="$server_zone"; Z_B="$client_zone"
       echo "[gcp] capacity preflight selected $topology zones $Z_A / $Z_B" >&2
       return 0
+    else
+      # Capture the failing command's status inside the `else` arm. The exit
+      # status of an `if` with no executed branch is otherwise zero, which
+      # would make a non-capacity startup failure look successful and leave
+      # Z_A/Z_B unset for the caller.
+      status=$?
     fi
-    status=$?
     cat "$log" >&2
     if ! capacity_exhausted "$log"; then
       rm -f "$log"
@@ -113,6 +118,19 @@ matrix_zone_pair_self_test() (
   provision_topology_pair same-zone server client || return 1
   [[ "$Z_A/$Z_B" == us-central1-c/us-central1-f ]] || return 1
   [[ "$calls" == ' create:us-central1-a/us-central1-b delete:us-central1-a/us-central1-b create:us-central1-c/us-central1-f' ]]
+)
+
+matrix_zone_pair_failure_self_test() (
+  local calls="" status=0
+  unset Z_A Z_B
+  create_vms() { calls+=" create:$2/$4"; return 37; }
+  delete_vms() { calls+=" delete:$2/$4"; }
+  provision_topology_pair same-zone server client >/dev/null 2>&1 || status=$?
+  [[ $status -eq 37 ]] || return 1
+  [[ -z "${Z_A+x}" && -z "${Z_B+x}" ]] || return 1
+  [[ "$ACTIVE_SRV/$ACTIVE_SRV_ZONE" == server/us-central1-a ]] || return 1
+  [[ "$ACTIVE_CLI/$ACTIVE_CLI_ZONE" == client/us-central1-b ]] || return 1
+  [[ "$calls" == ' create:us-central1-a/us-central1-b' ]]
 )
 
 MATRIX_SELF_TEST=0
@@ -1030,6 +1048,7 @@ matrix_inbound_write_worker_self_test
 matrix_linux_udp_receive_modes_self_test
 matrix_linux_udp_tx_gso_mode_self_test
 matrix_zone_pair_self_test
+matrix_zone_pair_failure_self_test
 matrix_finalization_self_test
 
 if (( MATRIX_SELF_TEST )); then

@@ -296,6 +296,18 @@ evidence bundles are tracked under
 and
 [`docs/performance/gcp-20260723-103928-732e18dea9`](performance/gcp-20260723-103928-732e18dea9/).
 
+A follow-up hybrid at exact clean source
+`6f0add024096a4a7bf80b9c741d065eb90dc4f82` kept an idle single-packet write
+inline while sending bursts and queued work through the worker. In a matched
+same-binary A/B it improved P500/P1000 throughput by 23.75%/20.89%, but
+regressed P1/P10/P100 by 9.66%/11.21%/1.37%, raised average userspace CPU by
+24.18% on the server and 6.10% on the client, and did not improve latency. The
+hybrid is rejected and its code is not part of the parity PR. Its exact
+evidence is retained under
+[`docs/performance/gcp-20260723-113500-c9144435e6`](performance/gcp-20260723-113500-c9144435e6/)
+and
+[`docs/performance/gcp-20260723-115345-ae16d4040d`](performance/gcp-20260723-115345-ae16d4040d/).
+
 ## Test infrastructure
 
 `crates/testcontrol` ✅ in-process fake control server (Noise handshake, h2c,

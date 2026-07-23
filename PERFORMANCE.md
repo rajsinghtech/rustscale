@@ -235,6 +235,40 @@ evidence and checksums are tracked in
 and
 [`docs/performance/gcp-20260723-103928-732e18dea9`](docs/performance/gcp-20260723-103928-732e18dea9/).
 
+### Hybrid TUN write-worker A/B (rejected)
+
+Runs `gcp-20260723-113500-c9144435e6` and
+`gcp-20260723-115345-ae16d4040d` tested a lower-latency follow-up at exact
+clean source `6f0add024096a4a7bf80b9c741d065eb90dc4f82`. The candidate kept a
+single inbound packet inline only when the worker had no outstanding job; all
+multi-packet bursts and any single packet that arrived behind queued work used
+the bounded FIFO worker. The control and candidate used identical machines,
+images, kernels, toolchains, build commands, and product hashes. Only
+`RUSTSCALE_TUN_INBOUND_WRITE_WORKER` differed.
+
+| Parallel streams | Worker off median (CV) | Hybrid worker median (CV) | Change |
+|---:|---:|---:|---:|
+| 1 | 1492.3 Mbps (0.97%) | 1348.0 Mbps (0.11%) | **-9.66%** |
+| 10 | 1235.0 Mbps (2.97%) | 1096.6 Mbps (1.16%) | **-11.21%** |
+| 100 | 957.0 Mbps (0.24%) | 943.8 Mbps (1.20%) | **-1.37%** |
+| 500 | 531.5 Mbps (6.80%) | 657.7 Mbps (0.50%) | **+23.75%** |
+| 1000 | 379.0 Mbps (6.37%) | 458.2 Mbps (0.49%) | **+20.89%** |
+
+The hybrid recovered much of the latency lost by always offloading writes, but
+it still regressed the control: p50/p95/p99 moved from
+1238.460/1369.623/1427.834 us to 1254.920/1385.405/1429.624 us, or
+1.33%/1.15%/0.13%. Average userspace CPU rose 24.18% on the server and 6.10%
+on the client, while RSS was effectively flat or lower. All 30 throughput
+trials retained exact connection lifecycle denominators and a direct path;
+both latency runs completed 200/200 exchanges.
+
+The candidate is rejected: its high-fanout gain does not compensate for the
+low-fanout and CPU regressions, and its code is not part of the parity PR. The
+complete credential-free evidence and checksums are tracked in
+[`docs/performance/gcp-20260723-113500-c9144435e6`](docs/performance/gcp-20260723-113500-c9144435e6/)
+and
+[`docs/performance/gcp-20260723-115345-ae16d4040d`](docs/performance/gcp-20260723-115345-ae16d4040d/).
+
 ### Historical RustScale outbound pipeline A/B (superseded)
 
 This is a same-binary A/B at source `ca56c1d0583249e97a3c68ca3ad00a48a0b95553`

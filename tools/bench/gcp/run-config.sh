@@ -11,7 +11,8 @@
 # Environment:
 #   BENCH_MATRIX  — optional, set by run-matrix.sh; "topo/path" for tagging.
 #   GCP_DRY_RUN   — when set, commands are echoed not executed (still emits a stub JSON).
-#   RS_TUN_INBOUND_PIPELINE / RS_TUN_OUTBOUND_SEND_PIPELINE — rs-tun pipeline toggles: 0 (default) or 1.
+#   RS_TUN_INBOUND_PIPELINE / RS_TUN_OUTBOUND_SEND_PIPELINE / RS_TUN_INBOUND_WRITE_WORKER
+#     — explicit rs-tun scheduler toggles: 0 (default) or 1.
 #   RS_LINUX_UDP_BATCH / RS_LINUX_UDP_GRO — Linux receive modes: 0 (disabled) or 1 (default).
 #   RS_LINUX_UDP_GSO — Linux TX-GSO mode: 0 (plain sendmmsg) or 1 (default/probed; requires batch=1).
 #
@@ -170,6 +171,20 @@ rs_tun_outbound_send_pipeline_self_test() {
   (( status == 2 ))
 }
 
+rs_tun_inbound_write_worker_self_test() {
+  local actual status
+  actual=$(export RS_TUN_INBOUND_PIPELINE=0 RS_TUN_OUTBOUND_SEND_PIPELINE=0 RS_TUN_INBOUND_WRITE_WORKER=1; configure_rs_tun_inbound_write_worker; printf '%s' "$RS_TUN_INBOUND_WRITE_WORKER") || return 1
+  [[ "$actual" == 1 ]] || return 1
+  actual=$(export RS_TUN_INBOUND_PIPELINE=0 RS_TUN_OUTBOUND_SEND_PIPELINE=0; unset RS_TUN_INBOUND_WRITE_WORKER; configure_rs_tun_inbound_write_worker; printf '%s' "$RS_TUN_INBOUND_WRITE_WORKER") || return 1
+  [[ "$actual" == 0 ]] || return 1
+  if ( export RS_TUN_INBOUND_WRITE_WORKER=invalid; configure_rs_tun_inbound_write_worker ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
+  if ( export RS_TUN_INBOUND_PIPELINE=1 RS_TUN_OUTBOUND_SEND_PIPELINE=0 RS_TUN_INBOUND_WRITE_WORKER=1; configure_rs_tun_inbound_write_worker ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
+  if ( export RS_TUN_INBOUND_PIPELINE=0 RS_TUN_OUTBOUND_SEND_PIPELINE=1 RS_TUN_INBOUND_WRITE_WORKER=1; configure_rs_tun_inbound_write_worker ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 ))
+}
+
 linux_udp_receive_modes_self_test() {
   local actual status
   for actual in 0/0 1/0 1/1; do
@@ -303,6 +318,7 @@ else
 fi
 configure_rs_tun_inbound_pipeline || exit $?
 configure_rs_tun_outbound_send_pipeline || exit $?
+configure_rs_tun_inbound_write_worker || exit $?
 configure_linux_udp_receive_modes || exit $?
 configure_linux_udp_tx_gso_mode || exit $?
 if (( PROFILE || PROFILE_ONLY )) && [[ "$CONFIG" != rs-tun ]]; then
@@ -353,7 +369,7 @@ if (( SELF_TEST )); then
   python3 "$PROVENANCE_HELPER" manifest "$RESULT_MANIFEST" --run-id gcp-20260714-000000-selftest \
     --started-at-utc 2026-07-14T00:00:00Z --commit "$self_commit" --dirty 0 --project dry-run \
     --image-project ubuntu-os-cloud --image-family ubuntu-2204-lts --machine "$GCP_MACHINE" --network default \
-    --disk-type pd-standard --disk-gb 200 --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" --dry-run --topologies same-zone --paths direct --configs rs-tun --parallelism 1 10 100 500 1000 --repeat 3
+    --disk-type pd-standard --disk-gb 200 --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --rs-tun-inbound-write-worker "$RS_TUN_INBOUND_WRITE_WORKER" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" --dry-run --topologies same-zone --paths direct --configs rs-tun --parallelism 1 10 100 500 1000 --repeat 3
   # The self-test config intentionally uses a non-production topology; the
   # provenance helper only validates endpoint identity when it is non-dry.
   python3 "$PROVENANCE_HELPER" dry-observed "$OBSERVED_METADATA"
@@ -367,7 +383,7 @@ preflight_current_metadata() {
   [[ -n "$RESULT_MANIFEST" && -n "$OBSERVED_METADATA" ]] || return 1
   python3 "$PROVENANCE_HELPER" preflight --manifest "$RESULT_MANIFEST" --observed "$OBSERVED_METADATA" \
     --config "$CONFIG" --topology "$TOPOLOGY" --path "$PATH_TAG" --server-zone "$SZONE" --client-zone "$CZONE" \
-    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
+    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --rs-tun-inbound-write-worker "$RS_TUN_INBOUND_WRITE_WORKER" --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
     --parallelism "${PARALLELS[@]}" --duration "$DURATION" --peer-count "$PEER_COUNT"
 }
 
@@ -611,7 +627,7 @@ linux_udp_environment() {
 }
 
 rs_tun_daemon_start_command() {
-  local pipeline="$1" batch="$2" gro="$3" authfile="$4" statedir="$5" socket="$6" hostname="$7" logfile="$8" pidfile="$9" outbound="${10:-0}" gso environment
+  local pipeline="$1" batch="$2" gro="$3" authfile="$4" statedir="$5" socket="$6" hostname="$7" logfile="$8" pidfile="$9" outbound="${10:-0}" gso write_worker="${12:-0}" environment
   if (( $# >= 11 )); then
     gso="${11}"
   elif [[ "$batch" == 0 ]]; then
@@ -621,6 +637,8 @@ rs_tun_daemon_start_command() {
   fi
   [[ "$pipeline" == 0 || "$pipeline" == 1 ]] || return 2
   [[ "$outbound" == 0 || "$outbound" == 1 ]] || return 2
+  [[ "$write_worker" == 0 || "$write_worker" == 1 ]] || return 2
+  [[ "$write_worker" != 1 || ( "$pipeline" == 0 && "$outbound" == 0 ) ]] || return 2
   [[ "$batch" == 0 || "$batch" == 1 ]] || return 2
   [[ "$gro" == 0 || "$gro" == 1 ]] || return 2
   [[ "$gso" == 0 || "$gso" == 1 ]] || return 2
@@ -630,6 +648,7 @@ rs_tun_daemon_start_command() {
   environment="$(linux_udp_environment "$batch" "$gro" "$gso")TS_AUTHKEY=\"\$(cat $authfile)\" "
   [[ "$pipeline" == 1 ]] && environment="RUSTSCALE_TUN_INBOUND_PIPELINE=1 $environment"
   [[ "$outbound" == 1 ]] && environment="RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 $environment"
+  [[ "$write_worker" == 1 ]] && environment="RUSTSCALE_TUN_INBOUND_WRITE_WORKER=1 $environment"
   nohup_background_command "$environment" \
     "prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir $statedir --socket $socket --hostname $hostname" \
     "$logfile" "$pidfile"
@@ -728,7 +747,7 @@ start_ts_userspace_bridge() {
 
 command_shape_self_test() {
   local ts_direct rs_direct ts_derp rs_derp nofile_gate bridge_calls bridge_definition
-  local rs_server_off rs_client_off rs_server_on rs_client_on rs_server_outbound rs_server_scalar rs_server_plain rs_server_gso_off rs_userspace_server rs_userspace_client
+  local rs_server_off rs_client_off rs_server_on rs_client_on rs_server_outbound rs_server_write_worker rs_server_scalar rs_server_plain rs_server_gso_off rs_userspace_server rs_userspace_client
   local go_server go_client go_latency credential_commands
   ts_direct=$(tun_ping_invocation tailscale /tmp/ts.sock direct 100.64.0.1)
   rs_direct=$(tun_ping_invocation /opt/rustscale/target/release/rustscale /tmp/rs.sock direct 100.64.0.1)
@@ -770,6 +789,12 @@ command_shape_self_test() {
   [[ "${rs_server_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* && "${rs_client_on#RUSTSCALE_TUN_INBOUND_PIPELINE=1 }" != *RUSTSCALE_TUN_INBOUND_PIPELINE* ]] || return 1
   rs_server_outbound=$(rs_tun_daemon_start_command 0 1 1 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 1)
   [[ "$rs_server_outbound" == 'RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  rs_server_write_worker=$(rs_tun_daemon_start_command 0 1 1 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 0 1 1)
+  [[ "$rs_server_write_worker" == 'RUSTSCALE_TUN_INBOUND_WRITE_WORKER=1 TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
+  if rs_tun_daemon_start_command 1 1 1 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 0 1 1 >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
+  if rs_tun_daemon_start_command 0 1 1 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid 1 1 1 >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
   rs_server_scalar=$(rs_tun_daemon_start_command 0 0 0 /tmp/rustscale-bench-authkey /tmp/srv /tmp/srv.sock srv /tmp/srv.log /tmp/srv.pid)
   [[ "$rs_server_scalar" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 RUSTSCALE_DISABLE_UDP_GSO=1 TS_AUTHKEY="$(cat /tmp/rustscale-bench-authkey)" nohup prlimit --nofile=65535:65535 -- /opt/rustscale/target/release/rustscaled run --tun --statedir /tmp/srv --socket /tmp/srv.sock --hostname srv > /tmp/srv.log 2>&1 & echo $! > /tmp/srv.pid' ]] || return 1
   [[ "$(linux_udp_environment 0 0)" == 'RUSTSCALE_DISABLE_UDP_GRO=1 RUSTSCALE_DISABLE_LINUX_UDP_BATCH=1 RUSTSCALE_DISABLE_UDP_GSO=1 ' ]] || return 1
@@ -1546,14 +1571,14 @@ cleanup_self_test() {
 
 result_shape_self_test() {
   emit_stub self-test '' server-evidence client-evidence
-  python3 - "$OUT" "$DURATION" "$LATENCY_COUNT" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" "${PARALLELS[@]}" <<'PYEOF'
+  python3 - "$OUT" "$DURATION" "$LATENCY_COUNT" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_TUN_INBOUND_WRITE_WORKER" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" "${PARALLELS[@]}" <<'PYEOF'
 import json, sys
-path, duration, latency_count, inbound_pipeline, outbound_pipeline, udp_batch, udp_gro, udp_gso, *parallels = sys.argv[1:]
+path, duration, latency_count, inbound_pipeline, outbound_pipeline, inbound_write_worker, udp_batch, udp_gro, udp_gso, *parallels = sys.argv[1:]
 with open(path) as f:
     result = json.load(f)
 assert result["schema_version"] == 6 and result["status"] == "failed"
 assert result["run"]["source"]["includes_uncommitted_changes"] is False
-assert result["run"]["runtime"] == {"rs_tun_inbound_pipeline": inbound_pipeline == "1", "rs_tun_outbound_send_pipeline": outbound_pipeline == "1", "linux_udp_batch": udp_batch == "1", "linux_udp_gro": udp_gro == "1", "linux_udp_gso": udp_gso == "1"}
+assert result["run"]["runtime"] == {"rs_tun_inbound_pipeline": inbound_pipeline == "1", "rs_tun_outbound_send_pipeline": outbound_pipeline == "1", "rs_tun_inbound_write_worker": inbound_write_worker == "1", "linux_udp_batch": udp_batch == "1", "linux_udp_gro": udp_gro == "1", "linux_udp_gso": udp_gso == "1"}
 assert result["observed"]["resolved_image"] == "dry-run"
 assert result["parallelism_requested"] == [int(p) for p in parallels]
 assert result["throughput"] is None and result["latency"] is None and result["footprint"] is None
@@ -1694,6 +1719,7 @@ path_gate_self_test
 run_config_option_parsing_self_test
 rs_tun_inbound_pipeline_self_test
 rs_tun_outbound_send_pipeline_self_test
+rs_tun_inbound_write_worker_self_test
 linux_udp_receive_modes_self_test
 linux_udp_tx_gso_mode_self_test
 authkey_file_self_test
@@ -2984,8 +3010,8 @@ run_rs_tun() {
   fi
   ssh_sudo "$SVM" "$SZONE"  'rm -rf /tmp/rs-tun-srv; rm -f /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid /tmp/rs-tun-srv.sock'
   ssh_sudo "$CVM" "$CZONE"  'rm -rf /tmp/rs-tun-cli; rm -f /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid /tmp/rs-tun-cli.sock'
-  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$REMOTE_AUTHKEY_FILE" /tmp/rs-tun-srv /tmp/rs-tun-srv.sock "$SHOST" /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_GSO")"
-  ssh_sudo "$CVM" "$CZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$REMOTE_AUTHKEY_FILE" /tmp/rs-tun-cli /tmp/rs-tun-cli.sock "$CHOST" /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_GSO")"
+  ssh_sudo "$SVM" "$SZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$REMOTE_AUTHKEY_FILE" /tmp/rs-tun-srv /tmp/rs-tun-srv.sock "$SHOST" /tmp/rs-tun-srv.log /tmp/rs-tun-srv.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_GSO" "$RS_TUN_INBOUND_WRITE_WORKER")"
+  ssh_sudo "$CVM" "$CZONE" "$(rs_tun_daemon_start_command "$RS_TUN_INBOUND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$REMOTE_AUTHKEY_FILE" /tmp/rs-tun-cli /tmp/rs-tun-cli.sock "$CHOST" /tmp/rs-tun-cli.log /tmp/rs-tun-cli.pid "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_GSO" "$RS_TUN_INBOUND_WRITE_WORKER")"
 
   local server_ip
   server_ip=$(wait_tun_ip 1 "$SVM" "$SZONE" /opt/rustscale/target/release/rustscale /tmp/rs-tun-srv.sock /tmp/rs-tun-srv.log) || {

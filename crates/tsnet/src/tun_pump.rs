@@ -19,28 +19,137 @@ fn tun_inbound_write_worker_enabled_for(
     cfg!(target_os = "linux") && env_present && !inbound_pipeline && !outbound_pipeline
 }
 
-fn tun_inbound_write_inline(
-    received_datagrams: usize,
-    bulk_recent: bool,
-    worker_outstanding: usize,
-) -> bool {
-    received_datagrams <= 1 && !bulk_recent && worker_outstanding == 0
+fn tun_inbound_write_inline(flow_bulk_recent: bool, worker_outstanding: usize) -> bool {
+    !flow_bulk_recent && worker_outstanding == 0
 }
 
 const TUN_WRITE_SCHEDULER_REPORT_INTERVAL: u64 = 4_096;
 const TUN_WRITE_BULK_HOLD: std::time::Duration = std::time::Duration::from_millis(5);
+const TUN_WRITE_FLOW_BUCKET_THRESHOLD: u32 = 32;
 
 fn log_tun_write_scheduler_stats(
     inline_batches: u64,
     offloaded_batches: u64,
-    bulk_bursts: u64,
+    flow_bulk_windows: u64,
+    flow_buckets: u32,
     worker_outstanding: usize,
 ) {
     log::info!(
         "rustscale: tun_write_scheduler_stats event=periodic inline_batches={inline_batches} \
-         offloaded_batches={offloaded_batches} bulk_bursts={bulk_bursts} \
-         worker_outstanding={worker_outstanding}"
+         offloaded_batches={offloaded_batches} flow_bulk_windows={flow_bulk_windows} \
+         flow_buckets={flow_buckets} worker_outstanding={worker_outstanding}"
     );
+}
+
+#[derive(Default)]
+struct TunWriteFlowWindow {
+    buckets: u64,
+    observation_until: Option<tokio::time::Instant>,
+    bulk_until: Option<tokio::time::Instant>,
+}
+
+impl TunWriteFlowWindow {
+    fn is_bulk(&self, now: tokio::time::Instant) -> bool {
+        self.bulk_until.is_some_and(|deadline| now < deadline)
+    }
+
+    /// Add the TCP-flow buckets authenticated in one receive burst.
+    ///
+    /// The observation epoch has a fixed end rather than sliding on every
+    /// packet. Sustained high diversity must therefore prove itself again
+    /// every 5 ms, while a completed fanout cannot keep one stale bitmap and
+    /// refresh worker ownership forever.
+    fn observe(&mut self, flow_buckets: u64, now: tokio::time::Instant) -> bool {
+        let was_bulk = self.is_bulk(now);
+        if self
+            .observation_until
+            .is_none_or(|deadline| now >= deadline)
+        {
+            self.buckets = 0;
+            self.observation_until = Some(now + TUN_WRITE_BULK_HOLD);
+        }
+        self.buckets |= flow_buckets;
+        if self.buckets.count_ones() > TUN_WRITE_FLOW_BUCKET_THRESHOLD {
+            self.bulk_until = Some(now + TUN_WRITE_BULK_HOLD);
+        }
+        !was_bulk && self.is_bulk(now)
+    }
+
+    fn bucket_count(&self) -> u32 {
+        self.buckets.count_ones()
+    }
+}
+
+fn tun_inbound_flow_buckets(packets: &[Vec<u8>]) -> u64 {
+    packets.iter().fold(0_u64, |buckets, packet| {
+        tun_tcp_flow_bucket(packet).map_or(buckets, |bucket| buckets | (1_u64 << bucket))
+    })
+}
+
+/// Return one stable approximate-flow bucket for a TCP packet.
+///
+/// IPv4 is decoded directly because it is the hot TUN benchmark path. IPv6
+/// uses the packet crate's allocation-free extension-header parser. The
+/// bitmap intentionally estimates diversity rather than identifying a flow:
+/// collisions delay worker activation and can never make ten flows look like
+/// more than ten.
+fn tun_tcp_flow_bucket(packet: &[u8]) -> Option<u32> {
+    let first = *packet.first()?;
+    let (src, dst, src_port, dst_port) = match first >> 4 {
+        4 => {
+            if packet.len() < 20 || packet[9] != rustscale_packet::TCP {
+                return None;
+            }
+            let header_len = usize::from(first & 0x0f) * 4;
+            if header_len < 20 || packet.len() < header_len + 4 {
+                return None;
+            }
+            let fragment = u16::from_be_bytes(packet[6..8].try_into().ok()?);
+            if fragment & 0x1fff != 0 {
+                return None;
+            }
+            let src = u64::from(u32::from_be_bytes(packet[12..16].try_into().ok()?));
+            let dst = u64::from(u32::from_be_bytes(packet[16..20].try_into().ok()?));
+            let src_port = u64::from(u16::from_be_bytes(
+                packet[header_len..header_len + 2].try_into().ok()?,
+            ));
+            let dst_port = u64::from(u16::from_be_bytes(
+                packet[header_len + 2..header_len + 4].try_into().ok()?,
+            ));
+            (src, dst, src_port, dst_port)
+        }
+        6 => {
+            let parsed = rustscale_packet::Parsed::decode(packet);
+            if parsed.ip_proto != rustscale_packet::TCP {
+                return None;
+            }
+            let fold_ip = |ip: std::net::IpAddr| match ip {
+                std::net::IpAddr::V4(addr) => u64::from(u32::from(addr)),
+                std::net::IpAddr::V6(addr) => {
+                    let value = u128::from(addr);
+                    (value as u64) ^ ((value >> 64) as u64)
+                }
+            };
+            (
+                fold_ip(parsed.src),
+                fold_ip(parsed.dst),
+                u64::from(parsed.src_port),
+                u64::from(parsed.dst_port),
+            )
+        }
+        _ => return None,
+    };
+    let mut hash = src
+        ^ dst.rotate_left(17)
+        ^ src_port.rotate_left(33)
+        ^ dst_port.rotate_left(49)
+        ^ 0x9e37_79b9_7f4a_7c15;
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    Some((hash & 63) as u32)
 }
 
 /// TUN data-plane pump: TUN device <-> WG <-> magicsock.
@@ -144,6 +253,7 @@ pub(crate) async fn run_tun_pump(
                 &peer_map,
                 &mut inbound,
                 outbound_sender.as_mut(),
+                None,
             )
             .await
             {
@@ -189,6 +299,7 @@ pub(crate) async fn run_tun_pump(
                         &peer_map,
                         &mut inbound,
                         outbound_sender.as_mut(),
+                        None,
                     )
                     .await {
                         break;
@@ -213,12 +324,13 @@ pub(crate) async fn run_tun_pump(
 }
 
 /// Experimental two-owner TUN scheduler. WireGuard state, transport sends,
-/// timers, and outbound TUN reads remain on this task. Isolated one-datagram
-/// deliveries stay on the scalar inline path. A multi-datagram burst arms a
-/// short monotonic bulk window so sustained traffic keeps one FIFO worker as
-/// the write owner instead of oscillating between tasks. Two scratch values
-/// are the hard queue bound, so a blocked bulk write can never grow plaintext
-/// memory without bound while the owner services outbound TCP ACK reads.
+/// timers, and outbound TUN reads remain on this task. Traffic stays on the
+/// exact scalar path until authenticated TCP packets occupy more than half of
+/// a 64-bucket approximate-flow map inside one fixed 5 ms observation epoch.
+/// Sustained high diversity then keeps one FIFO worker as the write owner
+/// instead of oscillating between tasks. Two scratch values are the hard queue
+/// bound, so a blocked bulk write can never grow plaintext memory without
+/// bound while the owner services outbound TCP ACK reads.
 async fn run_tun_pump_with_write_worker(
     magicsock: Arc<Magicsock>,
     mut wg_recv: mpsc::Receiver<rustscale_magicsock::WgReceiveBatch>,
@@ -260,8 +372,8 @@ async fn run_tun_pump_with_write_worker(
     let mut worker_outstanding = 0_usize;
     let mut inline_batches = 0_u64;
     let mut offloaded_batches = 0_u64;
-    let mut bulk_bursts = 0_u64;
-    let mut bulk_until = None;
+    let mut flow_bulk_windows = 0_u64;
+    let mut flow_window = TunWriteFlowWindow::default();
     let mut next_stats_report = TUN_WRITE_SCHEDULER_REPORT_INTERVAL;
 
     loop {
@@ -276,18 +388,13 @@ async fn run_tun_pump_with_write_worker(
             inbound.peer_map_epoch = peer_map.authorization_epoch();
             pending_wg_batch =
                 take_immediate_receive_batches(first, &mut wg_recv, &mut inbound.datagrams);
-            let received_datagrams = inbound.datagrams.len();
             let now = tokio::time::Instant::now();
-            let mut bulk_recent = bulk_until.is_some_and(|deadline| now < deadline);
-            if received_datagrams > 1 {
-                bulk_bursts += 1;
-                bulk_until = Some(now + TUN_WRITE_BULK_HOLD);
-                bulk_recent = true;
-            }
-            if tun_inbound_write_inline(received_datagrams, bulk_recent, worker_outstanding) {
+            if tun_inbound_write_inline(flow_window.is_bulk(now), worker_outstanding) {
                 // Preserve the exact scalar authorization and delivery path
-                // for isolated one-datagram traffic. The bulk scheduler adds
-                // no second barrier or task hop to that latency path.
+                // until sustained authenticated TCP-flow diversity proves
+                // high fanout. The scheduler adds no second barrier or task
+                // hop to the low-fanout path.
+                let mut observed_flow_buckets = 0;
                 if !process_tun_inbound_batch(
                     &magicsock,
                     tun.as_ref(),
@@ -299,10 +406,14 @@ async fn run_tun_pump_with_write_worker(
                     &peer_map,
                     &mut inbound,
                     None,
+                    Some(&mut observed_flow_buckets),
                 )
                 .await
                 {
                     break;
+                }
+                if flow_window.observe(observed_flow_buckets, tokio::time::Instant::now()) {
+                    flow_bulk_windows += 1;
                 }
                 inline_batches += 1;
                 free.push(inbound);
@@ -318,6 +429,10 @@ async fn run_tun_pump_with_write_worker(
                 {
                     break;
                 }
+                let observed_flow_buckets = tun_inbound_flow_buckets(inbound.plaintext.packets());
+                if flow_window.observe(observed_flow_buckets, tokio::time::Instant::now()) {
+                    flow_bulk_windows += 1;
+                }
                 if write_tx.send(inbound).is_err() {
                     break;
                 }
@@ -328,7 +443,8 @@ async fn run_tun_pump_with_write_worker(
                 log_tun_write_scheduler_stats(
                     inline_batches,
                     offloaded_batches,
-                    bulk_bursts,
+                    flow_bulk_windows,
+                    flow_window.bucket_count(),
                     worker_outstanding,
                 );
                 next_stats_report =
@@ -533,6 +649,7 @@ async fn process_tun_inbound_batch(
     peer_map: &crate::peer_map::Runtime,
     inbound: &mut InboundBatchScratch,
     outbound_sender: Option<&mut OutboundSendPipeline>,
+    flow_buckets: Option<&mut u64>,
 ) -> bool {
     let observed_peer_map_epoch = peer_map.authorization_epoch();
     let map_guard = peer_map.gate.read().await;
@@ -545,6 +662,9 @@ async fn process_tun_inbound_batch(
     }
     for &index in &inbound.authenticated_datagrams {
         magicsock.note_authenticated_wg_transport(&inbound.datagrams[index]);
+    }
+    if let Some(flow_buckets) = flow_buckets {
+        *flow_buckets = tun_inbound_flow_buckets(inbound.plaintext.packets());
     }
     // Normal transport data only writes the TUN and must not serialize the
     // outbound pipeline. Fence precisely before a generated reply could
@@ -3053,6 +3173,7 @@ mod tests {
         read_ready: tokio::sync::Notify,
         read_seen: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         read_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        writes_before_block: std::sync::atomic::AtomicUsize,
         write_entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         replay_tunnel: Arc<Mutex<WgTunn>>,
@@ -3531,19 +3652,69 @@ mod tests {
             cfg!(target_os = "linux"),
             "the write worker must remain an isolated Linux experiment"
         );
-        assert!(tun_inbound_write_inline(1, false, 0));
+        assert!(tun_inbound_write_inline(false, 0));
         assert!(
-            !tun_inbound_write_inline(2, false, 0),
-            "a multi-datagram burst must arm bidirectional scheduling"
+            !tun_inbound_write_inline(true, 0),
+            "a proven high-diversity window must retain one write owner"
         );
         assert!(
-            !tun_inbound_write_inline(1, true, 0),
-            "an isolated datagram inside the bulk window must retain one owner"
+            !tun_inbound_write_inline(false, 1),
+            "a later low-diversity burst must not overtake an offloaded write"
         );
+    }
+
+    fn scheduler_tcp_v4_packet(src_port: u16) -> Vec<u8> {
+        let mut packet = vec![0_u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = rustscale_packet::TCP;
+        packet[12..16].copy_from_slice(&[100, 64, 0, 1]);
+        packet[16..20].copy_from_slice(&[100, 64, 0, 2]);
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&5201_u16.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn inbound_write_flow_buckets_distinguish_low_and_high_fanout() {
+        let one = vec![scheduler_tcp_v4_packet(10_000)];
+        assert_eq!(tun_inbound_flow_buckets(&one).count_ones(), 1);
+
+        let low = (10_000..10_010)
+            .map(scheduler_tcp_v4_packet)
+            .collect::<Vec<_>>();
         assert!(
-            !tun_inbound_write_inline(1, false, 1),
-            "a later isolated datagram must not overtake an offloaded write"
+            tun_inbound_flow_buckets(&low).count_ones() <= 10,
+            "hash collisions may reduce but cannot inflate flow diversity"
         );
+
+        let high = (10_000..10_128)
+            .map(scheduler_tcp_v4_packet)
+            .collect::<Vec<_>>();
+        assert!(
+            tun_inbound_flow_buckets(&high).count_ones() > TUN_WRITE_FLOW_BUCKET_THRESHOLD,
+            "a 128-flow fanout must cross the conservative activation threshold"
+        );
+
+        let mut udp = scheduler_tcp_v4_packet(10_000);
+        udp[9] = rustscale_packet::UDP;
+        assert_eq!(tun_inbound_flow_buckets(&[udp]), 0);
+    }
+
+    #[test]
+    fn inbound_write_flow_window_expires_without_diversity() {
+        let now = tokio::time::Instant::now();
+        let mut window = TunWriteFlowWindow::default();
+        assert!(!window.observe((1_u64 << 10) - 1, now));
+        assert!(!window.is_bulk(now));
+        assert!(window.observe(u64::MAX, now));
+        assert!(window.is_bulk(now));
+
+        let expired = now + TUN_WRITE_BULK_HOLD;
+        assert!(!window.is_bulk(expired));
+        assert!(!window.observe(1, expired));
+        assert_eq!(window.bucket_count(), 1);
     }
 
     #[async_trait::async_trait]
@@ -3645,6 +3816,17 @@ mod tests {
         }
 
         async fn write_batch(&self, _packets: &mut [Vec<u8>]) -> std::io::Result<()> {
+            if self
+                .writes_before_block
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
             if let Some(entered) = self.write_entered.lock().unwrap().take() {
                 let _ = entered.send(());
             }
@@ -4214,24 +4396,27 @@ mod tests {
             WgTunn::new(&target_private, &source_public, 40).expect("target tunnel"),
         ));
         establish_tunnels(&sender, &receiver).await;
-        let ciphertext = sender
-            .lock()
-            .await
-            .encapsulate(&[
-                0x45, 0, 0, 20, 0, 1, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
-            ])
-            .expect("encrypt inbound packet")
-            .pop()
-            .expect("one inbound packet");
+        let mut ciphertexts = Vec::with_capacity(rustscale_tun::TunPacketBatch::MAX_PACKETS);
+        for src_port in
+            10_000..10_000 + u16::try_from(rustscale_tun::TunPacketBatch::MAX_PACKETS).unwrap()
+        {
+            ciphertexts.push(
+                sender
+                    .lock()
+                    .await
+                    .encapsulate(&scheduler_tcp_v4_packet(src_port))
+                    .expect("encrypt flow-diverse inbound packet")
+                    .pop()
+                    .expect("one flow-diverse inbound packet"),
+            );
+        }
         let second_ciphertext = sender
             .lock()
             .await
-            .encapsulate(&[
-                0x45, 0, 0, 20, 0, 3, 0, 0, 64, 17, 0, 0, 100, 64, 0, 1, 100, 64, 0, 2,
-            ])
-            .expect("encrypt second inbound packet")
+            .encapsulate(&scheduler_tcp_v4_packet(20_000))
+            .expect("encrypt backlogged inbound packet")
             .pop()
-            .expect("one second inbound packet");
+            .expect("one backlogged inbound packet");
 
         let (write_entered_tx, write_entered_rx) = tokio::sync::oneshot::channel();
         let (write_release_tx, write_release_rx) = tokio::sync::oneshot::channel();
@@ -4242,10 +4427,11 @@ mod tests {
             read_ready: tokio::sync::Notify::new(),
             read_seen: std::sync::Mutex::new(Some(read_seen_tx)),
             read_release: tokio::sync::Mutex::new(Some(read_release_rx)),
+            writes_before_block: std::sync::atomic::AtomicUsize::new(1),
             write_entered: std::sync::Mutex::new(Some(write_entered_tx)),
             release: tokio::sync::Mutex::new(Some(write_release_rx)),
             replay_tunnel: receiver.clone(),
-            next_ciphertext: ciphertext.clone(),
+            next_ciphertext: ciphertexts[0].clone(),
             read_must_be_eligible: false,
             outbound_packet: vec![
                 0x45, 0, 0, 20, 0, 2, 0, 0, 64, 17, 0, 0, 100, 64, 0, 2, 100, 64, 0, 1,
@@ -4276,14 +4462,15 @@ mod tests {
             }])
             .await
             .unwrap();
-        // Fill the first whole TUN batch to arm bulk scheduling and retain a
-        // second item in the receive channel. Replayed ciphertext after the
-        // first item is harmless here: the test needs one deliverable packet
-        // plus deterministic queued work while the write is blocked.
-        let datagrams = (0..rustscale_tun::TunPacketBatch::MAX_PACKETS)
-            .map(|_| {
+        // Fill the first whole TUN batch with distinct authenticated TCP flows
+        // to arm bulk scheduling, then retain one second item in the receive
+        // channel. The test TUN lets that first scalar write complete and
+        // blocks the worker-owned second write.
+        let datagrams = ciphertexts
+            .into_iter()
+            .map(|ciphertext| {
                 magicsock
-                    .authorized_wg_datagram(source_public.clone(), ciphertext.clone())
+                    .authorized_wg_datagram(source_public.clone(), ciphertext)
                     .expect("authorized datagram")
             })
             .collect();
@@ -4407,6 +4594,7 @@ mod tests {
             read_ready: tokio::sync::Notify::new(),
             read_seen: std::sync::Mutex::new(Some(read_seen_tx)),
             read_release: tokio::sync::Mutex::new(Some(read_release_rx)),
+            writes_before_block: std::sync::atomic::AtomicUsize::new(0),
             write_entered: std::sync::Mutex::new(Some(write_entered_tx)),
             release: tokio::sync::Mutex::new(Some(release_rx)),
             replay_tunnel: receiver.clone(),
@@ -4584,6 +4772,7 @@ mod tests {
             read_ready: tokio::sync::Notify::new(),
             read_seen: std::sync::Mutex::new(Some(read_seen_tx)),
             read_release: tokio::sync::Mutex::new(Some(read_release_rx)),
+            writes_before_block: std::sync::atomic::AtomicUsize::new(0),
             write_entered: std::sync::Mutex::new(Some(write_entered_tx)),
             release: tokio::sync::Mutex::new(Some(write_release_rx)),
             replay_tunnel: receiver.clone(),

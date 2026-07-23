@@ -104,46 +104,46 @@
         <p>Environment and evidence status are part of every result</p>
       </div>
 
-      <article class="performance-panel" data-benchmark="performance" data-environment="gcp-host-vm" data-mode="five-config-rsb1" data-evidence-status="measured" data-comparison="matched-evidence-without-winner" data-run="gcp-20260721-080637-4aca6f6c1e" data-source-commit="395bf8db6648e67f61bc571e1a755b27cd714e12" data-provenance="docs/performance">
+      <article class="performance-panel" data-benchmark="performance" data-environment="gcp-host-vm" data-mode="five-config-rsb1" data-evidence-status="measured" data-comparison="matched-evidence-mixed-outcome" data-run="gcp-20260723-064751-19775b4c5b" data-source-commit="70a7e09d460e33664bc570db8e68b77f694309a0" data-provenance="docs/performance">
         <div class="panel-heading">
           <h3>Canonical RSB1 · five configurations</h3>
           <span class="status status-measured">Complete matched evidence</span>
         </div>
-        <p class="scope">Direct path on matched GCP <code>n1-standard-4</code> endpoints in <code>us-central1-a/b</code>. Every configuration completed P1/P10/P100/P500/P1000 three times for 10 seconds, plus 200/200 latency exchanges. Values below are medians with population coefficient of variation (CV); no winner is declared.</p>
+        <p class="scope">Direct path on matched GCP <code>n1-standard-4</code> endpoints in <code>us-central1-a/b</code>. Every configuration completed P1/P10/P100/P500/P1000 three times for 10 seconds, plus 200/200 latency exchanges. Values below are medians with population coefficient of variation (CV); embedded RustScale leads, while kernel-TUN throughput remains behind tailscaled.</p>
         <div class="facts canonical-results">
-          <div class="fact canonical-config" data-config="rs-userspace" data-p1-mbps="83.9519232" data-p10-mbps="328.45249920000003" data-p100-mbps="124.723872" data-p500-mbps="19.614815999999998" data-p1000-mbps="59.6936" data-p50-us="1069.747" data-p95-us="1167.274" data-p99-us="1218.603" data-latency-count="200" data-client-cpu-avg="62.59" data-client-cpu-peak="219.16" data-client-rss-avg-kb="39467.99" data-client-rss-peak-kb="209016" data-server-cpu-avg="70.18" data-server-cpu-peak="276.89" data-server-rss-avg-kb="2144364.93" data-server-rss-peak-kb="9158072">
+          <div class="fact canonical-config" data-config="rs-userspace" data-p1-mbps="2349.4117568" data-p10-mbps="2296.7976128" data-p100-mbps="2337.0035072" data-p500-mbps="2231.2545984" data-p1000-mbps="2180.3080896" data-p50-us="1123.879" data-p95-us="1229.095" data-p99-us="1286.476" data-latency-count="200" data-client-cpu-avg="127.43" data-client-cpu-peak="294.94" data-client-rss-avg-kb="209570.05" data-client-rss-peak-kb="1255472" data-server-cpu-avg="105.03" data-server-cpu-peak="287.69" data-server-rss-avg-kb="699004.86" data-server-rss-peak-kb="2506004">
             <h4>RustScale · embedded tsnet</h4>
-            <p>Median Mbps (CV): P1 84.0 (53.2%) · P10 328.5 (11.0%) · P100 124.7 (1.2%) · P500 19.6 (57.8%) · P1000 59.7 (60.5%).</p>
-            <p>Latency: p50 1069.747 us · p95 1167.274 us · p99 1218.603 us · 200/200.</p>
-            <p>Client CPU avg/peak 62.59/219.16%; RSS 38.54/204.12 MiB. Server CPU 70.18/276.89%; RSS 2094.11/8943.43 MiB.</p>
+            <p>Median Mbps (CV): P1 2349.4 (1.2%) · P10 2296.8 (1.1%) · P100 2337.0 (0.3%) · P500 2231.3 (2.0%) · P1000 2180.3 (1.0%).</p>
+            <p>Latency: p50 1123.879 us · p95 1229.095 us · p99 1286.476 us · 200/200.</p>
+            <p>Client CPU avg/peak 127.43/294.94%; RSS 204.66/1226.05 MiB. Server CPU 105.03/287.69%; RSS 682.62/2447.27 MiB.</p>
           </div>
-          <div class="fact canonical-config" data-config="ts-embedded" data-p1-mbps="1395.868876" data-p10-mbps="1564.8284159999998" data-p100-mbps="1430.5026560000001" data-p500-mbps="1289.1252479999998" data-p1000-mbps="1178.8644736" data-p50-us="1142.742" data-p95-us="1322.729" data-p99-us="1651.217" data-latency-count="200" data-client-cpu-avg="156.81" data-client-cpu-peak="322.14" data-client-rss-avg-kb="287581.53" data-client-rss-peak-kb="873148" data-server-cpu-avg="161.56" data-server-cpu-peak="401.68" data-server-rss-avg-kb="2221622.94" data-server-rss-peak-kb="6588056">
+          <div class="fact canonical-config" data-config="ts-embedded" data-p1-mbps="1128.321024" data-p10-mbps="1510.434816" data-p100-mbps="1435.58624" data-p500-mbps="1331.6191488" data-p1000-mbps="1129.3671168" data-p50-us="1140.439" data-p95-us="1249.78" data-p99-us="1370.256" data-latency-count="200" data-client-cpu-avg="151.83" data-client-cpu-peak="317.8" data-client-rss-avg-kb="275691.04" data-client-rss-peak-kb="893920" data-server-cpu-avg="145.45" data-server-cpu-peak="400.2" data-server-rss-avg-kb="1897518.95" data-server-rss-peak-kb="5940984">
             <h4>Tailscale · embedded Go tsnet</h4>
-            <p>Median Mbps (CV): P1 1395.9 (0.3%) · P10 1564.8 (0.3%) · P100 1430.5 (4.8%) · P500 1289.1 (2.3%) · P1000 1178.9 (6.4%).</p>
-            <p>Latency: p50 1142.742 us · p95 1322.729 us · p99 1651.217 us · 200/200.</p>
-            <p>Client CPU avg/peak 156.81/322.14%; RSS 280.84/852.68 MiB. Server CPU 161.56/401.68%; RSS 2169.55/6433.65 MiB.</p>
+            <p>Median Mbps (CV): P1 1128.3 (3.9%) · P10 1510.4 (1.7%) · P100 1435.6 (3.1%) · P500 1331.6 (1.7%) · P1000 1129.4 (3.2%).</p>
+            <p>Latency: p50 1140.439 us · p95 1249.780 us · p99 1370.256 us · 200/200.</p>
+            <p>Client CPU avg/peak 151.83/317.80%; RSS 269.23/872.97 MiB. Server CPU 145.45/400.20%; RSS 1853.05/5801.74 MiB.</p>
           </div>
-          <div class="fact canonical-config" data-config="rs-tun" data-p1-mbps="1613.3350328000001" data-p10-mbps="1513.5724192" data-p100-mbps="1215.4660128" data-p500-mbps="511.09385599999996" data-p1000-mbps="366.1974656" data-p50-us="1185.821" data-p95-us="1298.025" data-p99-us="1328.048" data-latency-count="200" data-client-cpu-avg="105.68" data-client-cpu-peak="173.99" data-client-rss-avg-kb="37974.27" data-client-rss-peak-kb="53796" data-server-cpu-avg="112.69" data-server-cpu-peak="173.57" data-server-rss-avg-kb="32604.09" data-server-rss-peak-kb="35448">
+          <div class="fact canonical-config" data-config="rs-tun" data-p1-mbps="1549.9031808" data-p10-mbps="1407.6363104" data-p100-mbps="1053.2780096000001" data-p500-mbps="545.5633152" data-p1000-mbps="417.44199360000005" data-p50-us="1232.88" data-p95-us="1338.271" data-p99-us="1368.507" data-latency-count="200" data-client-cpu-avg="108.0" data-client-cpu-peak="181.73" data-client-rss-avg-kb="35577.67" data-client-rss-peak-kb="54968" data-server-cpu-avg="134.51" data-server-cpu-peak="244.29" data-server-rss-avg-kb="32516.69" data-server-rss-peak-kb="35664">
             <h4>RustScale · kernel TUN</h4>
-            <p>Median Mbps (CV): P1 1613.3 (0.6%) · P10 1513.6 (0.3%) · P100 1215.5 (1.6%) · P500 511.1 (0.8%) · P1000 366.2 (9.2%).</p>
-            <p>Latency: p50 1185.821 us · p95 1298.025 us · p99 1328.048 us · 200/200.</p>
-            <p>Client CPU avg/peak 105.68/173.99%; RSS 37.08/52.54 MiB. Server CPU 112.69/173.57%; RSS 31.84/34.62 MiB.</p>
+            <p>Median Mbps (CV): P1 1549.9 (1.3%) · P10 1407.6 (0.5%) · P100 1053.3 (0.2%) · P500 545.6 (4.0%) · P1000 417.4 (8.2%).</p>
+            <p>Latency: p50 1232.880 us · p95 1338.271 us · p99 1368.507 us · 200/200.</p>
+            <p>Client CPU avg/peak 108.00/181.73%; RSS 34.74/53.68 MiB. Server CPU 134.51/244.29%; RSS 31.75/34.83 MiB.</p>
           </div>
-          <div class="fact canonical-config" data-config="ts-userspace" data-p1-mbps="1332.9690624" data-p10-mbps="1343.4000472" data-p100-mbps="1114.3585416" data-p500-mbps="852.54872" data-p1000-mbps="685.5614367999999" data-p50-us="1551.578" data-p95-us="1660.892" data-p99-us="1700.585" data-latency-count="200" data-client-cpu-avg="143.5" data-client-cpu-peak="386.73" data-client-rss-avg-kb="3023103.76" data-client-rss-peak-kb="11061808" data-server-cpu-avg="132.18" data-server-cpu-peak="403.6" data-server-rss-avg-kb="1215135.29" data-server-rss-peak-kb="2810832">
+          <div class="fact canonical-config" data-config="ts-userspace" data-p1-mbps="1209.8217976" data-p10-mbps="1273.8830408" data-p100-mbps="1083.7995552" data-p500-mbps="795.5881360000001" data-p1000-mbps="629.9861664" data-p50-us="1691.7" data-p95-us="1845.124" data-p99-us="1906.0" data-latency-count="200" data-client-cpu-avg="145.2" data-client-cpu-peak="395.47" data-client-rss-avg-kb="3030916.96" data-client-rss-peak-kb="11131216" data-server-cpu-avg="113.04" data-server-cpu-peak="399.23" data-server-rss-avg-kb="1098440.95" data-server-rss-peak-kb="2424476">
             <h4>Tailscale · tailscaled daemon proxy</h4>
-            <p>Median Mbps (CV): P1 1333.0 (1.3%) · P10 1343.4 (1.0%) · P100 1114.4 (3.2%) · P500 852.5 (1.0%) · P1000 685.6 (2.7%).</p>
-            <p>Latency: p50 1551.578 us · p95 1660.892 us · p99 1700.585 us · 200/200.</p>
-            <p>Client CPU avg/peak 143.50/386.73%; RSS 2952.25/10802.55 MiB. Server CPU 132.18/403.60%; RSS 1186.66/2744.95 MiB.</p>
+            <p>Median Mbps (CV): P1 1209.8 (2.5%) · P10 1273.9 (1.3%) · P100 1083.8 (1.7%) · P500 795.6 (1.7%) · P1000 630.0 (1.8%).</p>
+            <p>Latency: p50 1691.700 us · p95 1845.124 us · p99 1906.000 us · 200/200.</p>
+            <p>Client CPU avg/peak 145.20/395.47%; RSS 2959.88/10870.33 MiB. Server CPU 113.04/399.23%; RSS 1072.70/2367.65 MiB.</p>
           </div>
-          <div class="fact canonical-config" data-config="ts-tun" data-p1-mbps="2243.7190368" data-p10-mbps="2185.589536" data-p100-mbps="1902.1785888" data-p500-mbps="1343.4285152" data-p1000-mbps="931.3570655999999" data-p50-us="1321.159" data-p95-us="1444.654" data-p99-us="1493.46" data-latency-count="200" data-client-cpu-avg="208.68" data-client-cpu-peak="327.94" data-client-rss-avg-kb="556339.57" data-client-rss-peak-kb="758408" data-server-cpu-avg="226.15" data-server-cpu-peak="337.22" data-server-rss-avg-kb="102026.62" data-server-rss-peak-kb="164412">
+          <div class="fact canonical-config" data-config="ts-tun" data-p1-mbps="2277.2137728000002" data-p10-mbps="2452.0397208" data-p100-mbps="2203.840188" data-p500-mbps="1618.9866832" data-p1000-mbps="1329.3396576" data-p50-us="1442.183" data-p95-us="1572.326" data-p99-us="1620.317" data-latency-count="200" data-client-cpu-avg="220.18" data-client-cpu-peak="346.87" data-client-rss-avg-kb="887581.55" data-client-rss-peak-kb="1347168" data-server-cpu-avg="203.96" data-server-cpu-peak="312.81" data-server-rss-avg-kb="80307.75" data-server-rss-peak-kb="120348">
             <h4>Tailscale · kernel TUN</h4>
-            <p>Median Mbps (CV): P1 2243.7 (1.7%) · P10 2185.6 (1.2%) · P100 1902.2 (0.7%) · P500 1343.4 (2.5%) · P1000 931.4 (1.7%).</p>
-            <p>Latency: p50 1321.159 us · p95 1444.654 us · p99 1493.460 us · 200/200.</p>
-            <p>Client CPU avg/peak 208.68/327.94%; RSS 543.30/740.63 MiB. Server CPU 226.15/337.22%; RSS 99.64/160.56 MiB.</p>
+            <p>Median Mbps (CV): P1 2277.2 (0.4%) · P10 2452.0 (1.0%) · P100 2203.8 (0.2%) · P500 1619.0 (1.5%) · P1000 1329.3 (2.9%).</p>
+            <p>Latency: p50 1442.183 us · p95 1572.326 us · p99 1620.317 us · 200/200.</p>
+            <p>Client CPU avg/peak 220.18/346.87%; RSS 866.78/1315.59 MiB. Server CPU 203.96/312.81%; RSS 78.43/117.53 MiB.</p>
           </div>
         </div>
-        <p class="performance-note">All five cells used the identical RSB1 payload and exact lifecycle denominators. CPU/RSS cover declared userspace process sets, exclude kernel CPU, and can double-count shared pages across proxy workers. RustScale embedded throughput had 53–60% CV at P1/P500/P1000, so the medians do not support a stable winner claim.</p>
-        <p class="provenance">Run <code>gcp-20260721-080637-4aca6f6c1e</code> · source <code>395bf8db6648e67f61bc571e1a755b27cd714e12</code> · <a href="https://github.com/rajsinghtech/rustscale/tree/master/docs/performance/gcp-20260721-080637-4aca6f6c1e">complete raw evidence</a> · <a href="https://github.com/rajsinghtech/rustscale/blob/master/docs/performance/gcp-20260721-080637-4aca6f6c1e/dashboard.html">full generated dashboard</a> · <a href="https://github.com/rajsinghtech/rustscale/blob/master/PERFORMANCE.md">methodology and caveats</a>.</p>
+        <p class="performance-note">All five cells used the identical RSB1 payload and exact lifecycle denominators. CPU/RSS cover declared userspace process sets, exclude kernel CPU, and can double-count shared pages across proxy workers. Embedded RustScale leads native Go tsnet at every stream count; RustScale TUN throughput reaches only 31–68% of tailscaled and remains the primary direct-path gap.</p>
+        <p class="provenance">Run <code>gcp-20260723-064751-19775b4c5b</code> · source <code>70a7e09d460e33664bc570db8e68b77f694309a0</code> · <a href="https://github.com/rajsinghtech/rustscale/tree/master/docs/performance/gcp-20260723-064751-19775b4c5b">complete raw evidence</a> · <a href="https://github.com/rajsinghtech/rustscale/blob/master/docs/performance/gcp-20260723-064751-19775b4c5b/dashboard.html">full generated dashboard</a> · <a href="https://github.com/rajsinghtech/rustscale/blob/master/PERFORMANCE.md">methodology and caveats</a>.</p>
         <div hidden>
         <details hidden>
           <summary>Earlier kernel-TUN comparison with tailscaled</summary>

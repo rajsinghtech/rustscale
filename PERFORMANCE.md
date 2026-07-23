@@ -237,9 +237,9 @@ The requested peer-load label is 1; observed membership was not instrumented,
 so this evidence does not claim peer-load scaling. The linked Pages dashboard
 renders the retained raw series without publishing failed cells.
 
-## Canonical five-configuration RSB1 matrix (2026-07-21)
+## Previous canonical five-configuration RSB1 matrix (2026-07-21)
 
-Run `gcp-20260721-080637-4aca6f6c1e` is the current matched evidence set for
+Run `gcp-20260721-080637-4aca6f6c1e` was the prior matched evidence set for
 RustScale embedded tsnet, pinned Tailscale Go tsnet, RustScale kernel TUN, the
 retained tailscaled SOCKS5/Serve daemon proxy, and tailscaled kernel TUN. It ran
 from clean source commit `395bf8db6648e67f61bc571e1a755b27cd714e12` on matched
@@ -301,3 +301,79 @@ The harness exited successfully only after all five cells, aggregate
 validation, and teardown passed; independent postflight found zero remaining
 VMs, disks, addresses, tailnets, benchmark processes, shared tailnet records,
 or auth-key files.
+
+## Current canonical five-configuration RSB1 matrix (2026-07-23)
+
+Run `gcp-20260723-064751-19775b4c5b` measured the PR #107 tree at clean
+source commit `70a7e09d460e33664bc570db8e68b77f694309a0` on matched GCP
+`n1-standard-4` endpoints in `us-central1-a` and `us-central1-b`. The pinned
+native comparator used `tailscale.com@v1.100.0` and Go 1.26.4. Every cell
+observed a direct path and completed three 10-second RSB1 download samples at
+P1/P10/P100/P500/P1000 with exact connection lifecycle denominators, followed
+by 200/200 latency exchanges. No valid outcome was retried or replaced.
+
+Median throughput is in Mbps; population CV is parenthesized.
+
+| Configuration | P1 | P10 | P100 | P500 | P1000 |
+|---|---:|---:|---:|---:|---:|
+| RustScale embedded tsnet | 2349.4 (1.2%) | 2296.8 (1.1%) | 2337.0 (0.3%) | 2231.3 (2.0%) | 2180.3 (1.0%) |
+| Tailscale embedded Go tsnet | 1128.3 (3.9%) | 1510.4 (1.7%) | 1435.6 (3.1%) | 1331.6 (1.7%) | 1129.4 (3.2%) |
+| RustScale kernel TUN | 1549.9 (1.3%) | 1407.6 (0.5%) | 1053.3 (0.2%) | 545.6 (4.0%) | 417.4 (8.2%) |
+| tailscaled daemon proxy | 1209.8 (2.5%) | 1273.9 (1.3%) | 1083.8 (1.7%) | 795.6 (1.7%) | 630.0 (1.8%) |
+| tailscaled kernel TUN | 2277.2 (0.4%) | 2452.0 (1.0%) | 2203.8 (0.2%) | 1619.0 (1.5%) | 1329.3 (2.9%) |
+
+RustScale embedded throughput was 2.082x, 1.521x, 1.628x, 1.676x, and
+1.931x native Go tsnet at the five stream counts. Kernel-TUN throughput is the
+remaining direct-path performance gap: RustScale reached only 68.1%, 57.4%,
+47.8%, 33.7%, and 31.4% of tailscaled. The P1000 RustScale TUN samples were
+`417.442, 426.234, 353.256` Mbps, so that cell's 8.2% CV is also a stability
+warning rather than a precise point estimate. The daemon-proxy result remains
+context only; its loopback kernel TCP, ncat, SOCKS5, Serve, and daemon process
+boundaries are not an embedded or TUN parity denominator.
+
+| Configuration | p50 us | p95 us | p99 us | Successful/requested |
+|---|---:|---:|---:|---:|
+| RustScale embedded tsnet | 1123.879 | 1229.095 | 1286.476 | 200/200 |
+| Tailscale embedded Go tsnet | 1140.439 | 1249.780 | 1370.256 | 200/200 |
+| RustScale kernel TUN | 1232.880 | 1338.271 | 1368.507 | 200/200 |
+| tailscaled daemon proxy | 1691.700 | 1845.124 | 1906.000 | 200/200 |
+| tailscaled kernel TUN | 1442.183 | 1572.326 | 1620.317 | 200/200 |
+
+RustScale embedded p50/p95/p99 were 1.5%, 1.7%, and 6.1% lower than native
+Go tsnet. RustScale TUN p50/p95/p99 were 14.5%, 14.9%, and 15.5% lower than
+tailscaled. The first RustScale embedded latency exchange was a 13.511 ms
+outlier, however, versus a 1.762 ms native maximum; the percentile win does not
+close that cold-tail observation.
+
+CPU is average/peak userspace percent and RSS is average/peak MiB across each
+endpoint's declared process set.
+
+| Configuration | Endpoint | Samples (missing) | CPU avg/peak | RSS avg/peak MiB |
+|---|---|---:|---:|---:|
+| RustScale embedded tsnet | client | 358 (81) | 127.43/294.94% | 204.66/1226.05 |
+| RustScale embedded tsnet | server | 357 (1) | 105.03/287.69% | 682.62/2447.27 |
+| Tailscale embedded Go tsnet | client | 309 (78) | 151.83/317.80% | 269.23/872.97 |
+| Tailscale embedded Go tsnet | server | 308 (1) | 145.45/400.20% | 1853.05/5801.74 |
+| RustScale kernel TUN | client | 216 (1) | 108.00/181.73% | 34.74/53.68 |
+| RustScale kernel TUN | server | 215 (1) | 134.51/244.29% | 31.75/34.83 |
+| tailscaled daemon proxy | client | 300 (1) | 145.20/395.47% | 2959.88/10870.33 |
+| tailscaled daemon proxy | server | 330 (1) | 113.04/399.23% | 1072.70/2367.65 |
+| tailscaled kernel TUN | client | 212 (1) | 220.18/346.87% | 866.78/1315.59 |
+| tailscaled kernel TUN | server | 212 (1) | 203.96/312.81% | 78.43/117.53 |
+
+RustScale used less average userspace CPU in both matched embedded and TUN
+comparisons. Its embedded server average/peak RSS was 63.2%/57.8% lower, while
+the RustScale embedded client peak was 40.4% higher than native despite a
+24.0% lower average. The RustScale benchmark binary was 20.35 MiB versus
+30.14 MiB for the Go comparator; `rustscaled` was 21.10 MiB versus 39.22 MiB
+for tailscaled.
+
+The complete credential-free matrix, endpoint metadata, result JSON,
+dashboard, summary, and per-file hashes are tracked in
+[`docs/performance/gcp-20260723-064751-19775b4c5b`](docs/performance/gcp-20260723-064751-19775b4c5b/).
+The summary SHA-256 is
+`6e739c2800f0592a33fde55c8faf75f0d3c23a23e1dba7294763643e8ae9de8c`.
+Strict aggregation reported five expected/five successful/zero failed/zero
+missing cells. Postflight found zero labeled VMs, disks, addresses, processes,
+locks, auth roots, or credential findings, and independently confirmed the
+ephemeral tailnet was gone.

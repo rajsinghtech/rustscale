@@ -245,13 +245,41 @@ The control/sender artifact SHA-256 was
 This A/B validates the headroom change relative to the accepted RustScale
 path; it is not a contemporaneous native-Tailscale P10 comparison.
 
-This evidence closes and exceeds the measured high-fanout embedded inbound
-throughput gap on this host and establishes a clean P10 candidate-versus-prior
-RustScale stability slice. It does not establish a matched native
-low-concurrency comparison, latency, download/bidirectional, DERP, TUN,
-daemon/userspace, startup, idle-resource, cross-host, or universal
-compatibility parity; those remain required before the overall parity goal or
-merge gate is complete.
+The subsequent canonical GCP run
+`gcp-20260723-064751-19775b4c5b` used two matched `n1-standard-4` VMs in
+`us-central1-a` and `us-central1-b`, clean source commit
+`70a7e09d460e33664bc570db8e68b77f694309a0`, and the pinned native Go tsnet
+comparator. Every cell retained a direct path, exactly three valid 10-second
+RSB1 download trials at P1/P10/P100/P500/P1000, and 200/200 latency exchanges.
+No valid outcome was retried or replaced.
+
+| Direct cross-host download | P1 | P10 | P100 | P500 | P1000 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RustScale embedded | 2349.4 | 2296.8 | 2337.0 | 2231.3 | 2180.3 Mbps |
+| Native Go tsnet | 1128.3 | 1510.4 | 1435.6 | 1331.6 | 1129.4 Mbps |
+| RustScale/native ratio | 2.082x | 1.521x | 1.628x | 1.676x | 1.931x |
+| RustScale TUN | 1549.9 | 1407.6 | 1053.3 | 545.6 | 417.4 Mbps |
+| tailscaled TUN | 2277.2 | 2452.0 | 2203.8 | 1619.0 | 1329.3 Mbps |
+| RustScale/tailscaled TUN ratio | 68.1% | 57.4% | 47.8% | 33.7% | 31.4% |
+
+RustScale embedded p50/p95/p99 latency was
+1123.879/1229.095/1286.476 microseconds versus
+1140.439/1249.780/1370.256 for native Go tsnet. RustScale embedded also used
+less average userspace CPU on both endpoints, 63.2% less server average RSS,
+and a 32.5% smaller binary. Its client peak RSS was 40.4% higher, however, and
+its single worst latency exchange was 13.511 ms versus 1.762 ms native. TUN
+latency, CPU, RSS, and binary footprint favored RustScale, but the throughput
+ratios above make TUN the primary known performance gap. Full raw arrays,
+resource timelines, product hashes, endpoint metadata, and strict cleanup
+evidence are tracked in
+[`docs/performance/gcp-20260723-064751-19775b4c5b`](performance/gcp-20260723-064751-19775b4c5b/).
+
+Together, the same-host upload and cross-host download evidence closes and
+exceeds the measured direct embedded throughput gap from P1 through P1000 and
+the measured p50/p95/p99 latency gap. It does not close kernel-TUN throughput,
+the embedded client peak-RSS/cold-tail observations, bidirectional traffic,
+DERP, startup, idle-resource, or universal compatibility parity; those remain
+required before the overall parity goal or merge gate is complete.
 
 ## Test infrastructure
 

@@ -1020,8 +1020,8 @@ rs_tun_measurement_preflight() {
     && ssh_sudo "$CVM" "$CZONE" "$(rs_tun_iperf_cleanup_command client)"
 }
 
-# Profile-only emits no metrics, but its reverse workload must use the exact
-# same labeled rs-tun iperf server contract as a production measurement.
+# Start the retained labeled iperf diagnostic used by tun_measure's local
+# compatibility checks. The current perf profile uses matched RSB1 instead.
 tun_start_iperf_server() {
   local label="$1" as_root="$2" server_pid_path server_log_path
   server_pid_path=$(tun_iperf_server_pid_path "$label")
@@ -1033,13 +1033,13 @@ tun_start_iperf_server() {
   sleep 2
 }
 
-# Profile-only is a diagnostic, not a second measurement implementation. Keep
-# its preflight, labeled server, readiness settle, and profile workload in the
-# same production helper so it cannot regress into racing a server bind.
+# Profile-only is a diagnostic, not a second measurement implementation. Use
+# the same kernel-TCP RSB1 server as the measured matrix; unlike iperf3, the
+# matched RSB1 workload supports the public P1000 contract.
 # Cleanup intentionally remains the caller's fail-closed responsibility.
 profile_only_rs_tun_workload() {
   rs_tun_measurement_preflight || return 1
-  tun_start_iperf_server rs-tun 0 || return 1
+  start_kernel_rsb1_server 0.0.0.0 || return 1
   profile_rs_tun
 }
 
@@ -1658,12 +1658,13 @@ rs_tun_lifecycle_self_test() {
 profile_only_server_contract_self_test() {
   local calls=""
   ssh_sudo() { calls+="$1|$2|$3"$'\n'; }
-  run_tun_command() { calls+="$1|$2|$3|$4"$'\n'; }
-  sleep() { calls+="sleep|$1"$'\n'; }
+  ssh_cmd() { calls+="$1|$2|$3"$'\n'; }
   profile_rs_tun() { calls+="profile"$'\n'; }
-  local expected="$SVM|$SZONE|$(rs_tun_iperf_cleanup_command server)"$'\n'"$CVM|$CZONE|$(rs_tun_iperf_cleanup_command client)"$'\n'"0|$SVM|$SZONE|pkill -x iperf3 2>/dev/null; nohup iperf3 -s -p $PORT > /tmp/rs-tun-iperf3-srv.log 2>&1 & echo \$! > /tmp/rs-tun-iperf3-srv.pid"$'\n''sleep|2'$'\n''profile'$'\n'
+  local preflight="$SVM|$SZONE|$(rs_tun_iperf_cleanup_command server)"$'\n'"$CVM|$CZONE|$(rs_tun_iperf_cleanup_command client)"$'\n'
   profile_only_rs_tun_workload || return 1
-  [[ "$calls" == "$expected" ]] || return 1
+  [[ "$calls" == "$preflight"* \
+    && "$calls" == *'/opt/rustscale/target/release/rustscale-bench server --transport kernel-tcp --bind 0.0.0.0'* \
+    && "$calls" == *'grep -q "BENCH_READY 1" /tmp/rsb1-server.log'*$'\n''profile'$'\n' ]] || return 1
 
   # A profile failure must be returned to run_rs_tun, which owns the
   # fail-closed cleanup path; the helper itself must not continue or emit.
@@ -1672,8 +1673,9 @@ profile_only_server_contract_self_test() {
   if profile_only_rs_tun_workload; then
     return 1
   fi
-  expected="${expected%profile$'\n'}profile-failed"$'\n'
-  [[ "$calls" == "$expected" ]] || return 1
+  [[ "$calls" == "$preflight"* \
+    && "$calls" == *'/opt/rustscale/target/release/rustscale-bench server --transport kernel-tcp --bind 0.0.0.0'* \
+    && "$calls" == *'grep -q "BENCH_READY 1" /tmp/rsb1-server.log'*$'\n''profile-failed'$'\n' ]] || return 1
 
   # A failed paid preflight must stop before server start or profiling.
   calls=""
@@ -1682,7 +1684,7 @@ profile_only_server_contract_self_test() {
     return 1
   fi
   [[ "$calls" == $'preflight-failed\n' ]] || return 1
-  unset -f ssh_sudo run_tun_command sleep profile_rs_tun
+  unset -f ssh_sudo ssh_cmd profile_rs_tun
 }
 
 classifier_self_test
@@ -2181,7 +2183,7 @@ profile_remote_cleanup_endpoint() {
   local endpoint="$1" vm="$2" zone="$3" prefix command
   prefix=$(profile_endpoint_prefix "$endpoint")
   command="pid=\$(cat ${prefix}.pid 2>/dev/null || true); case \$pid in \"\"|0|0[0-9]*|*[!0-9]*) ;; *) kill \"\$pid\" 2>/dev/null || true ;; esac; rm -f ${prefix}.pid ${prefix}.status ${prefix}.data ${prefix}-children.txt ${prefix}-self.txt ${prefix}.log"
-  [[ "$endpoint" == client ]] && command+=" /tmp/rs-tun-profile-iperf.json"
+  [[ "$endpoint" == client ]] && command+=" /tmp/rs-tun-profile-rsb1.json /tmp/rsb1-profile-client.log; rm -rf /tmp/rsb1-profile-client-state"
   ssh_sudo "$vm" "$zone" "$command"
 }
 
@@ -2201,7 +2203,10 @@ profile_remote_cleanup() {
 profile_start_command() {
   local endpoint="$1" daemon_pid="$2" prefix duration
   prefix=$(profile_endpoint_prefix "$endpoint")
-  duration=$((DURATION + 3))
+  # P1000 establishes and handshakes every RSB1 stream before its common
+  # timing barrier. Keep the profiler alive through that bounded setup and the
+  # complete measured interval; idle tail time produces no on-CPU samples.
+  duration=$((DURATION + 15))
   # No single quotes: ssh_sudo wraps this program in a single-quoted bash -c.
   printf 'rm -f %s.pid %s.status %s.data %s-children.txt %s-self.txt %s.log; nohup bash -c "perf record -F 199 -g -p %s -o %s.data -- sleep %s; status=\$?; printf \\"%%s\\n\\" \\"\$status\\" > %s.status; exit \\"\$status\\"" >%s.log 2>&1 & echo $! >%s.pid' \
     "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$daemon_pid" "$prefix" "$duration" "$prefix" "$prefix" "$prefix"
@@ -2222,11 +2227,43 @@ profile_report_command() {
     "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix" "$prefix"
 }
 
+profile_rsb1_workload_valid() {
+  local path="$1" parallel="$2" duration="$3"
+  python3 - "$path" "$parallel" "$duration" <<'PYEOF'
+import json, math, sys
+path, parallel, duration = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(path) as src:
+    result = json.load(src)
+assert result["tool"] == "rustscale-bench"
+assert result["mode"] == "throughput"
+assert result["transport"] == "kernel-tcp"
+assert result["protocol"] == "RSB1"
+assert result["direction"] == "down"
+assert result["parallel"] == parallel
+assert result["established"] == parallel
+assert result["handshaken"] == parallel
+assert result["completed"] == parallel
+assert result["duration_secs"] == duration
+assert isinstance(result["total_mbps"], (int, float))
+assert not isinstance(result["total_mbps"], bool)
+assert math.isfinite(result["total_mbps"]) and result["total_mbps"] > 0
+samples = result["samples"]
+assert len(samples) == duration
+assert [sample["elapsed_secs"] for sample in samples] == list(range(1, duration + 1))
+assert all(isinstance(sample["mbps"], (int, float))
+           and not isinstance(sample["mbps"], bool)
+           and math.isfinite(sample["mbps"])
+           and sample["mbps"] >= 0 for sample in samples)
+PYEOF
+}
+
 profile_rs_tun() {
   local profile_dir="$RDIR/profile" server_dir="$RDIR/profile/server" client_dir="$RDIR/profile/client"
   local srv_pid cli_pid status=0 server_wait_status=0 client_wait_status=0
-  local profile_parallelism="${PROFILE_PARALLELISM:-10}"
+  local profile_parallelism="${PROFILE_PARALLELISM:-10}" profile_command
   mkdir -p "$server_dir" "$client_dir"
+  profile_command=$(rsb1_client_command rust-kernel throughput "$server_ip:$PORT" "$DURATION" \
+    "$profile_parallelism" /tmp/rsb1-profile-client-state /tmp/rsb1-profile-client.log) || return 1
 
   if ! srv_pid=$(ssh_sudo "$SVM" "$SZONE" 'cat /tmp/rs-tun-srv.pid'); then
     status=1
@@ -2238,9 +2275,9 @@ profile_rs_tun() {
     status=1
   elif ! ssh_sudo "$CVM" "$CZONE" "$(profile_start_command client "$cli_pid")"; then
     status=1
-  # This extra diagnostic workload is intentionally outside tun_measure and
-  # result JSON. Its stream count is recorded in profile metadata.
-  elif ! run_tun_command 0 "$CVM" "$CZONE" "iperf3 -c $server_ip -p $PORT -t $DURATION -P $profile_parallelism -R -J >/tmp/rs-tun-profile-iperf.json"; then
+  # This extra matched RSB1 diagnostic is intentionally outside rsb1_measure
+  # and the accepted result JSON. Its complete lifecycle is retained below.
+  elif ! run_tun_command 0 "$CVM" "$CZONE" "$profile_command >/tmp/rs-tun-profile-rsb1.json"; then
     status=1
   else
     # Do not combine waits: each endpoint's profiler status is independently
@@ -2267,14 +2304,18 @@ profile_rs_tun() {
          ! scp_from "$CVM" "$CZONE" /tmp/rs-tun-perf-client.data "$client_dir/perf.data" ||
          ! scp_from "$CVM" "$CZONE" /tmp/rs-tun-perf-client-children.txt "$client_dir/perf-children.txt" ||
          ! scp_from "$CVM" "$CZONE" /tmp/rs-tun-perf-client-self.txt "$client_dir/perf-self.txt" ||
-         [[ ! -s "$server_dir/perf.data" || ! -s "$server_dir/perf-children.txt" || ! -s "$server_dir/perf-self.txt" || ! -s "$client_dir/perf.data" || ! -s "$client_dir/perf-children.txt" || ! -s "$client_dir/perf-self.txt" ]]; then
+         ! scp_from "$CVM" "$CZONE" /tmp/rs-tun-profile-rsb1.json "$profile_dir/workload.json" ||
+         [[ ! -s "$server_dir/perf.data" || ! -s "$server_dir/perf-children.txt" || ! -s "$server_dir/perf-self.txt" || ! -s "$client_dir/perf.data" || ! -s "$client_dir/perf-children.txt" || ! -s "$client_dir/perf-self.txt" || ! -s "$profile_dir/workload.json" ]]; then
+      status=1
+    elif ! profile_rsb1_workload_valid "$profile_dir/workload.json" "$profile_parallelism" "$DURATION"; then
       status=1
     elif ! python3 - "$profile_dir/metadata.json" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$profile_parallelism" "$DURATION" "$REPEAT" "$srv_pid" "$cli_pid" "$OUT" <<'PYEOF'
 import json, sys
 out, topo, path, config, parallel, duration, repeat, srv_pid, cli_pid, result = sys.argv[1:]
 json.dump({"topology":topo,"path":path,"config":config,
            "parallel":int(parallel),"duration_s":int(duration),"repeat":int(repeat),"frequency_hz":199,
-           "result_json":result,"workload_direction":"server_to_client",
+           "result_json":result,"workload_result":"workload.json","workload_protocol":"RSB1",
+           "workload_transport":"kernel-tcp","workload_direction":"server_to_client",
            "reverse":True,"endpoints":{
              "server":{"pid":int(srv_pid),"command":"rustscaled","role":"sender"},
              "client":{"pid":int(cli_pid),"command":"rustscaled","role":"receiver"}}},
@@ -2295,9 +2336,29 @@ PYEOF
 
 profile_command_self_test() {
   local log="" log_file server_ip=100.64.0.1 result
-  local -a copied=(server/perf.data server/perf-children.txt server/perf-self.txt client/perf.data client/perf-children.txt client/perf-self.txt)
+  local -a copied=(server/perf.data server/perf-children.txt server/perf-self.txt client/perf.data client/perf-children.txt client/perf-self.txt workload.json)
   mkdir -p "$RDIR"
   log_file=$(mktemp "$RDIR/profile-test.XXXXXX")
+
+  profile_test_copy() {
+    printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"
+    if [[ "$3" == /tmp/rs-tun-profile-rsb1.json ]]; then
+      python3 - "$4" "$DURATION" "${PROFILE_PARALLELISM:-10}" <<'PYEOF'
+import json, sys
+path, duration, parallel = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+result = {"tool":"rustscale-bench","mode":"throughput","transport":"kernel-tcp",
+          "protocol":"RSB1","direction":"down","duration_secs":duration,
+          "parallel":parallel,"established":parallel,"handshaken":parallel,
+          "completed":parallel,"total_mbps":1.0,
+          "samples":[{"elapsed_secs":second,"mbps":1.0}
+                     for second in range(1, duration + 1)]}
+with open(path, "w") as dst:
+    json.dump(result, dst)
+PYEOF
+    else
+      printf x >"$4"
+    fi
+  }
 
   ssh_sudo() { printf ' sudo:%s:%s' "$1" "$3" >>"$log_file"; }
   profile_prepare || return 1
@@ -2315,20 +2376,25 @@ profile_command_self_test() {
     esac
     return 0
   }
-  run_tun_command() { printf ' iperf:%s:%s' "$2" "$4" >>"$log_file"; }
-  scp_from() { printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"; printf x >"$4"; }
+  run_tun_command() { printf ' workload:%s:%s' "$2" "$4" >>"$log_file"; }
+  scp_from() { profile_test_copy "$@"; }
   profile_rs_tun || return 1
   log=$(<"$log_file")
   [[ "$log" == *"perf record -F 199 -g -p 42"* && "$log" == *"perf record -F 199 -g -p 84"* ]] || return 1
-  [[ "${log%% iperf:*}" == *"perf record -F 199 -g -p 42"* && "${log%% iperf:*}" == *"perf record -F 199 -g -p 84"* ]] || return 1
+  [[ "$log" == *'perf record -F 199 -g -p 42 -o /tmp/rs-tun-perf-server.data -- sleep 25'* \
+    && "$log" == *'perf record -F 199 -g -p 84 -o /tmp/rs-tun-perf-client.data -- sleep 25'* ]] || return 1
+  [[ "${log%% workload:*}" == *"perf record -F 199 -g -p 42"* && "${log%% workload:*}" == *"perf record -F 199 -g -p 84"* ]] || return 1
   [[ "$log" == *"sudo:$SVM:"*"rs-tun-perf-server.status"* && "$log" == *"sudo:$CVM:"*"rs-tun-perf-client.status"* && "$log" == *"perf report --stdio --children -i /tmp/rs-tun-perf-server.data"* && "$log" == *"perf report --stdio --children -i /tmp/rs-tun-perf-client.data"* ]] || return 1
   for artifact in "${copied[@]}"; do [[ "$log" == *"$RDIR/profile/$artifact"* ]] || return 1; done
-  [[ "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* && "$log" == *"/tmp/rs-tun-profile-iperf.json"* ]] || return 1
+  [[ "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* && "$log" == *"/tmp/rs-tun-profile-rsb1.json"* ]] || return 1
   python3 - "$RDIR/profile/metadata.json" <<'PYEOF'
 import json, sys
 with open(sys.argv[1]) as f:
     metadata = json.load(f)
 assert metadata["workload_direction"] == "server_to_client"
+assert metadata["workload_protocol"] == "RSB1"
+assert metadata["workload_transport"] == "kernel-tcp"
+assert metadata["workload_result"] == "workload.json"
 assert metadata["reverse"] is True
 assert metadata["parallel"] == 10
 assert metadata["repeat"] == 3
@@ -2344,7 +2410,7 @@ PYEOF
   ssh_sudo() { printf ' sudo:%s:%s' "$1" "$3" >>"$log_file"; [[ "$3" == 'cat /tmp/rs-tun-srv.pid' ]] && printf 'not-a-pid\n'; return 0; }
   if profile_rs_tun; then return 1; fi
   log=$(<"$log_file")
-  [[ "$log" == *'cat /tmp/rs-tun-srv.pid'* && "$log" == *'cat /tmp/rs-tun-cli.pid'* && "$log" != *'perf record'* && "$log" != *'iperf3 -c'* ]] || return 1
+  [[ "$log" == *'cat /tmp/rs-tun-srv.pid'* && "$log" == *'cat /tmp/rs-tun-cli.pid'* && "$log" != *'perf record'* && "$log" != *'rustscale-bench client'* ]] || return 1
 
   # A failure starting either endpoint profiler skips the workload but still
   # cleans both endpoint filename sets.
@@ -2360,7 +2426,7 @@ PYEOF
   }
   if profile_rs_tun; then return 1; fi
   log=$(<"$log_file")
-  [[ "$log" == *"perf record -F 199 -g -p 42"* && "$log" == *"perf record -F 199 -g -p 84"* && "$log" != *'iperf3 -c'* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
+  [[ "$log" == *"perf record -F 199 -g -p 42"* && "$log" == *"perf record -F 199 -g -p 84"* && "$log" != *'rustscale-bench client'* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
 
   # Empty or missing endpoint artifacts fail the profile instead of producing
   # partial evidence; cleanup still reaches both endpoint VMs.
@@ -2375,28 +2441,46 @@ PYEOF
       esac
       return 0
     }
-    scp_from() { printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"; [[ "$3" == *"$empty_endpoint-self.txt" ]] && : >"$4" || printf x >"$4"; }
+    scp_from() {
+      if [[ "$3" == *"$empty_endpoint-self.txt" ]]; then
+        printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"
+        : >"$4"
+      else
+        profile_test_copy "$@"
+      fi
+    }
     if profile_rs_tun; then return 1; fi
     log=$(<"$log_file")
     [[ "$log" == *"copy:"*"/tmp/rs-tun-perf-$empty_endpoint-self.txt"* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
   done
 
+  # A successful process exit with a malformed or partial lifecycle result is
+  # not profile evidence; reject it and still clean both profiler endpoints.
+  : >"$log_file"
+  scp_from() {
+    printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"
+    if [[ "$3" == /tmp/rs-tun-profile-rsb1.json ]]; then printf '{}\n' >"$4"; else printf x >"$4"; fi
+  }
+  if profile_rs_tun; then return 1; fi
+  log=$(<"$log_file")
+  [[ "$log" == *'/tmp/rs-tun-profile-rsb1.json'* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
+
   # A workload failure also cleans both endpoints.
   : >"$log_file"
-  run_tun_command() { printf ' iperf:%s:%s' "$2" "$4" >>"$log_file"; return 1; }
+  run_tun_command() { printf ' workload:%s:%s' "$2" "$4" >>"$log_file"; return 1; }
   scp_from() { return 1; }
   if profile_rs_tun; then return 1; fi
   log=$(<"$log_file")
-  [[ "$log" == *'iperf3 -c 100.64.0.1 -p 5201 -t 10 -P 10 -R'* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
+  [[ "$log" == *'rustscale-bench client --transport kernel-tcp --target 100.64.0.1:5201 --duration 10 --parallel 10 --direction down'* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
 
   # A non-default stream count is applied to the workload and metadata.
   PROFILE_PARALLELISM=1000
   : >"$log_file"
-  run_tun_command() { printf ' iperf:%s:%s' "$2" "$4" >>"$log_file"; }
-  scp_from() { printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"; printf x >"$4"; }
+  run_tun_command() { printf ' workload:%s:%s' "$2" "$4" >>"$log_file"; }
+  scp_from() { profile_test_copy "$@"; }
   profile_rs_tun || return 1
   log=$(<"$log_file")
-  [[ "$log" == *'iperf3 -c 100.64.0.1 -p 5201 -t 10 -P 1000 -R'* ]] || return 1
+  [[ "$log" == *'rustscale-bench client --transport kernel-tcp --target 100.64.0.1:5201 --duration 10 --parallel 1000 --direction down'* ]] || return 1
   python3 - "$RDIR/profile/metadata.json" <<'PYEOF'
 import json, sys
 with open(sys.argv[1]) as f:
@@ -2405,7 +2489,7 @@ assert metadata["parallel"] == 1000
 PYEOF
   PROFILE_PARALLELISM=10
   rm -f "$log_file"
-  unset -f ssh_sudo run_tun_command scp_from
+  unset -f ssh_sudo run_tun_command scp_from profile_test_copy
 }
 
 rsb1_result_payload_cleanup() {
@@ -2934,6 +3018,11 @@ run_rs_tun() {
   # the labeled iperf server lifecycle.
   if (( PROFILE_ONLY )); then
     if ! profile_only_rs_tun_workload; then
+      cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
+      return 1
+    fi
+    if ! tun_path_gate 1 "$CVM" "$CZONE" /opt/rustscale/target/release/rustscale \
+        /tmp/rs-tun-cli.sock "$server_ip" "$PATH_TAG" /tmp/rs-tun-cli.profile-path-post.log >/dev/null; then
       cleanup_rs_tun || return "$FATAL_HANDOFF_STATUS"
       return 1
     fi

@@ -383,11 +383,16 @@ async fn run_netstack_inbound_pump(
     capture: crate::capture::CaptureSlot,
     peer_map: Arc<crate::peer_map::Runtime>,
 ) {
-    if std::env::var_os("RUSTSCALE_FORCE_NETSTACK_DETACHED_PIPELINE").is_some() {
-        eprintln!(
-            "rustscale: detached netstack receive pipeline forced by \
-             RUSTSCALE_FORCE_NETSTACK_DETACHED_PIPELINE"
-        );
+    let detached_forced = std::env::var_os("RUSTSCALE_FORCE_NETSTACK_DETACHED_PIPELINE").is_some();
+    let detached_disabled =
+        std::env::var_os("RUSTSCALE_DISABLE_NETSTACK_DETACHED_PIPELINE").is_some();
+    if detached_forced || !detached_disabled {
+        if detached_forced {
+            eprintln!(
+                "rustscale: detached netstack receive pipeline forced by \
+                 RUSTSCALE_FORCE_NETSTACK_DETACHED_PIPELINE"
+            );
+        }
         run_netstack_detached_pipeline(
             magicsock,
             wg_recv,
@@ -402,6 +407,10 @@ async fn run_netstack_inbound_pump(
         .await;
         return;
     }
+    eprintln!(
+        "rustscale: detached netstack receive pipeline disabled by \
+         RUSTSCALE_DISABLE_NETSTACK_DETACHED_PIPELINE"
+    );
     let mut pump_stats = NetstackPumpStats::new("inbound");
     let mut inbound = NetstackInboundScratch::default();
     if let Ok(raw_segments) = std::env::var("RUSTSCALE_FORCE_NETSTACK_RX_GRO_SEGMENTS") {
@@ -600,6 +609,7 @@ fn deliver_netstack_detached_batch(
             .gro
             .coalesce_recycling(&mut output.packets, &mut output.recycled);
         netstack.push_rx_batch_from(&mut output.packets, peer);
+        scratch.plaintext.refill_from(&mut output.recycled);
     }
     output.accepted = accepted;
     output.decrypted = decrypted;

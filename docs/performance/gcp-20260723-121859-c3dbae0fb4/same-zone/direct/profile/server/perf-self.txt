@@ -1,0 +1,1410 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 5K of event 'task-clock:ppp'
+# Event count (approx.): 26467333375
+#
+# Overhead  Command     Shared Object      Symbol                                                                                                                                                    
+# ........  ..........  .................  ..........................................................................................................................................................
+#
+     7.52%  tailscaled  tailscaled         [.] golang.org/x/crypto/chacha20poly1305.chacha20Poly1305Seal.abi0
+            |
+            ---golang.org/x/crypto/chacha20poly1305.chacha20Poly1305Seal.abi0
+
+     3.70%  tailscaled  [kernel.kallsyms]  [k] rep_movs_alternative
+            |
+            ---rep_movs_alternative
+               |          
+               |--2.09%--ip_generic_getfrag
+               |          __ip_append_data
+               |          ip_make_skb
+               |          udp_sendmsg
+               |          inet_sendmsg
+               |          ____sys_sendmsg
+               |          ___sys_sendmsg
+               |          __sys_sendmmsg
+               |          __x64_sys_sendmmsg
+               |          x64_sys_call
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          internal/runtime/syscall/linux.Syscall6
+               |          syscall.Syscall6
+               |          golang.org/x/net/internal/socket.sendmmsg
+               |          golang.org/x/net/internal/socket.(*syscaller).sendmmsgF
+               |          golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+               |          internal/poll.(*FD).RawWrite
+               |          net.(*rawConn).Write
+               |          golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+               |          golang.org/x/net/internal/socket.(*Conn).sendMsgs
+               |          golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+               |          tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+               |          tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+               |          tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+               |          tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+               |          tailscale.com/wgengine/magicsock.(*endpoint).send
+               |          tailscale.com/wgengine/magicsock.(*Conn).Send
+               |          github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+               |          github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+               |          github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+               |          github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+               |          runtime.goexit.abi0
+               |          
+                --1.37%--simple_copy_to_iter
+                          __skb_datagram_iter
+                          skb_copy_datagram_iter
+                          |          
+                           --1.23%--tun_put_user.constprop.0
+                                     tun_do_read
+                                     tun_chr_read_iter
+                                     vfs_read
+                                     ksys_read
+                                     __x64_sys_read
+                                     x64_sys_call
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     internal/runtime/syscall/linux.Syscall6
+                                     syscall.Syscall
+                                     syscall.read
+                                     internal/poll.(*FD).Read
+                                     os.(*File).Read
+                                     github.com/tailscale/wireguard-go/tun.(*NativeTun).Read
+                                     github.com/tailscale/wireguard-go/tun.Device.Read-fm
+                                     tailscale.com/net/tstun.(*Wrapper).pollVector
+                                     tailscale.com/net/tstun.wrap.gowrap1
+                                     runtime.goexit.abi0
+
+     3.63%  tailscaled  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+            |
+            ---_raw_spin_unlock_irqrestore
+               |          
+               |--1.67%--__wake_up_sync_key
+               |          |          
+               |          |--1.12%--sock_wfree
+               |          |          skb_release_head_state
+               |          |          |          
+               |          |           --1.10%--kfree_skb_reason
+               |          |                     dev_kfree_skb_any_reason
+               |          |                     napi_consume_skb
+               |          |                     free_old_xmit_skbs
+               |          |                     start_xmit
+               |          |                     dev_hard_start_xmit
+               |          |                     sch_direct_xmit
+               |          |                     __dev_xmit_skb
+               |          |                     __dev_queue_xmit
+               |          |                     neigh_hh_output
+               |          |                     ip_finish_output2
+               |          |                     __ip_finish_output
+               |          |                     ip_finish_output
+               |          |                     ip_output
+               |          |                     ip_send_skb
+               |          |                     udp_send_skb
+               |          |                     udp_sendmsg
+               |          |                     inet_sendmsg
+               |          |                     ____sys_sendmsg
+               |          |                     ___sys_sendmsg
+               |          |                     __sys_sendmmsg
+               |          |                     __x64_sys_sendmmsg
+               |          |                     x64_sys_call
+               |          |                     do_syscall_64
+               |          |                     entry_SYSCALL_64_after_hwframe
+               |          |                     internal/runtime/syscall/linux.Syscall6
+               |          |                     syscall.Syscall6
+               |          |                     golang.org/x/net/internal/socket.sendmmsg
+               |          |                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF
+               |          |                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+               |          |                     internal/poll.(*FD).RawWrite
+               |          |                     net.(*rawConn).Write
+               |          |                     golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+               |          |                     golang.org/x/net/internal/socket.(*Conn).sendMsgs
+               |          |                     golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+               |          |                     tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+               |          |                     tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+               |          |                     tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+               |          |                     tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+               |          |                     tailscale.com/wgengine/magicsock.(*endpoint).send
+               |          |                     tailscale.com/wgengine/magicsock.(*Conn).Send
+               |          |                     github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+               |          |                     github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+               |          |                     github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+               |          |                     github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+               |          |                     runtime.goexit.abi0
+               |          |          
+               |           --0.55%--sock_def_readable
+               |          
+                --1.01%--try_to_wake_up
+                          wake_up_q
+                          futex_wake
+                          do_futex
+                          __x64_sys_futex
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          runtime.futex.abi0
+                          runtime.notewakeup
+                          |          
+                           --0.99%--runtime.startm
+                                     runtime.wakep
+                                     |          
+                                      --0.70%--runtime.ready
+                                                runtime.send.goready.func1
+                                                runtime.systemstack.abi0
+                                                runtime.send
+
+     2.98%  tailscaled  tailscaled         [.] internal/runtime/syscall/linux.Syscall6
+            |
+            ---internal/runtime/syscall/linux.Syscall6
+               |          
+               |--1.25%--syscall.Syscall
+               |          |          
+               |          |--0.74%--syscall.read
+               |          |          internal/poll.(*FD).Read
+               |          |          os.(*File).Read
+               |          |          github.com/tailscale/wireguard-go/tun.(*NativeTun).Read
+               |          |          github.com/tailscale/wireguard-go/tun.Device.Read-fm
+               |          |          tailscale.com/net/tstun.(*Wrapper).pollVector
+               |          |          tailscale.com/net/tstun.wrap.gowrap1
+               |          |          runtime.goexit.abi0
+               |          |          
+               |           --0.51%--syscall.write
+               |                     internal/poll.(*FD).Write
+               |                     os.(*File).Write
+               |                     github.com/tailscale/wireguard-go/tun.(*NativeTun).Write
+               |                     tailscale.com/net/tstun.(*Wrapper).tdevWrite
+               |                     tailscale.com/net/tstun.(*Wrapper).Write
+               |                     github.com/tailscale/wireguard-go/device.(*Peer).processInboundContainer
+               |                     github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialReceiver
+               |                     github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap3
+               |                     runtime.goexit.abi0
+               |          
+               |--1.08%--syscall.Syscall6
+               |          |          
+               |           --0.87%--golang.org/x/net/internal/socket.sendmmsg
+               |                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF
+               |                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+               |                     internal/poll.(*FD).RawWrite
+               |                     net.(*rawConn).Write
+               |                     golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+               |                     golang.org/x/net/internal/socket.(*Conn).sendMsgs
+               |                     golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+               |                     tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+               |                     tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+               |                     tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+               |                     tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+               |                     tailscale.com/wgengine/magicsock.(*endpoint).send
+               |                     tailscale.com/wgengine/magicsock.(*Conn).Send
+               |                     github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+               |                     github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+               |                     github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+               |                     github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+               |                     runtime.goexit.abi0
+               |          
+                --0.65%--runtime.netpoll
+                          runtime.findRunnable
+                          runtime.schedule
+                          runtime.park_m
+                          runtime.mcall
+
+     2.41%  tailscaled  [kernel.kallsyms]  [k] do_syscall_64
+            |
+            ---do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               |          
+                --2.20%--internal/runtime/syscall/linux.Syscall6
+                          |          
+                          |--0.93%--syscall.Syscall
+                          |          |          
+                          |           --0.59%--syscall.read
+                          |                     internal/poll.(*FD).Read
+                          |                     os.(*File).Read
+                          |                     github.com/tailscale/wireguard-go/tun.(*NativeTun).Read
+                          |                     github.com/tailscale/wireguard-go/tun.Device.Read-fm
+                          |                     tailscale.com/net/tstun.(*Wrapper).pollVector
+                          |                     tailscale.com/net/tstun.wrap.gowrap1
+                          |                     runtime.goexit.abi0
+                          |          
+                          |--0.72%--syscall.Syscall6
+                          |          
+                           --0.55%--runtime.netpoll
+                                     runtime.findRunnable
+                                     runtime.schedule
+                                     runtime.park_m
+                                     runtime.mcall
+
+     2.35%  tailscaled  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               |          
+                --2.30%--schedule
+                          |          
+                          |--0.84%--futex_wait_queue
+                          |          __futex_wait
+                          |          futex_wait
+                          |          do_futex
+                          |          __x64_sys_futex
+                          |          x64_sys_call
+                          |          do_syscall_64
+                          |          entry_SYSCALL_64_after_hwframe
+                          |          runtime.futex.abi0
+                          |          runtime.notesleep
+                          |          runtime.stopm
+                          |          runtime.findRunnable
+                          |          runtime.schedule
+                          |          runtime.park_m
+                          |          runtime.mcall
+                          |          
+                           --0.82%--do_nanosleep
+                                     hrtimer_nanosleep
+                                     __x64_sys_nanosleep
+                                     x64_sys_call
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     runtime.usleep.abi0
+
+     2.15%  tailscaled  tailscaled         [.] tailscale.com/net/batching.(*linuxBatchingConn).putSendBatch
+            |
+            ---tailscale.com/net/batching.(*linuxBatchingConn).putSendBatch
+               tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo.deferwrap1
+               tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+               tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+               tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+               tailscale.com/wgengine/magicsock.(*endpoint).send
+               tailscale.com/wgengine/magicsock.(*Conn).Send
+               github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+               github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+               github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+               github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+               runtime.goexit.abi0
+
+     2.09%  tailscaled  [kernel.kallsyms]  [k] memset_orig
+            |
+            ---memset_orig
+               |          
+                --1.73%--kmalloc_reserve
+                          __alloc_skb
+                          |          
+                           --1.27%--skb_segment
+                                     __udp_gso_segment
+                                     udp4_ufo_fragment
+                                     inet_gso_segment
+                                     skb_mac_gso_segment
+                                     __skb_gso_segment
+                                     validate_xmit_skb
+                                     validate_xmit_skb_list
+                                     sch_direct_xmit
+                                     __dev_xmit_skb
+                                     __dev_queue_xmit
+                                     neigh_hh_output
+                                     ip_finish_output2
+                                     __ip_finish_output
+                                     ip_finish_output
+                                     ip_output
+                                     ip_send_skb
+                                     udp_send_skb
+                                     udp_sendmsg
+                                     inet_sendmsg
+                                     ____sys_sendmsg
+                                     ___sys_sendmsg
+                                     __sys_sendmmsg
+                                     __x64_sys_sendmmsg
+                                     x64_sys_call
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     internal/runtime/syscall/linux.Syscall6
+                                     syscall.Syscall6
+                                     golang.org/x/net/internal/socket.sendmmsg
+                                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF
+                                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+                                     internal/poll.(*FD).RawWrite
+                                     net.(*rawConn).Write
+                                     golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+                                     golang.org/x/net/internal/socket.(*Conn).sendMsgs
+                                     golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+                                     tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+                                     tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+                                     tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+                                     tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+                                     tailscale.com/wgengine/magicsock.(*endpoint).send
+                                     tailscale.com/wgengine/magicsock.(*Conn).Send
+                                     github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+                                     github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+                                     github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+                                     github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+                                     runtime.goexit.abi0
+
+     1.92%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Device).RoutineReadFromTUN
+            |
+            ---github.com/tailscale/wireguard-go/device.(*Device).RoutineReadFromTUN
+               github.com/tailscale/wireguard-go/device.NewDevice.gowrap4
+               runtime.goexit.abi0
+
+     1.84%  tailscaled  [kernel.kallsyms]  [k] detach_buf_split
+            |
+            ---detach_buf_split
+               virtqueue_get_buf_ctx_split
+               |          
+                --1.77%--virtqueue_get_buf
+                          free_old_xmit_skbs
+                          |          
+                           --1.54%--start_xmit
+                                     dev_hard_start_xmit
+                                     sch_direct_xmit
+                                     __dev_xmit_skb
+                                     __dev_queue_xmit
+                                     neigh_hh_output
+                                     ip_finish_output2
+                                     __ip_finish_output
+                                     ip_finish_output
+                                     ip_output
+                                     ip_send_skb
+                                     udp_send_skb
+                                     udp_sendmsg
+                                     inet_sendmsg
+                                     ____sys_sendmsg
+                                     ___sys_sendmsg
+                                     __sys_sendmmsg
+                                     __x64_sys_sendmmsg
+                                     x64_sys_call
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     internal/runtime/syscall/linux.Syscall6
+                                     syscall.Syscall6
+                                     golang.org/x/net/internal/socket.sendmmsg
+                                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF
+                                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+                                     internal/poll.(*FD).RawWrite
+                                     net.(*rawConn).Write
+                                     golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+                                     golang.org/x/net/internal/socket.(*Conn).sendMsgs
+                                     golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+                                     tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+                                     tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+                                     tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+                                     tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+                                     tailscale.com/wgengine/magicsock.(*endpoint).send
+                                     tailscale.com/wgengine/magicsock.(*Conn).Send
+                                     github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+                                     github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+                                     github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+                                     github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+                                     runtime.goexit.abi0
+
+     1.42%  tailscaled  [kernel.kallsyms]  [k] clear_page_erms
+            |
+            ---clear_page_erms
+               get_page_from_freelist
+               __alloc_pages
+               alloc_pages_mpol
+               alloc_pages
+               skb_page_frag_refill
+               |          
+                --1.35%--sk_page_frag_refill
+                          __ip_append_data
+                          ip_make_skb
+                          udp_sendmsg
+                          inet_sendmsg
+                          ____sys_sendmsg
+                          ___sys_sendmsg
+                          __sys_sendmmsg
+                          __x64_sys_sendmmsg
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          internal/runtime/syscall/linux.Syscall6
+                          syscall.Syscall6
+                          golang.org/x/net/internal/socket.sendmmsg
+                          golang.org/x/net/internal/socket.(*syscaller).sendmmsgF
+                          golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+                          internal/poll.(*FD).RawWrite
+                          net.(*rawConn).Write
+                          golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+                          golang.org/x/net/internal/socket.(*Conn).sendMsgs
+                          golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+                          tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+                          tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+                          tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+                          tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+                          tailscale.com/wgengine/magicsock.(*endpoint).send
+                          tailscale.com/wgengine/magicsock.(*Conn).Send
+                          github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+                          github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+                          github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+                          github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+                          runtime.goexit.abi0
+
+     1.42%  tailscaled  tailscaled         [.] runtime.memmove
+            |
+            ---runtime.memmove
+               |          
+               |--0.66%--github.com/tailscale/wireguard-go/device.(*Device).RoutineReadFromTUN
+               |          github.com/tailscale/wireguard-go/device.NewDevice.gowrap4
+               |          runtime.goexit.abi0
+               |          
+                --0.51%--github.com/tailscale/wireguard-go/tun.handleVirtioRead
+                          github.com/tailscale/wireguard-go/tun.(*NativeTun).Read
+                          github.com/tailscale/wireguard-go/tun.Device.Read-fm
+                          tailscale.com/net/tstun.(*Wrapper).pollVector
+                          tailscale.com/net/tstun.wrap.gowrap1
+                          runtime.goexit.abi0
+
+     1.39%  tailscaled  [kernel.kallsyms]  [k] sock_wfree
+            |
+            ---sock_wfree
+               |          
+                --1.31%--skb_release_head_state
+                          |          
+                           --1.18%--kfree_skb_reason
+                                     dev_kfree_skb_any_reason
+                                     napi_consume_skb
+                                     free_old_xmit_skbs
+                                     start_xmit
+                                     dev_hard_start_xmit
+                                     sch_direct_xmit
+                                     __dev_xmit_skb
+                                     __dev_queue_xmit
+                                     neigh_hh_output
+                                     ip_finish_output2
+                                     __ip_finish_output
+                                     ip_finish_output
+                                     ip_output
+                                     ip_send_skb
+                                     udp_send_skb
+                                     udp_sendmsg
+                                     inet_sendmsg
+                                     ____sys_sendmsg
+                                     ___sys_sendmsg
+                                     __sys_sendmmsg
+                                     __x64_sys_sendmmsg
+                                     x64_sys_call
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     internal/runtime/syscall/linux.Syscall6
+                                     syscall.Syscall6
+                                     golang.org/x/net/internal/socket.sendmmsg
+                                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF
+                                     golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+                                     internal/poll.(*FD).RawWrite
+                                     net.(*rawConn).Write
+                                     golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+                                     golang.org/x/net/internal/socket.(*Conn).sendMsgs
+                                     golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+                                     tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+                                     tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+                                     tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+                                     tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+                                     tailscale.com/wgengine/magicsock.(*endpoint).send
+                                     tailscale.com/wgengine/magicsock.(*Conn).Send
+                                     github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+                                     github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+                                     github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+                                     github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+                                     runtime.goexit.abi0
+
+     1.06%  tailscaled  [kernel.kallsyms]  [k] virtqueue_add_split
+            |
+            ---virtqueue_add_split
+               |          
+                --1.01%--virtqueue_add_outbuf
+                          xmit_skb
+                          start_xmit
+                          dev_hard_start_xmit
+                          sch_direct_xmit
+                          __dev_xmit_skb
+                          __dev_queue_xmit
+                          neigh_hh_output
+                          ip_finish_output2
+                          __ip_finish_output
+                          ip_finish_output
+                          ip_output
+                          ip_send_skb
+                          udp_send_skb
+                          udp_sendmsg
+                          inet_sendmsg
+                          ____sys_sendmsg
+                          ___sys_sendmsg
+                          __sys_sendmmsg
+                          __x64_sys_sendmmsg
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          internal/runtime/syscall/linux.Syscall6
+                          syscall.Syscall6
+                          golang.org/x/net/internal/socket.sendmmsg
+                          golang.org/x/net/internal/socket.(*syscaller).sendmmsgF
+                          golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+                          internal/poll.(*FD).RawWrite
+                          net.(*rawConn).Write
+                          golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+                          golang.org/x/net/internal/socket.(*Conn).sendMsgs
+                          golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+                          tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+                          tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+                          tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+                          tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+                          tailscale.com/wgengine/magicsock.(*endpoint).send
+                          tailscale.com/wgengine/magicsock.(*Conn).Send
+                          github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+                          github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+                          github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+                          github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+                          runtime.goexit.abi0
+
+     1.01%  tailscaled  tailscaled         [.] sync.(*poolDequeue).pushHead
+            |
+            ---sync.(*poolDequeue).pushHead
+               sync.(*poolChain).pushHead
+               sync.(*Pool).Put
+               |          
+                --0.99%--github.com/tailscale/wireguard-go/device.(*WaitPool).Put
+
+     0.84%  tailscaled  [kernel.kallsyms]  [k] kmem_cache_alloc_node
+            |
+            ---kmem_cache_alloc_node
+               |          
+                --0.55%--kmalloc_reserve
+                          __alloc_skb
+
+     0.76%  tailscaled  [kernel.kallsyms]  [k] free_old_xmit_skbs
+            |
+            ---free_old_xmit_skbs
+               |          
+                --0.68%--start_xmit
+                          dev_hard_start_xmit
+                          sch_direct_xmit
+                          __dev_xmit_skb
+                          __dev_queue_xmit
+                          neigh_hh_output
+                          ip_finish_output2
+                          __ip_finish_output
+                          ip_finish_output
+                          ip_output
+                          ip_send_skb
+                          udp_send_skb
+                          udp_sendmsg
+                          inet_sendmsg
+                          ____sys_sendmsg
+                          ___sys_sendmsg
+                          __sys_sendmmsg
+                          __x64_sys_sendmmsg
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          internal/runtime/syscall/linux.Syscall6
+                          syscall.Syscall6
+                          golang.org/x/net/internal/socket.sendmmsg
+                          golang.org/x/net/internal/socket.(*syscaller).sendmmsgF
+                          golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+                          internal/poll.(*FD).RawWrite
+                          net.(*rawConn).Write
+                          golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+                          golang.org/x/net/internal/socket.(*Conn).sendMsgs
+                          golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+                          tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+                          tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+                          tailscale.com/wgengine/magicsock.(*RebindingUDPConn).WriteWireGuardBatchTo
+                          tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+                          tailscale.com/wgengine/magicsock.(*endpoint).send
+                          tailscale.com/wgengine/magicsock.(*Conn).Send
+                          github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+                          github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+                          github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+                          github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+                          runtime.goexit.abi0
+
+     0.70%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*Conn).putReceiveBatch
+            |
+            ---tailscale.com/wgengine/magicsock.(*Conn).putReceiveBatch
+               tailscale.com/wgengine/magicsock.(*Conn).receiveIPv4.(*Conn).mkReceiveFunc.func1.deferwrap2
+               tailscale.com/wgengine/magicsock.(*Conn).receiveIPv4.(*Conn).mkReceiveFunc.func1
+               github.com/tailscale/wireguard-go/device.(*Device).RoutineReceiveIncoming
+               github.com/tailscale/wireguard-go/device.(*Device).BindUpdate.gowrap2
+               runtime.goexit.abi0
+
+     0.63%  tailscaled  [kernel.kallsyms]  [k] skb_release_data
+            |
+            ---skb_release_data
+
+     0.63%  tailscaled  tailscaled         [.] tailscale.com/net/packet.(*Parsed).decode4
+            |
+            ---tailscale.com/net/packet.(*Parsed).decode4
+
+     0.61%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.checksumAVX2.abi0
+            |
+            ---github.com/tailscale/wireguard-go/tun.checksumAVX2.abi0
+               github.com/tailscale/wireguard-go/tun.GSOSplit
+               github.com/tailscale/wireguard-go/tun.handleVirtioRead
+               github.com/tailscale/wireguard-go/tun.(*NativeTun).Read
+               github.com/tailscale/wireguard-go/tun.Device.Read-fm
+               tailscale.com/net/tstun.(*Wrapper).pollVector
+               tailscale.com/net/tstun.wrap.gowrap1
+               runtime.goexit.abi0
+
+     0.57%  tailscaled  [kernel.kallsyms]  [k] virtqueue_get_buf_ctx_split
+            |
+            ---virtqueue_get_buf_ctx_split
+
+     0.57%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Device).NewOutboundElement
+            |
+            ---github.com/tailscale/wireguard-go/device.(*Device).NewOutboundElement
+               github.com/tailscale/wireguard-go/device.(*Device).RoutineReadFromTUN
+               github.com/tailscale/wireguard-go/device.NewDevice.gowrap4
+               runtime.goexit.abi0
+
+     0.57%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+            |
+            ---github.com/tailscale/wireguard-go/device.(*Peer).processOutboundContainer
+               github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+               github.com/tailscale/wireguard-go/device.(*Peer).Start.gowrap2
+               runtime.goexit.abi0
+
+     0.55%  tailscaled  [kernel.kallsyms]  [k] nft_do_chain
+            |
+            ---nft_do_chain
+
+     0.55%  tailscaled  tailscaled         [.] internal/runtime/maps.(*Iter).Next
+            |
+            ---internal/runtime/maps.(*Iter).Next
+
+     0.53%  tailscaled  [kernel.kallsyms]  [k] __alloc_skb
+            |
+            ---__alloc_skb
+
+     0.53%  tailscaled  tailscaled         [.] runtime.lock2
+            |
+            ---runtime.lock2
+
+     0.51%  tailscaled  [kernel.kallsyms]  [k] handle_softirqs
+            |
+            ---handle_softirqs
+
+     0.51%  tailscaled  [kernel.kallsyms]  [k] kmem_cache_free
+            |
+            ---kmem_cache_free
+
+     0.49%  tailscaled  [kernel.kallsyms]  [k] ___slab_alloc
+     0.49%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.GSOSplit
+     0.49%  tailscaled  tailscaled         [.] runtime.unlock2
+     0.46%  tailscaled  [kernel.kallsyms]  [k] check_heap_object
+     0.46%  tailscaled  tailscaled         [.] runtime.chanrecv
+     0.46%  tailscaled  tailscaled         [.] runtime.stealWork
+     0.44%  tailscaled  [kernel.kallsyms]  [k] slab_update_freelist.constprop.0.isra.0
+     0.44%  tailscaled  [vdso]             [.] 0x0000000000000b03
+     0.44%  tailscaled  tailscaled         [.] github.com/gaissmai/bart.(*liteTable[go.shape.struct {}]).Contains
+     0.44%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*AllowedIPs).LookupFromPacket
+     0.42%  tailscaled  [kernel.kallsyms]  [k] __nf_conntrack_find_get
+     0.42%  tailscaled  tailscaled         [.] tailscale.com/net/packet.(*Parsed).Decode
+     0.40%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Device).RoutineEncryption
+     0.40%  tailscaled  tailscaled         [.] runtime.findRunnable
+     0.40%  tailscaled  tailscaled         [.] sync.(*Pool).getSlow
+     0.40%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*Wrapper).pollVector
+     0.38%  tailscaled  [kernel.kallsyms]  [k] skb_segment
+     0.38%  tailscaled  tailscaled         [.] sync.(*poolDequeue).popHead
+     0.36%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Device).RoutineReceiveIncoming
+     0.36%  tailscaled  tailscaled         [.] sync.(*poolDequeue).popTail
+     0.34%  tailscaled  [kernel.kallsyms]  [k] kfree
+     0.34%  tailscaled  tailscaled         [.] runtime.mapaccess2
+     0.34%  tailscaled  tailscaled         [.] runtime.nanotime1.abi0
+     0.34%  tailscaled  tailscaled         [.] sync.(*Pool).Put
+     0.34%  tailscaled  tailscaled         [.] tailscale.com/wgengine/netstack.(*Impl).handleLocalPackets
+     0.32%  tailscaled  [kernel.kallsyms]  [k] __fdget_pos
+     0.32%  tailscaled  [kernel.kallsyms]  [k] tcp_clean_rtx_queue.constprop.0
+     0.32%  tailscaled  [kernel.kallsyms]  [k] tun_put_user.constprop.0
+     0.32%  tailscaled  tailscaled         [.] runtime.casgstatus
+     0.30%  tailscaled  [kernel.kallsyms]  [k] __slab_free
+     0.30%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*Wrapper).filterPacketOutboundToWireGuard
+     0.28%  tailscaled  [kernel.kallsyms]  [k] x64_sys_call
+     0.28%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*endpoint).send
+     0.27%  tailscaled  [kernel.kallsyms]  [k] __virt_addr_valid
+     0.27%  tailscaled  [kernel.kallsyms]  [k] tcp_ack
+     0.27%  tailscaled  [kernel.kallsyms]  [k] tcp_write_xmit
+     0.27%  tailscaled  [kernel.kallsyms]  [k] xmit_skb
+     0.27%  tailscaled  tailscaled         [.] runtime.futex.abi0
+     0.25%  tailscaled  [kernel.kallsyms]  [k] __ip_append_data
+     0.25%  tailscaled  [kernel.kallsyms]  [k] udp_sendmsg
+     0.25%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.checksumAVX2
+     0.25%  tailscaled  tailscaled         [.] runtime.usleep.abi0
+     0.25%  tailscaled  tailscaled         [.] tailscale.com/ipn/ipnlocal.(*nodeBackend).NodeByAddr
+     0.23%  tailscaled  [kernel.kallsyms]  [k] __siphash_unaligned
+     0.23%  tailscaled  [kernel.kallsyms]  [k] mod_memcg_state
+     0.23%  tailscaled  [kernel.kallsyms]  [k] read_tsc
+     0.23%  tailscaled  [kernel.kallsyms]  [k] start_xmit
+     0.23%  tailscaled  [kernel.kallsyms]  [k] vring_map_one_sg
+     0.23%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).processInboundContainer
+     0.23%  tailscaled  tailscaled         [.] runtime.mapaccess2_fast64
+     0.23%  tailscaled  tailscaled         [.] tailscale.com/tstime/rate.(*Limiter).allow
+     0.21%  tailscaled  [kernel.kallsyms]  [k] __build_skb_around
+     0.21%  tailscaled  [kernel.kallsyms]  [k] __inet_lookup_established
+     0.21%  tailscaled  [kernel.kallsyms]  [k] fib_table_lookup
+     0.21%  tailscaled  [kernel.kallsyms]  [k] skb_clone_tx_timestamp
+     0.21%  tailscaled  [kernel.kallsyms]  [k] virtqueue_kick_prepare
+     0.21%  tailscaled  tailscaled         [.] golang.org/x/crypto/chacha20poly1305.(*chacha20poly1305).seal
+     0.21%  tailscaled  tailscaled         [.] golang.org/x/crypto/chacha20poly1305.chacha20Poly1305Open.abi0
+     0.21%  tailscaled  tailscaled         [.] runtime.exitsyscall
+     0.21%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*Conn).getReceiveBatchForBuffs
+     0.19%  tailscaled  [kernel.kallsyms]  [k] __fdget
+     0.19%  tailscaled  [kernel.kallsyms]  [k] __ip_local_out
+     0.19%  tailscaled  [kernel.kallsyms]  [k] skb_release_head_state
+     0.19%  tailscaled  [kernel.kallsyms]  [k] skb_split
+     0.19%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).SendStagedPackets
+     0.19%  tailscaled  tailscaled         [.] runtime.netpoll
+     0.19%  tailscaled  tailscaled         [.] runtime.selectgo
+     0.19%  tailscaled  tailscaled         [.] sync.(*Pool).Get
+     0.19%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*Wrapper).Read
+     0.17%  tailscaled  [kernel.kallsyms]  [k] __raw_callee_save___pv_queued_spin_unlock
+     0.17%  tailscaled  [kernel.kallsyms]  [k] aa_inet_msg_perm
+     0.17%  tailscaled  [kernel.kallsyms]  [k] dev_hard_start_xmit
+     0.17%  tailscaled  [kernel.kallsyms]  [k] nf_nat_inet_fn
+     0.17%  tailscaled  [kernel.kallsyms]  [k] tun_chr_read_iter
+     0.17%  tailscaled  tailscaled         [.] runtime.runqgrab
+     0.15%  tailscaled  [kernel.kallsyms]  [k] __copy_skb_header
+     0.15%  tailscaled  [kernel.kallsyms]  [k] __skb_to_sgvec
+     0.15%  tailscaled  [kernel.kallsyms]  [k] ep_item_poll.isra.0
+     0.15%  tailscaled  [kernel.kallsyms]  [k] ip_finish_output2
+     0.15%  tailscaled  [kernel.kallsyms]  [k] nf_route_table_hook4
+     0.15%  tailscaled  [kernel.kallsyms]  [k] put_cpu_partial
+     0.15%  tailscaled  [vdso]             [.] __vdso_clock_gettime
+     0.15%  tailscaled  tailscaled         [.] golang.org/x/crypto/chacha20poly1305.(*chacha20poly1305).Seal
+     0.15%  tailscaled  tailscaled         [.] internal/poll.runtime_pollReset
+     0.15%  tailscaled  tailscaled         [.] runtime.memhash64
+     0.15%  tailscaled  tailscaled         [.] runtime.reentersyscall
+     0.15%  tailscaled  tailscaled         [.] runtime.schedule
+     0.15%  tailscaled  tailscaled         [.] tailscale.com/ipn/ipnlocal.(*nodeBackend).NodeByID
+     0.13%  tailscaled  [kernel.kallsyms]  [k] __skb_clone
+     0.13%  tailscaled  [kernel.kallsyms]  [k] __tcp_transmit_skb
+     0.13%  tailscaled  [kernel.kallsyms]  [k] _copy_from_iter
+     0.13%  tailscaled  [kernel.kallsyms]  [k] _raw_spin_lock
+     0.13%  tailscaled  [kernel.kallsyms]  [k] free_tail_page_prepare
+     0.13%  tailscaled  [kernel.kallsyms]  [k] ip_output
+     0.13%  tailscaled  [kernel.kallsyms]  [k] nf_conntrack_tcp_packet
+     0.13%  tailscaled  [kernel.kallsyms]  [k] nf_hook_slow
+     0.13%  tailscaled  [kernel.kallsyms]  [k] nf_nat_ipv4_out
+     0.13%  tailscaled  [kernel.kallsyms]  [k] nft_match_eval
+     0.13%  tailscaled  [kernel.kallsyms]  [k] tcp_check_space
+     0.13%  tailscaled  [kernel.kallsyms]  [k] tcp_v4_rcv
+     0.13%  tailscaled  [kernel.kallsyms]  [k] virtqueue_add_outbuf
+     0.13%  tailscaled  tailscaled         [.] aeshashbody
+     0.13%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*mmsghdrsPacker).pack
+     0.13%  tailscaled  tailscaled         [.] runtime.(*timers).check
+     0.13%  tailscaled  tailscaled         [.] runtime.park_m
+     0.13%  tailscaled  tailscaled         [.] runtime.send
+     0.13%  tailscaled  tailscaled         [.] sync/atomic.StoreUintptr
+     0.13%  tailscaled  tailscaled         [.] tailscale.com/ipn/ipnlocal.(*LocalBackend).lookupPeerByIP-fm
+     0.13%  tailscaled  tailscaled         [.] tailscale.com/ipn/ipnlocal.(*nodeBackend).NodeByAddr.deferwrap1
+     0.13%  tailscaled  tailscaled         [.] tailscale.com/net/batching.(*linuxBatchingConn).coalesceMessages
+     0.13%  tailscaled  tailscaled         [.] tailscale.com/wgengine/filter.(*Filter).pre
+     0.11%  tailscaled  [kernel.kallsyms]  [k] __check_object_size
+     0.11%  tailscaled  [kernel.kallsyms]  [k] __netif_receive_skb_core.constprop.0
+     0.11%  tailscaled  [kernel.kallsyms]  [k] __skb_flow_dissect
+     0.11%  tailscaled  [kernel.kallsyms]  [k] __skb_recv_udp
+     0.11%  tailscaled  [kernel.kallsyms]  [k] __sys_sendmmsg
+     0.11%  tailscaled  [kernel.kallsyms]  [k] apparmor_file_permission
+     0.11%  tailscaled  [kernel.kallsyms]  [k] conntrack_mt.isra.0
+     0.11%  tailscaled  [kernel.kallsyms]  [k] conntrack_mt_v3
+     0.11%  tailscaled  [kernel.kallsyms]  [k] fib_rules_lookup
+     0.11%  tailscaled  [kernel.kallsyms]  [k] its_return_thunk
+     0.11%  tailscaled  [kernel.kallsyms]  [k] netif_skb_features
+     0.11%  tailscaled  [kernel.kallsyms]  [k] nf_conntrack_in
+     0.11%  tailscaled  [kernel.kallsyms]  [k] nf_nat_ipv4_local_in
+     0.11%  tailscaled  [kernel.kallsyms]  [k] nft_meta_get_eval
+     0.11%  tailscaled  [kernel.kallsyms]  [k] rb_first
+     0.11%  tailscaled  [kernel.kallsyms]  [k] receive_buf
+     0.11%  tailscaled  [kernel.kallsyms]  [k] resolve_normal_ct
+     0.11%  tailscaled  [kernel.kallsyms]  [k] rw_verify_area
+     0.11%  tailscaled  [kernel.kallsyms]  [k] skb_clone
+     0.11%  tailscaled  [kernel.kallsyms]  [k] strscpy_pad
+     0.11%  tailscaled  [kernel.kallsyms]  [k] tcp_rbtree_insert
+     0.11%  tailscaled  [kernel.kallsyms]  [k] vfs_read
+     0.11%  tailscaled  [kernel.kallsyms]  [k] virtnet_receive.constprop.0
+     0.11%  tailscaled  tailscaled         [.] github.com/gaissmai/bart.(*liteTable[struct {}]).Contains-fm
+     0.11%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*msghdr).pack
+     0.11%  tailscaled  tailscaled         [.] memeqbody
+     0.11%  tailscaled  tailscaled         [.] os.(*File).Write
+     0.11%  tailscaled  tailscaled         [.] runtime.(*timer).stop
+     0.11%  tailscaled  tailscaled         [.] sync.(*poolChain).popTail
+     0.11%  tailscaled  tailscaled         [.] sync.runtime_procPin
+     0.11%  tailscaled  tailscaled         [.] tailscale.com/wgengine/filter.(*Filter).RunOut
+     0.11%  tailscaled  tailscaled         [.] tailscale.com/wgengine/filter.(*Filter).loggingAllowed
+     0.11%  tailscaled  tailscaled         [.] tailscale.com/wgengine/netstack.(*Impl).handleLocalPackets-fm
+     0.09%  tailscaled  [kernel.kallsyms]  [k] ____sys_sendmsg
+     0.09%  tailscaled  [kernel.kallsyms]  [k] __ip_select_ident
+     0.09%  tailscaled  [kernel.kallsyms]  [k] __netif_receive_skb_one_core
+     0.09%  tailscaled  [kernel.kallsyms]  [k] __nf_ct_refresh_acct
+     0.09%  tailscaled  [kernel.kallsyms]  [k] __raw_spin_unlock_irq
+     0.09%  tailscaled  [kernel.kallsyms]  [k] __udp_gso_segment
+     0.09%  tailscaled  [kernel.kallsyms]  [k] __x2apic_send_IPI_mask
+     0.09%  tailscaled  [kernel.kallsyms]  [k] _raw_spin_lock_bh
+     0.09%  tailscaled  [kernel.kallsyms]  [k] build_detached_freelist
+     0.09%  tailscaled  [kernel.kallsyms]  [k] dequeue_skb
+     0.09%  tailscaled  [kernel.kallsyms]  [k] dev_kfree_skb_any_reason
+     0.09%  tailscaled  [kernel.kallsyms]  [k] ip_rcv_finish_core.constprop.0
+     0.09%  tailscaled  [kernel.kallsyms]  [k] irqentry_exit_to_user_mode
+     0.09%  tailscaled  [kernel.kallsyms]  [k] kfree_skbmem
+     0.09%  tailscaled  [kernel.kallsyms]  [k] memcpy_orig
+     0.09%  tailscaled  [kernel.kallsyms]  [k] nf_ct_get_tuple
+     0.09%  tailscaled  [kernel.kallsyms]  [k] nft_counter_eval
+     0.09%  tailscaled  [kernel.kallsyms]  [k] schedule
+     0.09%  tailscaled  [kernel.kallsyms]  [k] security_file_permission
+     0.09%  tailscaled  [kernel.kallsyms]  [k] sk_forced_mem_schedule
+     0.09%  tailscaled  [kernel.kallsyms]  [k] skb_gso_validate_network_len
+     0.09%  tailscaled  [kernel.kallsyms]  [k] skb_network_protocol
+     0.09%  tailscaled  [kernel.kallsyms]  [k] tcp_current_mss
+     0.09%  tailscaled  [kernel.kallsyms]  [k] tcp_rcv_established
+     0.09%  tailscaled  [kernel.kallsyms]  [k] vring_unmap_one_split
+     0.09%  tailscaled  tailscaled         [.] context.(*cancelCtx).Err
+     0.09%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.pseudoHeaderChecksum64
+     0.09%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*Conn).recvMsgs
+     0.09%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*mmsgTmpsPool).Get
+     0.09%  tailscaled  tailscaled         [.] internal/poll.(*FD).RawWrite
+     0.09%  tailscaled  tailscaled         [.] internal/runtime/maps.(*Map).getWithKeySmall
+     0.09%  tailscaled  tailscaled         [.] net/netip.Addr.IsMulticast
+     0.09%  tailscaled  tailscaled         [.] os.(*File).Read
+     0.09%  tailscaled  tailscaled         [.] runtime.chansend
+     0.09%  tailscaled  tailscaled         [.] runtime.mapassign_fast64ptr
+     0.09%  tailscaled  tailscaled         [.] runtime.memclrNoHeapPointers
+     0.09%  tailscaled  tailscaled         [.] runtime.memhash_varlen
+     0.09%  tailscaled  tailscaled         [.] runtime.releaseSudog
+     0.09%  tailscaled  tailscaled         [.] sync.(*Pool).pin
+     0.09%  tailscaled  tailscaled         [.] sync.(*poolChain).pushHead
+     0.09%  tailscaled  tailscaled         [.] tailscale.com/ipn/ipnlocal.(*nodeBackend).NodeByID.deferwrap1
+     0.09%  tailscaled  tailscaled         [.] tailscale.com/net/batching.(*linuxBatchingConn).writeBatch
+     0.09%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*Wrapper).sendBufferConsumed
+     0.09%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*Wrapper).sendVectorOutbound
+     0.09%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*Conn).receiveIPv4.(*Conn).mkReceiveFunc.func1
+     0.08%  tailscaled  [kernel.kallsyms]  [k] __check_heap_object
+     0.08%  tailscaled  [kernel.kallsyms]  [k] __import_iovec
+     0.08%  tailscaled  [kernel.kallsyms]  [k] __ip_finish_output
+     0.08%  tailscaled  [kernel.kallsyms]  [k] __ip_queue_xmit
+     0.08%  tailscaled  [kernel.kallsyms]  [k] __kfree_skb
+     0.08%  tailscaled  [kernel.kallsyms]  [k] __local_bh_enable_ip
+     0.08%  tailscaled  [kernel.kallsyms]  [k] __mod_timer
+     0.08%  tailscaled  [kernel.kallsyms]  [k] __netif_receive_skb_list_core
+     0.08%  tailscaled  [kernel.kallsyms]  [k] __udp_enqueue_schedule_skb
+     0.08%  tailscaled  [kernel.kallsyms]  [k] alloc_skb_with_frags
+     0.08%  tailscaled  [kernel.kallsyms]  [k] check_sq_full_and_disable.isra.0
+     0.08%  tailscaled  [kernel.kallsyms]  [k] cubictcp_acked
+     0.08%  tailscaled  [kernel.kallsyms]  [k] expr_call_ops_eval
+     0.08%  tailscaled  [kernel.kallsyms]  [k] fib4_rule_match
+     0.08%  tailscaled  [kernel.kallsyms]  [k] fput
+     0.08%  tailscaled  [kernel.kallsyms]  [k] free_unref_page_prepare
+     0.08%  tailscaled  [kernel.kallsyms]  [k] get_l4proto
+     0.08%  tailscaled  [kernel.kallsyms]  [k] ip_protocol_deliver_rcu
+     0.08%  tailscaled  [kernel.kallsyms]  [k] ipv4_conntrack_defrag
+     0.08%  tailscaled  [kernel.kallsyms]  [k] ipv4_mtu
+     0.08%  tailscaled  [kernel.kallsyms]  [k] kmalloc_reserve
+     0.08%  tailscaled  [kernel.kallsyms]  [k] ktime_get
+     0.08%  tailscaled  [kernel.kallsyms]  [k] napi_gro_complete.constprop.0
+     0.08%  tailscaled  [kernel.kallsyms]  [k] nft_immediate_eval
+     0.08%  tailscaled  [kernel.kallsyms]  [k] refill_stock
+     0.08%  tailscaled  [kernel.kallsyms]  [k] sch_direct_xmit
+     0.08%  tailscaled  [kernel.kallsyms]  [k] should_failslab.constprop.0
+     0.08%  tailscaled  [kernel.kallsyms]  [k] syscall_exit_to_user_mode
+     0.08%  tailscaled  [kernel.kallsyms]  [k] tcp_schedule_loss_probe.part.0
+     0.08%  tailscaled  [kernel.kallsyms]  [k] tcp_v4_early_demux
+     0.08%  tailscaled  [kernel.kallsyms]  [k] tcp_validate_incoming
+     0.08%  tailscaled  [kernel.kallsyms]  [k] tun_chr_write_iter
+     0.08%  tailscaled  [kernel.kallsyms]  [k] tun_get_user
+     0.08%  tailscaled  [kernel.kallsyms]  [k] validate_xmit_skb
+     0.08%  tailscaled  [kernel.kallsyms]  [k] vfs_write
+     0.08%  tailscaled  [kernel.kallsyms]  [k] virtqueue_get_buf
+     0.08%  tailscaled  tailscaled         [.] expvar.(*Int).Add
+     0.08%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Device).LookupPeer
+     0.08%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Keypairs).Current
+     0.08%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*WaitPool).Get
+     0.08%  tailscaled  tailscaled         [.] golang.org/x/crypto/chacha20poly1305.setupState
+     0.08%  tailscaled  tailscaled         [.] internal/runtime/maps.(*table).Delete
+     0.08%  tailscaled  tailscaled         [.] net/netip.Prefix.Contains
+     0.08%  tailscaled  tailscaled         [.] runtime.execute
+     0.08%  tailscaled  tailscaled         [.] runtime.gopark
+     0.08%  tailscaled  tailscaled         [.] runtime.memequal_varlen
+     0.08%  tailscaled  tailscaled         [.] runtime.procyieldAsm.abi0
+     0.08%  tailscaled  tailscaled         [.] runtime.ready
+     0.08%  tailscaled  tailscaled         [.] runtime.runqput
+     0.08%  tailscaled  tailscaled         [.] runtime.systemstack.abi0
+     0.08%  tailscaled  tailscaled         [.] sync.(*RWMutex).Lock
+     0.08%  tailscaled  tailscaled         [.] sync.(*WaitGroup).Add
+     0.08%  tailscaled  tailscaled         [.] syscall.Getenv
+     0.08%  tailscaled  tailscaled         [.] tailscale.com/ipn/ipnlocal.(*LocalBackend).lookupPeerByIP
+     0.08%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*Wrapper).Write
+     0.08%  tailscaled  tailscaled         [.] tailscale.com/wgengine/filter.(*Filter).logRateLimit
+     0.08%  tailscaled  tailscaled         [.] time.runtimeNano
+     0.06%  tailscaled  [kernel.kallsyms]  [k] ___sys_recvmsg
+     0.06%  tailscaled  [kernel.kallsyms]  [k] ___sys_sendmsg
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __cond_resched
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __fsnotify_parent
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __ip_make_skb
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __memcg_slab_free_hook
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __mkroute_output
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __raw_spin_lock_irqsave
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __sk_dst_check
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __skb_checksum
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __tcp_select_window
+     0.06%  tailscaled  [kernel.kallsyms]  [k] __x64_sys_sendmmsg
+     0.06%  tailscaled  [kernel.kallsyms]  [k] begin_current_label_crit_section
+     0.06%  tailscaled  [kernel.kallsyms]  [k] destroy_large_folio
+     0.06%  tailscaled  [kernel.kallsyms]  [k] do_softirq.part.0
+     0.06%  tailscaled  [kernel.kallsyms]  [k] ep_poll
+     0.06%  tailscaled  [kernel.kallsyms]  [k] fib_lookup_good_nhc
+     0.06%  tailscaled  [kernel.kallsyms]  [k] ip_finish_output
+     0.06%  tailscaled  [kernel.kallsyms]  [k] ip_rcv
+     0.06%  tailscaled  [kernel.kallsyms]  [k] ip_send_check
+     0.06%  tailscaled  [kernel.kallsyms]  [k] ip_skb_dst_mtu
+     0.06%  tailscaled  [kernel.kallsyms]  [k] ip_sublist_rcv
+     0.06%  tailscaled  [kernel.kallsyms]  [k] ipv4_conntrack_local
+     0.06%  tailscaled  [kernel.kallsyms]  [k] is_vmalloc_addr
+     0.06%  tailscaled  [kernel.kallsyms]  [k] kfree_skb_reason
+     0.06%  tailscaled  [kernel.kallsyms]  [k] lock_timer_base
+     0.06%  tailscaled  [kernel.kallsyms]  [k] net_rx_action
+     0.06%  tailscaled  [kernel.kallsyms]  [k] nf_confirm
+     0.06%  tailscaled  [kernel.kallsyms]  [k] nf_conntrack_handle_packet
+     0.06%  tailscaled  [kernel.kallsyms]  [k] nf_conntrack_udp_packet
+     0.06%  tailscaled  [kernel.kallsyms]  [k] nft_target_eval_xt
+     0.06%  tailscaled  [kernel.kallsyms]  [k] qdisc_run_end
+     0.06%  tailscaled  [kernel.kallsyms]  [k] rb_erase
+     0.06%  tailscaled  [kernel.kallsyms]  [k] rcu_all_qs
+     0.06%  tailscaled  [kernel.kallsyms]  [k] schedule_debug.constprop.0
+     0.06%  tailscaled  [kernel.kallsyms]  [k] skb_gso_transport_seglen
+     0.06%  tailscaled  [kernel.kallsyms]  [k] skb_to_sgvec
+     0.06%  tailscaled  [kernel.kallsyms]  [k] skb_zerocopy_clone
+     0.06%  tailscaled  [kernel.kallsyms]  [k] sock_poll
+     0.06%  tailscaled  [kernel.kallsyms]  [k] sock_put
+     0.06%  tailscaled  [kernel.kallsyms]  [k] strscpy
+     0.06%  tailscaled  [kernel.kallsyms]  [k] syscall_exit_to_user_mode_prepare
+     0.06%  tailscaled  [kernel.kallsyms]  [k] tcp_ack_update_rtt
+     0.06%  tailscaled  [kernel.kallsyms]  [k] tcp_in_window
+     0.06%  tailscaled  [kernel.kallsyms]  [k] tcp_v4_do_rcv
+     0.06%  tailscaled  [kernel.kallsyms]  [k] timespec64_add_safe
+     0.06%  tailscaled  [kernel.kallsyms]  [k] tun_net_xmit
+     0.06%  tailscaled  [kernel.kallsyms]  [k] udp4_lib_lookup2
+     0.06%  tailscaled  [kernel.kallsyms]  [k] udp_send_skb
+     0.06%  tailscaled  [kernel.kallsyms]  [k] update_blocked_averages
+     0.06%  tailscaled  [kernel.kallsyms]  [k] validate_xmit_skb_list
+     0.06%  tailscaled  [kernel.kallsyms]  [k] virtnet_rq_alloc.constprop.0
+     0.06%  tailscaled  [kernel.kallsyms]  [k] virtqueue_enable_cb_delayed
+     0.06%  tailscaled  [vdso]             [.] 0x0000000000000ab0
+     0.06%  tailscaled  tailscaled         [.] errors.Is
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*IndexTable).Lookup
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).SendBuffers
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).keepKeyFreshSending
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*WaitPool).Put
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.(*NativeTun).Read
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.(*NativeTun).Write.func1
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.(*virtioNetHdr).toGSOOptions
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.Device.Read-fm
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.applyTCPCoalesceAccounting
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.handleGRO
+     0.06%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.handleVirtioRead
+     0.06%  tailscaled  tailscaled         [.] golang.org/x/crypto/chacha20poly1305.(*chacha20poly1305).open
+     0.06%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*Conn).sendMsgs
+     0.06%  tailscaled  tailscaled         [.] internal/poll.(*FD).RawRead
+     0.06%  tailscaled  tailscaled         [.] internal/poll.(*FD).readUnlock
+     0.06%  tailscaled  tailscaled         [.] internal/poll.(*FD).writeUnlock
+     0.06%  tailscaled  tailscaled         [.] internal/poll.(*fdMutex).rwlock
+     0.06%  tailscaled  tailscaled         [.] internal/poll.(*pollDesc).prepare
+     0.06%  tailscaled  tailscaled         [.] internal/runtime/maps.(*Iter).Init
+     0.06%  tailscaled  tailscaled         [.] net.(*rawConn).Write
+     0.06%  tailscaled  tailscaled         [.] runtime.(*m).clearAllpSnapshot
+     0.06%  tailscaled  tailscaled         [.] runtime.(*timeHistogram).record
+     0.06%  tailscaled  tailscaled         [.] runtime.bulkBarrierPreWrite
+     0.06%  tailscaled  tailscaled         [.] runtime.chanparkcommit
+     0.06%  tailscaled  tailscaled         [.] runtime.getcallerfp
+     0.06%  tailscaled  tailscaled         [.] runtime.memhash
+     0.06%  tailscaled  tailscaled         [.] runtime.netpollready
+     0.06%  tailscaled  tailscaled         [.] runtime.pidleget
+     0.06%  tailscaled  tailscaled         [.] runtime.pidlegetSpinning
+     0.06%  tailscaled  tailscaled         [.] runtime.save
+     0.06%  tailscaled  tailscaled         [.] runtime.scanObject
+     0.06%  tailscaled  tailscaled         [.] runtime.selectnbsend
+     0.06%  tailscaled  tailscaled         [.] runtime.sendDirect
+     0.06%  tailscaled  tailscaled         [.] sync.(*poolChain).popHead
+     0.06%  tailscaled  tailscaled         [.] syscall.Syscall
+     0.06%  tailscaled  tailscaled         [.] syscall.Syscall6
+     0.06%  tailscaled  tailscaled         [.] tailscale.com/ipn/ipnlocal.(*LocalBackend).currentNode
+     0.06%  tailscaled  tailscaled         [.] tailscale.com/net/batching.(*linuxBatchingConn).splitCoalescedMessages
+     0.06%  tailscaled  tailscaled         [.] tailscale.com/syncs.(*AtomicValue[go.shape.map[net/netip.Addr]tailscale.com/tailcfg.ServiceName]).Load
+     0.06%  tailscaled  tailscaled         [.] tailscale.com/wgengine.(*userspaceEngine).trackOpenPreFilterIn
+     0.06%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*Conn).receiveIP
+     0.06%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*RebindingUDPConn).ReadBatch
+     0.06%  tailscaled  tailscaled         [.] tailscale.com/wgengine/netstack.(*Impl).injectInbound
+     0.06%  tailscaled  tailscaled         [.] tailscale.com/wgengine/netstack.(*Impl).shouldProcessInbound
+     0.04%  tailscaled  [kernel.kallsyms]  [k] ____sys_recvmsg
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __check_object_size.part.0
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __consume_stateless_skb
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __dev_queue_xmit
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __hrtimer_init
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __skb_datagram_iter
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __sock_recv_cmsgs
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __udp4_lib_lookup
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __x64_sys_epoll_pwait
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __x64_sys_futex
+     0.04%  tailscaled  [kernel.kallsyms]  [k] __xfrm_policy_check2.constprop.0
+     0.04%  tailscaled  [kernel.kallsyms]  [k] _copy_to_iter
+     0.04%  tailscaled  [kernel.kallsyms]  [k] _raw_spin_trylock
+     0.04%  tailscaled  [kernel.kallsyms]  [k] aa_file_perm
+     0.04%  tailscaled  [kernel.kallsyms]  [k] apparmor_ip_postroute
+     0.04%  tailscaled  [kernel.kallsyms]  [k] apparmor_socket_sock_rcv_skb
+     0.04%  tailscaled  [kernel.kallsyms]  [k] bictcp_update
+     0.04%  tailscaled  [kernel.kallsyms]  [k] check_stack_object
+     0.04%  tailscaled  [kernel.kallsyms]  [k] copy_msghdr_from_user
+     0.04%  tailscaled  [kernel.kallsyms]  [k] do_futex
+     0.04%  tailscaled  [kernel.kallsyms]  [k] do_nanosleep
+     0.04%  tailscaled  [kernel.kallsyms]  [k] do_recvmmsg
+     0.04%  tailscaled  [kernel.kallsyms]  [k] eth_type_trans
+     0.04%  tailscaled  [kernel.kallsyms]  [k] fib4_rule_action
+     0.04%  tailscaled  [kernel.kallsyms]  [k] fib_get_table
+     0.04%  tailscaled  [kernel.kallsyms]  [k] fq_codel_dequeue
+     0.04%  tailscaled  [kernel.kallsyms]  [k] futex_q_lock
+     0.04%  tailscaled  [kernel.kallsyms]  [k] futex_wake
+     0.04%  tailscaled  [kernel.kallsyms]  [k] get_page_from_freelist
+     0.04%  tailscaled  [kernel.kallsyms]  [k] gro_list_prepare
+     0.04%  tailscaled  [kernel.kallsyms]  [k] hash_conntrack_raw
+     0.04%  tailscaled  [kernel.kallsyms]  [k] import_iovec
+     0.04%  tailscaled  [kernel.kallsyms]  [k] inet_gso_segment
+     0.04%  tailscaled  [kernel.kallsyms]  [k] inet_sendmsg
+     0.04%  tailscaled  [kernel.kallsyms]  [k] ip_route_input_slow
+     0.04%  tailscaled  [kernel.kallsyms]  [k] ip_send_skb
+     0.04%  tailscaled  [kernel.kallsyms]  [k] ipv4_dst_check
+     0.04%  tailscaled  [kernel.kallsyms]  [k] ipv4_pktinfo_prepare
+     0.04%  tailscaled  [kernel.kallsyms]  [k] kmem_cache_alloc
+     0.04%  tailscaled  [kernel.kallsyms]  [k] ksys_read
+     0.04%  tailscaled  [kernel.kallsyms]  [k] mutex_lock
+     0.04%  tailscaled  [kernel.kallsyms]  [k] neigh_hh_output
+     0.04%  tailscaled  [kernel.kallsyms]  [k] netdev_pick_tx
+     0.04%  tailscaled  [kernel.kallsyms]  [k] netif_receive_skb
+     0.04%  tailscaled  [kernel.kallsyms]  [k] netif_receive_skb_list_internal
+     0.04%  tailscaled  [kernel.kallsyms]  [k] nf_checksum
+     0.04%  tailscaled  [kernel.kallsyms]  [k] page_to_skb
+     0.04%  tailscaled  [kernel.kallsyms]  [k] passthru_features_check
+     0.04%  tailscaled  [kernel.kallsyms]  [k] put_cmsg
+     0.04%  tailscaled  [kernel.kallsyms]  [k] receive_mergeable
+     0.04%  tailscaled  [kernel.kallsyms]  [k] rmqueue
+     0.04%  tailscaled  [kernel.kallsyms]  [k] skb_copy_datagram_from_iter
+     0.04%  tailscaled  [kernel.kallsyms]  [k] skb_set_owner_w
+     0.04%  tailscaled  [kernel.kallsyms]  [k] sock_def_readable
+     0.04%  tailscaled  [kernel.kallsyms]  [k] tcp_do_parse_auth_options
+     0.04%  tailscaled  [kernel.kallsyms]  [k] tcp_established_options
+     0.04%  tailscaled  [kernel.kallsyms]  [k] tcp_rack_advance
+     0.04%  tailscaled  [kernel.kallsyms]  [k] tcp_rearm_rto.part.0
+     0.04%  tailscaled  [kernel.kallsyms]  [k] tcp_v4_fill_cb
+     0.04%  tailscaled  [kernel.kallsyms]  [k] udp4_gro_receive
+     0.04%  tailscaled  [kernel.kallsyms]  [k] udp_gro_receive_segment
+     0.04%  tailscaled  [kernel.kallsyms]  [k] udp_mt
+     0.04%  tailscaled  [kernel.kallsyms]  [k] udp_v4_early_demux
+     0.04%  tailscaled  [kernel.kallsyms]  [k] virtio_net_hdr_to_skb.constprop.0
+     0.04%  tailscaled  [kernel.kallsyms]  [k] virtnet_poll
+     0.04%  tailscaled  [kernel.kallsyms]  [k] virtnet_rq_get_buf
+     0.04%  tailscaled  [kernel.kallsyms]  [k] virtqueue_disable_cb
+     0.04%  tailscaled  [vdso]             [.] 0x0000000000000abb
+     0.04%  tailscaled  [vdso]             [.] 0x0000000000000b05
+     0.04%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Device).PutOutboundElement
+     0.04%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Device).RoutineDecryption
+     0.04%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialSender
+     0.04%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Timer).IsPending.deferwrap1
+     0.04%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*mmsghdrsPacker).prepare
+     0.04%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*syscaller).recvmmsgF
+     0.04%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*syscaller).sendmmsgF-fm
+     0.04%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.mmsghdrs.unpack
+     0.04%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.parseInetAddr
+     0.04%  tailscaled  tailscaled         [.] internal/chacha8rand.block
+     0.04%  tailscaled  tailscaled         [.] internal/poll.(*FD).Read.deferwrap1
+     0.04%  tailscaled  tailscaled         [.] internal/poll.(*FD).Write
+     0.04%  tailscaled  tailscaled         [.] internal/runtime/maps.(*Map).Delete
+     0.04%  tailscaled  tailscaled         [.] internal/runtime/syscall/linux.EpollWait
+     0.04%  tailscaled  tailscaled         [.] net/netip.Addr.IsLinkLocalUnicast
+     0.04%  tailscaled  tailscaled         [.] runtime.(*gcControllerState).releaseNextGCMarkWorker
+     0.04%  tailscaled  tailscaled         [.] runtime.(*listHeadManual).pop
+     0.04%  tailscaled  tailscaled         [.] runtime.(*timer).modify
+     0.04%  tailscaled  tailscaled         [.] runtime.checkRunqsNoP
+     0.04%  tailscaled  tailscaled         [.] runtime.futexsleep
+     0.04%  tailscaled  tailscaled         [.] runtime.makeslice
+     0.04%  tailscaled  tailscaled         [.] runtime.mallocgc
+     0.04%  tailscaled  tailscaled         [.] runtime.mallocgcSmallScanNoHeader
+     0.04%  tailscaled  tailscaled         [.] runtime.mapaccess2_faststr
+     0.04%  tailscaled  tailscaled         [.] runtime.mcall
+     0.04%  tailscaled  tailscaled         [.] runtime.pidleput
+     0.04%  tailscaled  tailscaled         [.] runtime.releasep
+     0.04%  tailscaled  tailscaled         [.] runtime.semrelease1
+     0.04%  tailscaled  tailscaled         [.] runtime.sweepone
+     0.04%  tailscaled  tailscaled         [.] runtime.sysmon
+     0.04%  tailscaled  tailscaled         [.] runtime.tracebackPCs
+     0.04%  tailscaled  tailscaled         [.] runtime.typedmemclr
+     0.04%  tailscaled  tailscaled         [.] runtime.typedmemmove
+     0.04%  tailscaled  tailscaled         [.] sync.(*Once).Do
+     0.04%  tailscaled  tailscaled         [.] sync.runtime_procUnpin
+     0.04%  tailscaled  tailscaled         [.] syscall.Getenv.deferwrap1
+     0.04%  tailscaled  tailscaled         [.] syscall.RawSyscall6
+     0.04%  tailscaled  tailscaled         [.] tailscale.com/net/batching.(*linuxBatchingConn).ReadBatch
+     0.04%  tailscaled  tailscaled         [.] tailscale.com/net/batching.(*linuxBatchingConn).WriteBatchTo
+     0.04%  tailscaled  tailscaled         [.] tailscale.com/syncs.(*AtomicValue[go.shape.func(tailscale.com/types/ipproto.Proto, net/netip.AddrPort, net/netip.AddrPort, int, int, bool)]).Load
+     0.04%  tailscaled  tailscaled         [.] tailscale.com/util/set.Set[net/netip.Addr].Contains-fm
+     0.04%  tailscaled  tailscaled         [.] tailscale.com/wgengine.(*userspaceEngine).SetPeerByIPPacketFunc.func1
+     0.04%  tailscaled  tailscaled         [.] tailscale.com/wgengine.(*userspaceEngine).handleLocalPackets-fm
+     0.04%  tailscaled  tailscaled         [.] tailscale.com/wgengine.(*userspaceEngine).trackOpenPreFilterIn-fm
+     0.04%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*Conn).Send
+     0.04%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*Conn).sendUDPBatch
+     0.04%  tailscaled  tailscaled         [.] time.Since
+     0.04%  tailscaled  tailscaled         [.] time.runtimeIsBubbled
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __build_skb
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __fib_lookup
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __fib_validate_source
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __folio_put
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __futex_unqueue
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __futex_wait
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __get_random_u32_below
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __get_user_4
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __inet_lookup_skb
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __kmalloc_node_track_caller
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __memcpy
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __memset
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __napi_poll
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __next_zones_zonelist
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __put_partials
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __put_user_nocheck_4
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __qdisc_run
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __rmqueue_pcplist
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __run_timers
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __schedule
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __sk_mem_raise_allocated
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __sk_mem_reduce_allocated
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __sk_mem_schedule
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __skb_checksum_complete
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __tcp_push_pending_frames
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __tcp_retransmit_skb.part.0
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __this_module+0x800000006ba6
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __udp4_lib_rcv
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __usecs_to_jiffies
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __x64_sys_nanosleep
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __x64_sys_recvmmsg
+     0.02%  tailscaled  [kernel.kallsyms]  [k] __x64_sys_write
+     0.02%  tailscaled  [kernel.kallsyms]  [k] _copy_from_user
+     0.02%  tailscaled  [kernel.kallsyms]  [k] _copy_to_user
+     0.02%  tailscaled  [kernel.kallsyms]  [k] _raw_spin_unlock_bh
+     0.02%  tailscaled  [kernel.kallsyms]  [k] allocate_slab
+     0.02%  tailscaled  [kernel.kallsyms]  [k] apparmor_socket_sendmsg
+     0.02%  tailscaled  [kernel.kallsyms]  [k] connmark_tg_shift
+     0.02%  tailscaled  [kernel.kallsyms]  [k] copy_iovec_from_user
+     0.02%  tailscaled  [kernel.kallsyms]  [k] cpuset_node_allowed
+     0.02%  tailscaled  [kernel.kallsyms]  [k] cubictcp_cong_avoid
+     0.02%  tailscaled  [kernel.kallsyms]  [k] datagram_poll
+     0.02%  tailscaled  [kernel.kallsyms]  [k] dev_gro_receive
+     0.02%  tailscaled  [kernel.kallsyms]  [k] discard_slab
+     0.02%  tailscaled  [kernel.kallsyms]  [k] do_epoll_pwait.part.0
+     0.02%  tailscaled  [kernel.kallsyms]  [k] do_epoll_wait
+     0.02%  tailscaled  [kernel.kallsyms]  [k] do_send_sig_info
+     0.02%  tailscaled  [kernel.kallsyms]  [k] do_user_addr_fault
+     0.02%  tailscaled  [kernel.kallsyms]  [k] ep_send_events
+     0.02%  tailscaled  [kernel.kallsyms]  [k] fib4_rule_suppress
+     0.02%  tailscaled  [kernel.kallsyms]  [k] fib_result_prefsrc
+     0.02%  tailscaled  [kernel.kallsyms]  [k] fib_validate_source
+     0.02%  tailscaled  [kernel.kallsyms]  [k] free_unref_page_commit
+     0.02%  tailscaled  [kernel.kallsyms]  [k] futex_unqueue
+     0.02%  tailscaled  [kernel.kallsyms]  [k] futex_wait
+     0.02%  tailscaled  [kernel.kallsyms]  [k] futex_wake_mark
+     0.02%  tailscaled  [kernel.kallsyms]  [k] get_any_partial
+     0.02%  tailscaled  [kernel.kallsyms]  [k] get_mem_cgroup_from_mm
+     0.02%  tailscaled  [kernel.kallsyms]  [k] get_pfnblock_flags_mask
+     0.02%  tailscaled  [kernel.kallsyms]  [k] get_timespec64
+     0.02%  tailscaled  [kernel.kallsyms]  [k] hrtimer_active
+     0.02%  tailscaled  [kernel.kallsyms]  [k] hrtimer_nanosleep
+     0.02%  tailscaled  [kernel.kallsyms]  [k] import_ubuf
+     0.02%  tailscaled  [kernel.kallsyms]  [k] inet_gro_complete
+     0.02%  tailscaled  [kernel.kallsyms]  [k] inet_gro_receive
+     0.02%  tailscaled  [kernel.kallsyms]  [k] inet_lookup_reuseport
+     0.02%  tailscaled  [kernel.kallsyms]  [k] inet_reqsk_alloc
+     0.02%  tailscaled  [kernel.kallsyms]  [k] iovec_from_user.part.0
+     0.02%  tailscaled  [kernel.kallsyms]  [k] ip_list_rcv
+     0.02%  tailscaled  [kernel.kallsyms]  [k] ip_local_deliver
+     0.02%  tailscaled  [kernel.kallsyms]  [k] ip_rcv_core
+     0.02%  tailscaled  [kernel.kallsyms]  [k] ip_route_output_key_hash_rcu
+     0.02%  tailscaled  [kernel.kallsyms]  [k] ip_setup_cork
+     0.02%  tailscaled  [kernel.kallsyms]  [k] jiffies_to_usecs
+     0.02%  tailscaled  [kernel.kallsyms]  [k] ktime_get_ts64
+     0.02%  tailscaled  [kernel.kallsyms]  [k] minmax_running_min
+     0.02%  tailscaled  [kernel.kallsyms]  [k] mod_node_page_state
+     0.02%  tailscaled  [kernel.kallsyms]  [k] move_addr_to_kernel
+     0.02%  tailscaled  [kernel.kallsyms]  [k] move_addr_to_user
+     0.02%  tailscaled  [kernel.kallsyms]  [k] mutex_unlock
+     0.02%  tailscaled  [kernel.kallsyms]  [k] napi_consume_skb
+     0.02%  tailscaled  [kernel.kallsyms]  [k] napi_gro_receive
+     0.02%  tailscaled  [kernel.kallsyms]  [k] napi_skb_cache_put
+     0.02%  tailscaled  [kernel.kallsyms]  [k] native_write_msr
+     0.02%  tailscaled  [kernel.kallsyms]  [k] neigh_connected_output
+     0.02%  tailscaled  [kernel.kallsyms]  [k] netdev_core_pick_tx
+     0.02%  tailscaled  [kernel.kallsyms]  [k] netif_tx_wake_queue
+     0.02%  tailscaled  [kernel.kallsyms]  [k] nf_ct_acct_add
+     0.02%  tailscaled  [kernel.kallsyms]  [k] nf_ip_checksum
+     0.02%  tailscaled  [kernel.kallsyms]  [k] nf_nat_ipv4_pre_routing
+     0.02%  tailscaled  [kernel.kallsyms]  [k] nft_do_chain_ipv4
+     0.02%  tailscaled  [kernel.kallsyms]  [k] page_frag_free
+     0.02%  tailscaled  [kernel.kallsyms]  [k] plist_add
+     0.02%  tailscaled  [kernel.kallsyms]  [k] post_alloc_hook
+     0.02%  tailscaled  [kernel.kallsyms]  [k] prep_compound_page
+     0.02%  tailscaled  [kernel.kallsyms]  [k] raw_local_deliver
+     0.02%  tailscaled  [kernel.kallsyms]  [k] raw_v4_input
+     0.02%  tailscaled  [kernel.kallsyms]  [k] rb_insert_color
+     0.02%  tailscaled  [kernel.kallsyms]  [k] rb_next
+     0.02%  tailscaled  [kernel.kallsyms]  [k] security_sk_classify_flow
+     0.02%  tailscaled  [kernel.kallsyms]  [k] security_socket_recvmsg
+     0.02%  tailscaled  [kernel.kallsyms]  [k] security_socket_sendmsg
+     0.02%  tailscaled  [kernel.kallsyms]  [k] select_estimate_accuracy
+     0.02%  tailscaled  [kernel.kallsyms]  [k] set_user_sigmask
+     0.02%  tailscaled  [kernel.kallsyms]  [k] sk_filter_trim_cap
+     0.02%  tailscaled  [kernel.kallsyms]  [k] sk_free
+     0.02%  tailscaled  [kernel.kallsyms]  [k] sk_reset_timer
+     0.02%  tailscaled  [kernel.kallsyms]  [k] sk_stream_write_space
+     0.02%  tailscaled  [kernel.kallsyms]  [k] skb_consume_udp
+     0.02%  tailscaled  [kernel.kallsyms]  [k] skb_copy_datagram_iter
+     0.02%  tailscaled  [kernel.kallsyms]  [k] skb_csum_hwoffload_help
+     0.02%  tailscaled  [kernel.kallsyms]  [k] skb_headers_offset_update
+     0.02%  tailscaled  [kernel.kallsyms]  [k] skb_mac_gso_segment
+     0.02%  tailscaled  [kernel.kallsyms]  [k] skb_page_frag_refill
+     0.02%  tailscaled  [kernel.kallsyms]  [k] skb_pull_rcsum
+     0.02%  tailscaled  [kernel.kallsyms]  [k] skb_shift
+     0.02%  tailscaled  [kernel.kallsyms]  [k] smp_call_function_many_cond
+     0.02%  tailscaled  [kernel.kallsyms]  [k] sock_alloc_send_pskb
+     0.02%  tailscaled  [kernel.kallsyms]  [k] sock_recvmsg
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_chrono_stop
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_cong_avoid_ai
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_event_new_data_sent
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_fastretrans_alert
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_filter
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_fragment_tstamp
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_inbound_hash.constprop.0
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_newly_delivered
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_parse_options
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_rack_detect_loss
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_rate_gen
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_rate_skb_delivered
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_retransmit_skb
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_rtt_estimator
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_shift_skb_data
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_sndbuf_expand
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_stream_alloc_skb
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_tso_segs
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_update_pacing_rate
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_v4_syn_recv_sock
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_write_queue_purge
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tcp_xmit_retransmit_queue.part.0
+     0.02%  tailscaled  [kernel.kallsyms]  [k] try_fill_recv
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tun_chr_poll
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tun_do_read
+     0.02%  tailscaled  [kernel.kallsyms]  [k] tun_rx_batched
+     0.02%  tailscaled  [kernel.kallsyms]  [k] udp4_ufo_fragment
+     0.02%  tailscaled  [kernel.kallsyms]  [k] udp_queue_rcv_one_skb
+     0.02%  tailscaled  [kernel.kallsyms]  [k] udp_queue_rcv_skb
+     0.02%  tailscaled  [kernel.kallsyms]  [k] udp_recvmsg
+     0.02%  tailscaled  [kernel.kallsyms]  [k] udp_rmem_release
+     0.02%  tailscaled  [kernel.kallsyms]  [k] udp_unicast_rcv_skb
+     0.02%  tailscaled  [kernel.kallsyms]  [k] validate_xmit_xfrm
+     0.02%  tailscaled  [kernel.kallsyms]  [k] virtqueue_get_buf_ctx
+     0.02%  tailscaled  [kernel.kallsyms]  [k] virtqueue_poll
+     0.02%  tailscaled  [kernel.kallsyms]  [k] wake_q_add_safe
+     0.02%  tailscaled  [kernel.kallsyms]  [k] xfrm_lookup_with_ifid
+     0.02%  tailscaled  [vdso]             [.] 0x0000000000000ab1
+     0.02%  tailscaled  [vdso]             [.] 0x0000000000000b00
+     0.02%  tailscaled  [vdso]             [.] 0x0000000000000b15
+     0.02%  tailscaled  [vdso]             [.] 0x0000000000000b3a
+     0.02%  tailscaled  [vdso]             [.] 0x0000000000000b50
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Keypairs).Current.deferwrap1
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).AllowedPeerSourceIP
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).RoutineSequentialReceiver
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).StagePackets
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).timersAnyAuthenticatedPacketSent
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Peer).timersDataSent
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Timer).Del
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/device.(*Timer).Mod
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.(*NativeTun).Write
+     0.02%  tailscaled  tailscaled         [.] github.com/tailscale/wireguard-go/tun.tcpGRO
+     0.02%  tailscaled  tailscaled         [.] gogo
+     0.02%  tailscaled  tailscaled         [.] golang.org/x/crypto/chacha20poly1305.(*chacha20poly1305).Open
+     0.02%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*Conn).sendMsgs.deferwrap1
+     0.02%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*syscaller).recvmmsgF-fm
+     0.02%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.(*syscaller).sendmmsg
+     0.02%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.marshalInetAddr
+     0.02%  tailscaled  tailscaled         [.] golang.org/x/net/internal/socket.sendmmsg
+     0.02%  tailscaled  tailscaled         [.] golang.org/x/net/ipv4.(*PacketConn).WriteBatch
+     0.02%  tailscaled  tailscaled         [.] golang.org/x/net/ipv4.(*payloadHandler).WriteBatch
+     0.02%  tailscaled  tailscaled         [.] golang.org/x/sys/unix.ParseOneSocketControlMessage
+     0.02%  tailscaled  tailscaled         [.] internal/chacha8rand.(*State).Refill
+     0.02%  tailscaled  tailscaled         [.] internal/poll.(*FD).RawWrite.deferwrap1
+     0.02%  tailscaled  tailscaled         [.] internal/poll.(*fdMutex).rwunlock
+     0.02%  tailscaled  tailscaled         [.] internal/poll.(*pollDesc).wait
+     0.02%  tailscaled  tailscaled         [.] internal/runtime/maps.typedmemclr
+     0.02%  tailscaled  tailscaled         [.] os.(*File).wrapErr
+     0.02%  tailscaled  tailscaled         [.] runtime.(*addrRanges).findSucc
+     0.02%  tailscaled  tailscaled         [.] runtime.(*limiterEvent).stop
+     0.02%  tailscaled  tailscaled         [.] runtime.(*mcache).prepareForSweep
+     0.02%  tailscaled  tailscaled         [.] runtime.(*mheap).initSpan
+     0.02%  tailscaled  tailscaled         [.] runtime.(*mspan).init
+     0.02%  tailscaled  tailscaled         [.] runtime.(*mspan).writeHeapBitsSmall
+     0.02%  tailscaled  tailscaled         [.] runtime.(*sysMemStat).add
+     0.02%  tailscaled  tailscaled         [.] runtime.acquireSudog
+     0.02%  tailscaled  tailscaled         [.] runtime.acquirep
+     0.02%  tailscaled  tailscaled         [.] runtime.castogscanstatus
+     0.02%  tailscaled  tailscaled         [.] runtime.chanlen
+     0.02%  tailscaled  tailscaled         [.] runtime.chanrecv2
+     0.02%  tailscaled  tailscaled         [.] runtime.empty
+     0.02%  tailscaled  tailscaled         [.] runtime.extractHeapBitsSmall
+     0.02%  tailscaled  tailscaled         [.] runtime.findObject
+     0.02%  tailscaled  tailscaled         [.] runtime.futexwakeup
+     0.02%  tailscaled  tailscaled         [.] runtime.gcTrigger.test
+     0.02%  tailscaled  tailscaled         [.] runtime.gogo.abi0
+     0.02%  tailscaled  tailscaled         [.] runtime.mallocgcTiny
+     0.02%  tailscaled  tailscaled         [.] runtime.mapdelete_fast64
+     0.02%  tailscaled  tailscaled         [.] runtime.memequal64
+     0.02%  tailscaled  tailscaled         [.] runtime.netpollblock
+     0.02%  tailscaled  tailscaled         [.] runtime.notesleep
+     0.02%  tailscaled  tailscaled         [.] runtime.preemptone
+     0.02%  tailscaled  tailscaled         [.] runtime.rand
+     0.02%  tailscaled  tailscaled         [.] runtime.read.abi0
+     0.02%  tailscaled  tailscaled         [.] runtime.resetspinning
+     0.02%  tailscaled  tailscaled         [.] runtime.retake
+     0.02%  tailscaled  tailscaled         [.] runtime.selectgo.func3
+     0.02%  tailscaled  tailscaled         [.] runtime.selectnbrecv
+     0.02%  tailscaled  tailscaled         [.] runtime.selunlock
+     0.02%  tailscaled  tailscaled         [.] runtime.setBlockOnExitSyscall
+     0.02%  tailscaled  tailscaled         [.] runtime.stopm
+     0.02%  tailscaled  tailscaled         [.] runtime.strhash
+     0.02%  tailscaled  tailscaled         [.] runtime.tryDeferToSpanScan
+     0.02%  tailscaled  tailscaled         [.] runtime.typePointers.next
+     0.02%  tailscaled  tailscaled         [.] runtime.wakep
+     0.02%  tailscaled  tailscaled         [.] sync.(*RWMutex).Unlock
+     0.02%  tailscaled  tailscaled         [.] sync.(*WaitGroup).Wait
+     0.02%  tailscaled  tailscaled         [.] sync/atomic.StorePointer
+     0.02%  tailscaled  tailscaled         [.] syscall.read
+     0.02%  tailscaled  tailscaled         [.] syscall.write
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/health.(*ReceiveFuncStats).Enter
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/health.(*ReceiveFuncStats).Exit
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/ipn/ipnlocal.generateInterceptTCPPortFunc.func1
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/batching.(*linuxBatchingConn).ReadBatch.deferwrap1
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/batching.(*linuxBatchingConn).handleRXQOverflowCounter
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/batching.getGSOSizeFromControl
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/batching.setGSOSizeInControl
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/ipset.NewContainsIPFunc.twoIP.func5
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*Wrapper).filterPacketInboundFromWireGuard
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*Wrapper).sendBufferConsumed.deferwrap1
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*peerConfigTable).inboundPacketIsJailed
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*peerConfigTable).outboundPacketIsJailed
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*peerConfigTable).selectSrcIP
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/net/tstun.(*peerConfigTable).snat
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/syncs.(*AtomicValue[go.shape.func(tailscale.com/net/packet.CapturePath, time.Time, []uint8, tailscale.com/net/packet.CaptureMeta)]).Load
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine.(*userspaceEngine).trackOpenPostFilterOut
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine.(*userspaceEngine).trackOpenPostFilterOut-fm
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine/filter.(*Filter).RunIn
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine/filter.(*Filter).runIn4
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine/filter.(*Filter).runOut
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*Conn).networkDown
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.(*Conn).receiveIPv4.(*Conn).mkReceiveFunc.func1.1
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine/magicsock.packetLooksLike
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine/netstack.(*Impl).injectInbound-fm
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine/netstack.(*Impl).isLocalIP
+     0.02%  tailscaled  tailscaled         [.] tailscale.com/wgengine/netstack.(*Impl).isVIPServiceIP
+     0.02%  tailscaled  tailscaled         [.] time.(*Timer).Reset
+     0.02%  tailscaled  tailscaled         [.] time.now
+     0.02%  tailscaled  tailscaled         [.] time.stopTimer
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

@@ -274,6 +274,18 @@ resource timelines, product hashes, endpoint metadata, and strict cleanup
 evidence are tracked in
 [`docs/performance/gcp-20260723-064751-19775b4c5b`](performance/gcp-20260723-064751-19775b4c5b/).
 
+A matched native P1000 profile in run `gcp-20260723-121859-c3dbae0fb4`
+used the same Haswell machine type, image, kernel, zones, direct RSB1
+kernel-TCP workload, fanout, and duration as the RustScale profile. Native
+measured 1125.652 Mbps versus RustScale's 325.777 Mbps, a 3.455x native
+advantage and a 71.06% RustScale shortfall. Normal P1000 medians were
+1271.231 versus 350.448 Mbps, a 3.627x native advantage. Native retained all
+1000 lifecycle denominators and four non-empty perf reports with zero lost
+samples. The runs are independent and use different source commits, so this
+is a matched cross-implementation gap rather than a causal same-binary A/B.
+The full native evidence is tracked under
+[`docs/performance/gcp-20260723-121859-c3dbae0fb4`](performance/gcp-20260723-121859-c3dbae0fb4/).
+
 Together, the same-host upload and cross-host download evidence closes and
 exceeds the measured direct embedded throughput gap from P1 through P1000 and
 the measured p50/p95/p99 latency gap. It does not close kernel-TUN throughput,

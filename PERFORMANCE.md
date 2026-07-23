@@ -196,6 +196,43 @@ The complete credential-free result, raw perf data and reports, workload
 accounting, and checksums are tracked in
 [`docs/performance/gcp-20260723-092124-39a3549e46`](docs/performance/gcp-20260723-092124-39a3549e46/).
 
+### Matched native P1000 TUN profile
+
+Run `gcp-20260723-121859-c3dbae0fb4` profiled native `tailscaled` TUN at
+exact clean harness source `8a0b7ef1f90d3ae2e15ce2ce3320bbd869d7f29b`.
+It used the same `n1-standard-4` Intel Haswell machine type, image, kernel,
+zones, direct-path RSB1 kernel-TCP workload, P1000 fanout, and ten-second
+profile contract as the RustScale profile above. The normal native medians
+were 2153.7, 2203.4, 1979.5, 1457.7, and 1271.2 Mbps at
+P1/P10/P100/P500/P1000, with CVs of 1.28%, 0.45%, 0.49%, 4.19%, and 2.48%.
+Latency completed 200/200 exchanges at 970.042/1106.283/1204.232 us
+p50/p95/p99.
+
+The diagnostic established, handshook, and completed all 1000 connections,
+retained ten ordered one-second samples, transferred 1,407,064,870 bytes, and
+measured 1125.652 Mbps. All four endpoint self/inclusive perf reports contain
+approximately 5,000 task-clock samples with zero lost samples. Native reached
+3.455x the prior RustScale profile throughput (1125.652 versus 325.777 Mbps),
+leaving RustScale 71.06% below native. The normal P1000 medians were 1271.231
+versus 350.448 Mbps, a 3.627x native advantage and a 72.43% RustScale
+shortfall. These are independent runs at different source commits, so they
+measure a matched implementation gap rather than a same-binary causal A/B.
+
+Native does not avoid the kernel boundary. On the sending endpoint, its
+per-peer sequential sender accounted for 33.23% inclusive time and Linux UDP
+batching/`sendmmsg` for 29.66%/26.24%; on the receiver, its per-peer
+sequential receiver accounted for 32.94% and the TUN wrapper write for 27.65%.
+TUN character-device paths remained about 13% inclusive on both endpoints.
+Native nevertheless kept approximately two CPU cores busy per endpoint,
+whereas the prior RustScale profile used about 1.3. Together with the rejected
+write-worker experiments below, this makes safe pipeline utilization and
+readiness scheduling the next diagnostic boundary; it does not justify
+removing TUN writes or weakening ordered WireGuard state.
+
+The complete credential-free result, raw perf data and reports, workload
+accounting, and checksums are tracked in
+[`docs/performance/gcp-20260723-121859-c3dbae0fb4`](docs/performance/gcp-20260723-121859-c3dbae0fb4/).
+
 ### Bidirectional TUN write-worker A/B (diagnostic only)
 
 Runs `gcp-20260723-102120-681c1f93dd` and

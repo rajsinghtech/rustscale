@@ -1,0 +1,65 @@
+{
+  "completed": 1000,
+  "direction": "down",
+  "down_bytes": 1407064870,
+  "down_mbps": 1125.6518959999999,
+  "duration_secs": 10,
+  "established": 1000,
+  "handshaken": 1000,
+  "mode": "throughput",
+  "parallel": 1000,
+  "path_class": "externally-gated",
+  "payload_bytes": 1280,
+  "protocol": "RSB1",
+  "samples": [
+    {
+      "elapsed_secs": 1,
+      "mbps": 688.048448
+    },
+    {
+      "elapsed_secs": 2,
+      "mbps": 1041.859008
+    },
+    {
+      "elapsed_secs": 3,
+      "mbps": 1094.02768
+    },
+    {
+      "elapsed_secs": 4,
+      "mbps": 1183.95136
+    },
+    {
+      "elapsed_secs": 5,
+      "mbps": 1186.230112
+    },
+    {
+      "elapsed_secs": 6,
+      "mbps": 1193.59296
+    },
+    {
+      "elapsed_secs": 7,
+      "mbps": 1226.395424
+    },
+    {
+      "elapsed_secs": 8,
+      "mbps": 1182.584448
+    },
+    {
+      "elapsed_secs": 9,
+      "mbps": 1258.530016
+    },
+    {
+      "elapsed_secs": 10,
+      "mbps": 1192.548096
+    }
+  ],
+  "tailscale_ip": "",
+  "target": "100.83.183.114:5201",
+  "tool": "rustscale-bench",
+  "total_bytes": 1407064870,
+  "total_mbps": 1125.6518959999999,
+  "transport": "kernel-tcp",
+  "up_bytes": 0,
+  "up_mbps": 0.0,
+  "version": "0.1.5"
+}

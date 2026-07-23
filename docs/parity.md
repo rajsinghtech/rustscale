@@ -386,6 +386,24 @@ is not part of this branch. Exact evidence is retained under
 and
 [`docs/performance/gcp-20260723-194656-40d2f57282`](performance/gcp-20260723-194656-40d2f57282/).
 
+A subsequent 5 ms bulk-hysteresis scheduler at exact clean source
+`64ba8d002bdb53cb6cc2babe9777d8c0e5700259` kept isolated one-datagram
+deliveries inline while retaining the FIFO write worker after a multi-datagram
+burst. The frozen same-binary A/B completed 15/15 direct throughput trials and
+200/200 latency exchanges without retry. It improved P500/P1000 throughput by
+23.05%/28.80% and improved p50/p95/p99 latency by
+53.24%/43.07%/36.32%, but regressed P1/P10 throughput by
+15.36%/6.25% with non-overlapping raw ranges. It also raised average userspace
+CPU by 9.85% on the server and 24.09% on the client. Scheduler evidence showed
+that the candidate offloaded 99.96% of server batches and 99.99% of client
+batches, so packet-batch size did not distinguish a fast low-fanout flow from
+true high-fanout pressure. The candidate is therefore rejected and its product
+change is not part of this branch. Both exact evidence bundles are retained
+under
+[`docs/performance/gcp-20260723-203120-6a44b68bae`](performance/gcp-20260723-203120-6a44b68bae/)
+and
+[`docs/performance/gcp-20260723-205344-dfc7416d32`](performance/gcp-20260723-205344-dfc7416d32/).
+
 ## Test infrastructure
 
 `crates/testcontrol` ✅ in-process fake control server (Noise handshake, h2c,

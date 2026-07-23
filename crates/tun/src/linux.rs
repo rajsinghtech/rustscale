@@ -138,6 +138,24 @@ fn classify_write_error(error: &io::Error) -> WriteRetry {
     }
 }
 
+/// Attempt one nonblocking write before registering or awaiting readiness.
+///
+/// Linux TUN descriptors are opened with `O_NONBLOCK`, so this cannot park a
+/// runtime worker. `EINTR` is retried in place, `EAGAIN` hands control to the
+/// existing `AsyncFd` readiness path, and every other error is preserved.
+fn try_immediate_write<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<Option<T>> {
+    loop {
+        match operation() {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) => match classify_write_error(&error) {
+                WriteRetry::Immediate => {}
+                WriteRetry::WaitWritable => return Ok(None),
+                WriteRetry::Terminal => return Err(error),
+            },
+        }
+    }
+}
+
 impl TunDevice {
     /// Create a tun device. `config.name` is the requested interface name (≤ 15
     /// bytes). Requires root or `CAP_NET_ADMIN`.
@@ -264,6 +282,25 @@ impl Tun for TunDevice {
             return self.write_vnet_packet(packet).await;
         }
 
+        if let Some(written) = try_immediate_write(|| {
+            // SAFETY: write the caller's packet bytes through the live,
+            // nonblocking TUN descriptor.
+            let n = unsafe {
+                libc::write(
+                    self.afd.get_ref().as_raw_fd(),
+                    packet.as_ptr().cast::<libc::c_void>(),
+                    packet.len(),
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        })? {
+            return validate_packet_write(Ok(written), packet.len());
+        }
+
         loop {
             let mut guard = self.afd.writable().await?;
             match guard.try_io(|afd| {
@@ -326,6 +363,26 @@ impl TunDevice {
         let header = [0_u8; offload::VIRTIO_NET_HDR_LEN];
         let expected = vnet_write_len(packet.len())?;
 
+        if let Some(written) = try_immediate_write(|| {
+            let iovecs = vnet_write_iovecs(&header, packet);
+            // SAFETY: both iovecs reference live immutable buffers for this
+            // call, and the TUN descriptor is nonblocking.
+            let n = unsafe {
+                libc::writev(
+                    self.afd.get_ref().as_raw_fd(),
+                    iovecs.as_ptr(),
+                    iovecs.len() as libc::c_int,
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        })? {
+            return validate_vnet_write(Ok(written), expected);
+        }
+
         loop {
             let mut guard = self.afd.writable().await?;
             match guard.try_io(|afd| {
@@ -372,6 +429,30 @@ impl TunDevice {
         output: &offload::GroOutput,
         packets: &[Vec<u8>],
     ) -> Result<(), OutputWriteError> {
+        let immediate = try_immediate_write(|| {
+            let mut iovecs: [MaybeUninit<libc::iovec>; offload::MAX_GRO_IOVECS] =
+                std::array::from_fn(|_| MaybeUninit::uninit());
+            let (iovecs, expected) = gro_write_iovecs(&mut iovecs, output, packets)?;
+            // SAFETY: `iovecs` borrows live packet/header storage only for this
+            // nonblocking syscall.
+            let n = unsafe {
+                libc::writev(
+                    self.afd.get_ref().as_raw_fd(),
+                    iovecs.as_ptr(),
+                    iovecs.len() as libc::c_int,
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok((n as usize, expected))
+            }
+        })
+        .map_err(OutputWriteError::Frame)?;
+        if let Some((written, expected)) = immediate {
+            return validate_vnet_write(Ok(written), expected).map_err(OutputWriteError::Frame);
+        }
+
         loop {
             let mut guard = self
                 .afd
@@ -1023,6 +1104,34 @@ mod tests {
         assert_eq!(
             classify_write_error(&io::Error::from_raw_os_error(libc::EBADF)),
             WriteRetry::Terminal
+        );
+    }
+
+    #[test]
+    fn immediate_write_retries_interrupt_and_defers_would_block() {
+        let mut attempts = 0;
+        let written = try_immediate_write(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            } else {
+                Ok(1280)
+            }
+        })
+        .unwrap();
+        assert_eq!(written, Some(1280));
+        assert_eq!(attempts, 2);
+
+        assert_eq!(
+            try_immediate_write::<usize>(|| Err(io::Error::from_raw_os_error(libc::EAGAIN)))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            try_immediate_write::<usize>(|| Err(io::Error::from_raw_os_error(libc::EBADF)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EBADF)
         );
     }
 

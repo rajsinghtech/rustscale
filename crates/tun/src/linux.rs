@@ -84,9 +84,9 @@ impl Drop for ActiveWritePlan<'_> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WriteRetry {
+enum IoRetry {
     Immediate,
-    WaitWritable,
+    WaitReady,
     Terminal,
 }
 
@@ -128,29 +128,29 @@ impl WritePlanErrors {
     }
 }
 
-fn classify_write_error(error: &io::Error) -> WriteRetry {
+fn classify_io_error(error: &io::Error) -> IoRetry {
     if error.raw_os_error() == Some(libc::EINTR) {
-        WriteRetry::Immediate
+        IoRetry::Immediate
     } else if error.kind() == io::ErrorKind::WouldBlock {
-        WriteRetry::WaitWritable
+        IoRetry::WaitReady
     } else {
-        WriteRetry::Terminal
+        IoRetry::Terminal
     }
 }
 
-/// Attempt one nonblocking write before registering or awaiting readiness.
+/// Attempt one nonblocking operation before registering or awaiting readiness.
 ///
 /// Linux TUN descriptors are opened with `O_NONBLOCK`, so this cannot park a
 /// runtime worker. `EINTR` is retried in place, `EAGAIN` hands control to the
 /// existing `AsyncFd` readiness path, and every other error is preserved.
-fn try_immediate_write<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<Option<T>> {
+fn try_immediate_io<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<Option<T>> {
     loop {
         match operation() {
             Ok(value) => return Ok(Some(value)),
-            Err(error) => match classify_write_error(&error) {
-                WriteRetry::Immediate => {}
-                WriteRetry::WaitWritable => return Ok(None),
-                WriteRetry::Terminal => return Err(error),
+            Err(error) => match classify_io_error(&error) {
+                IoRetry::Immediate => {}
+                IoRetry::WaitReady => return Ok(None),
+                IoRetry::Terminal => return Err(error),
             },
         }
     }
@@ -240,6 +240,35 @@ impl Tun for TunDevice {
         // Keep the vector valid if this future is cancelled while waiting, or
         // if readiness proves stale and we retry below.
         prepare_read_buffer(packet, read_len);
+        if let Some(n) = try_immediate_io(|| {
+            let spare = &mut packet.spare_capacity_mut()[..read_len];
+            // SAFETY: `spare` names exactly the vector's uninitialized
+            // capacity, and the live TUN descriptor is nonblocking.
+            let n = unsafe {
+                libc::read(
+                    self.afd.get_ref().as_raw_fd(),
+                    spare.as_mut_ptr().cast::<libc::c_void>(),
+                    spare.len(),
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        })? {
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "tun device closed",
+                ));
+            }
+            // SAFETY: the successful read initialized exactly `n` bytes in
+            // `packet`'s spare capacity.
+            unsafe { packet.set_len(n) };
+            batch.set_len(1);
+            return Ok(());
+        }
         loop {
             let mut guard = self.afd.readable().await?;
             match guard.try_io(|afd| {
@@ -282,7 +311,7 @@ impl Tun for TunDevice {
             return self.write_vnet_packet(packet).await;
         }
 
-        if let Some(written) = try_immediate_write(|| {
+        if let Some(written) = try_immediate_io(|| {
             // SAFETY: write the caller's packet bytes through the live,
             // nonblocking TUN descriptor.
             let n = unsafe {
@@ -363,7 +392,7 @@ impl TunDevice {
         let header = [0_u8; offload::VIRTIO_NET_HDR_LEN];
         let expected = vnet_write_len(packet.len())?;
 
-        if let Some(written) = try_immediate_write(|| {
+        if let Some(written) = try_immediate_io(|| {
             let iovecs = vnet_write_iovecs(&header, packet);
             // SAFETY: both iovecs reference live immutable buffers for this
             // call, and the TUN descriptor is nonblocking.
@@ -429,7 +458,7 @@ impl TunDevice {
         output: &offload::GroOutput,
         packets: &[Vec<u8>],
     ) -> Result<(), OutputWriteError> {
-        let immediate = try_immediate_write(|| {
+        let immediate = try_immediate_io(|| {
             let mut iovecs: [MaybeUninit<libc::iovec>; offload::MAX_GRO_IOVECS] =
                 std::array::from_fn(|_| MaybeUninit::uninit());
             let (iovecs, expected) = gro_write_iovecs(&mut iovecs, output, packets)?;
@@ -479,9 +508,9 @@ impl TunDevice {
                     return Ok((n as usize, expected));
                 }
                 let error = io::Error::last_os_error();
-                match classify_write_error(&error) {
-                    WriteRetry::Immediate => {}
-                    WriteRetry::WaitWritable | WriteRetry::Terminal => return Err(error),
+                match classify_io_error(&error) {
+                    IoRetry::Immediate => {}
+                    IoRetry::WaitReady | IoRetry::Terminal => return Err(error),
                 }
             }) {
                 Ok(Ok((written, expected))) => {
@@ -498,6 +527,34 @@ impl TunDevice {
         batch.clear();
         let mut raw = self.raw_frame.lock().await;
         prepare_read_buffer(&mut raw, VNET_READ_LEN);
+        if let Some(n) = try_immediate_io(|| {
+            let spare = &mut raw.spare_capacity_mut()[..VNET_READ_LEN];
+            // SAFETY: the spare capacity is the exact destination of this
+            // nonblocking read.
+            let n = unsafe {
+                libc::read(
+                    self.afd.get_ref().as_raw_fd(),
+                    spare.as_mut_ptr().cast(),
+                    spare.len(),
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        })? {
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "tun device closed",
+                ));
+            }
+            // SAFETY: the successful read initialized exactly `n` bytes in
+            // `raw`'s spare capacity.
+            unsafe { raw.set_len(n) };
+            return offload::split_virtio(&raw, batch);
+        }
         loop {
             let mut guard = self.afd.readable().await?;
             match guard.try_io(|afd| {
@@ -1094,23 +1151,23 @@ mod tests {
     #[test]
     fn syscall_retry_classification_handles_eintr_and_eagain() {
         assert_eq!(
-            classify_write_error(&io::Error::from_raw_os_error(libc::EINTR)),
-            WriteRetry::Immediate
+            classify_io_error(&io::Error::from_raw_os_error(libc::EINTR)),
+            IoRetry::Immediate
         );
         assert_eq!(
-            classify_write_error(&io::Error::from_raw_os_error(libc::EAGAIN)),
-            WriteRetry::WaitWritable
+            classify_io_error(&io::Error::from_raw_os_error(libc::EAGAIN)),
+            IoRetry::WaitReady
         );
         assert_eq!(
-            classify_write_error(&io::Error::from_raw_os_error(libc::EBADF)),
-            WriteRetry::Terminal
+            classify_io_error(&io::Error::from_raw_os_error(libc::EBADF)),
+            IoRetry::Terminal
         );
     }
 
     #[test]
-    fn immediate_write_retries_interrupt_and_defers_would_block() {
+    fn immediate_io_retries_interrupt_and_defers_would_block() {
         let mut attempts = 0;
-        let written = try_immediate_write(|| {
+        let written = try_immediate_io(|| {
             attempts += 1;
             if attempts == 1 {
                 Err(io::Error::from_raw_os_error(libc::EINTR))
@@ -1123,12 +1180,11 @@ mod tests {
         assert_eq!(attempts, 2);
 
         assert_eq!(
-            try_immediate_write::<usize>(|| Err(io::Error::from_raw_os_error(libc::EAGAIN)))
-                .unwrap(),
+            try_immediate_io::<usize>(|| Err(io::Error::from_raw_os_error(libc::EAGAIN))).unwrap(),
             None
         );
         assert_eq!(
-            try_immediate_write::<usize>(|| Err(io::Error::from_raw_os_error(libc::EBADF)))
+            try_immediate_io::<usize>(|| Err(io::Error::from_raw_os_error(libc::EBADF)))
                 .unwrap_err()
                 .raw_os_error(),
             Some(libc::EBADF)

@@ -30,7 +30,7 @@ mod device;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
@@ -135,7 +135,10 @@ pub enum NetstackError {
 pub struct Netstack {
     addr: Ipv4Addr,
     rx_queue: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
+    rx_recycle: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     tx_queue: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
+    rx_depth: Arc<AtomicUsize>,
+    tx_depth: Arc<AtomicUsize>,
     inbound_flows: Arc<std::sync::Mutex<HashMap<TcpFlow, NodePublic>>>,
     cmd_tx: mpsc::Sender<Command>,
     notify: Arc<Notify>,
@@ -144,6 +147,20 @@ pub struct Netstack {
     dial_stats: Arc<DialStatsInner>,
     connection_stats: Arc<ConnectionStatsInner>,
 }
+
+/// Maximum plaintext packets waiting for WireGuard encapsulation.
+///
+/// This is intentionally much larger than one pump burst while still
+/// bounding memory and producer latency under thousands of active sockets.
+const TX_QUEUE_CAPACITY: usize = 4096;
+
+/// Consecutive packets one active socket may place in the plaintext queue.
+///
+/// A 32-packet run stays below the 64 KiB GSO/GRO ceiling at the tailnet MTU
+/// and leaves four independently scheduled flows in each full 128-packet
+/// WireGuard pump batch. This preserves receive-side aggregation without
+/// letting one busy socket monopolize the shared queue.
+const SOCKET_EGRESS_BURST: usize = 32;
 
 /// Live resource counts for pending userspace TCP dials.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -192,6 +209,12 @@ struct ConnectionStatsInner {
 struct ConnectionLifecycle {
     close_requested: std::sync::atomic::AtomicBool,
     abort_requested: std::sync::atomic::AtomicBool,
+    /// At least one application write may be waiting in `ConnState::app_rx`.
+    ///
+    /// The producer publishes this after enqueueing. The poll-loop consumer
+    /// clears it before draining, so a concurrent enqueue always either joins
+    /// the current drain or restores the bit and wakes the loop.
+    write_pending: std::sync::atomic::AtomicBool,
     close_completed: std::sync::atomic::AtomicBool,
     retired: std::sync::atomic::AtomicBool,
     remote_closed: std::sync::atomic::AtomicBool,
@@ -328,6 +351,33 @@ impl Drop for Listener {
 struct TcpFlow {
     remote: SocketAddr,
     local: SocketAddr,
+}
+
+/// Return the flow carried by a TCP SYN. The saturated IPv4 data path rejects
+/// ordinary ACK/data packets from fixed header bytes before constructing the
+/// richer parser; IPv6 retains extension-header-aware parsing.
+fn tcp_syn_flow(packet: &[u8]) -> Option<TcpFlow> {
+    let version = packet.first().copied()? >> 4;
+    if version == 4 {
+        if packet.len() < 20 || packet[9] != TCP {
+            return None;
+        }
+        let ip_header_len = usize::from(packet[0] & 0x0f) * 4;
+        if ip_header_len < 20 || packet.len() < ip_header_len + 14 {
+            return None;
+        }
+        if packet[ip_header_len + 13] & TCPFlag::SYN.0 == 0 {
+            return None;
+        }
+    } else if version != 6 {
+        return None;
+    }
+
+    let parsed = Parsed::decode(packet);
+    (parsed.ip_proto == TCP && parsed.tcp_flags.contains(TCPFlag::SYN)).then(|| TcpFlow {
+        remote: SocketAddr::new(parsed.src, parsed.src_port),
+        local: SocketAddr::new(parsed.dst, parsed.dst_port),
+    })
 }
 
 /// A received UDP packet.
@@ -499,15 +549,11 @@ impl AsyncWrite for NetstackStream {
             return std::task::Poll::Ready(Ok(0));
         }
         let chunk_len = buf.len().min(TCP_BUF);
-        let was_empty = self
-            .tx
-            .get_ref()
-            .is_some_and(|s| s.capacity() == s.max_capacity());
         match self.tx.poll_reserve(cx) {
             std::task::Poll::Ready(Ok(())) => {
                 self.write_backpressured = false;
                 let _ = self.tx.send_item(Bytes::copy_from_slice(&buf[..chunk_len]));
-                if was_empty {
+                if !self.lifecycle.write_pending.swap(true, Ordering::Release) {
                     self.notify.notify_one();
                 }
                 std::task::Poll::Ready(Ok(chunk_len))
@@ -583,7 +629,10 @@ impl Netstack {
             )
         })?;
         let rx_queue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let rx_recycle = Arc::new(std::sync::Mutex::new(Vec::new()));
         let tx_queue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let rx_depth = Arc::new(AtomicUsize::new(0));
+        let tx_depth = Arc::new(AtomicUsize::new(0));
         let notify = Arc::new(Notify::new());
         let tx_notify = Arc::new(Notify::new());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -592,8 +641,16 @@ impl Netstack {
         let connection_stats = Arc::new(ConnectionStatsInner::default());
         let tcp_ephemeral_start = rand::thread_rng().gen_range(49152..=u16::MAX);
 
-        let device =
-            LoopbackDevice::new(rx_queue.clone(), tx_queue.clone(), mtu, tx_notify.clone());
+        let device = LoopbackDevice::new_with_recycle(
+            rx_queue.clone(),
+            tx_queue.clone(),
+            rx_depth.clone(),
+            tx_depth.clone(),
+            rx_recycle.clone(),
+            mtu,
+            TX_QUEUE_CAPACITY,
+            tx_notify.clone(),
+        );
         handle.spawn(poll_loop(
             addr,
             device,
@@ -608,7 +665,10 @@ impl Netstack {
         Ok(Self {
             addr,
             rx_queue,
+            rx_recycle,
             tx_queue,
+            rx_depth,
+            tx_depth,
             inbound_flows,
             cmd_tx,
             notify,
@@ -631,14 +691,58 @@ impl Netstack {
         self.push_rx_inner(packet, Some(peer));
     }
 
+    /// Feed one ordered plaintext burst authenticated by the same WireGuard
+    /// peer. The queue and provenance maps are each locked at most once, and a
+    /// single retained notification wakes the poll loop for the whole burst.
+    pub fn push_rx_batch_from(&self, packets: &mut Vec<Vec<u8>>, peer: NodePublic) {
+        if packets.is_empty() {
+            return;
+        }
+
+        let mut syn_flows = packets.iter().filter_map(|packet| tcp_syn_flow(packet));
+        if let Some(first) = syn_flows.next() {
+            if let Ok(mut flows) = self.inbound_flows.lock() {
+                for flow in std::iter::once(first).chain(syn_flows) {
+                    if flows.len() >= 4096 && !flows.contains_key(&flow) {
+                        flows.clear();
+                    }
+                    flows.insert(flow, peer.clone());
+                }
+            }
+        }
+
+        let count = packets.len();
+        if let Ok(mut queue) = self.rx_queue.lock() {
+            queue.extend(packets.drain(..));
+            self.rx_depth.fetch_add(count, Ordering::Relaxed);
+        } else {
+            // Match repeated `push_rx_from` calls after a poisoned queue: the
+            // caller relinquishes every packet even though none can be queued.
+            packets.clear();
+        }
+        self.notify.notify_one();
+    }
+
+    /// Take up to `limit` buffers released by the userspace IP stack. Receive
+    /// pumps refill plaintext scratch slots once per burst, avoiding both
+    /// per-packet allocation and per-packet synchronization.
+    pub fn take_recycled_rx_buffers(&self, output: &mut Vec<Vec<u8>>, limit: usize) {
+        if output.len() >= limit {
+            return;
+        }
+        if let Ok(mut recycled) = self.rx_recycle.lock() {
+            while output.len() < limit {
+                let Some(buffer) = recycled.pop() else {
+                    break;
+                };
+                output.push(buffer);
+            }
+        }
+    }
+
     fn push_rx_inner(&self, packet: Vec<u8>, peer: Option<NodePublic>) {
         if let Some(peer) = peer {
-            let parsed = Parsed::decode(&packet);
-            if parsed.ip_proto == TCP && parsed.tcp_flags.contains(TCPFlag::SYN) {
-                let flow = TcpFlow {
-                    remote: SocketAddr::new(parsed.src, parsed.src_port),
-                    local: SocketAddr::new(parsed.dst, parsed.dst_port),
-                };
+            if let Some(flow) = tcp_syn_flow(&packet) {
                 if let Ok(mut flows) = self.inbound_flows.lock() {
                     if flows.len() >= 4096 && !flows.contains_key(&flow) {
                         flows.clear();
@@ -649,13 +753,30 @@ impl Netstack {
         }
         if let Ok(mut queue) = self.rx_queue.lock() {
             queue.push_back(packet);
+            self.rx_depth.fetch_add(1, Ordering::Relaxed);
         }
         self.notify.notify_one();
     }
 
     /// Drain one outbound IP packet (for WireGuard encapsulation).
     pub fn pop_tx(&self) -> Option<Vec<u8>> {
-        self.tx_queue.lock().ok()?.pop_front()
+        let (packet, now_empty) = {
+            let mut queue = self.tx_queue.lock().ok()?;
+            let packet = queue.pop_front();
+            if packet.is_some() {
+                let previous = self.tx_depth.fetch_sub(1, Ordering::Relaxed);
+                assert!(previous > 0, "netstack tx depth underflow");
+            }
+            let now_empty = queue.is_empty();
+            (packet, now_empty)
+        };
+        if packet.is_some() && now_empty {
+            // Incoming packets may trigger fair refills before this point.
+            // Wake explicitly once a bounded pump drain empties the queue,
+            // without creating a notification storm for every freed slot.
+            self.notify.notify_one();
+        }
+        packet
     }
 
     /// Whether outbound packets remain after a bounded pump drain.
@@ -663,24 +784,25 @@ impl Netstack {
     /// This is a predicate, not a wakeup mechanism: callers use it to avoid
     /// sleeping after a `Notify` permit has already been consumed.
     pub fn has_tx_packets(&self) -> bool {
-        self.tx_queue.lock().is_ok_and(|queue| !queue.is_empty())
+        self.tx_depth.load(Ordering::Relaxed) != 0
     }
 
     /// Current plaintext data-plane queue depths for bounded runtime
     /// diagnostics. Values are instantaneous and must not be used for flow
     /// control.
     pub fn data_plane_queue_depths(&self) -> (usize, usize) {
-        let rx = self.rx_queue.lock().map_or(0, |queue| queue.len());
-        let tx = self.tx_queue.lock().map_or(0, |queue| queue.len());
-        (rx, tx)
+        (
+            self.rx_depth.load(Ordering::Relaxed),
+            self.tx_depth.load(Ordering::Relaxed),
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn push_tx_for_test(&self, packet: Vec<u8>) {
-        self.tx_queue
-            .lock()
-            .expect("netstack tx queue lock")
-            .push_back(packet);
+        let mut queue = self.tx_queue.lock().expect("netstack tx queue lock");
+        queue.push_back(packet);
+        self.tx_depth.fetch_add(1, Ordering::Relaxed);
+        drop(queue);
         self.tx_notify.notify_one();
     }
 
@@ -1115,6 +1237,7 @@ fn make_stream_and_conn(
     let lifecycle = Arc::new(ConnectionLifecycle {
         close_requested: std::sync::atomic::AtomicBool::new(false),
         abort_requested: std::sync::atomic::AtomicBool::new(false),
+        write_pending: std::sync::atomic::AtomicBool::new(false),
         close_completed: std::sync::atomic::AtomicBool::new(false),
         retired: std::sync::atomic::AtomicBool::new(false),
         remote_closed: std::sync::atomic::AtomicBool::new(false),
@@ -1154,12 +1277,21 @@ async fn poll_loop(
 ) {
     let start = std::time::Instant::now();
     let smol_now = || SmolInstant::from_millis(start.elapsed().as_millis() as i64);
+    let socket_diagnostics = std::env::var_os("RUSTSCALE_NETSTACK_SOCKET_DIAGNOSTICS").is_some();
+    let mut next_socket_diagnostic = start + std::time::Duration::from_millis(500);
+    if socket_diagnostics {
+        eprintln!(
+            "rustscale: netstack socket diagnostics enabled by \
+             RUSTSCALE_NETSTACK_SOCKET_DIAGNOSTICS"
+        );
+    }
 
     let mut config = smoltcp::iface::Config::new(HardwareAddress::Ip);
     config.random_seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0xdead_beef, |d| d.as_nanos() as u64);
     let mut iface = Interface::new(config, &mut device, smol_now());
+    iface.set_socket_egress_burst(SOCKET_EGRESS_BURST);
     iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::new(to_smoltcp_v4(addr), 32));
     });
@@ -1339,6 +1471,8 @@ async fn poll_loop(
                             });
                     let accepted = sockets.remove(lh);
                     let conn_handle = sockets.add(accepted);
+                    let flow_registered = sockets.register_tcp_flow(conn_handle);
+                    debug_assert!(flow_registered);
                     let peer_node_key = remote_addr.and_then(|remote| {
                         inbound_flows.lock().ok()?.remove(&TcpFlow {
                             remote,
@@ -1422,6 +1556,8 @@ async fn poll_loop(
             match state {
                 State::Established => {
                     if let Some(pd) = pending_dials.remove(&handle) {
+                        let flow_registered = sockets.register_tcp_flow(handle);
+                        debug_assert!(flow_registered);
                         let local_port = pd.local_port;
                         let (stream, conn) = make_stream_and_conn(
                             notify.clone(),
@@ -1468,10 +1604,9 @@ async fn poll_loop(
         }
 
         // Pass 3: pump data for established connections.
-        let conn_handles: Vec<SocketHandle> = conns.keys().copied().collect();
         let mut did_work = false;
-        for handle in conn_handles {
-            if pump_connection(&mut sockets, handle, &mut conns) {
+        for (&handle, conn) in &mut conns {
+            if pump_connection(&mut sockets, handle, conn) {
                 did_work = true;
             }
         }
@@ -1487,6 +1622,8 @@ async fn poll_loop(
             iface.poll(smol_now(), &mut device, &mut sockets);
         }
 
+        device.publish_rx_recycled();
+
         // Pass 5: clean up closed connections.
         cleanup_closed(
             &mut sockets,
@@ -1495,11 +1632,105 @@ async fn poll_loop(
             &mut tcp_allocated_ports,
         );
         publish_tcp_port_stats(&connection_stats, &tcp_allocated_ports);
+        let diagnostic_now = std::time::Instant::now();
+        if socket_diagnostics && diagnostic_now >= next_socket_diagnostic {
+            emit_tcp_socket_diagnostics(&sockets, &conns, start.elapsed());
+            next_socket_diagnostic = diagnostic_now + std::time::Duration::from_millis(500);
+        }
     }
     dial_stats.pending_dials.store(0, Ordering::Release);
     connection_stats
         .allocated_tcp_ports
         .store(0, Ordering::Release);
+}
+
+fn emit_tcp_socket_diagnostics(
+    sockets: &SocketSet<'_>,
+    conns: &HashMap<SocketHandle, ConnState>,
+    elapsed: std::time::Duration,
+) {
+    let mut established = 0usize;
+    let mut can_send = 0usize;
+    let mut full_send_buffers = 0usize;
+    let mut full_app_delivery_queues = 0usize;
+    let mut zero_remote_windows = 0usize;
+    let mut retransmission_timers = 0usize;
+    let mut zero_window_probe_timers = 0usize;
+    let mut duplicate_ack_sockets = 0usize;
+    let mut remote_window_min = usize::MAX;
+    let mut remote_window_max = 0usize;
+    let mut remote_window_bytes = 0usize;
+    let mut congestion_window_min = usize::MAX;
+    let mut congestion_window_max = 0usize;
+    let mut congestion_window_bytes = 0usize;
+    let mut rto_min_ms = u64::MAX;
+    let mut rto_max_ms = 0u64;
+    let mut send_queue_bytes = 0usize;
+    let mut send_capacity_bytes = 0usize;
+    let mut recv_queue_bytes = 0usize;
+    let mut pending_write_bytes = 0usize;
+    let mut app_write_chunks = 0usize;
+
+    for (handle, conn) in conns {
+        let socket = sockets.get::<tcp::Socket>(*handle);
+        established += usize::from(socket.state() == State::Established);
+        can_send += usize::from(socket.can_send());
+        let send_queue = socket.send_queue();
+        let send_capacity = socket.send_capacity();
+        full_send_buffers += usize::from(send_queue == send_capacity);
+        full_app_delivery_queues += usize::from(conn.app_tx.capacity() == 0);
+        send_queue_bytes = send_queue_bytes.saturating_add(send_queue);
+        send_capacity_bytes = send_capacity_bytes.saturating_add(send_capacity);
+        recv_queue_bytes = recv_queue_bytes.saturating_add(socket.recv_queue());
+        let remote_window = socket.remote_window();
+        zero_remote_windows += usize::from(remote_window == 0);
+        remote_window_min = remote_window_min.min(remote_window);
+        remote_window_max = remote_window_max.max(remote_window);
+        remote_window_bytes = remote_window_bytes.saturating_add(remote_window);
+        let congestion_window = socket.congestion_window();
+        congestion_window_min = congestion_window_min.min(congestion_window);
+        congestion_window_max = congestion_window_max.max(congestion_window);
+        congestion_window_bytes = congestion_window_bytes.saturating_add(congestion_window);
+        let rto_ms = socket.retransmission_timeout().total_millis();
+        rto_min_ms = rto_min_ms.min(rto_ms);
+        rto_max_ms = rto_max_ms.max(rto_ms);
+        retransmission_timers += usize::from(socket.retransmission_timer_active());
+        zero_window_probe_timers += usize::from(socket.zero_window_probe_active());
+        duplicate_ack_sockets += usize::from(socket.duplicate_ack_count() >= 3);
+        pending_write_bytes = pending_write_bytes.saturating_add(conn.pending_write.len());
+        app_write_chunks = app_write_chunks.saturating_add(conn.app_rx.len());
+    }
+    if conns.is_empty() {
+        remote_window_min = 0;
+        congestion_window_min = 0;
+        rto_min_ms = 0;
+    }
+    eprintln!(
+        "rustscale: netstack_socket_stats elapsed_ms={} connections={} established={} can_send={} full_send_buffers={} full_app_delivery_queues={} zero_remote_windows={} retransmission_timers={} zero_window_probe_timers={} duplicate_ack_sockets={} remote_window_min={} remote_window_max={} remote_window_bytes={} congestion_window_min={} congestion_window_max={} congestion_window_bytes={} rto_min_ms={} rto_max_ms={} send_queue_bytes={} send_capacity_bytes={} recv_queue_bytes={} pending_write_bytes={} app_write_chunks={}",
+        elapsed.as_millis(),
+        conns.len(),
+        established,
+        can_send,
+        full_send_buffers,
+        full_app_delivery_queues,
+        zero_remote_windows,
+        retransmission_timers,
+        zero_window_probe_timers,
+        duplicate_ack_sockets,
+        remote_window_min,
+        remote_window_max,
+        remote_window_bytes,
+        congestion_window_min,
+        congestion_window_max,
+        congestion_window_bytes,
+        rto_min_ms,
+        rto_max_ms,
+        send_queue_bytes,
+        send_capacity_bytes,
+        recv_queue_bytes,
+        pending_write_bytes,
+        app_write_chunks,
+    );
 }
 
 fn publish_dial_stats(stats: &DialStatsInner, pending_dials: &HashMap<SocketHandle, PendingDial>) {
@@ -1761,7 +1992,7 @@ fn pump_udp(
 fn pump_connection(
     sockets: &mut SocketSet<'static>,
     handle: SocketHandle,
-    conns: &mut HashMap<SocketHandle, ConnState>,
+    conn: &mut ConnState,
 ) -> bool {
     let mut did_work = false;
     // --- Read: socket -> app ---
@@ -1772,9 +2003,7 @@ fn pump_connection(
     // recv buffer; the TCP receive window shrinks and the sender backs off.
     let can_recv = sockets.get::<tcp::Socket>(handle).can_recv();
     if can_recv {
-        let has_room = conns
-            .get(&handle)
-            .is_some_and(|conn| conn.app_tx.capacity() > 0);
+        let has_room = conn.app_tx.capacity() > 0;
         if has_room {
             let socket = sockets.get_mut::<tcp::Socket>(handle);
             let mut data = Bytes::new();
@@ -1783,9 +2012,7 @@ fn pump_connection(
                 (buf.len(), ())
             });
             if result.is_ok() && !data.is_empty() {
-                if let Some(conn) = conns.get(&handle) {
-                    let _ = conn.app_tx.try_send(data);
-                }
+                let _ = conn.app_tx.try_send(data);
             }
         }
     }
@@ -1794,9 +2021,7 @@ fn pump_connection(
     let socket = sockets.get::<tcp::Socket>(handle);
     let may_recv = socket.may_recv();
     if !may_recv && !can_recv {
-        if let Some(conn) = conns.get(&handle) {
-            conn.lifecycle.publish_remote_close();
-        }
+        conn.lifecycle.publish_remote_close();
     }
 
     // --- Write: app -> socket ---
@@ -1807,33 +2032,35 @@ fn pump_connection(
     // backpressure up the mpsc chain — the bounded app_rx fills, which
     // makes `NetstackStream::poll_write` return Pending to the app.
     let can_send = sockets.get::<tcp::Socket>(handle).can_send();
-    if let Some(conn) = conns.get_mut(&handle) {
-        if conn.lifecycle.abort_requested.load(Ordering::Acquire) {
-            conn.pending_write.clear();
-            while conn.app_rx.try_recv().is_ok() {}
-            sockets.get_mut::<tcp::Socket>(handle).abort();
-            return true;
+    if conn.lifecycle.abort_requested.load(Ordering::Acquire) {
+        conn.pending_write.clear();
+        while conn.app_rx.try_recv().is_ok() {}
+        conn.lifecycle.write_pending.store(false, Ordering::Relaxed);
+        sockets.get_mut::<tcp::Socket>(handle).abort();
+        return true;
+    }
+
+    if can_send {
+        // 1. Flush a previously-stored unwritten tail.
+        if !conn.pending_write.is_empty() {
+            let socket = sockets.get_mut::<tcp::Socket>(handle);
+            let written = socket.send_slice(&conn.pending_write).unwrap_or(0);
+            if written > 0 {
+                conn.pending_write.drain(..written);
+                did_work = true;
+            }
+            // If the tail still isn't fully flushed, wait for the next
+            // poll cycle (when ACKs free up send capacity).
+            if !conn.pending_write.is_empty() {
+                return did_work;
+            }
         }
 
-        if can_send {
-            // 1. Flush a previously-stored unwritten tail.
-            if !conn.pending_write.is_empty() {
-                let socket = sockets.get_mut::<tcp::Socket>(handle);
-                let written = socket.send_slice(&conn.pending_write).unwrap_or(0);
-                if written > 0 {
-                    conn.pending_write.drain(..written);
-                    did_work = true;
-                }
-                // If the tail still isn't fully flushed, wait for the next
-                // poll cycle (when ACKs free up send capacity).
-                if !conn.pending_write.is_empty() {
-                    return did_work;
-                }
-            }
-
-            // 2. Drain newly-arrived app data. Close ownership is out of band:
-            // a full channel cannot discard shutdown, while data accepted
-            // before shutdown remains ordered ahead of the FIN.
+        // 2. Drain newly-arrived app data only when a producer published
+        // readiness. Clearing before `try_recv` prevents a lost wakeup: an
+        // enqueue racing this drain either becomes visible below or restores
+        // the bit and notifies the next poll turn.
+        if conn.lifecycle.write_pending.swap(false, Ordering::Acquire) {
             while let Ok(data) = conn.app_rx.try_recv() {
                 let socket = sockets.get_mut::<tcp::Socket>(handle);
                 let written = socket.send_slice(&data).unwrap_or(0);
@@ -1842,25 +2069,27 @@ fn pump_connection(
                 }
                 if written < data.len() {
                     // Socket send buffer filled — keep the remainder and
-                    // stop draining so the app channel applies pressure.
+                    // preserve readiness for older channel entries that were
+                    // not reached in this drain.
                     conn.pending_write = data[written..].to_vec();
+                    conn.lifecycle.write_pending.store(true, Ordering::Release);
                     break;
                 }
             }
         }
+    }
 
-        // A peer can make the socket non-sendable while a local shutdown is
-        // pending. Once all application bytes already accepted by this stream
-        // are drained, closing must not wait for `can_send` to become true.
-        if conn.pending_write.is_empty()
-            && conn.app_rx.is_empty()
-            && conn.lifecycle.close_requested.load(Ordering::Acquire)
-        {
-            sockets.get_mut::<tcp::Socket>(handle).close();
-            // Completion belongs to cleanup_closed after a terminal socket
-            // state; poll_shutdown already transferred durable ownership.
-            did_work = true;
-        }
+    // A peer can make the socket non-sendable while a local shutdown is
+    // pending. Once all application bytes already accepted by this stream
+    // are drained, closing must not wait for `can_send` to become true.
+    if conn.lifecycle.close_requested.load(Ordering::Acquire)
+        && conn.pending_write.is_empty()
+        && conn.app_rx.is_empty()
+    {
+        sockets.get_mut::<tcp::Socket>(handle).close();
+        // Completion belongs to cleanup_closed after a terminal socket
+        // state; poll_shutdown already transferred durable ownership.
+        did_work = true;
     }
     did_work
 }

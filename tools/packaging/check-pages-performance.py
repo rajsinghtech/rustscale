@@ -14,8 +14,8 @@ DATA = ROOT / "docs/performance/benchmarks-2026-07-15.json"
 PAGE = ROOT / "site/index.html"
 PERFORMANCE = ROOT / "PERFORMANCE.md"
 USERSPACE = ROOT / "docs/benchmarks.md"
-CANONICAL_RUN_ID = "gcp-20260721-080637-4aca6f6c1e"
-CANONICAL_SOURCE_COMMIT = "395bf8db6648e67f61bc571e1a755b27cd714e12"
+CANONICAL_RUN_ID = "gcp-20260723-064751-19775b4c5b"
+CANONICAL_SOURCE_COMMIT = "70a7e09d460e33664bc570db8e68b77f694309a0"
 CANONICAL_DIR = ROOT / "docs/performance" / CANONICAL_RUN_ID
 
 
@@ -46,7 +46,7 @@ PANEL_CONTRACTS = {
         "data-environment": "gcp-host-vm",
         "data-mode": "five-config-rsb1",
         "data-evidence-status": "measured",
-        "data-comparison": "matched-evidence-without-winner",
+        "data-comparison": "matched-evidence-mixed-outcome",
         "data-run": CANONICAL_RUN_ID,
         "data-source-commit": CANONICAL_SOURCE_COMMIT,
         "data-provenance": "docs/performance",
@@ -584,7 +584,7 @@ def validate_evidence_docs(selected: dict[str, dict], performance: str) -> None:
 
 
 def validate_canonical_evidence(parser: PerformanceParser, performance: str) -> None:
-    configs = ("rs-userspace", "ts-embedded", "rs-tun", "ts-userspace", "ts-tun")
+    configs = ("rs-userspace", "rs-tun", "ts-embedded", "ts-userspace", "ts-tun")
     parallelism = (1, 10, 100, 500, 1000)
     manifest = json.loads((CANONICAL_DIR / "matrix.json").read_text(encoding="utf-8"))
     source = manifest.get("run", {}).get("source", {})
@@ -711,8 +711,8 @@ def validate_canonical_evidence(parser: PerformanceParser, performance: str) -> 
     require_text(
         canonical,
         "Complete matched evidence",
-        "no winner is declared",
-        "53–60% CV",
+        "embedded RustScale leads",
+        "RustScale TUN throughput reaches only 31–68%",
         "exclude kernel CPU",
         "double-count shared pages",
         "complete raw evidence",

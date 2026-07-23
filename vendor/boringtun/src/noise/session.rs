@@ -6,11 +6,13 @@ use crate::noise::errors::WireGuardError;
 use parking_lot::Mutex;
 use portable_atomic::{AtomicU64, Ordering};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use std::convert::TryFrom;
+use std::sync::Arc;
 
 pub struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
-    receiver: LessSafeKey,
+    receiver: Arc<LessSafeKey>,
     sender: LessSafeKey,
     sending_key_counter: AtomicU64,
     receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
@@ -161,9 +163,9 @@ impl Session {
         Session {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: LessSafeKey::new(
+            receiver: Arc::new(LessSafeKey::new(
                 UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
-            ),
+            )),
             sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
             sending_key_counter: AtomicU64::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
@@ -180,6 +182,10 @@ impl Session {
         counter_validator.will_accept(counter)
     }
 
+    pub(super) fn receiving_key(&self) -> Arc<LessSafeKey> {
+        Arc::clone(&self.receiver)
+    }
+
     /// Returns true if receiving counter is good to use, and marks it as used {
     fn receiving_counter_mark(&self, counter: u64) -> Result<(), WireGuardError> {
         let mut counter_validator = self.receiving_key_counter.lock();
@@ -190,26 +196,16 @@ impl Session {
         ret
     }
 
-    /// Authenticate established data without changing the replay window. The
-    /// ordered receiver marks the counter only after whole-burst validation.
-    pub(super) fn open_packet_data<'a>(
+    fn open_packet_data_unchecked<'a>(
         &self,
         packet: PacketData,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        let ct_len = packet.encrypted_encapsulated_packet.len();
-        if dst.len() < ct_len {
-            panic!("The destination buffer is too small");
-        }
-        if packet.receiver_idx != self.receiving_index {
-            return Err(WireGuardError::WrongIndex);
-        }
-        self.receiving_counter_quick_check(packet.counter)?;
-        self.open_packet_data_unchecked(packet, dst)
+        Self::open_packet_data_with_key(&self.receiver, packet, dst)
     }
 
-    fn open_packet_data_unchecked<'a>(
-        &self,
+    pub(super) fn open_packet_data_with_key<'a>(
+        receiver: &LessSafeKey,
         packet: PacketData,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
@@ -217,7 +213,7 @@ impl Session {
         let mut nonce = [0u8; 12];
         nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
         dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
-        self.receiver
+        receiver
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce),
                 Aad::from(&[]),
@@ -230,15 +226,43 @@ impl Session {
         self.receiving_counter_mark(counter)
     }
 
+    /// Reserve a contiguous range of sending counters without ever wrapping.
+    /// A failed reservation leaves the counter unchanged.
+    pub(super) fn reserve_sending_counters(
+        &self,
+        count: usize,
+    ) -> Result<u64, WireGuardError> {
+        let count = u64::try_from(count).map_err(|_| WireGuardError::InvalidCounter)?;
+        self.sending_key_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(count)
+            })
+            .map_err(|_| WireGuardError::InvalidCounter)
+    }
+
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
-    /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+    /// returns the formatted packet
+    pub(super) fn format_packet_data<'a>(
+        &self,
+        src: &[u8],
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        let sending_key_counter = self.reserve_sending_counters(1)?;
+        self.format_packet_data_with_counter(src, dst, sending_key_counter)
+    }
+
+    /// Format one data packet using a counter previously reserved by
+    /// [`Self::reserve_sending_counters`].
+    pub(super) fn format_packet_data_with_counter<'a>(
+        &self,
+        src: &[u8],
+        dst: &'a mut [u8],
+        sending_key_counter: u64,
+    ) -> Result<&'a mut [u8], WireGuardError> {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
-
-        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
@@ -263,10 +287,10 @@ impl Session {
                     data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
                     src.len() + AEAD_SIZE
                 })
-                .unwrap()
+                .map_err(|_| WireGuardError::InvalidPacket)?
         };
 
-        &mut dst[..DATA_OFFSET + n]
+        Ok(&mut dst[..DATA_OFFSET + n])
     }
 
     /// packet - a data packet we received from the network
@@ -307,6 +331,29 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session() -> Session {
+        Session::new(1, 2, [3; 32], [4; 32])
+    }
+
+    #[test]
+    fn sending_counter_reservations_are_contiguous_and_non_overlapping() {
+        let session = session();
+        assert_eq!(session.reserve_sending_counters(4).unwrap(), 0);
+        assert_eq!(session.reserve_sending_counters(3).unwrap(), 4);
+        assert_eq!(session.reserve_sending_counters(0).unwrap(), 7);
+    }
+
+    #[test]
+    fn sending_counter_reservation_never_wraps_or_mutates_on_failure() {
+        let session = session();
+        session
+            .sending_key_counter
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        assert!(session.reserve_sending_counters(2).is_err());
+        assert_eq!(session.reserve_sending_counters(1).unwrap(), u64::MAX - 1);
+        assert!(session.reserve_sending_counters(1).is_err());
+    }
     #[test]
     fn test_replay_counter() {
         let mut c: ReceivingKeyCounterValidator = Default::default();

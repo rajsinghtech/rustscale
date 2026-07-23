@@ -12,10 +12,13 @@
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::{OpenedData, PreparedData, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use rayon::prelude::*;
 use rustscale_key::{NodePrivate, NodePublic};
 
 /// Maximum WireGuard message size (header + payload).
@@ -25,6 +28,30 @@ const MAX_WG_MSG: usize = 65_536;
 pub const MAX_PIPELINED_ENCRYPTED_BODY: usize = 2048;
 static NEXT_PLAINTEXT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_WG_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
+const PARALLEL_ENCRYPT_MIN_PACKETS: usize = 8;
+const PARALLEL_ENCRYPT_MIN_BYTES: usize = 16 * 1024;
+const PARALLEL_ENCRYPT_MAX_WORKERS: usize = 4;
+static ENCRYPT_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+fn encrypt_pool() -> Option<&'static rayon::ThreadPool> {
+    ENCRYPT_POOL
+        .get_or_init(|| {
+            let workers = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .saturating_sub(1)
+                .clamp(1, PARALLEL_ENCRYPT_MAX_WORKERS);
+            (workers > 1)
+                .then(|| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(workers)
+                        .thread_name(|index| format!("rustscale-wg-{index}"))
+                        .build()
+                        .ok()
+                })
+                .flatten()
+        })
+        .as_ref()
+}
 
 /// Errors from the WireGuard tunnel wrapper.
 #[derive(Debug, thiserror::Error)]
@@ -109,7 +136,10 @@ pub struct WgOpenedPacket {
 
 /// Opaque mutation-free data preflight result.
 #[derive(Debug)]
-pub struct WgPreparedPacket(PreparedData);
+pub struct WgPreparedPacket {
+    prepared: PreparedData,
+    tunnel_instance_id: u64,
+}
 
 /// Ordered speculative commit result.
 pub enum WgCommitResult {
@@ -141,6 +171,14 @@ impl WgPlaintextBatch {
     /// This is normally zero at pipeline ownership boundaries.
     pub fn reserved_len(&self) -> usize {
         self.reserved
+    }
+
+    /// Close a speculative-open turn after every capability has been either
+    /// committed or aborted. Any accidentally retained capability becomes
+    /// stale and can no longer address a slot in this batch.
+    pub fn finish_opened_batch(&mut self) {
+        self.reserved = 0;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Forget the initialized packet prefix without releasing slot storage.
@@ -188,6 +226,52 @@ impl WgPlaintextBatch {
             }
         }
         self.len = retained;
+    }
+
+    /// Move the initialized packet prefix into caller-owned delivery storage.
+    /// Vacated slots remain in the batch and can be refilled with buffers
+    /// returned by the downstream consumer before the next receive burst.
+    pub fn drain_into(&mut self, output: &mut Vec<Vec<u8>>) {
+        debug_assert_eq!(self.reserved, 0);
+        output.reserve(self.len);
+        for packet in &mut self.packets[..self.len] {
+            output.push(std::mem::take(packet));
+        }
+        self.clear();
+    }
+
+    /// Refill vacated plaintext slots from downstream-owned buffers. Oversized
+    /// GRO allocations are released instead of pinning one large allocation
+    /// in every MTU-sized WireGuard slot.
+    pub fn refill_from(&mut self, buffers: &mut Vec<Vec<u8>>) {
+        debug_assert_eq!(self.len, 0);
+        debug_assert_eq!(self.reserved, 0);
+        self.release_oversized_slots();
+
+        let next_buffer = |buffers: &mut Vec<Vec<u8>>| {
+            while let Some(mut buffer) = buffers.pop() {
+                if buffer.capacity() <= MAX_PIPELINED_ENCRYPTED_BODY {
+                    buffer.clear();
+                    return Some(buffer);
+                }
+            }
+            None
+        };
+        for packet in &mut self.packets {
+            if packet.capacity() == 0 {
+                let Some(buffer) = next_buffer(buffers) else {
+                    return;
+                };
+                *packet = buffer;
+            }
+        }
+        while self.packets.len() < Self::MAX_PACKETS {
+            let Some(buffer) = next_buffer(buffers) else {
+                return;
+            };
+            self.packets.push(buffer);
+        }
+        buffers.clear();
     }
 
     /// Copy one packet into the next retained plaintext slot.
@@ -285,6 +369,18 @@ impl WgDatagramBatch {
     pub fn packets(&self) -> &[Vec<u8>] {
         &self.packets[..self.len]
     }
+
+    fn prepare_append_slots(&mut self, plaintexts: &[Vec<u8>]) -> &mut [Vec<u8>] {
+        let start = self.len;
+        let end = start + plaintexts.len();
+        if self.packets.len() < end {
+            self.packets.resize_with(end, Vec::new);
+        }
+        for (packet, plaintext) in self.packets[start..end].iter_mut().zip(plaintexts) {
+            packet.resize(plaintext.len() + 32, 0);
+        }
+        &mut self.packets[start..end]
+    }
 }
 
 impl WgTunn {
@@ -347,6 +443,78 @@ impl WgTunn {
             | TunnResult::WriteToTunnelV4(_, _)
             | TunnResult::WriteToTunnelV6(_, _) => Ok(()),
         }
+    }
+
+    /// Encapsulate an ordered plaintext batch, parallelizing established-data
+    /// AEAD work only when the batch is large enough to amortize scheduling.
+    ///
+    /// The complete counter range is reserved before worker dispatch. If any
+    /// worker fails, no output is published and the consumed counters remain
+    /// gaps; the method never retries them through the scalar path.
+    pub fn encapsulate_batch_into(
+        &mut self,
+        plaintexts: &[Vec<u8>],
+        batch: &mut WgDatagramBatch,
+    ) -> Result<(), WgError> {
+        if plaintexts.is_empty() {
+            return Ok(());
+        }
+        let total_bytes = plaintexts.iter().try_fold(0usize, |total, packet| {
+            if packet.len() > MAX_WG_MSG {
+                return Err(WgError::PlaintextTooLarge);
+            }
+            total
+                .checked_add(packet.len())
+                .ok_or(WgError::PlaintextTooLarge)
+        })?;
+        let Some(pool) = (plaintexts.len() >= PARALLEL_ENCRYPT_MIN_PACKETS
+            && total_bytes >= PARALLEL_ENCRYPT_MIN_BYTES)
+            .then(encrypt_pool)
+            .flatten()
+        else {
+            for plaintext in plaintexts {
+                self.encapsulate_into(plaintext, batch)?;
+            }
+            return Ok(());
+        };
+
+        let prepared = match self.tunn.prepare_send_batch(plaintexts.len()) {
+            Ok(prepared) => prepared,
+            Err(WireGuardError::NoCurrentSession) => {
+                for plaintext in plaintexts {
+                    self.encapsulate_into(plaintext, batch)?;
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(WgError::Tunnel(format!("{error:?}"))),
+        };
+        debug_assert_eq!(prepared.len(), plaintexts.len());
+        let start = batch.len;
+        let outputs = batch.prepare_append_slots(plaintexts);
+        let formatted = pool.install(|| {
+            outputs
+                .par_iter_mut()
+                .zip(plaintexts.par_iter())
+                .enumerate()
+                .try_for_each(|(index, (output, plaintext))| {
+                    prepared
+                        .format_packet_data(index, plaintext, output)
+                        .map(|_| ())
+                })
+        });
+        drop(prepared);
+        if let Err(error) = formatted {
+            return Err(WgError::Tunnel(format!("{error:?}")));
+        }
+        for (output, plaintext) in batch.packets[start..start + plaintexts.len()]
+            .iter_mut()
+            .zip(plaintexts)
+        {
+            output.truncate(plaintext.len() + 32);
+        }
+        batch.len += plaintexts.len();
+        self.tunn.complete_send_batch(plaintexts.len(), total_bytes);
+        Ok(())
     }
 
     /// Decapsulate an incoming WireGuard datagram.
@@ -425,7 +593,10 @@ impl WgTunn {
         }
         self.tunn
             .preflight_data(datagram)
-            .map(WgPreparedPacket)
+            .map(|prepared| WgPreparedPacket {
+                prepared,
+                tunnel_instance_id: self.pipeline_instance_id,
+            })
             .map_err(|error| WgError::Tunnel(format!("{error:?}")))
     }
 
@@ -437,7 +608,10 @@ impl WgTunn {
         plaintext: &mut WgPlaintextBatch,
     ) -> Result<WgOpenedPacket, WgError> {
         let (slot, packet) = plaintext.take_open_slot(datagram.len().saturating_sub(16))?;
-        let opened = match self.tunn.open_prepared_data(datagram, &prepared.0, packet) {
+        let opened = match self
+            .tunn
+            .open_prepared_data(datagram, &prepared.prepared, packet)
+        {
             Ok(opened) => opened,
             Err(error) => {
                 // An AEAD or immutable-token failure must not turn this
@@ -453,6 +627,31 @@ impl WgTunn {
             batch_id: plaintext.id,
             batch_epoch: plaintext.epoch,
             tunnel_instance_id: self.pipeline_instance_id,
+        })
+    }
+
+    /// Authenticate prepared data without retaining or locking the tunnel.
+    /// Replay and all mutable state remain deferred to [`Self::commit_opened`].
+    pub fn open_prepared_detached_into(
+        datagram: &[u8],
+        prepared: &WgPreparedPacket,
+        plaintext: &mut WgPlaintextBatch,
+    ) -> Result<WgOpenedPacket, WgError> {
+        let (slot, packet) = plaintext.take_open_slot(datagram.len().saturating_sub(16))?;
+        let opened = match Tunn::open_prepared_data_detached(datagram, &prepared.prepared, packet) {
+            Ok(opened) => opened,
+            Err(error) => {
+                let restored = plaintext.return_open_slot(slot, error.plaintext, None);
+                debug_assert!(restored);
+                return Err(WgError::Tunnel(format!("{:?}", error.error)));
+            }
+        };
+        Ok(WgOpenedPacket {
+            opened: Some(opened),
+            slot,
+            batch_id: plaintext.id,
+            batch_epoch: plaintext.epoch,
+            tunnel_instance_id: prepared.tunnel_instance_id,
         })
     }
 
@@ -932,6 +1131,27 @@ mod tests {
     }
 
     #[test]
+    fn drained_plaintext_slot_accepts_its_downstream_allocation_back() {
+        let mut batch = WgPlaintextBatch::new();
+        batch.push_copy(&vec![7; 1400]).unwrap();
+        let allocation = batch.packets()[0].as_ptr();
+        let capacity = batch.packets()[0].capacity();
+
+        let mut delivered = Vec::new();
+        batch.drain_into(&mut delivered);
+        assert!(batch.is_empty());
+        assert_eq!(delivered[0].as_ptr(), allocation);
+        delivered[0].clear();
+        batch.refill_from(&mut delivered);
+        assert!(delivered.is_empty());
+
+        batch.push_copy(&vec![9; 1400]).unwrap();
+        assert_eq!(batch.packets()[0].as_ptr(), allocation);
+        assert_eq!(batch.packets()[0].capacity(), capacity);
+        assert_eq!(batch.packets()[0], vec![9; 1400]);
+    }
+
+    #[test]
     fn encapsulate_into_retains_ordered_ciphertexts_after_scratch_reuse() {
         let a_priv = NodePrivate::generate();
         let b_priv = NodePrivate::generate();
@@ -966,6 +1186,144 @@ mod tests {
                 .plaintext,
             Some(scalar),
             "encapsulate_into follows the existing encapsulate behavior"
+        );
+    }
+
+    #[test]
+    fn established_batch_encrypts_with_ordered_unique_counters() {
+        fn counter(packet: &[u8]) -> u64 {
+            assert_eq!(u32::from_le_bytes(packet[0..4].try_into().unwrap()), 4);
+            u64::from_le_bytes(packet[8..16].try_into().unwrap())
+        }
+
+        let a_priv = NodePrivate::generate();
+        let b_priv = NodePrivate::generate();
+        let mut a = WgTunn::new(&a_priv, &b_priv.public(), 60).expect("A tunnel");
+        let mut b = WgTunn::new(&b_priv, &a_priv.public(), 61).expect("B tunnel");
+        handshake(&mut a, &mut b);
+
+        let plaintexts: Vec<Vec<u8>> = (0u8..16)
+            .map(|index| make_ipv4_packet(&vec![index; 1200]))
+            .collect();
+        let mut batch = WgDatagramBatch::new();
+        a.encapsulate_batch_into(&plaintexts, &mut batch)
+            .expect("batch encrypt");
+        assert_eq!(batch.packets().len(), plaintexts.len());
+        let counters: Vec<u64> = batch
+            .packets()
+            .iter()
+            .map(|packet| counter(packet))
+            .collect();
+        assert!(counters.windows(2).all(|pair| pair[1] == pair[0] + 1));
+
+        let opened: Vec<Vec<u8>> = batch
+            .packets()
+            .iter()
+            .map(|packet| {
+                b.decapsulate(packet)
+                    .expect("batch decrypt")
+                    .plaintext
+                    .expect("data plaintext")
+            })
+            .collect();
+        assert_eq!(opened, plaintexts);
+
+        let scalar_plaintext = make_ipv4_packet(b"after prepared batch");
+        let scalar = a
+            .encapsulate(&scalar_plaintext)
+            .expect("scalar after batch");
+        assert_eq!(counter(&scalar[0]), counters.last().copied().unwrap() + 1);
+        assert_eq!(
+            b.decapsulate(&scalar[0]).expect("scalar decrypt").plaintext,
+            Some(scalar_plaintext)
+        );
+    }
+
+    #[test]
+    fn large_batch_without_session_preserves_scalar_handshake_path() {
+        let a_priv = NodePrivate::generate();
+        let b_priv = NodePrivate::generate();
+        let mut a = WgTunn::new(&a_priv, &b_priv.public(), 62).expect("A tunnel");
+        let plaintexts: Vec<Vec<u8>> = (0u8..16)
+            .map(|index| make_ipv4_packet(&vec![index; 1200]))
+            .collect();
+        let mut batch = WgDatagramBatch::new();
+        a.encapsulate_batch_into(&plaintexts, &mut batch)
+            .expect("handshake fallback");
+        assert!(!batch.packets().is_empty());
+        assert_eq!(
+            u32::from_le_bytes(batch.packets()[0][0..4].try_into().unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn prepared_send_capability_is_worker_safe() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<boringtun::noise::PreparedSendBatch<'static>>();
+    }
+
+    /// Reproducible focused throughput probe for the established-data crypto
+    /// path. Run with:
+    /// `RUSTSCALE_RUN_WG_ENCRYPT_MICROBENCH=1 cargo test -p rustscale-wg --release report_batch_encrypt_microbenchmark -- --nocapture`
+    #[test]
+    fn report_batch_encrypt_microbenchmark() {
+        if std::env::var_os("RUSTSCALE_RUN_WG_ENCRYPT_MICROBENCH").is_none() {
+            return;
+        }
+        const PACKETS: usize = 64;
+        const ROUNDS: usize = 2_000;
+
+        fn established_pair(index: u32) -> (WgTunn, WgTunn) {
+            let a_private = NodePrivate::generate();
+            let b_private = NodePrivate::generate();
+            let mut a = WgTunn::new(&a_private, &b_private.public(), index).expect("sender");
+            let mut b = WgTunn::new(&b_private, &a_private.public(), index + 1).expect("receiver");
+            handshake(&mut a, &mut b);
+            (a, b)
+        }
+
+        let plaintexts: Vec<Vec<u8>> = (0..PACKETS)
+            .map(|index| make_ipv4_packet(&vec![index as u8; 1_260]))
+            .collect();
+        let (mut scalar, _scalar_receiver) = established_pair(70);
+        let (mut parallel, _parallel_receiver) = established_pair(72);
+        let mut output = WgDatagramBatch::new();
+
+        // Initialize worker threads and retained ciphertext slots outside the
+        // measured interval.
+        parallel
+            .encapsulate_batch_into(&plaintexts, &mut output)
+            .expect("parallel warmup");
+        output.clear();
+
+        let scalar_start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            output.clear();
+            for packet in &plaintexts {
+                scalar
+                    .encapsulate_into(packet, &mut output)
+                    .expect("scalar encrypt");
+            }
+            std::hint::black_box(output.packets());
+        }
+        let scalar_elapsed = scalar_start.elapsed();
+
+        let parallel_start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            output.clear();
+            parallel
+                .encapsulate_batch_into(&plaintexts, &mut output)
+                .expect("parallel encrypt");
+            std::hint::black_box(output.packets());
+        }
+        let parallel_elapsed = parallel_start.elapsed();
+        let speedup = scalar_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64();
+        eprintln!(
+            "wg_encrypt packets={PACKETS} payload_bytes={} rounds={ROUNDS} scalar_ms={:.3} parallel_ms={:.3} speedup={speedup:.3}x",
+            plaintexts[0].len(),
+            scalar_elapsed.as_secs_f64() * 1_000.0,
+            parallel_elapsed.as_secs_f64() * 1_000.0,
         );
     }
 
@@ -1025,6 +1383,45 @@ mod tests {
         assert_eq!(plaintext.packets[0].as_ptr(), pointer);
         assert_eq!(plaintext.packets[0].capacity(), capacity);
         assert!(receiver.preflight_data(&ciphertext).is_ok());
+    }
+
+    #[test]
+    fn detached_open_crosses_a_worker_boundary_before_ordered_commit() {
+        let sender_private = NodePrivate::generate();
+        let receiver_private = NodePrivate::generate();
+        let mut sender =
+            WgTunn::new(&sender_private, &receiver_private.public(), 65).expect("sender tunnel");
+        let mut receiver =
+            WgTunn::new(&receiver_private, &sender_private.public(), 66).expect("receiver tunnel");
+        handshake(&mut sender, &mut receiver);
+
+        let packet = make_ipv4_packet(b"detached worker open");
+        let ciphertext = sender
+            .encapsulate(&packet)
+            .expect("encrypt")
+            .pop()
+            .expect("data packet");
+        let prepared = receiver.preflight_data(&ciphertext).expect("preflight");
+        let (mut opened, mut plaintext) = std::thread::spawn(move || {
+            let mut plaintext = WgPlaintextBatch::new();
+            let opened =
+                WgTunn::open_prepared_detached_into(&ciphertext, &prepared, &mut plaintext)
+                    .expect("detached open");
+            (opened, plaintext)
+        })
+        .join()
+        .expect("worker join");
+
+        assert!(receiver
+            .preflight_data(&sender.encapsulate(&packet).unwrap()[0])
+            .is_ok());
+        assert!(matches!(
+            receiver.commit_opened(&mut opened, &mut plaintext).unwrap(),
+            WgCommitResult::Accepted
+        ));
+        plaintext.finish_opened_batch();
+        assert_eq!(plaintext.reserved_len(), 0);
+        assert_eq!(plaintext.packets(), [packet]);
     }
 
     #[test]

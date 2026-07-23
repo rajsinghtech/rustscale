@@ -49,10 +49,10 @@ const SENDMMSG_FLAGS: libc::c_uint = libc::MSG_DONTWAIT as libc::c_uint;
 type Packet = [u8; LOGICAL_PACKET_CAPACITY];
 type KernelPacket = [u8];
 /// Total fixed receive storage. 128 boxes are always installed in recvmmsg
-/// scratch, leaving exactly 384 independently reserved detachable buffers.
-/// This is exactly 1 MiB of pooled fast-path payload storage; separate
+/// scratch, leaving exactly 512 independently reserved detachable buffers.
+/// This is exactly 1.25 MiB of pooled fast-path payload storage; separate
 /// per-slot kernel scratch is never detached into queued ciphertexts.
-pub(crate) const RECEIVE_BUFFER_POOL_CAPACITY: usize = 512;
+pub(crate) const RECEIVE_BUFFER_POOL_CAPACITY: usize = 640;
 const RECEIVE_BUFFER_POOL_FREE_CAPACITY: usize = RECEIVE_BUFFER_POOL_CAPACITY;
 pub(crate) const RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY: usize =
     RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH;
@@ -788,8 +788,8 @@ pub(crate) struct ReceiveBatch {
     packets: Vec<Box<Packet>>,
     pool: ReceiveBufferPool,
     /// One bounded kernel tail per plain slot. This is intentionally scratch,
-    /// not detached ownership: it avoids 512 jumbo-sized pooled buffers while
-    /// allowing every valid scalar-sized UDP payload to be received intact.
+    /// not detached ownership: it avoids making every pooled fast-path buffer
+    /// jumbo-sized while allowing every valid scalar UDP payload intact.
     #[allow(clippy::vec_box)]
     kernel_packets: Vec<Box<KernelPacket>>,
     /// True when a published logical packet is backed by its kernel scratch
@@ -1951,11 +1951,20 @@ mod tests {
         let mut extracted = receive.into_datagrams();
         let last = extracted.pop().unwrap();
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
-        assert_eq!(batch.pool_inventory().available_permits(), 381);
+        assert_eq!(
+            batch.pool_inventory().available_permits(),
+            RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY - 3
+        );
         drop(extracted);
-        assert_eq!(batch.pool_inventory().available_permits(), 381);
+        assert_eq!(
+            batch.pool_inventory().available_permits(),
+            RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY - 3
+        );
         drop(last);
-        assert_eq!(batch.pool_inventory().available_permits(), 384);
+        assert_eq!(
+            batch.pool_inventory().available_permits(),
+            RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY
+        );
 
         let snapshot = batch.pool_snapshot();
         assert_eq!(snapshot.free, RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH);
@@ -1974,10 +1983,16 @@ mod tests {
         let peer = NodePrivate::generate().public();
         let queued = pooled_receive_batch(&mut batch, &credits, &peer, 1);
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY - 1);
-        assert_eq!(batch.pool_inventory().available_permits(), 383);
+        assert_eq!(
+            batch.pool_inventory().available_permits(),
+            RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY - 1
+        );
         drop(queued);
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
-        assert_eq!(batch.pool_inventory().available_permits(), 384);
+        assert_eq!(
+            batch.pool_inventory().available_permits(),
+            RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY
+        );
         let snapshot = batch.pool_snapshot();
         assert_eq!(snapshot.free, RECEIVE_BUFFER_POOL_CAPACITY - MAX_BATCH);
         assert_eq!(snapshot.unavailable, 0);
@@ -2018,11 +2033,17 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY - 1);
-        assert_eq!(batch.pool_inventory().available_permits(), 383);
+        assert_eq!(
+            batch.pool_inventory().available_permits(),
+            RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY - 1
+        );
         cancelled.abort();
         let _ = cancelled.await;
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
-        assert_eq!(batch.pool_inventory().available_permits(), 384);
+        assert_eq!(
+            batch.pool_inventory().available_permits(),
+            RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY
+        );
         drop(receiver.recv().await);
 
         set_plain_message(&mut batch, 0, b"closed", 3001);
@@ -2041,17 +2062,20 @@ mod tests {
         )
         .await;
         assert_eq!(credits.available_permits(), WG_RECEIVE_PACKET_CAPACITY);
-        assert_eq!(batch.pool_inventory().available_permits(), 384);
+        assert_eq!(
+            batch.pool_inventory().available_permits(),
+            RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY
+        );
         assert_eq!(batch.pool_snapshot().unavailable, 0);
     }
 
     #[tokio::test]
-    async fn retained_pooled_packets_fill_384_inventory_then_wait_without_pool_miss() {
+    async fn retained_pooled_packets_fill_inventory_then_wait_without_pool_miss() {
         let mut batch = ReceiveBatch::with_gro(false);
         let peer = NodePrivate::generate().public();
         let credits = Arc::new(Semaphore::new(WG_RECEIVE_PACKET_CAPACITY));
         let mut retained = Vec::new();
-        for burst in 0..3 {
+        for burst in 0..(RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY / MAX_BATCH) {
             for index in 0..MAX_BATCH {
                 set_plain_message(
                     &mut batch,
@@ -2091,7 +2115,10 @@ mod tests {
         assert_eq!(batch.pool_snapshot().unavailable, 0);
         drop(reservation);
         drop(retained);
-        assert_eq!(batch.pool_inventory().available_permits(), 384);
+        assert_eq!(
+            batch.pool_inventory().available_permits(),
+            RECEIVE_BUFFER_POOL_DETACHABLE_CAPACITY
+        );
     }
 
     #[tokio::test]

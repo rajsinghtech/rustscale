@@ -37,6 +37,7 @@ pub use endpoint::{
     BestPath, DiscoPingPurpose, Endpoint, PathClass, PathTelemetry, PendingPing, ProbeUDPLifetime,
     PATH_ACTIVITY_TIMEOUT, TRUST_BEST_ADDR_DURATION,
 };
+use endpoint::{SendFallback, SendPlan};
 pub use relay::{
     decode_geneve, decode_geneve_full, encode_geneve, encode_geneve_disco,
     encode_geneve_disco_control, encode_geneve_wireguard, looks_like_geneve_disco,
@@ -232,13 +233,18 @@ fn linux_batch_requires_scalar_handler<'a>(
 struct LinuxUdpSendConfig {
     use_batch: bool,
     disable_udp_gso: bool,
+    force_never_gso_equal_tail: bool,
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn never_gso_equal_tail(control_knobs: Option<&rustscale_controlknobs::ControlKnobs>) -> bool {
-    control_knobs.is_some_and(|knobs| {
-        knobs.get_bool(rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL, false)
-    })
+fn never_gso_equal_tail(
+    control_knobs: Option<&rustscale_controlknobs::ControlKnobs>,
+    force: bool,
+) -> bool {
+    force
+        || control_knobs.is_some_and(|knobs| {
+            knobs.get_bool(rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL, false)
+        })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -248,13 +254,19 @@ impl LinuxUdpSendConfig {
         Self::from_environment_presence(
             std::env::var_os("RUSTSCALE_DISABLE_LINUX_UDP_BATCH").is_some(),
             std::env::var_os("RUSTSCALE_DISABLE_UDP_GSO").is_some(),
+            std::env::var_os("RUSTSCALE_FORCE_NEVER_GSO_EQUAL_TAIL").is_some(),
         )
     }
 
-    fn from_environment_presence(disable_batch: bool, disable_gso: bool) -> Self {
+    fn from_environment_presence(
+        disable_batch: bool,
+        disable_gso: bool,
+        force_never_gso_equal_tail: bool,
+    ) -> Self {
         Self {
             use_batch: !disable_batch,
             disable_udp_gso: disable_batch || disable_gso,
+            force_never_gso_equal_tail,
         }
     }
 }
@@ -819,6 +831,16 @@ enum WgTransportEvidence {
     Relay(SocketAddr),
 }
 
+fn note_endpoint_wg_transport(endpoint: &mut Endpoint, transport: WgTransportEvidence) {
+    match transport {
+        WgTransportEvidence::Direct(addr) => {
+            endpoint.confirm_direct(addr, std::time::Instant::now());
+        }
+        WgTransportEvidence::Derp(region) => endpoint.note_derp_transport(region, true),
+        WgTransportEvidence::Relay(addr) => endpoint.note_relay_transport(addr, true),
+    }
+}
+
 enum WgCiphertextStorage {
     Vec {
         bytes: Vec<u8>,
@@ -1265,6 +1287,10 @@ struct Inner {
     /// permanently if a GSO send reports an unsupported/checksum-offload error.
     #[cfg(target_os = "linux")]
     udp_tx_gso: AtomicBool,
+    /// Operator override for the upstream equal-tail GSO mitigation. Control
+    /// can still enable the same behavior dynamically for ordinary clients.
+    #[cfg(target_os = "linux")]
+    udp_tx_force_never_gso_equal_tail: bool,
     local_udp_addrs: RwLock<Vec<String>>,
     /// Multi-region DERP connection manager.
     derp: DerpManager,
@@ -1787,6 +1813,12 @@ impl Magicsock {
             && udp
                 .as_ref()
                 .is_some_and(|socket| udp_batch::supports_gso(socket));
+        #[cfg(target_os = "linux")]
+        if udp_send_config.force_never_gso_equal_tail {
+            eprintln!(
+                "rustscale: Linux equal-tail UDP GSO mitigation forced by RUSTSCALE_FORCE_NEVER_GSO_EQUAL_TAIL"
+            );
+        }
 
         // The registry lives outside Inner. Inner keeps only a Weak pointer,
         // so task futures may own Inner without creating a reference cycle.
@@ -1832,6 +1864,8 @@ impl Magicsock {
             udp_tx_batch: AtomicBool::new(udp_tx_batch),
             #[cfg(target_os = "linux")]
             udp_tx_gso: AtomicBool::new(udp_tx_gso),
+            #[cfg(target_os = "linux")]
+            udp_tx_force_never_gso_equal_tail: udp_send_config.force_never_gso_equal_tail,
             local_udp_addrs: RwLock::new(local_udp_addrs),
             derp,
             endpoints: RwLock::new(HashMap::new()),
@@ -2475,12 +2509,67 @@ impl Magicsock {
         let Some(endpoint) = endpoints.get_mut(&datagram.peer) else {
             return;
         };
-        match transport {
-            WgTransportEvidence::Direct(addr) => {
-                endpoint.confirm_direct(addr, std::time::Instant::now());
+        note_endpoint_wg_transport(endpoint, transport);
+    }
+
+    /// Publish ordered path activity for already-authenticated datagrams.
+    ///
+    /// Contiguous entries from one authorization generation share one
+    /// revalidation and endpoint lock. Repeated evidence for the same
+    /// transport is coalesced, while path transitions remain ordered so a
+    /// direct observation followed by DERP still establishes direct trust and
+    /// leaves DERP as the latest telemetry class.
+    pub fn note_authenticated_wg_transports(
+        &self,
+        datagrams: &[WgDatagram],
+        authenticated: &[usize],
+    ) {
+        let mut cursor = 0;
+        while cursor < authenticated.len() {
+            let Some(first_datagram) = authenticated
+                .get(cursor)
+                .and_then(|&index| datagrams.get(index))
+            else {
+                cursor += 1;
+                continue;
+            };
+            let peer = &first_datagram.peer;
+            let generation = first_datagram.authorization_generation();
+            let mut end = cursor + 1;
+            while end < authenticated.len()
+                && authenticated[end] == authenticated[end - 1].saturating_add(1)
+                && datagrams.get(authenticated[end]).is_some_and(|datagram| {
+                    datagram.peer == *peer && datagram.authorization_generation() == generation
+                })
+            {
+                end += 1;
             }
-            WgTransportEvidence::Derp(region) => endpoint.note_derp_transport(region, true),
-            WgTransportEvidence::Relay(addr) => endpoint.note_relay_transport(addr, true),
+
+            if self.is_authorization_current(peer, generation) {
+                let mut endpoints = self
+                    .inner
+                    .endpoints
+                    .write()
+                    .expect("endpoints lock poisoned");
+                if let Some(endpoint) = endpoints.get_mut(peer) {
+                    let mut pending = None;
+                    for &index in &authenticated[cursor..end] {
+                        let Some(transport) = datagrams[index].data.transport else {
+                            continue;
+                        };
+                        if pending.is_some_and(|current| current == transport) {
+                            continue;
+                        }
+                        if let Some(current) = pending.replace(transport) {
+                            note_endpoint_wg_transport(endpoint, current);
+                        }
+                    }
+                    if let Some(transport) = pending {
+                        note_endpoint_wg_transport(endpoint, transport);
+                    }
+                }
+            }
+            cursor = end;
         }
     }
 
@@ -2534,7 +2623,7 @@ impl Magicsock {
         }
         // Note TX activity before path lookup. Only an inactive-to-active
         // transition arms the independent heartbeat cadence.
-        let (arm_heartbeat, path, derp_region, node_addr) = {
+        let (arm_heartbeat, plan, derp_region, node_addr) = {
             let mut endpoints = self
                 .inner
                 .endpoints
@@ -2546,7 +2635,7 @@ impl Magicsock {
                 .ok_or(MagicsockError::PeerNotFound)?;
             (
                 ep.note_tx_activity_transition(now, SESSION_ACTIVE_TIMEOUT),
-                ep.best_path(now),
+                ep.send_plan(now),
                 ep.derp_send_region(),
                 ep.node_addr(),
             )
@@ -2560,143 +2649,177 @@ impl Magicsock {
         // never waits on UDP probes or CallMeMaybe.
         if !self.inner.disable_direct_paths
             && matches!(
-                path,
-                endpoint::BestPath::Derp { .. } | endpoint::BestPath::None
+                plan,
+                SendPlan::Derp { .. } | SendPlan::None | SendPlan::ExpiredDirect { .. }
             )
         {
             self.start_discovery(peer.clone());
         }
 
+        match plan {
+            SendPlan::Direct { addr } => {
+                if !self.inner.disable_direct_paths {
+                    if let Some(result) = self
+                        .try_send_direct_batch(&peer, addr, node_addr, datagrams)
+                        .await
+                    {
+                        return result;
+                    }
+                }
+                self.send_derp_batch(&peer, node_addr, derp_region, datagrams)
+                    .await
+            }
+            SendPlan::Relay { addr, vni } => {
+                self.send_relay_batch(&peer, addr, vni, node_addr, derp_region, datagrams)
+                    .await
+            }
+            SendPlan::Derp { region } => {
+                self.send_derp_batch(&peer, node_addr, region, datagrams)
+                    .await
+            }
+            SendPlan::None => {
+                self.send_derp_batch(&peer, node_addr, derp_region, datagrams)
+                    .await
+            }
+            SendPlan::ExpiredDirect { addr, fallback } => {
+                let direct = if self.inner.disable_direct_paths {
+                    None
+                } else {
+                    self.try_send_direct_batch(&peer, addr, node_addr, datagrams)
+                        .await
+                };
+                let fallback = match fallback {
+                    SendFallback::Derp { region } => Some(
+                        self.send_derp_batch(&peer, node_addr, region, datagrams)
+                            .await,
+                    ),
+                    SendFallback::Relay { addr, vni } => Some(
+                        self.send_relay_batch(&peer, addr, vni, node_addr, derp_region, datagrams)
+                            .await,
+                    ),
+                };
+                combine_hedged_results(direct, fallback).unwrap_or(Err(MagicsockError::NoPath))
+            }
+        }
+    }
+
+    async fn send_derp_batch<T: AsRef<[u8]>>(
+        &self,
+        peer: &NodePublic,
+        node_addr: Option<IpAddr>,
+        region: i32,
+        datagrams: &[T],
+    ) -> Result<(), MagicsockError> {
         let mut first_error = None;
-        match path {
-            endpoint::BestPath::Direct { addr, .. } => {
-                if self.inner.disable_direct_paths {
-                    for datagram in datagrams {
-                        if let Err(e) = self
-                            .send_data_via_derp(
-                                peer.clone(),
-                                node_addr,
-                                derp_region,
-                                datagram.as_ref(),
-                            )
-                            .await
-                        {
-                            first_error.get_or_insert(e);
-                        }
-                    }
-                    return first_error.map_or(Ok(()), Err);
-                }
-                if let Some(udp) = self.inner.udp_socket() {
-                    #[cfg(target_os = "linux")]
-                    {
-                        return self
-                            .send_direct_batch_linux(&peer, &udp, addr, node_addr, datagrams)
-                            .await;
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        let (mut sent_packets, mut sent_bytes) = (0, 0);
-                        for datagram in datagrams {
-                            let datagram = datagram.as_ref();
-                            if let Err(e) = udp.send_to(datagram, addr).await {
-                                if !treat_as_lost_udp(&e) {
-                                    first_error.get_or_insert(MagicsockError::Io(e));
-                                }
-                            } else {
-                                self.inner.record_udp_tx(addr, datagram.len());
-                                sent_packets += 1;
-                                sent_bytes += datagram.len() as u64;
-                            }
-                        }
-                        self.inner.connection_counter.record(
-                            node_addr,
-                            addr,
-                            sent_packets,
-                            sent_bytes,
-                            false,
-                        );
-                        if sent_packets > 0 {
-                            if let Some(endpoint) = self
-                                .inner
-                                .endpoints
-                                .write()
-                                .expect("endpoints lock poisoned")
-                                .get_mut(&peer)
-                            {
-                                endpoint.note_direct_transport(addr, false);
-                            }
-                        }
-                        return first_error.map_or(Ok(()), Err);
-                    }
-                }
-                for datagram in datagrams {
-                    if let Err(e) = self
-                        .send_data_via_derp(peer.clone(), node_addr, derp_region, datagram.as_ref())
-                        .await
-                    {
-                        first_error.get_or_insert(e);
-                    }
-                }
+        for datagram in datagrams {
+            if let Err(error) = self
+                .send_data_via_derp(peer.clone(), node_addr, region, datagram.as_ref())
+                .await
+            {
+                first_error.get_or_insert(error);
             }
-            endpoint::BestPath::Relay { addr, vni } => {
-                // Relay paths work even when direct paths are disabled —
-                // the relay path is established by the relay manager, not
-                // by direct disco pinging.
-                if let Some(udp) = self.inner.udp_socket() {
-                    let (mut sent_packets, mut sent_bytes) = (0, 0);
-                    for datagram in datagrams {
-                        let datagram = datagram.as_ref();
-                        let framed = relay::encode_geneve(vni, datagram);
-                        if let Err(e) = udp.send_to(&framed, addr).await {
-                            if !treat_as_lost_udp(&e) {
-                                first_error.get_or_insert(MagicsockError::Io(e));
-                            }
-                        } else {
-                            self.inner.record_udp_tx(addr, framed.len());
-                            sent_packets += 1;
-                            // Upstream physical netlog excludes the Geneve
-                            // header on transmit.
-                            sent_bytes += datagram.len() as u64;
-                        }
-                    }
-                    self.inner.connection_counter.record(
-                        node_addr,
-                        addr,
-                        sent_packets,
-                        sent_bytes,
-                        false,
-                    );
-                    if sent_packets > 0 {
-                        if let Some(endpoint) = self
-                            .inner
-                            .endpoints
-                            .write()
-                            .expect("endpoints lock poisoned")
-                            .get_mut(&peer)
-                        {
-                            endpoint.note_relay_transport(addr, false);
-                        }
-                    }
-                    return first_error.map_or(Ok(()), Err);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn try_send_direct_batch<T: AsRef<[u8]>>(
+        &self,
+        peer: &NodePublic,
+        addr: SocketAddr,
+        node_addr: Option<IpAddr>,
+        datagrams: &[T],
+    ) -> Option<Result<(), MagicsockError>> {
+        let udp = self.inner.udp_socket()?;
+        Some(
+            self.send_direct_batch_linux(peer, &udp, addr, node_addr, datagrams)
+                .await,
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn try_send_direct_batch<T: AsRef<[u8]>>(
+        &self,
+        peer: &NodePublic,
+        addr: SocketAddr,
+        node_addr: Option<IpAddr>,
+        datagrams: &[T],
+    ) -> Option<Result<(), MagicsockError>> {
+        let udp = self.inner.udp_socket()?;
+        let (mut sent_packets, mut sent_bytes) = (0, 0);
+        let mut first_error = None;
+        for datagram in datagrams {
+            let datagram = datagram.as_ref();
+            if let Err(error) = udp.send_to(datagram, addr).await {
+                if !treat_as_lost_udp(&error) {
+                    first_error.get_or_insert(MagicsockError::Io(error));
                 }
-                for datagram in datagrams {
-                    if let Err(e) = self
-                        .send_data_via_derp(peer.clone(), node_addr, derp_region, datagram.as_ref())
-                        .await
-                    {
-                        first_error.get_or_insert(e);
-                    }
-                }
+            } else {
+                self.inner.record_udp_tx(addr, datagram.len());
+                sent_packets += 1;
+                sent_bytes += datagram.len() as u64;
             }
-            endpoint::BestPath::Derp { .. } | endpoint::BestPath::None => {
-                for datagram in datagrams {
-                    if let Err(e) = self
-                        .send_data_via_derp(peer.clone(), node_addr, derp_region, datagram.as_ref())
-                        .await
-                    {
-                        first_error.get_or_insert(e);
-                    }
+        }
+        self.inner
+            .connection_counter
+            .record(node_addr, addr, sent_packets, sent_bytes, false);
+        if sent_packets > 0 {
+            if let Some(endpoint) = self
+                .inner
+                .endpoints
+                .write()
+                .expect("endpoints lock poisoned")
+                .get_mut(peer)
+            {
+                endpoint.note_direct_transport(addr, false);
+            }
+        }
+        Some(first_error.map_or(Ok(()), Err))
+    }
+
+    async fn send_relay_batch<T: AsRef<[u8]>>(
+        &self,
+        peer: &NodePublic,
+        addr: SocketAddr,
+        vni: u32,
+        node_addr: Option<IpAddr>,
+        derp_region: i32,
+        datagrams: &[T],
+    ) -> Result<(), MagicsockError> {
+        let Some(udp) = self.inner.udp_socket() else {
+            return self
+                .send_derp_batch(peer, node_addr, derp_region, datagrams)
+                .await;
+        };
+        let (mut sent_packets, mut sent_bytes) = (0, 0);
+        let mut first_error = None;
+        for datagram in datagrams {
+            let datagram = datagram.as_ref();
+            let framed = relay::encode_geneve(vni, datagram);
+            if let Err(error) = udp.send_to(&framed, addr).await {
+                if !treat_as_lost_udp(&error) {
+                    first_error.get_or_insert(MagicsockError::Io(error));
                 }
+            } else {
+                self.inner.record_udp_tx(addr, framed.len());
+                sent_packets += 1;
+                // Upstream physical netlog excludes the Geneve header on
+                // transmit.
+                sent_bytes += datagram.len() as u64;
+            }
+        }
+        self.inner
+            .connection_counter
+            .record(node_addr, addr, sent_packets, sent_bytes, false);
+        if sent_packets > 0 {
+            if let Some(endpoint) = self
+                .inner
+                .endpoints
+                .write()
+                .expect("endpoints lock poisoned")
+                .get_mut(peer)
+            {
+                endpoint.note_relay_transport(addr, false);
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -2715,7 +2838,10 @@ impl Magicsock {
     ) -> Result<(), MagicsockError> {
         // Match upstream's per-write atomic snapshot: a live knob update takes
         // effect on the next API batch, never halfway through this one.
-        let never_gso_equal_tail = never_gso_equal_tail(self.inner.control_knobs.as_deref());
+        let never_gso_equal_tail = never_gso_equal_tail(
+            self.inner.control_knobs.as_deref(),
+            self.inner.udp_tx_force_never_gso_equal_tail,
+        );
         let mut head = 0;
         let mut first_error = None;
         let (mut sent_packets, mut sent_bytes) = (0, 0);
@@ -4394,7 +4520,7 @@ impl Inner {
         }
         // No ReceiveBatch slice borrow or endpoint/address lock survives
         // either await. Channel backpressure keeps its established queued
-        // lifetime; fixed-buffer inventory is a separate 384-slot limit.
+        // lifetime; fixed-buffer inventory has its own bounded packet limit.
         let credit_count = u32::try_from(known).expect("known batch count fits u32");
         let credit_started = std::time::Instant::now();
         let (channel_permit, credit_waited) = match self
@@ -5202,6 +5328,26 @@ impl Inner {
     }
 }
 
+/// Combine two independently attempted paths. One successful copy makes the
+/// hedged send successful; when both fail, retain the first path's error.
+fn combine_hedged_results<E>(
+    direct: Option<Result<(), E>>,
+    fallback: Option<Result<(), E>>,
+) -> Option<Result<(), E>> {
+    let mut first_error = None;
+    let mut attempted = false;
+    for result in [direct, fallback].into_iter().flatten() {
+        attempted = true;
+        match result {
+            Ok(()) => return Some(Ok(())),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    attempted.then(|| Err(first_error.expect("failed attempt has an error")))
+}
+
 /// Generate a random 12-byte disco ping tx_id.
 fn random_tx_id() -> [u8; 12] {
     use rand::RngCore;
@@ -5297,6 +5443,23 @@ mod linux_batch_tests {
                 data: vec![index as u8].into(),
             })
             .collect()
+    }
+
+    #[test]
+    fn hedged_send_succeeds_when_either_path_delivers() {
+        assert_eq!(
+            combine_hedged_results(Some(Ok::<(), &str>(())), Some(Err("fallback"))),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            combine_hedged_results(Some(Err("direct")), Some(Ok(()))),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            combine_hedged_results(Some(Err("direct")), Some(Err("fallback"))),
+            Some(Err("direct"))
+        );
+        assert_eq!(combine_hedged_results::<&str>(None, None), None);
     }
 
     #[test]
@@ -5554,24 +5717,35 @@ mod linux_batch_tests {
     #[test]
     fn linux_send_configuration_preserves_independent_fallbacks() {
         assert_eq!(
-            LinuxUdpSendConfig::from_environment_presence(false, false),
+            LinuxUdpSendConfig::from_environment_presence(false, false, false),
             LinuxUdpSendConfig {
                 use_batch: true,
                 disable_udp_gso: false,
+                force_never_gso_equal_tail: false,
             }
         );
         assert_eq!(
-            LinuxUdpSendConfig::from_environment_presence(false, true),
+            LinuxUdpSendConfig::from_environment_presence(false, true, false),
             LinuxUdpSendConfig {
                 use_batch: true,
                 disable_udp_gso: true,
+                force_never_gso_equal_tail: false,
             }
         );
         assert_eq!(
-            LinuxUdpSendConfig::from_environment_presence(true, false),
+            LinuxUdpSendConfig::from_environment_presence(true, false, false),
             LinuxUdpSendConfig {
                 use_batch: false,
                 disable_udp_gso: true,
+                force_never_gso_equal_tail: false,
+            }
+        );
+        assert_eq!(
+            LinuxUdpSendConfig::from_environment_presence(false, false, true),
+            LinuxUdpSendConfig {
+                use_batch: true,
+                disable_udp_gso: false,
+                force_never_gso_equal_tail: true,
             }
         );
     }
@@ -5579,17 +5753,19 @@ mod linux_batch_tests {
     #[test]
     fn never_gso_equal_tail_reads_each_live_knob_update() {
         let knobs = rustscale_controlknobs::ControlKnobs::new();
-        assert!(!never_gso_equal_tail(Some(&knobs)));
+        assert!(!never_gso_equal_tail(Some(&knobs), false));
+        assert!(never_gso_equal_tail(Some(&knobs), true));
         knobs.apply(HashMap::from([(
             rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL.to_string(),
             "true".to_string(),
         )]));
-        assert!(never_gso_equal_tail(Some(&knobs)));
+        assert!(never_gso_equal_tail(Some(&knobs), false));
         knobs.apply(HashMap::from([(
             rustscale_tailcfg::NODE_ATTR_NEVER_GSO_EQUAL_TAIL.to_string(),
             "false".to_string(),
         )]));
-        assert!(!never_gso_equal_tail(Some(&knobs)));
+        assert!(!never_gso_equal_tail(Some(&knobs), false));
+        assert!(never_gso_equal_tail(Some(&knobs), true));
     }
 
     #[test]

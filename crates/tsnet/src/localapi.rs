@@ -7500,7 +7500,7 @@ mod tests {
             .expect("stale capture handler did not exit")
             .unwrap()
             .unwrap();
-        let current = state.capture.read().unwrap().clone().unwrap();
+        let current = crate::capture::current(&state.capture).unwrap();
         assert!(Arc::ptr_eq(&current, &successor));
     }
 

@@ -174,6 +174,236 @@ event-driven) · packet filter (incl. stateful UDP, capability ACLs, shields-up 
 with distinct embedded Rust, pinned embedded Go tsnet, daemon-proxy, and TUN
 cells; historical SOCKS5/Serve numbers are not embedded-tsnet claims.
 
+## Current embedded performance evidence (2026-07-23)
+
+The latest matched high-fanout receive comparison used the tracked RSB1
+userspace-tsnet upload workload on one 8-core ARM Neoverse-V2 AWS host running
+Ubuntu 24.04 and Linux 6.17. This is a same-host software-path comparison, not
+cross-machine or external-NIC evidence. A fixed Rust client sent 1,280-byte
+application payload chunks to either accepted RustScale, the current RustScale
+tree, or the pinned `tailscale.com/tsnet` v1.100.0 comparator. The current tree
+used neither detached-pipeline force nor disable controls, so it exercised the
+corrected default path.
+
+Each P500/P1000 cell contains three valid 20-second trials in serial balanced
+randomized blocks, following a separate three-second P1 direct-path warmup.
+Every trial established, handshook, completed, and retained exactly the
+requested 500 or 1,000 streams; reported 20/20 one-second samples; had no low,
+zero, or stalled interval; and passed descriptor, memory, process, and state
+cleanup checks. No trial was replaced and no valid outlier was removed.
+
+| Streams | Accepted RustScale | Current RustScale | Go tsnet v1.100.0 | Current vs accepted | Current vs Go | Current CV |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 500 | 3134.669 Mbps | 5270.876 Mbps | 4788.978 Mbps | +68.15% | +10.06% | 0.552% |
+| 1000 | 2853.839 Mbps | 5222.082 Mbps | 4875.703 Mbps | +82.98% | +7.10% | 0.301% |
+
+Raw P500 samples in accepted/current/Go order were
+`[3054.216704, 3170.086912, 3179.703296]`,
+`[5271.126528, 5241.629696, 5299.870720]`, and
+`[4794.399232, 4775.576064, 4796.958720]` Mbps. P1000 samples were
+`[2873.769984, 2849.022464, 2838.724608]`,
+`[5204.455424, 5227.130880, 5234.658816]`, and
+`[4859.879936, 4880.611328, 4886.617088]` Mbps.
+
+| Streams | Accepted cores / mean RSS | Current cores / mean RSS | Go cores / mean RSS |
+| ---: | ---: | ---: | ---: |
+| 500 | 1.277 / 576.7 MiB | 1.825 / 591.1 MiB | 2.540 / 1214.6 MiB |
+| 1000 | 1.753 / 1134.2 MiB | 1.923 / 1137.5 MiB | 2.520 / 1441.7 MiB |
+
+The current artifact came from committed clean tree
+`6258ee659c58c78a92e644163dd103f384364188` and was built with Rust 1.97.1;
+the native comparator used Go 1.26.4 and exactly matched the tracked
+`tools/bench/go-tsnet/` sources. The workload maps to `crates/bench`, the
+current receive implementation to `crates/tsnet/src/netstack_pump.rs`, and the
+standard maintained matrix analogue to `tools/bench/gcp/`.
+
+A follow-up P10 stability A/B on the same host compared that accepted receive
+path with one additional bounded `recvmmsg` burst of detachable-buffer
+headroom. A fixed sampler-corrected Rust sender was used for both arms. The
+order `control,candidate,candidate,control,candidate,control,control,candidate,control,candidate`
+was frozen before execution; each arm ran five fresh-tailnet 20-second trials,
+and every outcome counted without retry or replacement. All ten trials were
+direct, established/handshook/completed exactly 10 streams, produced exactly
+20 one-second samples, and had no low, zero, or stalled interval.
+
+| P10 upload | Trial totals (Mbps) | Mean | Population CV | Clean trials |
+| --- | --- | ---: | ---: | ---: |
+| Accepted receive path | `5286.489, 5016.107, 5484.906, 5447.920, 5321.950` | 5311.474 Mbps | 3.113% | 5/5 |
+| One-burst pool headroom | `5544.594, 5667.583, 5705.693, 5344.741, 5327.224` | 5517.967 Mbps | 2.862% | 5/5 |
+
+The candidate improved mean throughput by 3.89%. Mean receiver pool-wait time
+fell from 1.661 seconds to 0.287 seconds per trial (82.7%), while mean receiver
+CPU changed from 1.547 to 1.598 cores. Maximum observed receiver RSS was
+58,780 KiB for control and 59,200 KiB for the candidate. The implementation
+adds 128 fixed 2 KiB buffers (256 KiB per magicsock receive pool), keeps the
+pool bounded, and leaves the separate 256-packet WireGuard handoff-credit cap
+unchanged. The candidate artifact was built from committed clean tree
+`54a89a6b0841c0c664ebc96b6bc3df0af730ddeb` with Rust 1.97.1; its SHA-256 was
+`c425fc949cce34af13431b0103c5de71a12bb4146a0c08a49af89a4781fccbbd`.
+The control/sender artifact SHA-256 was
+`d1d533e901f234ce9c77c2a436bdafd98c52381cbfb37aa29c90bc1bbe1a9adc`.
+This A/B validates the headroom change relative to the accepted RustScale
+path; it is not a contemporaneous native-Tailscale P10 comparison.
+
+Three subsequent first-execution diagnostics exercised the production
+direct-UDP/WireGuard/netstack P1000 retention test on Linux with the kernel
+clamping each requested 7 MiB UDP buffer to 425,984 bytes. Raising packet
+handoff/pool capacity from the accepted 256/512 detachable packets to
+1,024/1,152 at exact source
+`625aaf0029ea9e93898c2c7d24ef507a267103dc` still starved a connection and
+ended with 314 kernel receive-queue overflows. Raising only detached-decrypt
+pipeline depth from three to eight at
+`15b1a1949630a463e77eeed41b3f54fd8c742e80` similarly ended with 317
+overflows. Finally, a 2,048/2,176 capacity candidate at
+`55421822566691695da78bbd4b795acd82db4746` ended with 316 overflows even
+though its channel and pool high-water marks were only 1,939 and 2,116. Each
+candidate completed its applicable Clippy and focused package gates before the
+same 30-second P1000 assertion; none was retried. The results reject both
+capacity increases and deeper detached-decrypt concurrency: the remaining
+constrained-socket issue is kernel-drain scheduling, not bounded queue
+capacity. None of these diagnostic product changes is part of this branch.
+
+The subsequent canonical GCP run
+`gcp-20260723-064751-19775b4c5b` used two matched `n1-standard-4` VMs in
+`us-central1-a` and `us-central1-b`, clean source commit
+`70a7e09d460e33664bc570db8e68b77f694309a0`, and the pinned native Go tsnet
+comparator. Every cell retained a direct path, exactly three valid 10-second
+RSB1 download trials at P1/P10/P100/P500/P1000, and 200/200 latency exchanges.
+No valid outcome was retried or replaced.
+
+| Direct cross-host download | P1 | P10 | P100 | P500 | P1000 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RustScale embedded | 2349.4 | 2296.8 | 2337.0 | 2231.3 | 2180.3 Mbps |
+| Native Go tsnet | 1128.3 | 1510.4 | 1435.6 | 1331.6 | 1129.4 Mbps |
+| RustScale/native ratio | 2.082x | 1.521x | 1.628x | 1.676x | 1.931x |
+| RustScale TUN | 1549.9 | 1407.6 | 1053.3 | 545.6 | 417.4 Mbps |
+| tailscaled TUN | 2277.2 | 2452.0 | 2203.8 | 1619.0 | 1329.3 Mbps |
+| RustScale/tailscaled TUN ratio | 68.1% | 57.4% | 47.8% | 33.7% | 31.4% |
+
+RustScale embedded p50/p95/p99 latency was
+1123.879/1229.095/1286.476 microseconds versus
+1140.439/1249.780/1370.256 for native Go tsnet. RustScale embedded also used
+less average userspace CPU on both endpoints, 63.2% less server average RSS,
+and a 32.5% smaller binary. Its client peak RSS was 40.4% higher, however, and
+its single worst latency exchange was 13.511 ms versus 1.762 ms native. TUN
+latency, CPU, RSS, and binary footprint favored RustScale, but the throughput
+ratios above make TUN the primary known performance gap. Full raw arrays,
+resource timelines, product hashes, endpoint metadata, and strict cleanup
+evidence are tracked in
+[`docs/performance/gcp-20260723-064751-19775b4c5b`](performance/gcp-20260723-064751-19775b4c5b/).
+
+A matched native P1000 profile in run `gcp-20260723-121859-c3dbae0fb4`
+used the same Haswell machine type, image, kernel, zones, direct RSB1
+kernel-TCP workload, fanout, and duration as the RustScale profile. Native
+measured 1125.652 Mbps versus RustScale's 325.777 Mbps, a 3.455x native
+advantage and a 71.06% RustScale shortfall. Normal P1000 medians were
+1271.231 versus 350.448 Mbps, a 3.627x native advantage. Native retained all
+1000 lifecycle denominators and four non-empty perf reports with zero lost
+samples. The runs are independent and use different source commits, so this
+is a matched cross-implementation gap rather than a causal same-binary A/B.
+The full native evidence is tracked under
+[`docs/performance/gcp-20260723-121859-c3dbae0fb4`](performance/gcp-20260723-121859-c3dbae0fb4/).
+
+The accepted Linux immediate-write change was then tested in serialized runs
+`gcp-20260723-125554-32995220c8` and
+`gcp-20260723-131614-95f50d8842`. It attempts the already-nonblocking TUN
+`write`/`writev` before registering an `AsyncFd` readiness wait and falls back
+unchanged on `EAGAIN`. In the exact focused cross-source A/B it improved
+P1/P10/P100/P500/P1000 throughput by
+9.82%/13.81%/11.91%/9.96%/11.14%, with every candidate raw range above the
+control range. It improved p50/p95/p99 latency by 21.90%/22.57%/24.92%; CPU,
+RSS, runtime, binary size, direct-path, lifecycle, GRO/RXQ, and cleanup gates
+all passed. The accepted candidate still reaches only
+69.44%/51.34%/45.73%/34.57%/27.87% of the independent matched native medians,
+so kernel-TUN throughput parity remains open. Exact evidence is retained under
+[`docs/performance/gcp-20260723-125554-32995220c8`](performance/gcp-20260723-125554-32995220c8/)
+and
+[`docs/performance/gcp-20260723-131614-95f50d8842`](performance/gcp-20260723-131614-95f50d8842/).
+
+A follow-up immediate-read candidate at exact clean source
+`dabefa6b917848291f7708e2844543848616707a` attempted the same nonblocking
+fast path before Linux TUN read-readiness registration. Against the accepted
+immediate-write control above, its P1/P10/P100/P500/P1000 median changes were
+only +0.53%/+0.64%/+0.31%/+1.52%/+3.26%, and every three-sample raw range
+overlapped. Mean and p50/p95/p99 latency instead regressed
+38.83%/34.80%/33.98%/36.78%; client handoff credit waits rose from 1,024 to
+4,096 and total receive-to-publish time rose 75.4%. All 15 throughput trials,
+200/200 latency exchanges, direct-path gates, GRO/RXQ/drop counters, resource
+capture, source seals, and cleanup gates remained valid. The candidate is
+therefore rejected and its product change is not part of this branch. Exact
+evidence is retained under
+[`docs/performance/gcp-20260723-183200-da8373691c`](performance/gcp-20260723-183200-da8373691c/).
+
+Together, the same-host upload and cross-host download evidence closes and
+exceeds the measured direct embedded throughput gap from P1 through P1000 and
+the measured p50/p95/p99 latency gap. It does not close kernel-TUN throughput,
+the embedded client peak-RSS/cold-tail observations, bidirectional traffic,
+DERP, startup, idle-resource, or universal compatibility parity; those remain
+required before the overall parity goal or merge gate is complete.
+
+A subsequent exact same-binary TUN A/B at clean source
+`ab1e85009afebc88fa97acc179954d9a4c6ffc07` separated final inbound TUN
+writes from the task that services outbound TUN reads. The opt-in worker
+improved P1/P10/P100/P500/P1000 throughput by
+1.00%/5.29%/10.17%/42.03%/35.44%, confirming that the bidirectional scheduling
+boundary is a material high-fanout constraint. It simultaneously regressed
+p50/p95/p99 latency by 32.79%/35.83%/41.82% and raised average userspace CPU
+18.34% on the server and 25.76% on the client. It therefore remains a
+Linux-only diagnostic behind `RUSTSCALE_TUN_INBOUND_WRITE_WORKER`, exclusive
+with the earlier TUN pipeline experiments and disabled by default. Both exact
+evidence bundles are tracked under
+[`docs/performance/gcp-20260723-102120-681c1f93dd`](performance/gcp-20260723-102120-681c1f93dd/)
+and
+[`docs/performance/gcp-20260723-103928-732e18dea9`](performance/gcp-20260723-103928-732e18dea9/).
+
+A follow-up hybrid at exact clean source
+`6f0add024096a4a7bf80b9c741d065eb90dc4f82` kept an idle single-packet write
+inline while sending bursts and queued work through the worker. In a matched
+same-binary A/B it improved P500/P1000 throughput by 23.75%/20.89%, but
+regressed P1/P10/P100 by 9.66%/11.21%/1.37%, raised average userspace CPU by
+24.18% on the server and 6.10% on the client, and did not improve latency. The
+hybrid is rejected and its code is not part of the parity PR. Its exact
+evidence is retained under
+[`docs/performance/gcp-20260723-113500-c9144435e6`](performance/gcp-20260723-113500-c9144435e6/)
+and
+[`docs/performance/gcp-20260723-115345-ae16d4040d`](performance/gcp-20260723-115345-ae16d4040d/).
+
+An ingress-backlog scheduler at exact clean source
+`573fdeecc11abbf5e7627cf20e4cb82939aeafc9` was then tested in one frozen,
+same-binary control-to-candidate pair without retries. It kept the exact scalar
+path while the receive channel was drained and offloaded only once another
+ciphertext batch was already waiting. The candidate offloaded 1.19% of server
+batches and 1.29% of client batches, but regressed
+P1/P10/P100/P500/P1000 throughput by
+15.25%/16.06%/13.25%/14.98%/8.63%. The P1 through P500 raw ranges did not
+overlap. Mean and p50/p95/p99 latency regressed
+30.40%/28.80%/28.24%/27.79%. Both arms completed 15/15 throughput trials and
+200/200 latency exchanges with direct paths, zero UDP receive overflow or
+handoff-pool waits, identical product bytes, exact provenance, and exact-zero
+cleanup. The backlog scheduler is therefore rejected and its product change
+is not part of this branch. Exact evidence is retained under
+[`docs/performance/gcp-20260723-192715-ac9a6b5709`](performance/gcp-20260723-192715-ac9a6b5709/)
+and
+[`docs/performance/gcp-20260723-194656-40d2f57282`](performance/gcp-20260723-194656-40d2f57282/).
+
+A subsequent 5 ms bulk-hysteresis scheduler at exact clean source
+`64ba8d002bdb53cb6cc2babe9777d8c0e5700259` kept isolated one-datagram
+deliveries inline while retaining the FIFO write worker after a multi-datagram
+burst. The frozen same-binary A/B completed 15/15 direct throughput trials and
+200/200 latency exchanges without retry. It improved P500/P1000 throughput by
+23.05%/28.80% and improved p50/p95/p99 latency by
+53.24%/43.07%/36.32%, but regressed P1/P10 throughput by
+15.36%/6.25% with non-overlapping raw ranges. It also raised average userspace
+CPU by 9.85% on the server and 24.09% on the client. Scheduler evidence showed
+that the candidate offloaded 99.96% of server batches and 99.99% of client
+batches, so packet-batch size did not distinguish a fast low-fanout flow from
+true high-fanout pressure. The candidate is therefore rejected and its product
+change is not part of this branch. Both exact evidence bundles are retained
+under
+[`docs/performance/gcp-20260723-203120-6a44b68bae`](performance/gcp-20260723-203120-6a44b68bae/)
+and
+[`docs/performance/gcp-20260723-205344-dfc7416d32`](performance/gcp-20260723-205344-dfc7416d32/).
+
 ## Test infrastructure
 
 `crates/testcontrol` ✅ in-process fake control server (Noise handshake, h2c,

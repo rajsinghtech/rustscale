@@ -95,12 +95,16 @@ def runtime_metadata(run):
     if "runtime" not in run:
         return None
     runtime = run["runtime"]
-    required = {"rs_tun_inbound_pipeline", "rs_tun_outbound_send_pipeline", "linux_udp_batch", "linux_udp_gro", "linux_udp_gso"}
+    required = {"rs_tun_inbound_pipeline", "rs_tun_outbound_send_pipeline", "rs_tun_inbound_write_worker", "linux_udp_batch", "linux_udp_gro", "linux_udp_gso"}
+    pre_write_worker = {"rs_tun_inbound_pipeline", "rs_tun_outbound_send_pipeline", "linux_udp_batch", "linux_udp_gro", "linux_udp_gso"}
     legacy = {"rs_tun_inbound_pipeline"}
     pre_outbound = {"rs_tun_inbound_pipeline", "linux_udp_batch", "linux_udp_gro"}
     pre_gso = {"rs_tun_inbound_pipeline", "rs_tun_outbound_send_pipeline", "linux_udp_batch", "linux_udp_gro"}
-    if not isinstance(runtime, dict) or set(runtime) not in (required, pre_gso, pre_outbound, legacy) or any(type(value) is not bool for value in runtime.values()):
+    if not isinstance(runtime, dict) or set(runtime) not in (required, pre_write_worker, pre_gso, pre_outbound, legacy) or any(type(value) is not bool for value in runtime.values()):
         raise ValueError("invalid runtime metadata")
+    if (runtime.get("rs_tun_inbound_write_worker", False)
+            and (runtime["rs_tun_inbound_pipeline"] or runtime["rs_tun_outbound_send_pipeline"])):
+        raise ValueError("rs_tun_inbound_write_worker requires legacy pipelines off")
     if ("linux_udp_batch" in runtime and not runtime["linux_udp_batch"]
             and runtime["linux_udp_gro"]):
         raise ValueError("linux_udp_gro requires linux_udp_batch")
@@ -113,7 +117,7 @@ def runtime_metadata(run):
 def current_runtime_modes(run):
     """Return complete runtime modes for a newly paid benchmark invocation."""
     runtime = runtime_metadata(run)
-    required = {"rs_tun_inbound_pipeline", "rs_tun_outbound_send_pipeline", "linux_udp_batch", "linux_udp_gro", "linux_udp_gso"}
+    required = {"rs_tun_inbound_pipeline", "rs_tun_outbound_send_pipeline", "rs_tun_inbound_write_worker", "linux_udp_batch", "linux_udp_gro", "linux_udp_gso"}
     if runtime is None or set(runtime) != required:
         raise ValueError("complete runtime modes are required for paid preflight")
     return runtime
@@ -162,13 +166,14 @@ def validate_manifest(manifest):
     if "duration_s" in manifest and (type(manifest["duration_s"]) is not int or not 3 <= manifest["duration_s"] <= 120): raise ValueError("invalid duration_s")
     if "sample_cadence_s" in manifest and (type(manifest["sample_cadence_s"]) is not int or manifest["sample_cadence_s"] != 1): raise ValueError("invalid sample_cadence_s")
     if "peer_count_requested" in manifest and (type(manifest["peer_count_requested"]) is not int or not 1 <= manifest["peer_count_requested"] <= 1000): raise ValueError("invalid peer_count_requested")
+    if manifest.get("direction", "down") not in {"down", "up", "bidir"}: raise ValueError("invalid direction")
     if type(manifest.get("dry_run")) is not bool: raise ValueError("invalid dry_run")
     if not manifest["dry_run"] and has_reserved(manifest.get("run")): raise ValueError("reserved sentinel in production run metadata")
 
     if schema == 2:
         if manifest.get("warmup") != {"parallel": 1, "duration_s": 3, "reverse": True}: raise ValueError("invalid historical warmup")
     else:
-        if manifest.get("warmup") != {"parallel": 1, "duration_s": 3, "direction": "down", "protocol": "RSB1"}:
+        if manifest.get("warmup") != {"parallel": 1, "duration_s": 3, "direction": manifest.get("direction", "down"), "protocol": "RSB1"}:
             raise ValueError("invalid RSB1 warmup")
         selection = manifest.get("selection")
         if not isinstance(selection, dict) or selection.get("preset") not in {"normal-v1", "full-v1", "custom"}:
@@ -284,6 +289,7 @@ def command_manifest(args):
                      "go_module_sum": GO_MODULE_SUM},
            "runtime": {"rs_tun_inbound_pipeline": args.rs_tun_inbound_pipeline == "1",
                        "rs_tun_outbound_send_pipeline": args.rs_tun_outbound_send_pipeline == "1",
+                       "rs_tun_inbound_write_worker": args.rs_tun_inbound_write_worker == "1",
                        "linux_udp_batch": args.linux_udp_batch == "1",
                        "linux_udp_gro": args.linux_udp_gro == "1",
                        "linux_udp_gso": args.linux_udp_gso == "1"}}
@@ -295,8 +301,9 @@ def command_manifest(args):
             "peer_load": {"requested": args.peer_count, "effective": None, "observed": None, "status": "not-applied"}}
     data = {"schema_version": 4, "topologies": args.topologies, "paths": args.paths, "configs": args.configs,
             "parallelism": args.parallelism, "repeat": args.repeat, "duration_s": args.duration,
-            "sample_cadence_s": 1, "peer_count_requested": args.peer_count, "dry_run": args.dry_run,
-            "warmup": {"parallel": 1, "duration_s": 3, "direction": "down", "protocol": "RSB1"},
+            "sample_cadence_s": 1, "peer_count_requested": args.peer_count, "direction": args.direction,
+            "dry_run": args.dry_run,
+            "warmup": {"parallel": 1, "duration_s": 3, "direction": args.direction, "protocol": "RSB1"},
             "selection": selection, "load": load, "run": run}
     validate_manifest(data); atomic(args.output, data)
 
@@ -436,6 +443,7 @@ def command_preflight(args):
     runtime = current_runtime_modes(manifest["run"])
     expected = {"rs_tun_inbound_pipeline": args.rs_tun_inbound_pipeline == "1",
                 "rs_tun_outbound_send_pipeline": args.rs_tun_outbound_send_pipeline == "1",
+                "rs_tun_inbound_write_worker": args.rs_tun_inbound_write_worker == "1",
                 "linux_udp_batch": args.linux_udp_batch == "1",
                 "linux_udp_gro": args.linux_udp_gro == "1",
                 "linux_udp_gso": args.linux_udp_gso == "1"}
@@ -447,6 +455,7 @@ def command_preflight(args):
     if args.parallelism is not None and args.parallelism != manifest["parallelism"]: raise ValueError("parallelism does not match immutable run metadata")
     if args.duration is not None and args.duration != manifest.get("duration_s", 10): raise ValueError("duration does not match immutable run metadata")
     if args.peer_count is not None and args.peer_count != manifest.get("peer_count_requested", 1): raise ValueError("peer count does not match immutable run metadata")
+    if args.direction is not None and args.direction != manifest.get("direction", "down"): raise ValueError("direction does not match immutable run metadata")
     validate_observed(observed, args.config, manifest["dry_run"], args.topology, args.server_zone, args.client_zone, manifest["run"]["cloud"]["requested_machine_type"])
 
 
@@ -461,18 +470,19 @@ def command_profile(args):
     profile["run"] = copy.deepcopy(manifest["run"]); profile["observed"] = observed
     profile["source_commit"] = manifest["run"]["source"]["commit"]; profile["run_id"] = manifest["run"]["id"]
     if profile.get("config") != args.config: raise ValueError("profile config mismatch")
+    if profile.get("workload_direction") != manifest.get("direction", "down"): raise ValueError("profile direction mismatch")
     atomic(args.profile, profile)
 
 
 def main():
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="command", required=True)
-    m = sub.add_parser("manifest"); m.add_argument("output"); m.add_argument("--run-id", required=True); m.add_argument("--started-at-utc", required=True); m.add_argument("--commit", required=True); m.add_argument("--dirty", choices=("0", "1"), required=True); m.add_argument("--project", required=True); m.add_argument("--image-project", required=True); m.add_argument("--image-family", required=True); m.add_argument("--machine", required=True); m.add_argument("--network", required=True); m.add_argument("--disk-type", required=True); m.add_argument("--disk-gb", type=int, required=True); m.add_argument("--build-command", default=""); m.add_argument("--go-build-command", default=""); m.add_argument("--rustflags", default=""); m.add_argument("--lto", default=""); m.add_argument("--codegen-units", default=""); m.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), default="0"); m.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), default="0"); m.add_argument("--linux-udp-batch", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gro", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gso", choices=("0", "1"), default="1"); m.add_argument("--dry-run", action="store_true"); m.add_argument("--topologies", nargs="+", required=True); m.add_argument("--paths", nargs="+", required=True); m.add_argument("--configs", nargs="+", required=True); m.add_argument("--parallelism", type=int, nargs="+", required=True); m.add_argument("--repeat", type=int, required=True); m.add_argument("--duration", type=int, default=10); m.add_argument("--peer-count", type=int, default=1); m.add_argument("--matrix-preset", choices=("normal-v1", "full-v1", "custom"), default="custom"); m.add_argument("--load-preset", choices=("routine-v1", "scale-streams-v1", "custom"), default="custom"); m.add_argument("--topology-source", choices=("default", "full", "explicit"), default="explicit"); m.add_argument("--path-source", choices=("default", "full", "explicit"), default="explicit"); m.add_argument("--config-source", choices=("default", "full", "explicit"), default="explicit"); m.set_defaults(func=command_manifest)
+    m = sub.add_parser("manifest"); m.add_argument("output"); m.add_argument("--run-id", required=True); m.add_argument("--started-at-utc", required=True); m.add_argument("--commit", required=True); m.add_argument("--dirty", choices=("0", "1"), required=True); m.add_argument("--project", required=True); m.add_argument("--image-project", required=True); m.add_argument("--image-family", required=True); m.add_argument("--machine", required=True); m.add_argument("--network", required=True); m.add_argument("--disk-type", required=True); m.add_argument("--disk-gb", type=int, required=True); m.add_argument("--build-command", default=""); m.add_argument("--go-build-command", default=""); m.add_argument("--rustflags", default=""); m.add_argument("--lto", default=""); m.add_argument("--codegen-units", default=""); m.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), default="0"); m.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), default="0"); m.add_argument("--rs-tun-inbound-write-worker", choices=("0", "1"), default="0"); m.add_argument("--linux-udp-batch", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gro", choices=("0", "1"), default="1"); m.add_argument("--linux-udp-gso", choices=("0", "1"), default="1"); m.add_argument("--dry-run", action="store_true"); m.add_argument("--topologies", nargs="+", required=True); m.add_argument("--paths", nargs="+", required=True); m.add_argument("--configs", nargs="+", required=True); m.add_argument("--parallelism", type=int, nargs="+", required=True); m.add_argument("--repeat", type=int, required=True); m.add_argument("--duration", type=int, default=10); m.add_argument("--peer-count", type=int, default=1); m.add_argument("--direction", choices=("down", "up", "bidir"), default="down"); m.add_argument("--matrix-preset", choices=("normal-v1", "full-v1", "custom"), default="custom"); m.add_argument("--load-preset", choices=("routine-v1", "scale-streams-v1", "custom"), default="custom"); m.add_argument("--topology-source", choices=("default", "full", "explicit"), default="explicit"); m.add_argument("--path-source", choices=("default", "full", "explicit"), default="explicit"); m.add_argument("--config-source", choices=("default", "full", "explicit"), default="explicit"); m.set_defaults(func=command_manifest)
     d = sub.add_parser("dry-observed"); d.add_argument("output"); d.set_defaults(func=command_dry_observed)
     o = sub.add_parser("observed-real"); o.add_argument("output"); o.add_argument("--server-instance", required=True); o.add_argument("--client-instance", required=True); o.add_argument("--server-boot-disk", required=True); o.add_argument("--client-boot-disk", required=True); o.add_argument("--server-endpoint", required=True); o.add_argument("--client-endpoint", required=True); o.set_defaults(func=command_observed_real)
     s = sub.add_parser("select-observed"); s.add_argument("output"); s.add_argument("--input", required=True); s.add_argument("--config", required=True, choices=CONFIG_PRODUCTS); s.add_argument("--topology", required=True); s.add_argument("--server-zone", required=True); s.add_argument("--client-zone", required=True); s.add_argument("--machine", required=True); s.add_argument("--dry-run", action="store_true"); s.set_defaults(func=command_select_observed)
     a = sub.add_parser("attach"); a.add_argument("--manifest", required=True); a.add_argument("--observed", required=True); a.add_argument("result"); a.set_defaults(func=command_attach)
     v = sub.add_parser("validate"); v.add_argument("--manifest", required=True); v.add_argument("--result"); v.set_defaults(func=command_validate)
-    f = sub.add_parser("preflight"); f.add_argument("--manifest", required=True); f.add_argument("--observed", required=True); f.add_argument("--config", required=True); f.add_argument("--topology", required=True); f.add_argument("--path", required=True); f.add_argument("--server-zone", required=True); f.add_argument("--client-zone", required=True); f.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), required=True); f.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), required=True); f.add_argument("--linux-udp-batch", choices=("0", "1"), required=True); f.add_argument("--linux-udp-gro", choices=("0", "1"), required=True); f.add_argument("--linux-udp-gso", choices=("0", "1"), required=True); f.add_argument("--parallelism", type=int, nargs="+"); f.add_argument("--duration", type=int); f.add_argument("--peer-count", type=int); f.set_defaults(func=command_preflight)
+    f = sub.add_parser("preflight"); f.add_argument("--manifest", required=True); f.add_argument("--observed", required=True); f.add_argument("--config", required=True); f.add_argument("--topology", required=True); f.add_argument("--path", required=True); f.add_argument("--server-zone", required=True); f.add_argument("--client-zone", required=True); f.add_argument("--rs-tun-inbound-pipeline", choices=("0", "1"), required=True); f.add_argument("--rs-tun-outbound-send-pipeline", choices=("0", "1"), required=True); f.add_argument("--rs-tun-inbound-write-worker", choices=("0", "1"), required=True); f.add_argument("--linux-udp-batch", choices=("0", "1"), required=True); f.add_argument("--linux-udp-gro", choices=("0", "1"), required=True); f.add_argument("--linux-udp-gso", choices=("0", "1"), required=True); f.add_argument("--parallelism", type=int, nargs="+"); f.add_argument("--duration", type=int); f.add_argument("--peer-count", type=int); f.add_argument("--direction", choices=("down", "up", "bidir")); f.set_defaults(func=command_preflight)
     q = sub.add_parser("profile"); q.add_argument("--manifest", required=True); q.add_argument("--observed", required=True); q.add_argument("--config", required=True); q.add_argument("profile"); q.set_defaults(func=command_profile)
     args = p.parse_args()
     try: args.func(args)

@@ -169,7 +169,31 @@ tools/bench/gcp/run-matrix.sh
 
 # Compatibility alias for the same exact certification stream contract.
 tools/bench/gcp/run-matrix.sh --scale-streams
+
+# Run the same matrix for client-to-server or simultaneous two-way traffic.
+tools/bench/gcp/run-matrix.sh --direction up
+tools/bench/gcp/run-matrix.sh --direction bidir
+
+# One exact rs-tun matrix plus a separate P1000 daemon profile diagnostic.
+tools/bench/gcp/run-matrix.sh \
+  --config rs-tun --topology same-zone --path direct \
+  --profile --profile-parallelism 1000
+
+# The identical diagnostic against pinned native tailscaled kernel TUN.
+tools/bench/gcp/run-matrix.sh \
+  --config ts-tun --topology same-zone --path direct \
+  --profile --profile-config ts-tun --profile-parallelism 1000
 ```
+
+The profile diagnostic runs only after the normal selected cell and never
+replaces its result JSON. It uses the same kernel-TCP RSB1 server/client rather
+than iperf3, retains a separate `profile/workload.json`, and accepts it only
+when all requested streams are established, handshaken, completed, and present
+in every ordered one-second sample. `profile/metadata.json` records the stream
+count, RSB1 protocol, kernel-TCP transport, source identity, and endpoint roles;
+both daemon `perf` self/children reports and pre/post path gates must also pass.
+`--profile-config` accepts `rs-tun` (the default) or `ts-tun`, and the selected
+profile target must also be present in `--config`.
 
 A paid run accepts only an existing noninteractive `gcloud` account or an
 already configured ADC, workload-identity, or service-account credential file.
@@ -177,12 +201,15 @@ If the active account is expired but an existing credential file is valid, the
 harness temporarily selects it with `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`;
 it never starts browser/device login, prints a token, or writes credentials.
 
-Every selected cell executes byte-identical RSB1 download semantics (direction
-`down`, 1280-byte writes), one P1/3-second warmup before sampling, the ordered
-throughput points and repeats, and 200 complete 8-byte TCP ping-pongs with raw
-nanosecond samples. Rust, daemon-proxy, and TUN cells use `rustscale-bench`;
-`ts-embedded` uses `go-tsnet-rsb1`. The daemon-proxy bridge admits 1100
-simultaneous connections, above the public P1000 contract.
+Every selected cell executes byte-identical RSB1 semantics with 1280-byte
+writes. `--direction` selects server-to-client (`down`, the default),
+client-to-server (`up`), or simultaneous two-way (`bidir`) traffic and is
+bound into the immutable manifest, warmup, every trial, result validation, and
+profile metadata. Each run performs one P1/3-second warmup before sampling,
+the ordered throughput points and repeats, and 200 complete 8-byte TCP
+ping-pongs with raw nanosecond samples. Rust, daemon-proxy, and TUN cells use
+`rustscale-bench`; `ts-embedded` uses `go-tsnet-rsb1`. The daemon-proxy bridge
+admits 1100 simultaneous connections, above the public P1000 contract.
 
 Certification accepts exactly the ordered stream set
 `1,10,100,500,1000`; `--parallelism` rejects every other list and
@@ -317,17 +344,18 @@ upload `bench-results/`. Production runs are explicit local operator actions.
 ### Current canonical matrix
 
 The complete five-configuration same-region/cross-zone direct-path run is
-`gcp-20260721-080637-4aca6f6c1e`, built from clean source commit
-`395bf8db6648e67f61bc571e1a755b27cd714e12`. Every configuration completed
+`gcp-20260723-064751-19775b4c5b`, built from clean source commit
+`70a7e09d460e33664bc570db8e68b77f694309a0`. Every configuration completed
 P1/P10/P100/P500/P1000 three times with exact connection denominators and
 200/200 latency exchanges. The credential-free manifest, raw samples,
 resource timelines, endpoint metadata, summary, dashboard, and hashes are
 tracked under
-[`docs/performance/gcp-20260721-080637-4aca6f6c1e`](performance/gcp-20260721-080637-4aca6f6c1e/).
-See [`PERFORMANCE.md`](../PERFORMANCE.md#canonical-five-configuration-rsb1-matrix-2026-07-21)
-for the compact five-mode tables and interpretation caveats. In particular,
-the high RustScale embedded CV and different daemon-proxy architecture mean
-the project does not declare an overall winner from this run.
+[`docs/performance/gcp-20260723-064751-19775b4c5b`](performance/gcp-20260723-064751-19775b4c5b/).
+See [`PERFORMANCE.md`](../PERFORMANCE.md#current-canonical-five-configuration-rsb1-matrix-2026-07-23)
+for the compact five-mode tables and interpretation caveats. Embedded
+RustScale leads the matched native tsnet cell at every stream count, while
+kernel-TUN throughput remains behind tailscaled. The daemon-proxy cell is a
+different architecture and is retained only as labeled context.
 
 The successful `ts-userspace` cell also exercises file-backed local result
 assembly: high-stream resource and trial JSON never cross an operating-system

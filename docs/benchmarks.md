@@ -169,7 +169,20 @@ tools/bench/gcp/run-matrix.sh
 
 # Compatibility alias for the same exact certification stream contract.
 tools/bench/gcp/run-matrix.sh --scale-streams
+
+# One exact rs-tun matrix plus a separate P1000 daemon profile diagnostic.
+tools/bench/gcp/run-matrix.sh \
+  --config rs-tun --topology same-zone --path direct \
+  --profile --profile-parallelism 1000
 ```
+
+The profile diagnostic runs only after the normal selected cell and never
+replaces its result JSON. It uses the same kernel-TCP RSB1 server/client rather
+than iperf3, retains a separate `profile/workload.json`, and accepts it only
+when all requested streams are established, handshaken, completed, and present
+in every ordered one-second sample. `profile/metadata.json` records the stream
+count, RSB1 protocol, kernel-TCP transport, source identity, and endpoint roles;
+both daemon `perf` self/children reports and pre/post path gates must also pass.
 
 A paid run accepts only an existing noninteractive `gcloud` account or an
 already configured ADC, workload-identity, or service-account credential file.

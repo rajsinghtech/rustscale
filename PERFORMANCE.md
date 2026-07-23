@@ -83,17 +83,14 @@ family.
 
 ### RustScale
 
-For maximum measured Linux TUN throughput:
+For the currently accepted Linux TUN configuration:
 
 1. Use a release build and TUN mode.
 2. Keep direct paths enabled and verify that the selected path is direct.
 3. Leave Linux UDP batching, GRO, and TX-GSO enabled. They are enabled by
    default on supported Linux kernels.
-4. Enable the Linux outbound crypto/send pipeline at daemon startup:
-
-```sh
-sudo env RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE=1 rustscaled run
-```
+4. Leave both experimental TUN pipelines disabled. They are opt-in and are not
+   part of the accepted performance configuration.
 
 Do **not** set these rollback variables in the throughput profile:
 
@@ -102,12 +99,14 @@ RUSTSCALE_DISABLE_LINUX_UDP_BATCH
 RUSTSCALE_DISABLE_UDP_GRO
 RUSTSCALE_DISABLE_UDP_GSO
 RUSTSCALE_TUN_INBOUND_PIPELINE
+RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE
 ```
 
-`RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE` is deliberately not the default. It
-improved throughput by 10.2-17.5% in the matched A/B below, but increased CPU and
-showed a latency-tail regression. The normal default is the balanced profile;
-the environment variable selects the throughput profile.
+The outbound send pipeline improved an older three-point workload, which is why
+the rollback control remains available. The current five-point A/B below
+regressed throughput and latency, so it supersedes that historical operating
+recommendation. The receive parallel-open experiment also regressed every
+point and was not merged.
 
 ### tailscaled
 
@@ -120,11 +119,57 @@ performance knobs.
 
 ## Optimization evidence
 
-### RustScale outbound pipeline A/B
+### Current RustScale outbound pipeline rejection
+
+Run `gcp-20260723-075354-e37065209b` tested the current PR product at clean
+source `7e0eb07f5afd03ecba34ae7f6ad7c29735b17e26`. It enabled only
+`RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE`; the inbound pipeline remained off and
+Linux UDP batching, GRO, and GSO remained on. All 15 direct DOWN trials were
+retained without retry or replacement.
+
+| Parallel streams | Pipeline-on median | Versus current default |
+|---:|---:|---:|
+| 1 | 1457.3 Mbps | **-6.0%** |
+| 10 | 1016.4 Mbps | **-27.8%** |
+| 100 | 791.6 Mbps | **-24.8%** |
+| 500 | 283.5 Mbps | **-48.0%** |
+| 1000 | 216.9 Mbps | **-48.0%** |
+
+Pipeline-on p50/p95/p99 latency was 1344.380/1597.294/1726.958 us, or
+9.0%/19.4%/26.2% above the current default. This evidence rejects enabling the
+pipeline for current operation. The complete credential-free result and
+checksums are tracked in
+[`docs/performance/gcp-20260723-075354-e37065209b`](docs/performance/gcp-20260723-075354-e37065209b/).
+
+### Receive parallel-open candidate rejection
+
+Run `gcp-20260723-081840-984481bfc6` tested the unmerged candidate
+`931170f997cc266e4e818486d6b26204c7ab9693`, which parallelized bulk receive
+authentication before ordered replay-state commit. Both runtime pipelines were
+off and Linux UDP batching, GRO, and GSO were on. All 15 direct DOWN trials were
+retained without retry or replacement.
+
+| Parallel streams | Candidate median | Versus current default |
+|---:|---:|---:|
+| 1 | 1066.5 Mbps | **-31.2%** |
+| 10 | 779.8 Mbps | **-44.6%** |
+| 100 | 707.9 Mbps | **-32.8%** |
+| 500 | 433.5 Mbps | **-20.5%** |
+| 1000 | 305.1 Mbps | **-26.9%** |
+
+Candidate p50/p95/p99 latency was 1376.262/1547.904/1703.883 us, or
+11.6%/15.7%/24.5% above the current default. The hypothesis is rejected and
+the product change is not part of the parity PR. The complete credential-free
+result and checksums are tracked in
+[`docs/performance/gcp-20260723-081840-984481bfc6`](docs/performance/gcp-20260723-081840-984481bfc6/).
+
+### Historical RustScale outbound pipeline A/B (superseded)
 
 This is a same-binary A/B at source `ca56c1d0583249e97a3c68ca3ad00a48a0b95553`
 on the `n1-standard-4` setup above. UDP batching and GRO were enabled in both
-runs; only `RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE` changed.
+runs; only `RUSTSCALE_TUN_OUTBOUND_SEND_PIPELINE` changed. It is retained to
+explain the experiment's origin, but the current five-point rejection above is
+the operating authority.
 
 | Metric | Pipeline off | Pipeline on | Change |
 |---|---:|---:|---:|
@@ -177,7 +222,6 @@ commits and packages byte-for-byte:
 ```sh
 export GCP_PROJECT=your-project
 export GCP_MACHINE=n1-standard-4
-export RS_TUN_OUTBOUND_SEND_PIPELINE=1
 export RS_LINUX_UDP_BATCH=1
 export RS_LINUX_UDP_GRO=1
 export RS_LINUX_UDP_GSO=1

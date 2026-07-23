@@ -322,9 +322,10 @@ pub const WG_RECEIVE_BATCH_MAX_PACKETS: usize = 128;
 
 /// Total number of WireGuard packets that may wait between magicsock and its
 /// consumer. This is deliberately packet-counted, even though the channel
-/// transports batches. One 1024-packet direct-UDP microburst can leave a
-/// constrained kernel socket before consumer scheduling applies backpressure.
-const WG_RECEIVE_PACKET_CAPACITY: usize = 1024;
+/// transports batches. A 2,048-packet bound is the smallest power of two above
+/// the combined userspace backlog and kernel overflow observed when the
+/// 1,024-packet candidate saturated on a constrained socket.
+const WG_RECEIVE_PACKET_CAPACITY: usize = 2048;
 
 /// Process-local Linux handoff diagnostics. They are deliberately bounded and
 /// credential-free so benchmark failure artifacts can retain the first

@@ -35,6 +35,7 @@ AUTHKEY_FILE RESULTS_DIR SERVER_HOSTNAME CLIENT_HOSTNAME
 CONFIG: rs-userspace | rs-tun | ts-embedded | ts-userspace | ts-tun
 --profile: rs-tun only; collect a Linux perf profile after normal metrics
 --profile-only: rs-tun only; collect a Linux perf diagnostic without writing metrics
+--profile-parallelism N: stream count for the profile workload (1..=1000; default 10)
 --repeat N: measured samples per parallelism (3..=9; default 3)
 --parallelism LIST: ordered unique stream counts, each in 1..=1000
 --duration N: measured throughput duration in seconds (3..=120)
@@ -49,13 +50,14 @@ EOF
 parse_run_config_options() {
   PROFILE=0
   PROFILE_ONLY=0
+  PROFILE_PARALLELISM=10
   REPEAT=3
   PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
   PEER_COUNT=1
   RESULT_MANIFEST=""
   OBSERVED_METADATA=""
-  local seen_profile=0 seen_profile_only=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_manifest=0 seen_observed=0
+  local seen_profile=0 seen_profile_only=0 seen_profile_parallelism=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_manifest=0 seen_observed=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --profile)
@@ -64,6 +66,10 @@ parse_run_config_options() {
       --profile-only)
         (( seen_profile_only == 0 )) || { echo "duplicate option: --profile-only" >&2; return 2; }
         PROFILE_ONLY=1; seen_profile_only=1; shift ;;
+      --profile-parallelism)
+        (( seen_profile_parallelism == 0 )) || { echo "duplicate option: --profile-parallelism" >&2; return 2; }
+        [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 1000 ]] || { echo "--profile-parallelism must be an integer in 1..=1000" >&2; return 2; }
+        PROFILE_PARALLELISM="$2"; seen_profile_parallelism=1; shift 2 ;;
       --repeat)
         (( seen_repeat == 0 )) || { echo "duplicate option: --repeat" >&2; return 2; }
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--repeat requires a value" >&2; return 2; }
@@ -94,6 +100,7 @@ parse_run_config_options() {
     esac
   done
   (( !(PROFILE && PROFILE_ONLY) )) || { echo "--profile and --profile-only are mutually exclusive" >&2; return 2; }
+  (( seen_profile_parallelism == 0 || PROFILE || PROFILE_ONLY )) || { echo "--profile-parallelism requires --profile or --profile-only" >&2; return 2; }
 }
 
 validate_parallelism_csv() {
@@ -111,10 +118,10 @@ validate_parallelism_csv() {
 
 run_config_option_parsing_self_test() {
   local actual status
-  actual=$(parse_run_config_options --profile --repeat 3; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
-  [[ "$actual" == '1/0/3' ]] || return 1
-  actual=$(parse_run_config_options --profile-only --repeat 3; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
-  [[ "$actual" == '0/1/3' ]] || return 1
+  actual=$(parse_run_config_options --profile --repeat 3; printf '%s/%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$PROFILE_PARALLELISM" "$REPEAT") || return 1
+  [[ "$actual" == '1/0/10/3' ]] || return 1
+  actual=$(parse_run_config_options --profile-only --profile-parallelism 1000 --repeat 3; printf '%s/%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$PROFILE_PARALLELISM" "$REPEAT") || return 1
+  [[ "$actual" == '0/1/1000/3' ]] || return 1
   actual=$(parse_run_config_options --repeat 9 --profile; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
   [[ "$actual" == '1/0/9' ]] || return 1
   actual=$(parse_run_config_options; printf '%s/%s/%s\n' "$PROFILE" "$PROFILE_ONLY" "$REPEAT") || return 1
@@ -122,7 +129,7 @@ run_config_option_parsing_self_test() {
   actual=$(parse_run_config_options --parallelism 1,10,100,500,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
   [[ "$actual" == '1,10,100,500,1000/20/250' ]] || return 1
   local -a case_args=()
-  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--parallelism' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1,a' '--parallelism 1 --parallelism 2' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001' '--profile --profile' '--profile-only --profile-only' '--profile --profile-only' '--unknown'; do
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--parallelism' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1,a' '--parallelism 1 --parallelism 2' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001' '--profile --profile' '--profile-only --profile-only' '--profile --profile-only' '--profile-parallelism' '--profile-parallelism 0 --profile' '--profile-parallelism 1001 --profile' '--profile-parallelism 100 --profile-parallelism 10 --profile' '--profile-parallelism 100' '--unknown'; do
     read -r -a case_args <<< "$args"
     if ( parse_run_config_options "${case_args[@]}" ) >/dev/null 2>&1; then
       return 1
@@ -2218,6 +2225,7 @@ profile_report_command() {
 profile_rs_tun() {
   local profile_dir="$RDIR/profile" server_dir="$RDIR/profile/server" client_dir="$RDIR/profile/client"
   local srv_pid cli_pid status=0 server_wait_status=0 client_wait_status=0
+  local profile_parallelism="${PROFILE_PARALLELISM:-10}"
   mkdir -p "$server_dir" "$client_dir"
 
   if ! srv_pid=$(ssh_sudo "$SVM" "$SZONE" 'cat /tmp/rs-tun-srv.pid'); then
@@ -2230,8 +2238,9 @@ profile_rs_tun() {
     status=1
   elif ! ssh_sudo "$CVM" "$CZONE" "$(profile_start_command client "$cli_pid")"; then
     status=1
-  # This extra P10 is intentionally outside tun_measure and result JSON.
-  elif ! run_tun_command 0 "$CVM" "$CZONE" "iperf3 -c $server_ip -p $PORT -t $DURATION -P 10 -R -J >/tmp/rs-tun-profile-iperf.json"; then
+  # This extra diagnostic workload is intentionally outside tun_measure and
+  # result JSON. Its stream count is recorded in profile metadata.
+  elif ! run_tun_command 0 "$CVM" "$CZONE" "iperf3 -c $server_ip -p $PORT -t $DURATION -P $profile_parallelism -R -J >/tmp/rs-tun-profile-iperf.json"; then
     status=1
   else
     # Do not combine waits: each endpoint's profiler status is independently
@@ -2260,11 +2269,11 @@ profile_rs_tun() {
          ! scp_from "$CVM" "$CZONE" /tmp/rs-tun-perf-client-self.txt "$client_dir/perf-self.txt" ||
          [[ ! -s "$server_dir/perf.data" || ! -s "$server_dir/perf-children.txt" || ! -s "$server_dir/perf-self.txt" || ! -s "$client_dir/perf.data" || ! -s "$client_dir/perf-children.txt" || ! -s "$client_dir/perf-self.txt" ]]; then
       status=1
-    elif ! python3 - "$profile_dir/metadata.json" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$DURATION" "$REPEAT" "$srv_pid" "$cli_pid" "$OUT" <<'PYEOF'
+    elif ! python3 - "$profile_dir/metadata.json" "$TOPOLOGY" "$PATH_TAG" "$CONFIG" "$profile_parallelism" "$DURATION" "$REPEAT" "$srv_pid" "$cli_pid" "$OUT" <<'PYEOF'
 import json, sys
-out, topo, path, config, duration, repeat, srv_pid, cli_pid, result = sys.argv[1:]
+out, topo, path, config, parallel, duration, repeat, srv_pid, cli_pid, result = sys.argv[1:]
 json.dump({"topology":topo,"path":path,"config":config,
-           "parallel":10,"duration_s":int(duration),"repeat":int(repeat),"frequency_hz":199,
+           "parallel":int(parallel),"duration_s":int(duration),"repeat":int(repeat),"frequency_hz":199,
            "result_json":result,"workload_direction":"server_to_client",
            "reverse":True,"endpoints":{
              "server":{"pid":int(srv_pid),"command":"rustscaled","role":"sender"},
@@ -2295,7 +2304,7 @@ profile_command_self_test() {
   log=$(<"$log_file")
   [[ "$log" == *"sudo:$SVM:"*'command -v perf'* && "$log" == *"sudo:$CVM:"*'command -v perf'* ]] || return 1
 
-  # The happy path proves two recordings start before reverse P10, endpoint
+  # The happy path proves two recordings start before the reverse diagnostic,
   # waits/reports are independent, all artifacts are copied, and both remote
   # filename sets are cleaned up.
   ssh_sudo() {
@@ -2321,6 +2330,7 @@ with open(sys.argv[1]) as f:
     metadata = json.load(f)
 assert metadata["workload_direction"] == "server_to_client"
 assert metadata["reverse"] is True
+assert metadata["parallel"] == 10
 assert metadata["repeat"] == 3
 assert metadata["run"]["id"] == "gcp-20260714-000000-selftest"
 assert metadata["source_commit"] == metadata["run"]["source"]["commit"]
@@ -2378,6 +2388,22 @@ PYEOF
   if profile_rs_tun; then return 1; fi
   log=$(<"$log_file")
   [[ "$log" == *'iperf3 -c 100.64.0.1 -p 5201 -t 10 -P 10 -R'* && "$log" == *"rm -f /tmp/rs-tun-perf-server.pid"* && "$log" == *"rm -f /tmp/rs-tun-perf-client.pid"* ]] || return 1
+
+  # A non-default stream count is applied to the workload and metadata.
+  PROFILE_PARALLELISM=1000
+  : >"$log_file"
+  run_tun_command() { printf ' iperf:%s:%s' "$2" "$4" >>"$log_file"; }
+  scp_from() { printf ' copy:%s:%s:%s' "$1" "$3" "$4" >>"$log_file"; printf x >"$4"; }
+  profile_rs_tun || return 1
+  log=$(<"$log_file")
+  [[ "$log" == *'iperf3 -c 100.64.0.1 -p 5201 -t 10 -P 1000 -R'* ]] || return 1
+  python3 - "$RDIR/profile/metadata.json" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    metadata = json.load(f)
+assert metadata["parallel"] == 1000
+PYEOF
+  PROFILE_PARALLELISM=10
   rm -f "$log_file"
   unset -f ssh_sudo run_tun_command scp_from
 }

@@ -339,6 +339,7 @@ matrix_profile_self_test() {
   local -a calls=()
   REPEAT=4
   PARALLELISM_CSV="1,10,100,500,1000"
+  PROFILE_PARALLELISM=1000
   DURATION=10
   PEER_COUNT=1
   PROFILE=1
@@ -356,7 +357,7 @@ matrix_profile_self_test() {
   [[ ${#calls[@]} -eq 3 ]] || return 1
   [[ "${calls[0]}" == 'rs-tun|rs-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
   [[ "${calls[1]}" == 'ts-tun|ts-tun s c sz cz /tmp/authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --manifest /dev/null --observed /dev/null' ]] || return 1
-  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz /tmp/profile-authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --profile-only --manifest /dev/null --observed /dev/null' ]] || return 1
+  [[ "${calls[2]}" == 'profile|rs-tun s c sz cz /tmp/profile-authkey-file dir host client --repeat 4 --parallelism 1,10,100,500,1000 --duration 10 --peer-count 1 --profile-only --profile-parallelism 1000 --manifest /dev/null --observed /dev/null' ]] || return 1
 }
 
 # Build the directly invocable run-config command shape used by each cell.
@@ -394,7 +395,8 @@ matrix_run_profile_diagnostic() {
   "$runner" rs-tun "$server_vm" "$client_vm" "$server_zone" "$client_zone" \
     "$authkey_file" "$results_dir" "$server_hostname" "$client_hostname" \
     --repeat "$REPEAT" --parallelism "$PARALLELISM_CSV" --duration "$DURATION" --peer-count "$PEER_COUNT" \
-    --profile-only --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
+    --profile-only --profile-parallelism "$PROFILE_PARALLELISM" \
+    --manifest "$MATRIX_MANIFEST_PATH" --observed "$MATRIX_OBSERVED_PATH"
 }
 
 # Parse command-line options without contacting GCP.  Keeping this separate
@@ -402,6 +404,7 @@ matrix_run_profile_diagnostic() {
 matrix_parse_args() {
   DRY_RUN=0
   PROFILE=0
+  PROFILE_PARALLELISM=10
   REPEAT=3
   PARALLELISM_CSV="1,10,100,500,1000"
   DURATION=10
@@ -413,7 +416,7 @@ matrix_parse_args() {
   PATH_FILTER=""
   CONFIG_FILTER=""
   FULL=0
-  local seen_dry_run=0 seen_profile=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_scale=0 seen_full=0
+  local seen_dry_run=0 seen_profile=0 seen_profile_parallelism=0 seen_repeat=0 seen_parallelism=0 seen_duration=0 seen_peer_count=0 seen_scale=0 seen_full=0
   local seen_topology=0 seen_path=0 seen_config=0
 
   while [[ $# -gt 0 ]]; do
@@ -472,6 +475,10 @@ matrix_parse_args() {
       --profile)
         (( seen_profile == 0 )) || { echo "duplicate option: --profile" >&2; return 2; }
         PROFILE=1; seen_profile=1; shift ;;
+      --profile-parallelism)
+        (( seen_profile_parallelism == 0 )) || { echo "duplicate option: --profile-parallelism" >&2; return 2; }
+        [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -ge 1 && "$2" -le 1000 ]] || { echo "--profile-parallelism must be an integer in 1..=1000" >&2; return 2; }
+        PROFILE_PARALLELISM="$2"; seen_profile_parallelism=1; shift 2 ;;
       --dry-run|-n)
         (( seen_dry_run == 0 )) || { echo "duplicate option: $1" >&2; return 2; }
         DRY_RUN=1; seen_dry_run=1; shift ;;
@@ -482,6 +489,7 @@ matrix_parse_args() {
       *) echo "unknown arg: $1" >&2; return 2 ;;
     esac
   done
+  (( seen_profile_parallelism == 0 || PROFILE )) || { echo "--profile-parallelism requires --profile" >&2; return 2; }
 }
 
 validate_matrix_parallelism_csv() {
@@ -501,8 +509,8 @@ matrix_option_parsing_self_test() {
   local actual status
   actual=$(matrix_parse_args; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
   [[ "$actual" == '3/0/0/0///' ]] || return 1
-  actual=$(matrix_parse_args --full --repeat 3 --profile --topology same-zone --path direct --config rs-tun,ts-tun; printf '%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
-  [[ "$actual" == '3/1/0/1/same-zone/direct/rs-tun,ts-tun' ]] || return 1
+  actual=$(matrix_parse_args --full --repeat 3 --profile --profile-parallelism 1000 --topology same-zone --path direct --config rs-tun,ts-tun; printf '%s/%s/%s/%s/%s/%s/%s/%s\n' "$REPEAT" "$PROFILE" "$PROFILE_PARALLELISM" "$DRY_RUN" "$FULL" "$TOPOLOGY_FILTER" "$PATH_FILTER" "$CONFIG_FILTER") || return 1
+  [[ "$actual" == '3/1/1000/0/1/same-zone/direct/rs-tun,ts-tun' ]] || return 1
   actual=$(matrix_parse_args --dry-run --help --not-an-error; printf '%s/%s/%s\n' "$DRY_RUN" "$SHOW_HELP" "$REPEAT") || return 1
   [[ "$actual" == '1/1/3' ]] || return 1
   actual=$(matrix_parse_args --parallelism 1,10,100,500,1000 --duration 20 --peer-count 250; printf '%s/%s/%s\n' "$PARALLELISM_CSV" "$DURATION" "$PEER_COUNT") || return 1
@@ -510,7 +518,7 @@ matrix_option_parsing_self_test() {
   actual=$(matrix_parse_args --scale-streams; printf '%s' "$PARALLELISM_CSV") || return 1
   [[ "$actual" == '1,10,100,500,1000' ]] || return 1
   local -a case_args=()
-  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--full --full' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1 --parallelism 2' '--scale-streams --scale-streams' '--scale-streams --parallelism 1' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001'; do
+  for args in '--repeat' '--repeat 0' '--repeat 10' '--repeat 1.5' '--repeat 1 --repeat 2' '--profile --profile' '--profile-parallelism' '--profile-parallelism 0 --profile' '--profile-parallelism 1001 --profile' '--profile-parallelism 100 --profile-parallelism 10 --profile' '--profile-parallelism 100' '--full --full' '--parallelism 1,1' '--parallelism 0' '--parallelism 1001' '--parallelism 1 --parallelism 2' '--scale-streams --scale-streams' '--scale-streams --parallelism 1' '--duration 2' '--duration 121' '--peer-count 0' '--peer-count 1001'; do
     read -r -a case_args <<< "$args"
     if ( matrix_parse_args "${case_args[@]}" ) >/dev/null 2>&1; then
       return 1
@@ -1014,7 +1022,7 @@ fi
 # ---------------------------------------------------------------------------
 matrix_usage() {
   cat <<EOF
-usage: $0 [--dry-run] [--full] [--profile] [--repeat N] [--parallelism LIST] [--scale-streams] [--duration N] [--peer-count N] [--topology LIST] [--path LIST] [--config LIST]
+usage: $0 [--dry-run] [--full] [--profile] [--profile-parallelism N] [--repeat N] [--parallelism LIST] [--scale-streams] [--duration N] [--peer-count N] [--topology LIST] [--path LIST] [--config LIST]
 Runs same-zone/direct rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun with one matched RSB1 workload.
   --dry-run  validate args + script structure without gcloud or API calls.
   --full     expand to both topologies and both paths; all five configs remain selected.
@@ -1027,6 +1035,7 @@ Runs same-zone/direct rs-userspace,rs-tun,ts-embedded,ts-userspace,ts-tun with o
   --duration N measured throughput seconds (3..=120; default 10)
   --peer-count N record configured remote-peer load (1..=1000; default 1)
   --profile  profile only the selected rs-tun cell after normal metrics
+  --profile-parallelism N stream count for the profile workload (1..=1000; default 10)
 EOF
 }
 matrix_parse_args "$@" || exit $?

@@ -296,27 +296,29 @@ where
     let up = Arc::new(AtomicU64::new(0));
     let down = Arc::new(AtomicU64::new(0));
     let tick_data = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let ready_barrier = Arc::new(tokio::sync::Barrier::new(parallel + 2));
+    let start_barrier = Arc::new(tokio::sync::Barrier::new(parallel + 1));
     let sampler_data = tick_data.clone();
     let sampler_up = up.clone();
     let sampler_down = down.clone();
+    let sampler_ready = ready_barrier.clone();
+    let sampler_start = start_barrier.clone();
     let sampler = tokio::spawn(async move {
+        sampler_ready.wait().await;
         sampler_data.lock().await.push((
             0,
             sampler_up.load(Ordering::Relaxed) + sampler_down.load(Ordering::Relaxed),
         ));
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.tick().await;
-        let mut elapsed = 0;
-        loop {
-            interval.tick().await;
-            elapsed += 1;
+        sampler_start.wait().await;
+        let started = tokio::time::Instant::now();
+        for elapsed in 1..=duration {
+            tokio::time::sleep_until(started + Duration::from_secs(elapsed)).await;
             sampler_data.lock().await.push((
                 elapsed,
                 sampler_up.load(Ordering::Relaxed) + sampler_down.load(Ordering::Relaxed),
             ));
         }
     });
-    let barrier = Arc::new(tokio::sync::Barrier::new(parallel + 1));
     let mut tasks = tokio::task::JoinSet::new();
     for stream in streams {
         tasks.spawn(run_single(
@@ -325,11 +327,14 @@ where
             Duration::from_secs(duration),
             up.clone(),
             down.clone(),
-            barrier.clone(),
+            ready_barrier.clone(),
+            start_barrier.clone(),
         ));
     }
-    // Every worker exists and every stream has completed RSB1 setup before GO.
-    barrier.wait().await;
+    // Every worker and the sampler are ready before the sampler records its
+    // zero point. A second barrier prevents any GO byte from racing ahead of
+    // that baseline, and the sampler then records exactly `duration` ticks.
+    ready_barrier.wait().await;
     let mut completed = 0;
     while let Some(joined) = tasks.join_next().await {
         match joined {
@@ -346,7 +351,9 @@ where
             }
         }
     }
-    sampler.abort();
+    sampler
+        .await
+        .map_err(|error| format!("throughput sampler failed: {error}"))?;
     let samples = compute_samples(&tick_data.lock().await);
     let up_bytes = up.load(Ordering::Relaxed);
     let down_bytes = down.load(Ordering::Relaxed);
@@ -378,12 +385,14 @@ async fn run_single<S>(
     duration: Duration,
     up: Arc<AtomicU64>,
     down: Arc<AtomicU64>,
-    barrier: Arc<tokio::sync::Barrier>,
+    ready_barrier: Arc<tokio::sync::Barrier>,
+    start_barrier: Arc<tokio::sync::Barrier>,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    barrier.wait().await;
+    ready_barrier.wait().await;
+    start_barrier.wait().await;
     tokio::time::timeout(Duration::from_secs(30), write_go(&mut stream))
         .await
         .map_err(|_| "GO timeout".to_string())?
@@ -634,6 +643,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn p1_sampler_records_every_requested_second() {
+        let (client, mut server) = tokio::io::duplex(64 << 10);
+        let server = tokio::spawn(async move {
+            let header = read_header(&mut server).await.unwrap();
+            assert_eq!(header.mode, MODE_THROUGHPUT);
+            assert_eq!(header.direction, DIR_UP);
+            assert_eq!(header.duration_secs, 1);
+            write_ack(&mut server).await.unwrap();
+            read_go(&mut server).await.unwrap();
+            let mut discard = [0; 16 << 10];
+            while server.read(&mut discard).await.unwrap() != 0 {}
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            measure(
+                vec![client],
+                "userspace-tsnet",
+                "100.64.0.1:5201".into(),
+                1,
+                "up",
+                1,
+                "direct".into(),
+                "100.64.0.2".into(),
+            ),
+        )
+        .await
+        .expect("P1 sampler deadline")
+        .expect("P1 measurement");
+        server.await.unwrap();
+
+        assert_eq!(result.samples.len(), 1);
+        assert_eq!(result.samples[0].elapsed_secs, 1);
+        assert!(result.samples[0].mbps > 0.0);
+        assert_eq!(
+            (result.established, result.handshaken, result.completed),
+            (1, 1, 1)
+        );
     }
 
     // This preserves the stream index in a failure and exercises the exact

@@ -2787,10 +2787,16 @@ rsb1_measure() {
   RSB1_MEASURE_PATH_POST=$(printf '%s' "$lat_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path_class"])') || return 1
   [[ "$reported_transport" == kernel-tcp ]] && RSB1_MEASURE_PATH_POST="$gated_path"
 
-  if [[ "$CONFIG" == rs-userspace ]]; then
-    runtime_server=$(capture_rs_userspace_runtime_stats "$SVM" "$SZONE" server)
-    runtime_client=$(capture_rs_userspace_runtime_stats "$CVM" "$CZONE" client)
-  fi
+  case "$CONFIG" in
+    rs-userspace)
+      runtime_server=$(capture_rs_userspace_runtime_stats "$SVM" "$SZONE" server)
+      runtime_client=$(capture_rs_userspace_runtime_stats "$CVM" "$CZONE" client)
+      ;;
+    rs-tun)
+      runtime_server=$(capture_rs_tun_runtime_stats "$SVM" "$SZONE" /tmp/rs-tun-srv.log)
+      runtime_client=$(capture_rs_tun_runtime_stats "$CVM" "$CZONE" /tmp/rs-tun-cli.log)
+      ;;
+  esac
   server_foot=$(remote_stop_footprint "$SVM" "$SZONE" /tmp/rsb1-server.footprint) || return 1
   client_foot=$(remote_stop_footprint "$CVM" "$CZONE" /tmp/rsb1-client.footprint) || return 1
   bin_size=$(ssh_cmd "$SVM" "$SZONE" "stat -c %s $primary_path") || return 1
@@ -2925,7 +2931,9 @@ rsb1_lifecycle_self_test() {
     && "$definition" == *'"$CHOST" "$state_dir"'* \
     && "$definition" == *'client_shutdown_modes'* \
     && "$definition" == *'process-exit-after-close-timeout'* \
-    && "$definition" == *'throughput_trials'* ]] || return 1
+    && "$definition" == *'throughput_trials'* \
+    && "$definition" == *'capture_rs_tun_runtime_stats "$SVM" "$SZONE" /tmp/rs-tun-srv.log'* \
+    && "$definition" == *'capture_rs_tun_runtime_stats "$CVM" "$CZONE" /tmp/rs-tun-cli.log'* ]] || return 1
   rust_trial=$(rsb1_client_command rust-userspace throughput 100.64.0.1:5201 10 100 /tmp/rs-state /tmp/rs.log) || return 1
   go_trial=$(rsb1_client_command go-userspace latency 100.64.0.1:5201 200 1 /tmp/go-state /tmp/go.log) || return 1
   [[ "$rust_trial" == "timeout --signal=TERM --kill-after=5s ${RSB1_TRIAL_TIMEOUT_SECONDS}s prlimit "* \

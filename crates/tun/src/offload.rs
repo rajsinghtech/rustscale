@@ -265,6 +265,7 @@ impl<S: BuildHasher> TcpGroState<S> {
 /// Materialize the platform-neutral GRO plan as ordinary, fully checksummed
 /// IP packets for a userspace stack. Scalar packets move without copying;
 /// coalesced packets reuse the head allocation and copy only tail payloads.
+#[cfg(test)]
 pub(crate) fn coalesce_tcp_packets(
     state: &mut TcpGroState,
     packets: &mut Vec<Vec<u8>>,

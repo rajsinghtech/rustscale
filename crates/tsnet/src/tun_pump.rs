@@ -270,11 +270,6 @@ async fn run_tun_pump_with_write_worker(
             inbound.peer_map_epoch = peer_map.authorization_epoch();
             pending_wg_batch =
                 take_immediate_receive_batches(first, &mut wg_recv, &mut inbound.datagrams);
-            if !prepare_tun_inbound_write(&magicsock, &wg_tunnels, &peer_map, &cancel, &mut inbound)
-                .await
-            {
-                break;
-            }
             // `take_immediate_receive_batches` already drained every complete
             // batch that fit. A retained whole batch or a newly queued batch
             // therefore means ingress remained backlogged across protocol
@@ -282,14 +277,32 @@ async fn run_tun_pump_with_write_worker(
             let ingress_backlogged = pending_wg_batch.is_some() || !wg_recv.is_empty();
             backlog_events += u64::from(ingress_backlogged);
             if tun_inbound_write_inline(ingress_backlogged, worker_outstanding) {
-                inline_batches += 1;
-                if !deliver_tun_inbound_write(
-                    tun.as_ref(),
+                // Preserve the exact scalar authorization and delivery path
+                // while ingress is drained. The adaptive scheduler should add
+                // no second barrier or task hop to the latency path.
+                if !process_tun_inbound_batch(
                     &magicsock,
-                    &peer_map,
+                    tun.as_ref(),
+                    &wg_tunnels,
                     &filter,
                     &packet_drops,
                     &capture,
+                    &cancel,
+                    &peer_map,
+                    &mut inbound,
+                    None,
+                )
+                .await
+                {
+                    break;
+                }
+                inline_batches += 1;
+                free.push(inbound);
+            } else {
+                if !prepare_tun_inbound_write(
+                    &magicsock,
+                    &wg_tunnels,
+                    &peer_map,
                     &cancel,
                     &mut inbound,
                 )
@@ -297,12 +310,10 @@ async fn run_tun_pump_with_write_worker(
                 {
                     break;
                 }
-                free.push(inbound);
-            } else {
-                offloaded_batches += 1;
                 if write_tx.send(inbound).is_err() {
                     break;
                 }
+                offloaded_batches += 1;
                 worker_outstanding += 1;
             }
             if inline_batches + offloaded_batches >= next_stats_report {
@@ -437,9 +448,8 @@ async fn tun_inbound_write_worker(
     }
 }
 
-/// Apply the final authorization barriers and deliver one prepared burst.
-/// The one-packet latency path calls this inline; larger bursts call it from
-/// the worker so their kernel write cannot delay outbound TUN reads.
+/// Apply the final authorization barriers and deliver one prepared backlogged
+/// burst from the worker so its kernel write cannot delay outbound TUN reads.
 async fn deliver_tun_inbound_write(
     tun: &dyn Tun,
     magicsock: &Magicsock,

@@ -23,6 +23,21 @@ fn tun_inbound_write_inline(ingress_backlogged: bool, worker_outstanding: usize)
     !ingress_backlogged && worker_outstanding == 0
 }
 
+const TUN_WRITE_SCHEDULER_REPORT_INTERVAL: u64 = 4_096;
+
+fn log_tun_write_scheduler_stats(
+    inline_batches: u64,
+    offloaded_batches: u64,
+    backlog_events: u64,
+    worker_outstanding: usize,
+) {
+    log::info!(
+        "rustscale: tun_write_scheduler_stats event=periodic inline_batches={inline_batches} \
+         offloaded_batches={offloaded_batches} backlog_events={backlog_events} \
+         worker_outstanding={worker_outstanding}"
+    );
+}
+
 /// TUN data-plane pump: TUN device <-> WG <-> magicsock.
 ///
 /// Inbound (from network): magicsock recv -> WG decapsulate -> TUN write.
@@ -238,6 +253,10 @@ async fn run_tun_pump_with_write_worker(
     ];
     let mut pending_wg_batch = None;
     let mut worker_outstanding = 0_usize;
+    let mut inline_batches = 0_u64;
+    let mut offloaded_batches = 0_u64;
+    let mut backlog_events = 0_u64;
+    let mut next_stats_report = TUN_WRITE_SCHEDULER_REPORT_INTERVAL;
 
     loop {
         if cancel.is_cancelled() {
@@ -261,7 +280,9 @@ async fn run_tun_pump_with_write_worker(
             // therefore means ingress remained backlogged across protocol
             // work, rather than merely arriving as one coalesced burst.
             let ingress_backlogged = pending_wg_batch.is_some() || !wg_recv.is_empty();
+            backlog_events += u64::from(ingress_backlogged);
             if tun_inbound_write_inline(ingress_backlogged, worker_outstanding) {
+                inline_batches += 1;
                 if !deliver_tun_inbound_write(
                     tun.as_ref(),
                     &magicsock,
@@ -278,10 +299,21 @@ async fn run_tun_pump_with_write_worker(
                 }
                 free.push(inbound);
             } else {
+                offloaded_batches += 1;
                 if write_tx.send(inbound).is_err() {
                     break;
                 }
                 worker_outstanding += 1;
+            }
+            if inline_batches + offloaded_batches >= next_stats_report {
+                log_tun_write_scheduler_stats(
+                    inline_batches,
+                    offloaded_batches,
+                    backlog_events,
+                    worker_outstanding,
+                );
+                next_stats_report =
+                    next_stats_report.saturating_add(TUN_WRITE_SCHEDULER_REPORT_INTERVAL);
             }
             continue;
         }

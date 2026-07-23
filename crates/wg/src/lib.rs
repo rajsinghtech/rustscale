@@ -1223,10 +1223,12 @@ mod tests {
 
     /// Reproducible focused throughput probe for the established-data crypto
     /// path. Run with:
-    /// `cargo test -p rustscale-wg --release report_batch_encrypt_microbenchmark -- --ignored --nocapture`
+    /// `RUSTSCALE_RUN_WG_ENCRYPT_MICROBENCH=1 cargo test -p rustscale-wg --release report_batch_encrypt_microbenchmark -- --nocapture`
     #[test]
-    #[ignore = "focused performance probe"]
     fn report_batch_encrypt_microbenchmark() {
+        if std::env::var_os("RUSTSCALE_RUN_WG_ENCRYPT_MICROBENCH").is_none() {
+            return;
+        }
         const PACKETS: usize = 64;
         const ROUNDS: usize = 2_000;
 

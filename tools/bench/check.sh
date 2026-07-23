@@ -48,6 +48,8 @@ run tools/bench/gcp/run-matrix.sh --self-test
 # also pass the command/provenance self-tests before any paid VM work starts.
 run env GCP_MACHINE=n2-standard-4 tools/bench/gcp/run-config.sh --self-test
 run env GCP_MACHINE=n2-standard-4 tools/bench/gcp/run-matrix.sh --self-test
+run env RS_TUN_INBOUND_WRITE_WORKER=1 tools/bench/gcp/run-config.sh --self-test
+run env RS_TUN_INBOUND_WRITE_WORKER=1 tools/bench/gcp/run-matrix.sh --self-test
 # Startup self-tests must be independent of the externally selected Linux UDP
 # experiment mode; these are all valid provenance/runtime combinations.
 for mode in '0 0 0' '1 0 1' '1 1 0'; do
@@ -66,7 +68,7 @@ assert (m["topologies"], m["paths"], m["configs"]) == (
 assert len(m["topologies"]) * len(m["paths"]) * len(m["configs"]) == 5
 assert m["schema_version"] == 4 and m["selection"]["preset"] == "normal-v1" and m["load"]["preset"] == "routine-v1" and root.name == m["run"]["id"]
 assert m["run"]["cloud"]["requested_machine_type"] == "n1-standard-4"
-assert m["run"]["runtime"] == {"rs_tun_inbound_pipeline": False, "rs_tun_outbound_send_pipeline": False, "linux_udp_batch": True, "linux_udp_gro": True, "linux_udp_gso": True}
+assert m["run"]["runtime"] == {"rs_tun_inbound_pipeline": False, "rs_tun_outbound_send_pipeline": False, "rs_tun_inbound_write_worker": False, "linux_udp_batch": True, "linux_udp_gro": True, "linux_udp_gso": True}
 for cell in (root / "same-zone" / "direct").glob("*.json"):
     r = json.load(open(cell))
     assert r["schema_version"] == 6 and r["run"] == m["run"] and r["observed"]["resolved_image"] == "dry-run"
@@ -116,7 +118,7 @@ import json, pathlib, sys
 root = next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json")).parent
 m = json.load(open(root / "matrix.json"))
 r = json.load(open(root / "same-zone/direct/rs-tun.json"))
-assert m["run"]["runtime"] == {"rs_tun_inbound_pipeline": True, "rs_tun_outbound_send_pipeline": False, "linux_udp_batch": True, "linux_udp_gro": True, "linux_udp_gso": True}
+assert m["run"]["runtime"] == {"rs_tun_inbound_pipeline": True, "rs_tun_outbound_send_pipeline": False, "rs_tun_inbound_write_worker": False, "linux_udp_batch": True, "linux_udp_gro": True, "linux_udp_gso": True}
 assert r["run"] == m["run"]
 PYEOF
 expect_status 2 env RS_TUN_INBOUND_PIPELINE=invalid tools/bench/gcp/run-matrix.sh --dry-run
@@ -130,6 +132,19 @@ assert json.load(open(root / "matrix.json"))["run"]["runtime"]["rs_tun_outbound_
 PYEOF
 expect_status 2 env RS_TUN_OUTBOUND_SEND_PIPELINE=invalid tools/bench/gcp/run-matrix.sh --dry-run
 expect_status 2 env RS_TUN_OUTBOUND_SEND_PIPELINE= tools/bench/gcp/run-config.sh --self-test
+run env RS_TUN_INBOUND_WRITE_WORKER=1 MATRIX_SKIP_COLLECT=1 MATRIX_RESULTS_DIR="$tmp/inbound-write-worker-on" tools/bench/gcp/run-matrix.sh --dry-run --config rs-tun
+run python3 - "$tmp/inbound-write-worker-on" <<'PYEOF'
+import json, pathlib, sys
+root = next(pathlib.Path(sys.argv[1]).glob("gcp-*/matrix.json")).parent
+runtime = json.load(open(root / "matrix.json"))["run"]["runtime"]
+assert runtime["rs_tun_inbound_write_worker"] is True
+assert runtime["rs_tun_inbound_pipeline"] is False
+assert runtime["rs_tun_outbound_send_pipeline"] is False
+PYEOF
+expect_status 2 env RS_TUN_INBOUND_WRITE_WORKER=invalid tools/bench/gcp/run-matrix.sh --dry-run
+expect_status 2 env RS_TUN_INBOUND_WRITE_WORKER= tools/bench/gcp/run-config.sh --self-test
+expect_status 2 env RS_TUN_INBOUND_WRITE_WORKER=1 RS_TUN_INBOUND_PIPELINE=1 tools/bench/gcp/run-matrix.sh --dry-run
+expect_status 2 env RS_TUN_INBOUND_WRITE_WORKER=1 RS_TUN_OUTBOUND_SEND_PIPELINE=1 tools/bench/gcp/run-config.sh --self-test
 expect_status 2 env RS_LINUX_UDP_BATCH=invalid tools/bench/gcp/run-matrix.sh --dry-run
 expect_status 2 env RS_LINUX_UDP_GRO=invalid tools/bench/gcp/run-config.sh --self-test
 expect_status 2 env RS_LINUX_UDP_GSO=invalid tools/bench/gcp/run-matrix.sh --dry-run

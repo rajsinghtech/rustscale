@@ -18,7 +18,8 @@
 #   GCP_DRY_RUN                              — set by --dry-run; propagated to lib.sh
 #   SKIP_VM_DELETE=1                         — keep VMs at the end (debugging)
 #   MATRIX_RESULTS_DIR                        — parent/root for the run-ID directory override
-#   RS_TUN_INBOUND_PIPELINE / RS_TUN_OUTBOUND_SEND_PIPELINE — rs-tun pipeline toggles: 0 (default) or 1
+#   RS_TUN_INBOUND_PIPELINE / RS_TUN_OUTBOUND_SEND_PIPELINE / RS_TUN_INBOUND_WRITE_WORKER
+#     — rs-tun scheduler toggles: 0 (default) or 1
 #   RS_LINUX_UDP_BATCH / RS_LINUX_UDP_GRO     — Linux receive modes: 0 (disabled) or 1 (default)
 #   RS_LINUX_UDP_GSO                          — Linux TX-GSO mode: 0 (plain sendmmsg) or 1 (default/probed; requires batch=1)
 
@@ -555,7 +556,7 @@ run = {"id":"gcp-20260714-000000-dirtytest", "started_at_utc":"2026-07-14T00:00:
        "source":{"commit":"a"*40,"delivery":"git-archive-head","includes_uncommitted_changes":False,"launch_worktree_dirty":True},
        "cloud":{"provider":"gcp","project":"dry-run","requested_image_project":"ubuntu-os-cloud","requested_image_family":"ubuntu-2204-lts","requested_machine_type":"n1-standard-4","network":"default","disk_type":"pd-standard","disk_gb":200},
        "build":{"command":"","rustflags":"","cargo_profile_release_lto":"","cargo_profile_release_codegen_units":""},
-       "runtime":{"rs_tun_inbound_pipeline":False,"rs_tun_outbound_send_pipeline":False,"linux_udp_batch":True,"linux_udp_gro":True,"linux_udp_gso":True}}
+       "runtime":{"rs_tun_inbound_pipeline":False,"rs_tun_outbound_send_pipeline":False,"rs_tun_inbound_write_worker":False,"linux_udp_batch":True,"linux_udp_gro":True,"linux_udp_gso":True}}
 provenance.validate_run(run)
 PYEOF
 }
@@ -751,7 +752,7 @@ matrix_write_manifest() {
     --image-family "$GCP_IMAGE" --machine "$GCP_MACHINE" --network "$GCP_NETWORK" --disk-type pd-standard \
     --disk-gb "$GCP_DISK_GB" --build-command "${RUST_BUILD_COMMAND:-}" --go-build-command "${GO_BUILD_COMMAND:-}" --rustflags "${RUSTFLAGS:-}" \
     --lto "${CARGO_PROFILE_RELEASE_LTO:-}" --codegen-units "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}" \
-    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" \
+    --rs-tun-inbound-pipeline "$RS_TUN_INBOUND_PIPELINE" --rs-tun-outbound-send-pipeline "$RS_TUN_OUTBOUND_SEND_PIPELINE" --rs-tun-inbound-write-worker "$RS_TUN_INBOUND_WRITE_WORKER" \
     --linux-udp-batch "$RS_LINUX_UDP_BATCH" --linux-udp-gro "$RS_LINUX_UDP_GRO" --linux-udp-gso "$RS_LINUX_UDP_GSO" \
     "${dry_flag[@]}" --topologies "${topologies[@]}" --paths "${paths[@]}" \
     --configs "${configs[@]}" --parallelism "${parallelism[@]}" --repeat "$repeat" \
@@ -912,9 +913,9 @@ matrix_manifest_self_test() {
   invalid_manifest="$temp_dir/invalid.json"
   matrix_write_manifest "$manifest" 3 same-zone -- direct -- rs-tun -- 1 10 100 500 1000 || { rm -rf "$temp_dir"; return 1; }
   python3 tools/bench/gcp/provenance.py validate --manifest "$manifest" || { rm -rf "$temp_dir"; return 1; }
-  python3 - "$manifest" "$GCP_MACHINE" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
+  python3 - "$manifest" "$GCP_MACHINE" "$RS_TUN_INBOUND_PIPELINE" "$RS_TUN_OUTBOUND_SEND_PIPELINE" "$RS_TUN_INBOUND_WRITE_WORKER" "$RS_LINUX_UDP_BATCH" "$RS_LINUX_UDP_GRO" "$RS_LINUX_UDP_GSO" <<'PYEOF' || { rm -rf "$temp_dir"; return 1; }
 import json, sys
-data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100,500,1000] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_toolchain_archive"] == "go1.26.4.linux-amd64.tar.gz" and build["go_toolchain_archive_sha256"] == "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "linux_udp_batch": sys.argv[5] == "1", "linux_udp_gro": sys.argv[6] == "1", "linux_udp_gso": sys.argv[7] == "1"}
+data=json.load(open(sys.argv[1])); runtime=data["run"]["runtime"]; build=data["run"]["build"]; assert data["schema_version"] == 4 and data["parallelism"] == [1,10,100,500,1000] and data["load"]["preset"] == "routine-v1" and data["run"]["cloud"]["disk_gb"] == 200 and data["run"]["cloud"]["requested_machine_type"] == sys.argv[2] and build["go_toolchain"] == "go1.26.4" and build["go_toolchain_archive"] == "go1.26.4.linux-amd64.tar.gz" and build["go_toolchain_archive_sha256"] == "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f" and build["go_module_version"] == "v1.100.0" and build["go_module_sum"] == "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=" and runtime == {"rs_tun_inbound_pipeline": sys.argv[3] == "1", "rs_tun_outbound_send_pipeline": sys.argv[4] == "1", "rs_tun_inbound_write_worker": sys.argv[5] == "1", "linux_udp_batch": sys.argv[6] == "1", "linux_udp_gro": sys.argv[7] == "1", "linux_udp_gso": sys.argv[8] == "1"}
 PYEOF
   if matrix_write_manifest "$invalid_manifest" 3 same-zone -- direct -- rs-tun -- 0 >/dev/null 2>&1 || [[ -e "$invalid_manifest" ]]; then
     rm -rf "$temp_dir"; return 1
@@ -952,6 +953,20 @@ matrix_outbound_send_pipeline_self_test() {
   (( status == 2 ))
 }
 
+matrix_inbound_write_worker_self_test() {
+  local actual status
+  actual=$(export RS_TUN_INBOUND_PIPELINE=0 RS_TUN_OUTBOUND_SEND_PIPELINE=0 RS_TUN_INBOUND_WRITE_WORKER=1; configure_rs_tun_inbound_write_worker; printf '%s' "$RS_TUN_INBOUND_WRITE_WORKER") || return 1
+  [[ "$actual" == 1 ]] || return 1
+  actual=$(export RS_TUN_INBOUND_PIPELINE=0 RS_TUN_OUTBOUND_SEND_PIPELINE=0; unset RS_TUN_INBOUND_WRITE_WORKER; configure_rs_tun_inbound_write_worker; printf '%s' "$RS_TUN_INBOUND_WRITE_WORKER") || return 1
+  [[ "$actual" == 0 ]] || return 1
+  if ( export RS_TUN_INBOUND_WRITE_WORKER=invalid; configure_rs_tun_inbound_write_worker ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
+  if ( export RS_TUN_INBOUND_PIPELINE=1 RS_TUN_OUTBOUND_SEND_PIPELINE=0 RS_TUN_INBOUND_WRITE_WORKER=1; configure_rs_tun_inbound_write_worker ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 )) || return 1
+  if ( export RS_TUN_INBOUND_PIPELINE=0 RS_TUN_OUTBOUND_SEND_PIPELINE=1 RS_TUN_INBOUND_WRITE_WORKER=1; configure_rs_tun_inbound_write_worker ) >/dev/null 2>&1; then return 1; else status=$?; fi
+  (( status == 2 ))
+}
+
 matrix_linux_udp_receive_modes_self_test() {
   local actual status
   for actual in 0/0 1/0 1/1; do
@@ -985,6 +1000,7 @@ matrix_linux_udp_tx_gso_mode_self_test() {
 
 configure_rs_tun_inbound_pipeline || exit $?
 configure_rs_tun_outbound_send_pipeline || exit $?
+configure_rs_tun_inbound_write_worker || exit $?
 configure_linux_udp_receive_modes || exit $?
 configure_linux_udp_tx_gso_mode || exit $?
 
@@ -1003,6 +1019,7 @@ matrix_instance_metadata_capture_self_test
 matrix_manifest_self_test
 matrix_inbound_pipeline_self_test
 matrix_outbound_send_pipeline_self_test
+matrix_inbound_write_worker_self_test
 matrix_linux_udp_receive_modes_self_test
 matrix_linux_udp_tx_gso_mode_self_test
 matrix_zone_pair_self_test

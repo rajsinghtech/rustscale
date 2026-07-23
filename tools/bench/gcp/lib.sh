@@ -56,6 +56,20 @@ configure_rs_tun_outbound_send_pipeline() {
   esac
 }
 
+configure_rs_tun_inbound_write_worker() {
+  [[ -n "${RS_TUN_INBOUND_WRITE_WORKER+x}" ]] || RS_TUN_INBOUND_WRITE_WORKER=0
+  case "$RS_TUN_INBOUND_WRITE_WORKER" in
+    0|1) export RS_TUN_INBOUND_WRITE_WORKER ;;
+    *) echo "RS_TUN_INBOUND_WRITE_WORKER must be 0 or 1" >&2; return 2 ;;
+  esac
+  if [[ "$RS_TUN_INBOUND_WRITE_WORKER" == 1 \
+        && ( "${RS_TUN_INBOUND_PIPELINE:-0}" == 1 \
+          || "${RS_TUN_OUTBOUND_SEND_PIPELINE:-0}" == 1 ) ]]; then
+    echo "RS_TUN_INBOUND_WRITE_WORKER=1 requires both legacy TUN pipelines off" >&2
+    return 2
+  fi
+}
+
 # Benchmark runtime modes are explicit 0/1 values so one delivered binary can
 # measure the scalar baseline, plain batch, or guarded-GRO candidate. The
 # daemon's production controls are presence-based disable switches, so `0`

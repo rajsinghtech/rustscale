@@ -233,6 +233,52 @@ The complete credential-free result, raw perf data and reports, workload
 accounting, and checksums are tracked in
 [`docs/performance/gcp-20260723-121859-c3dbae0fb4`](docs/performance/gcp-20260723-121859-c3dbae0fb4/).
 
+### Immediate nonblocking TUN writes (accepted)
+
+Runs `gcp-20260723-125554-32995220c8` and
+`gcp-20260723-131614-95f50d8842` compared exact clean source
+`6a6e2c78cd7a574243c7cbf8ab6f7bf8cf52efe6` with candidate
+`0b4fe21d6b2725a0931d93257bbceb9c3f652be0`. The candidate changes only the
+Linux TUN write path: because the descriptor is already `O_NONBLOCK`, it
+attempts `write`/`writev` immediately, retries `EINTR`, and uses the existing
+`AsyncFd` readiness wait unchanged after `EAGAIN`. It does not change packet
+ordering, authorization, WireGuard state, queues, GRO planning, or fallback
+behavior.
+
+The runs were serialized and used matched `n1-standard-4` Intel Haswell
+machines, zones, image, kernel, toolchain, build command, direct path, and
+default runtime configuration. Every one of the 30 retained trials had exact
+established, handshaken, and completed connection counts; both latency runs
+completed 200/200 exchanges. No valid result was retried or replaced.
+
+| Parallel streams | Readiness-first median (CV) | Immediate-write median (CV) | Change |
+|---:|---:|---:|---:|
+| 1 | 1361.9 Mbps (1.18%) | 1495.6 Mbps (0.82%) | **+9.82%** |
+| 10 | 994.1 Mbps (2.55%) | 1131.3 Mbps (0.74%) | **+13.81%** |
+| 100 | 809.0 Mbps (0.71%) | 905.3 Mbps (0.35%) | **+11.91%** |
+| 500 | 458.3 Mbps (0.61%) | 503.9 Mbps (1.58%) | **+9.96%** |
+| 1000 | 318.8 Mbps (4.75%) | 354.4 Mbps (1.05%) | **+11.14%** |
+
+Every candidate raw sample range was above its control range. Candidate
+p50/p95/p99 latency improved from 1239.640/1388.170/1473.650 us to
+968.166/1074.792/1106.366 us, or 21.90%/22.57%/24.92%. Average/peak server
+CPU changed by +3.90%/+6.53% and client CPU by -8.67%/-4.37%; endpoint RSS
+changes stayed within 1.80%, measured runtime fell about 0.5%, and the binary
+grew 1,024 bytes (0.0046%). GRO and RXQ remained enabled with zero parse
+failures, fallbacks, dropped batches, dropped kernel messages, RXQ overflow,
+or pool waits.
+
+This focused cross-source A/B accepts the candidate as the Linux default. It
+does not close native TUN throughput: against the independent matched native
+cell above, the accepted candidate reaches 69.44%, 51.34%, 45.73%, 34.57%,
+and 27.87% of native at P1/P10/P100/P500/P1000. Its latency is within 0.2% at
+p50 and 2.8%/8.1% lower at p95/p99, but those native comparisons are
+independent runs rather than a causal A/B. The complete credential-free
+evidence and checksums are tracked in
+[`docs/performance/gcp-20260723-125554-32995220c8`](docs/performance/gcp-20260723-125554-32995220c8/)
+and
+[`docs/performance/gcp-20260723-131614-95f50d8842`](docs/performance/gcp-20260723-131614-95f50d8842/).
+
 ### Bidirectional TUN write-worker A/B (diagnostic only)
 
 Runs `gcp-20260723-102120-681c1f93dd` and

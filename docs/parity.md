@@ -286,6 +286,22 @@ is a matched cross-implementation gap rather than a causal same-binary A/B.
 The full native evidence is tracked under
 [`docs/performance/gcp-20260723-121859-c3dbae0fb4`](performance/gcp-20260723-121859-c3dbae0fb4/).
 
+The accepted Linux immediate-write change was then tested in serialized runs
+`gcp-20260723-125554-32995220c8` and
+`gcp-20260723-131614-95f50d8842`. It attempts the already-nonblocking TUN
+`write`/`writev` before registering an `AsyncFd` readiness wait and falls back
+unchanged on `EAGAIN`. In the exact focused cross-source A/B it improved
+P1/P10/P100/P500/P1000 throughput by
+9.82%/13.81%/11.91%/9.96%/11.14%, with every candidate raw range above the
+control range. It improved p50/p95/p99 latency by 21.90%/22.57%/24.92%; CPU,
+RSS, runtime, binary size, direct-path, lifecycle, GRO/RXQ, and cleanup gates
+all passed. The accepted candidate still reaches only
+69.44%/51.34%/45.73%/34.57%/27.87% of the independent matched native medians,
+so kernel-TUN throughput parity remains open. Exact evidence is retained under
+[`docs/performance/gcp-20260723-125554-32995220c8`](performance/gcp-20260723-125554-32995220c8/)
+and
+[`docs/performance/gcp-20260723-131614-95f50d8842`](performance/gcp-20260723-131614-95f50d8842/).
+
 Together, the same-host upload and cross-host download evidence closes and
 exceeds the measured direct embedded throughput gap from P1 through P1000 and
 the measured p50/p95/p99 latency gap. It does not close kernel-TUN throughput,

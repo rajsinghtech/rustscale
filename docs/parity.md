@@ -174,7 +174,7 @@ event-driven) · packet filter (incl. stateful UDP, capability ACLs, shields-up 
 with distinct embedded Rust, pinned embedded Go tsnet, daemon-proxy, and TUN
 cells; historical SOCKS5/Serve numbers are not embedded-tsnet claims.
 
-## Current embedded performance evidence (2026-07-22)
+## Current embedded performance evidence (2026-07-23)
 
 The latest matched high-fanout receive comparison used the tracked RSB1
 userspace-tsnet upload workload on one 8-core ARM Neoverse-V2 AWS host running
@@ -217,11 +217,41 @@ the native comparator used Go 1.26.4 and exactly matched the tracked
 current receive implementation to `crates/tsnet/src/netstack_pump.rs`, and the
 standard maintained matrix analogue to `tools/bench/gcp/`.
 
+A follow-up P10 stability A/B on the same host compared that accepted receive
+path with one additional bounded `recvmmsg` burst of detachable-buffer
+headroom. A fixed sampler-corrected Rust sender was used for both arms. The
+order `control,candidate,candidate,control,candidate,control,control,candidate,control,candidate`
+was frozen before execution; each arm ran five fresh-tailnet 20-second trials,
+and every outcome counted without retry or replacement. All ten trials were
+direct, established/handshook/completed exactly 10 streams, produced exactly
+20 one-second samples, and had no low, zero, or stalled interval.
+
+| P10 upload | Trial totals (Mbps) | Mean | Population CV | Clean trials |
+| --- | --- | ---: | ---: | ---: |
+| Accepted receive path | `5286.489, 5016.107, 5484.906, 5447.920, 5321.950` | 5311.474 Mbps | 3.113% | 5/5 |
+| One-burst pool headroom | `5544.594, 5667.583, 5705.693, 5344.741, 5327.224` | 5517.967 Mbps | 2.862% | 5/5 |
+
+The candidate improved mean throughput by 3.89%. Mean receiver pool-wait time
+fell from 1.661 seconds to 0.287 seconds per trial (82.7%), while mean receiver
+CPU changed from 1.547 to 1.598 cores. Maximum observed receiver RSS was
+58,780 KiB for control and 59,200 KiB for the candidate. The implementation
+adds 128 fixed 2 KiB buffers (256 KiB per magicsock receive pool), keeps the
+pool bounded, and leaves the separate 256-packet WireGuard handoff-credit cap
+unchanged. The candidate artifact was built from committed clean tree
+`54a89a6b0841c0c664ebc96b6bc3df0af730ddeb` with Rust 1.97.1; its SHA-256 was
+`c425fc949cce34af13431b0103c5de71a12bb4146a0c08a49af89a4781fccbbd`.
+The control/sender artifact SHA-256 was
+`d1d533e901f234ce9c77c2a436bdafd98c52381cbfb37aa29c90bc1bbe1a9adc`.
+This A/B validates the headroom change relative to the accepted RustScale
+path; it is not a contemporaneous native-Tailscale P10 comparison.
+
 This evidence closes and exceeds the measured high-fanout embedded inbound
-throughput gap on this host. It does not establish latency, low-concurrency,
-download/bidirectional, DERP, TUN, daemon/userspace, startup, idle-resource,
-cross-host, or universal compatibility parity; those remain required before
-the overall parity goal or merge gate is complete.
+throughput gap on this host and establishes a clean P10 candidate-versus-prior
+RustScale stability slice. It does not establish a matched native
+low-concurrency comparison, latency, download/bidirectional, DERP, TUN,
+daemon/userspace, startup, idle-resource, cross-host, or universal
+compatibility parity; those remain required before the overall parity goal or
+merge gate is complete.
 
 ## Test infrastructure
 

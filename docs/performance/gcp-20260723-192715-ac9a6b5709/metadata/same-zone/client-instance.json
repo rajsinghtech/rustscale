@@ -1,0 +1,10 @@
+{
+  "cpuPlatform": "Intel Haswell",
+  "disks": [
+    {
+      "source": "https://www.googleapis.com/compute/v1/projects/tailscale-sandbox/zones/us-central1-b/disks/rs-bench-same-zone-cli-20260723-192715-ac9a6b5709"
+    }
+  ],
+  "machineType": "https://www.googleapis.com/compute/v1/projects/tailscale-sandbox/zones/us-central1-b/machineTypes/n1-standard-4",
+  "zone": "https://www.googleapis.com/compute/v1/projects/tailscale-sandbox/zones/us-central1-b"
+}

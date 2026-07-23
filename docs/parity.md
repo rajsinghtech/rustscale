@@ -350,6 +350,24 @@ evidence is retained under
 and
 [`docs/performance/gcp-20260723-115345-ae16d4040d`](performance/gcp-20260723-115345-ae16d4040d/).
 
+An ingress-backlog scheduler at exact clean source
+`573fdeecc11abbf5e7627cf20e4cb82939aeafc9` was then tested in one frozen,
+same-binary control-to-candidate pair without retries. It kept the exact scalar
+path while the receive channel was drained and offloaded only once another
+ciphertext batch was already waiting. The candidate offloaded 1.19% of server
+batches and 1.29% of client batches, but regressed
+P1/P10/P100/P500/P1000 throughput by
+15.25%/16.06%/13.25%/14.98%/8.63%. The P1 through P500 raw ranges did not
+overlap. Mean and p50/p95/p99 latency regressed
+30.40%/28.80%/28.24%/27.79%. Both arms completed 15/15 throughput trials and
+200/200 latency exchanges with direct paths, zero UDP receive overflow or
+handoff-pool waits, identical product bytes, exact provenance, and exact-zero
+cleanup. The backlog scheduler is therefore rejected and its product change
+is not part of this branch. Exact evidence is retained under
+[`docs/performance/gcp-20260723-192715-ac9a6b5709`](performance/gcp-20260723-192715-ac9a6b5709/)
+and
+[`docs/performance/gcp-20260723-194656-40d2f57282`](performance/gcp-20260723-194656-40d2f57282/).
+
 ## Test infrastructure
 
 `crates/testcontrol` ✅ in-process fake control server (Noise handshake, h2c,

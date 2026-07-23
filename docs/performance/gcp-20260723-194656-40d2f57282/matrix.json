@@ -1,0 +1,105 @@
+{
+  "configs": [
+    "rs-tun"
+  ],
+  "dry_run": false,
+  "duration_s": 10,
+  "load": {
+    "duration_s": 10,
+    "parallelism_target": [
+      1,
+      10,
+      100,
+      500,
+      1000
+    ],
+    "peer_load": {
+      "effective": null,
+      "observed": null,
+      "requested": 1,
+      "status": "not-applied"
+    },
+    "preset": "custom",
+    "repeat": 3,
+    "sample_cadence_s": 1
+  },
+  "parallelism": [
+    1,
+    10,
+    100,
+    500,
+    1000
+  ],
+  "paths": [
+    "direct"
+  ],
+  "peer_count_requested": 1,
+  "repeat": 3,
+  "run": {
+    "build": {
+      "cargo_profile_release_codegen_units": "",
+      "cargo_profile_release_lto": "",
+      "command": "export RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/rust/cargo; cd /opt/rustscale && cargo build --release -p rustscale-bench -p rustscale-cli -p rustscale-rustscaled",
+      "go_command": "",
+      "go_module": "tailscale.com",
+      "go_module_sum": "h1:nm/M/dEaW9RaRsGUjW2HsSDpsZ60Jwd9k4gNW9tTFiE=",
+      "go_module_version": "v1.100.0",
+      "go_toolchain": "go1.26.4",
+      "go_toolchain_archive": "go1.26.4.linux-amd64.tar.gz",
+      "go_toolchain_archive_sha256": "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f",
+      "rustflags": ""
+    },
+    "cloud": {
+      "disk_gb": 200,
+      "disk_type": "pd-standard",
+      "network": "default",
+      "project": "tailscale-sandbox",
+      "provider": "gcp",
+      "requested_image_family": "ubuntu-2204-lts",
+      "requested_image_project": "ubuntu-os-cloud",
+      "requested_machine_type": "n1-standard-4"
+    },
+    "id": "gcp-20260723-194656-40d2f57282",
+    "runtime": {
+      "linux_udp_batch": true,
+      "linux_udp_gro": true,
+      "linux_udp_gso": true,
+      "rs_tun_inbound_pipeline": false,
+      "rs_tun_inbound_write_worker": true,
+      "rs_tun_outbound_send_pipeline": false
+    },
+    "source": {
+      "commit": "573fdeecc11abbf5e7627cf20e4cb82939aeafc9",
+      "delivery": "git-archive-head",
+      "includes_uncommitted_changes": false,
+      "launch_worktree_dirty": false
+    },
+    "started_at_utc": "2026-07-23T19:46:56Z"
+  },
+  "sample_cadence_s": 1,
+  "schema_version": 4,
+  "selection": {
+    "cells": [
+      {
+        "id": "rs-tun",
+        "implementation": "rustscale",
+        "mode": "tun"
+      }
+    ],
+    "preset": "custom",
+    "source": {
+      "configs": "explicit",
+      "paths": "explicit",
+      "topologies": "explicit"
+    }
+  },
+  "topologies": [
+    "same-zone"
+  ],
+  "warmup": {
+    "direction": "down",
+    "duration_s": 3,
+    "parallel": 1,
+    "protocol": "RSB1"
+  }
+}

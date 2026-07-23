@@ -4520,7 +4520,7 @@ impl Inner {
         }
         // No ReceiveBatch slice borrow or endpoint/address lock survives
         // either await. Channel backpressure keeps its established queued
-        // lifetime; fixed-buffer inventory is a separate 384-slot limit.
+        // lifetime; fixed-buffer inventory has its own bounded packet limit.
         let credit_count = u32::try_from(known).expect("known batch count fits u32");
         let credit_started = std::time::Instant::now();
         let (channel_permit, credit_waited) = match self

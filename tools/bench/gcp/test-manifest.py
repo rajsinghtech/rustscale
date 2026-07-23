@@ -91,14 +91,14 @@ def valid_ts_tun():
     return obj
 
 
-def matched_manifest(root, identity):
+def matched_manifest(root, identity, direction="down"):
     configs = ["rs-userspace", "rs-tun", "ts-embedded", "ts-userspace", "ts-tun"]
     modes = {"rs-userspace": "embedded", "rs-tun": "tun", "ts-embedded": "embedded",
              "ts-userspace": "daemon-proxy", "ts-tun": "tun"}
     data = {"schema_version": 4, "topologies": ["same-zone"], "paths": ["direct"],
             "configs": configs, "parallelism": PARALLELS, "repeat": 3, "duration_s": 10,
-            "sample_cadence_s": 1, "peer_count_requested": 1, "dry_run": False,
-            "warmup": {"parallel": 1, "duration_s": 3, "direction": "down", "protocol": "RSB1"},
+            "sample_cadence_s": 1, "peer_count_requested": 1, "direction": direction, "dry_run": False,
+            "warmup": {"parallel": 1, "duration_s": 3, "direction": direction, "protocol": "RSB1"},
             "selection": {"preset": "normal-v1", "source": {"topologies": "default", "paths": "default", "configs": "default"},
                           "cells": [{"id": config, "implementation": "rustscale" if config.startswith("rs-") else "tailscale",
                                      "mode": modes[config]} for config in configs]},
@@ -165,13 +165,14 @@ def matched_result(root, config, manifest):
     server = resource("server", subject_map[config][0])
     client = resource("client", subject_map[config][1])
     warmup_path = "direct" if config in {"rs-userspace", "ts-embedded"} else "externally-gated"
+    direction = manifest.get("direction", "down")
     raw_latency = list(range(1, 201))
     result = {"schema_version": 6, "status": "ok", "tool": tool, "implementation": implementation,
               "mode": mode, "topology": "same-zone", "path": "direct", "config": config,
               "repeat": 3, "parallelism_requested": PARALLELS, "duration_s_requested": 10,
               "sample_cadence_s": 1, "peer_count_requested": 1, "error": "", "log_tail": "",
               "path_class_reported": "direct", "transport": transport,
-              "warmup_evidence": {"transport": transport, "protocol": "RSB1", "direction": "down",
+              "warmup_evidence": {"transport": transport, "protocol": "RSB1", "direction": direction,
                                   "duration_secs": 3, "parallel": 1, "established": 1,
                                   "handshaken": 1, "completed": 1, "total_mbps": 10.0,
                                   "path_class": warmup_path},
@@ -181,7 +182,7 @@ def matched_result(root, config, manifest):
                               "population_stddev_mbps": 0.0,
                               "coefficient_of_variation_pct": 0.0} for p in PARALLELS],
               "throughput_trials": [{"parallel": p, "repeat_index": repeat_index, "transport": transport,
-                                     "protocol": "RSB1", "direction": "down", "duration_s": 10,
+                                     "protocol": "RSB1", "direction": direction, "duration_s": 10,
                                      "established": p, "handshaken": p, "completed": p,
                                      "total_mbps": 100.0, "path_class": warmup_path}
                                     for p in PARALLELS for repeat_index in (1, 2, 3)],
@@ -191,7 +192,7 @@ def matched_result(root, config, manifest):
                           "min_us": .001, "max_us": .2, "mean_us": .1005,
                           "p50_us": .101, "p95_us": .19, "p99_us": .198, "samples_ns": raw_latency},
               "workload": {"implementation": "go-tsnet-rsb1" if config == "ts-embedded" else "rustscale-bench",
-                           "protocol": "RSB1", "direction": "down", "payload_bytes": 1280,
+                           "protocol": "RSB1", "direction": direction, "payload_bytes": 1280,
                            "warmup": {"parallel": 1, "duration_s": 3, "max_attempts": 1},
                            "client_lifecycle": "new_benchmark_process_per_trial",
                            "transport_identity_lifecycle": "one_persisted_identity_per_endpoint_cell",
@@ -267,6 +268,21 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "RustScale embedded tsnet" in moved_html and "Go embedded tsnet" in moved_html
     assert "tailscaled daemon proxy" in moved_html
     assert "Repeat dispersion" in moved_html and "coefficient of variation" in moved_html
+
+    # Direction is an immutable matrix dimension. A complete bidirectional
+    # matrix is valid only when every workload, warmup, and trial reports it.
+    bidir_identity = run_identity(); bidir_identity["id"] = "gcp-20260714-010203-bidir"
+    bidir_root = Path(tmp) / bidir_identity["id"]; bidir_root.mkdir()
+    bidir = matched_manifest(bidir_root, bidir_identity, "bidir")
+    for config in bidir["configs"]:
+        write_cell(bidir_root, matched_result(bidir_root, config, bidir), f"{config}.json")
+    assert json.loads(run("python3", GCP / "aggregate.py", bidir_root).stdout)["completeness"]["complete"] is True
+    bidir_cell = bidir_root / "same-zone/direct/rs-tun.json"
+    mismatched_direction = json.loads(bidir_cell.read_text())
+    mismatched_direction["throughput_trials"][0]["direction"] = "down"
+    bidir_cell.write_text(json.dumps(mismatched_direction))
+    assert "incomplete RSB1 lifecycle" in run("python3", GCP / "aggregate.py", bidir_root, ok=False).stderr
+
     ts_user_path = matched_root / "same-zone/direct/ts-userspace.json"
     original_ts_user = json.loads(ts_user_path.read_text())
     for expected_error, mutate in (

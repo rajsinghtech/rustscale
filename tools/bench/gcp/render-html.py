@@ -58,6 +58,10 @@ def valid_matrix(data: dict) -> dict | None:
         if not isinstance(data.get("dry_run", False), bool):
             return None
         matrix["dry_run"] = data.get("dry_run", False)
+        direction = data.get("direction", "down")
+        if direction not in {"down", "up", "bidir"}:
+            return None
+        matrix["direction"] = direction
         for key in ("parallelism", "duration_s", "sample_cadence_s", "peer_count_requested"):
             if key in data: matrix[key] = data[key]
         if data.get("schema_version") in (2, 3) and isinstance(data.get("run"), dict):
@@ -420,7 +424,7 @@ def throughput_groups(configs: list[str], runs_idx: dict, topo: str, path: str) 
         run = runs_idx.get((topo, path, cfg)) or {}
         workload = run.get("workload") if isinstance(run.get("workload"), dict) else {}
         if run.get("schema_version") == 6 and workload.get("implementation") in {"rustscale-bench", "go-tsnet-rsb1"} and workload.get("protocol") == "RSB1":
-            label = "Matched five-cell RSB1 workload"
+            label = f"Matched five-cell RSB1 workload ({workload.get('direction', 'down')})"
         elif run.get("schema_version") == 5 and workload.get("implementation") == "rustscale-bench" and workload.get("protocol") == "RSB1":
             label = "Historical matched four-cell RSB1 workload"
         elif workload.get("implementation") == "rustscale-bench" and workload.get("protocol") == "RSB1":

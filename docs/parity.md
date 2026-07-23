@@ -281,6 +281,21 @@ the embedded client peak-RSS/cold-tail observations, bidirectional traffic,
 DERP, startup, idle-resource, or universal compatibility parity; those remain
 required before the overall parity goal or merge gate is complete.
 
+A subsequent exact same-binary TUN A/B at clean source
+`ab1e85009afebc88fa97acc179954d9a4c6ffc07` separated final inbound TUN
+writes from the task that services outbound TUN reads. The opt-in worker
+improved P1/P10/P100/P500/P1000 throughput by
+1.00%/5.29%/10.17%/42.03%/35.44%, confirming that the bidirectional scheduling
+boundary is a material high-fanout constraint. It simultaneously regressed
+p50/p95/p99 latency by 32.79%/35.83%/41.82% and raised average userspace CPU
+18.34% on the server and 25.76% on the client. It therefore remains a
+Linux-only diagnostic behind `RUSTSCALE_TUN_INBOUND_WRITE_WORKER`, exclusive
+with the earlier TUN pipeline experiments and disabled by default. Both exact
+evidence bundles are tracked under
+[`docs/performance/gcp-20260723-102120-681c1f93dd`](performance/gcp-20260723-102120-681c1f93dd/)
+and
+[`docs/performance/gcp-20260723-103928-732e18dea9`](performance/gcp-20260723-103928-732e18dea9/).
+
 ## Test infrastructure
 
 `crates/testcontrol` ✅ in-process fake control server (Noise handshake, h2c,

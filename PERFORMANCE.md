@@ -196,6 +196,45 @@ The complete credential-free result, raw perf data and reports, workload
 accounting, and checksums are tracked in
 [`docs/performance/gcp-20260723-092124-39a3549e46`](docs/performance/gcp-20260723-092124-39a3549e46/).
 
+### Bidirectional TUN write-worker A/B (diagnostic only)
+
+Runs `gcp-20260723-102120-681c1f93dd` and
+`gcp-20260723-103928-732e18dea9` tested the profile-directed scheduling
+hypothesis at exact clean source
+`ab1e85009afebc88fa97acc179954d9a4c6ffc07`. Both runs used the same
+`n1-standard-4` Intel Haswell endpoints, zones, image, kernel, toolchain, build
+command, and binary hashes. The only runtime difference was
+`RUSTSCALE_TUN_INBOUND_WRITE_WORKER`: off for the control and on for the
+candidate. Both legacy TUN pipelines were off and Linux UDP batching, GRO, and
+GSO were on. Every one of the 30 retained trials had a direct path and exact
+established, handshaken, and completed connection counts; no valid result was
+retried or replaced.
+
+| Parallel streams | Worker off median (CV) | Worker on median (CV) | Change |
+|---:|---:|---:|---:|
+| 1 | 1509.0 Mbps (1.21%) | 1524.0 Mbps (1.87%) | **+1.00%** |
+| 10 | 1200.3 Mbps (1.73%) | 1263.8 Mbps (2.18%) | **+5.29%** |
+| 100 | 950.4 Mbps (0.42%) | 1047.1 Mbps (1.00%) | **+10.17%** |
+| 500 | 516.4 Mbps (1.26%) | 733.5 Mbps (1.00%) | **+42.03%** |
+| 1000 | 379.7 Mbps (5.96%) | 514.2 Mbps (2.92%) | **+35.44%** |
+
+The high-fanout gain confirms that serializing inbound TUN delivery with
+outbound TUN reads is one material throughput constraint. It is not an
+acceptable operating default. Candidate p50/p95/p99 latency regressed from
+950.845/1040.114/1081.908 us to 1262.619/1412.800/1534.360 us, or
+32.79%/35.83%/41.82%. Average userspace CPU rose 18.34% on the server and
+25.76% on the client. Average RSS changed by -0.08% and +1.40%, respectively.
+Both latency runs completed 200/200 requests without malformed results.
+
+The worker therefore remains an explicit Linux-only diagnostic, is mutually
+exclusive with the earlier TUN pipeline experiments, and is not enabled by
+default. The next TUN change must retain the observed high-fanout scheduling
+benefit without its latency and CPU cost. The complete credential-free
+evidence and checksums are tracked in
+[`docs/performance/gcp-20260723-102120-681c1f93dd`](docs/performance/gcp-20260723-102120-681c1f93dd/)
+and
+[`docs/performance/gcp-20260723-103928-732e18dea9`](docs/performance/gcp-20260723-103928-732e18dea9/).
+
 ### Historical RustScale outbound pipeline A/B (superseded)
 
 This is a same-binary A/B at source `ca56c1d0583249e97a3c68ca3ad00a48a0b95553`

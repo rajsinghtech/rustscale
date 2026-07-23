@@ -1,0 +1,151 @@
+{
+  "client": {
+    "cpu_model": "Intel(R) Xeon(R) CPU @ 2.30GHz",
+    "cpu_platform": "Intel Haswell",
+    "kernel_release": "6.8.0-1064-gcp",
+    "logical_cpus": 4,
+    "machine_type": "n1-standard-4",
+    "os_pretty_name": "Ubuntu 22.04.5 LTS",
+    "zone": "us-central1-b"
+  },
+  "measurement_tools": {
+    "client": [
+      {
+        "path": "/usr/bin/iperf3",
+        "sha256": "2c54c89b4d9016b9fe59ba83518348477fb290fdb6fc7ae12cb6773ecb9b1910",
+        "version": "iperf 3.9 (cJSON 1.7.13)\nLinux rs-bench-same-zone-cli-20260723-103928-732e18dea9 6.8.0-1064-gcp #72~22.04.1-Ubuntu SMP Sat Jul 11 00:27:00 UTC 2026 x86_64\nOptional features available: CPU affinity setting, IPv6 flow label, SCTP, TCP congestion algorithm setting, sendfile / zerocopy, socket pacing, authentication"
+      },
+      {
+        "path": "/usr/bin/socat",
+        "sha256": "ac1a7165c0ade4dfdab602895cc56ff21d61f8443a80fb676946e4a624c52f68",
+        "version": "socat by Gerhard Rieger and contributors - see www.dest-unreach.org\nsocat version 1.7.4.1 on Mar 25 2022 09:51:32\n   running on Linux version #72~22.04.1-Ubuntu SMP Sat Jul 11 00:27:00 UTC 2026, release 6.8.0-1064-gcp, machine x86_64\nfeatures:\n  #define WITH_STDIO 1\n  #define WITH_FDNUM 1\n  #define WITH_FILE 1\n  #define WITH_CREAT 1\n  #define WITH_GOPEN 1\n  #define WITH_TERMIOS 1\n  #define WITH_PIPE 1\n  #define WITH_UNIX 1\n  #define WITH_ABSTRACT_UNIXSOCKET 1\n  #define WITH_IP4 1\n  #define WITH_IP6 1\n  #define WITH_RAWIP 1\n  #define WITH_GENERICSOCKET 1\n  #define WITH_INTERFACE 1\n  #define WITH_TCP 1\n  #define WITH_UDP 1\n  #define WITH_SCTP 1\n  #define WITH_LISTEN 1\n  #define WITH_SOCKS4 1\n  #define WITH_SOCKS4A 1\n  #define WITH_VSOCK 1\n  #define WITH_PROXY 1\n  #define WITH_SYSTEM 1\n  #define WITH_EXEC 1\n  #undef WITH_READLINE\n  #define WITH_TUN 1\n  #define WITH_PTY 1\n  #define WITH_OPENSSL 1\n  #undef WITH_FIPS\n  #define WITH_LIBWRAP 1\n  #define WITH_SYCLS 1\n  #define WITH_FILAN 1\n  #define WITH_RETRY 1\n  #define WITH_MSGLEVEL 0 /*debug*/"
+      },
+      {
+        "path": "/usr/bin/ncat",
+        "sha256": "f75c3de611ca99e6dc8ebf381eb888df86c008a7eace99207ad2ad614d8dfcda",
+        "version": "Ncat: Version 7.80 ( https://nmap.org/ncat )"
+      },
+      {
+        "path": "/usr/bin/pidstat",
+        "sha256": "bb48ce4dad4beaa9972eb78ba19baeb8338306aa31a1917032cab17f994c392b",
+        "version": "sysstat version 12.5.2\n(C) Sebastien Godard (sysstat <at> orange.fr)"
+      },
+      {
+        "path": "/usr/bin/python3",
+        "sha256": "7d51cd6b48b521277f5caa4610a82126e315fa2be4df069823a8b1eeb5bd4a86",
+        "version": "Python 3.10.12"
+      }
+    ],
+    "server": [
+      {
+        "path": "/usr/bin/iperf3",
+        "sha256": "2c54c89b4d9016b9fe59ba83518348477fb290fdb6fc7ae12cb6773ecb9b1910",
+        "version": "iperf 3.9 (cJSON 1.7.13)\nLinux rs-bench-same-zone-srv-20260723-103928-732e18dea9 6.8.0-1064-gcp #72~22.04.1-Ubuntu SMP Sat Jul 11 00:27:00 UTC 2026 x86_64\nOptional features available: CPU affinity setting, IPv6 flow label, SCTP, TCP congestion algorithm setting, sendfile / zerocopy, socket pacing, authentication"
+      },
+      {
+        "path": "/usr/bin/socat",
+        "sha256": "ac1a7165c0ade4dfdab602895cc56ff21d61f8443a80fb676946e4a624c52f68",
+        "version": "socat by Gerhard Rieger and contributors - see www.dest-unreach.org\nsocat version 1.7.4.1 on Mar 25 2022 09:51:32\n   running on Linux version #72~22.04.1-Ubuntu SMP Sat Jul 11 00:27:00 UTC 2026, release 6.8.0-1064-gcp, machine x86_64\nfeatures:\n  #define WITH_STDIO 1\n  #define WITH_FDNUM 1\n  #define WITH_FILE 1\n  #define WITH_CREAT 1\n  #define WITH_GOPEN 1\n  #define WITH_TERMIOS 1\n  #define WITH_PIPE 1\n  #define WITH_UNIX 1\n  #define WITH_ABSTRACT_UNIXSOCKET 1\n  #define WITH_IP4 1\n  #define WITH_IP6 1\n  #define WITH_RAWIP 1\n  #define WITH_GENERICSOCKET 1\n  #define WITH_INTERFACE 1\n  #define WITH_TCP 1\n  #define WITH_UDP 1\n  #define WITH_SCTP 1\n  #define WITH_LISTEN 1\n  #define WITH_SOCKS4 1\n  #define WITH_SOCKS4A 1\n  #define WITH_VSOCK 1\n  #define WITH_PROXY 1\n  #define WITH_SYSTEM 1\n  #define WITH_EXEC 1\n  #undef WITH_READLINE\n  #define WITH_TUN 1\n  #define WITH_PTY 1\n  #define WITH_OPENSSL 1\n  #undef WITH_FIPS\n  #define WITH_LIBWRAP 1\n  #define WITH_SYCLS 1\n  #define WITH_FILAN 1\n  #define WITH_RETRY 1\n  #define WITH_MSGLEVEL 0 /*debug*/"
+      },
+      {
+        "path": "/usr/bin/ncat",
+        "sha256": "f75c3de611ca99e6dc8ebf381eb888df86c008a7eace99207ad2ad614d8dfcda",
+        "version": "Ncat: Version 7.80 ( https://nmap.org/ncat )"
+      },
+      {
+        "path": "/usr/bin/pidstat",
+        "sha256": "bb48ce4dad4beaa9972eb78ba19baeb8338306aa31a1917032cab17f994c392b",
+        "version": "sysstat version 12.5.2\n(C) Sebastien Godard (sysstat <at> orange.fr)"
+      },
+      {
+        "path": "/usr/bin/python3",
+        "sha256": "7d51cd6b48b521277f5caa4610a82126e315fa2be4df069823a8b1eeb5bd4a86",
+        "version": "Python 3.10.12"
+      }
+    ]
+  },
+  "product": {
+    "client": [
+      {
+        "path": "/opt/rustscale/target/release/rustscale-bench",
+        "sha256": "fda86f80c478870c42e1f478ce16d759e249d0aebc03db0dc1db1c4a691a3682",
+        "version": "rustscale-bench 0.1.5",
+        "version_source": "executable --version"
+      },
+      {
+        "path": "/opt/rustscale/target/release/rustscale",
+        "sha256": "fabc98cc8f8aa64beebf61e33c32b990f9a5b974d7613970e7990513416f3d75",
+        "version": "0.1.5",
+        "version_source": "executable --version"
+      },
+      {
+        "path": "/opt/rustscale/target/release/rustscaled",
+        "sha256": "d8eba76b45b34f5f9249cb944ac981b28791904087ce4e1c8cab2aa903f17d0b",
+        "version": "rustscaled 0.1.5",
+        "version_source": "executable --version"
+      },
+      {
+        "path": "/usr/sbin/tailscaled",
+        "sha256": "8da02a9f8fde1847982d28cfc2f1d77849b26633f2250e26f5316c3617e4db18",
+        "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+        "version_source": "executable --version"
+      },
+      {
+        "path": "/usr/bin/tailscale",
+        "sha256": "061bdadd0d9306ff7fd4368bd5022cdbb068828631cd981ef2163454f136d4b3",
+        "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+        "version_source": "executable --version"
+      }
+    ],
+    "server": [
+      {
+        "path": "/opt/rustscale/target/release/rustscale-bench",
+        "sha256": "fda86f80c478870c42e1f478ce16d759e249d0aebc03db0dc1db1c4a691a3682",
+        "version": "rustscale-bench 0.1.5",
+        "version_source": "executable --version"
+      },
+      {
+        "path": "/opt/rustscale/target/release/rustscale",
+        "sha256": "fabc98cc8f8aa64beebf61e33c32b990f9a5b974d7613970e7990513416f3d75",
+        "version": "0.1.5",
+        "version_source": "executable --version"
+      },
+      {
+        "path": "/opt/rustscale/target/release/rustscaled",
+        "sha256": "d8eba76b45b34f5f9249cb944ac981b28791904087ce4e1c8cab2aa903f17d0b",
+        "version": "rustscaled 0.1.5",
+        "version_source": "executable --version"
+      },
+      {
+        "path": "/usr/sbin/tailscaled",
+        "sha256": "8da02a9f8fde1847982d28cfc2f1d77849b26633f2250e26f5316c3617e4db18",
+        "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+        "version_source": "executable --version"
+      },
+      {
+        "path": "/usr/bin/tailscale",
+        "sha256": "061bdadd0d9306ff7fd4368bd5022cdbb068828631cd981ef2163454f136d4b3",
+        "version": "1.98.9\n  tailscale commit: 4fb758c39ae5b208b974af14ba6bc896a250394c\n  long version: 1.98.9-t4fb758c39-g200941d74\n  other commit: 200941d74860e4e5843de3d7d22ef7191fcac6ef\n  go version: go1.26.5 (tailscale/go 63ae404c82)",
+        "version_source": "executable --version"
+      }
+    ]
+  },
+  "resolved_image": "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260721",
+  "server": {
+    "cpu_model": "Intel(R) Xeon(R) CPU @ 2.30GHz",
+    "cpu_platform": "Intel Haswell",
+    "kernel_release": "6.8.0-1064-gcp",
+    "logical_cpus": 4,
+    "machine_type": "n1-standard-4",
+    "os_pretty_name": "Ubuntu 22.04.5 LTS",
+    "zone": "us-central1-a"
+  },
+  "toolchain": {
+    "client_cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "client_go": "go version go1.26.4 linux/amd64",
+    "client_rustc_verbose": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6",
+    "server_cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "server_go": "go version go1.26.4 linux/amd64",
+    "server_rustc_verbose": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6"
+  }
+}
